@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build documentation
@@ -29,4 +33,26 @@ jobs:
         run: uv sync --all-groups --python 3.13
 
       - name: Build docs
-        run: uv run mkdocs build --strict
+        run: uv run mkdocs build --strict --site-dir site
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: Deploy documentation
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5.0.0
