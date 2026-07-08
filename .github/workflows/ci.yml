@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync workspace
+        run: uv sync --all-groups --python ${{ matrix.python-version }}
+
+      - name: Agent policy check
+        run: uv run scaffold-guard check
+
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+
+
+      - name: Type check with mypy
+        run: uv run mypy src tests examples
+
+
+
+      - name: Type check with Pyright
+        run: uv run pyright
+
+
+      - name: Build docs
+        run: uv run mkdocs build --strict
+
+      - name: Test
+        run: >
+          uv run pytest tests
+          --cov=atoll
+          --cov-report=term-missing
+          --cov-fail-under=95

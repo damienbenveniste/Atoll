@@ -1,0 +1,62 @@
+[project]
+name = "atoll"
+package = "atoll"
+profile = "python"
+python_min = "3.13"
+coverage_fail_under = 95
+ci = "github"
+
+[agents]
+codex = true
+claude = false
+cursor = false
+
+[features]
+docs = true
+github_actions = true
+gitlab_ci = false
+mkdocs = true
+
+[tools]
+ruff = true
+ruff_mode = "strict"
+mypy = true
+pyright = true
+python_typecheck = "strict"
+python_typechecker = "mypy+pyright"
+
+[policy]
+forbid_type_ignore = true
+forbid_pyright_ignore = true
+forbid_noqa = true
+forbid_any = true
+forbid_dict_str_any = true
+forbid_shell_true = true
+require_tests_for_src_changes = true
+require_docs_for_public_api_changes = true
+require_lockfile_for_dependency_changes = true
+
+[validation]
+quick = [
+
+  "uv run ruff format --check .",
+  "uv run ruff check .",
+
+  "uv run pytest tests/unit",
+  "scaffold-guard check"
+]
+full = [
+
+  "uv run ruff format --check .",
+  "uv run ruff check .",
+
+
+  "uv run mypy src tests examples",
+
+
+  "uv run pyright",
+
+  "uv run mkdocs build --strict",
+  "uv run pytest tests --cov=atoll --cov-report=term-missing --cov-fail-under=95",
+  "scaffold-guard check"
+]
