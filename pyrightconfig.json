@@ -8,7 +8,7 @@
     ".ruff_cache",
     "tests/fixtures"
   ],
-  "pythonVersion": "3.13",
+  "pythonVersion": "3.12",
   "typeCheckingMode": "strict",
   "venvPath": ".",
   "venv": ".venv",

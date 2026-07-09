@@ -30,7 +30,7 @@ These rules apply to every code, documentation, and configuration change in this
 ## Python Tooling
 
 - Use `uv` for dependency management and command execution.
-- Keep generated projects on Python `3.13` or newer.
+- Keep generated projects on Python `3.12` or newer.
 - Use Ruff, mypy, Pyright, pytest, coverage, and MkDocs as configured in `pyproject.toml`.
 
 ## Types and Data Modeling

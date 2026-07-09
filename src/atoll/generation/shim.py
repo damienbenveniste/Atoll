@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import difflib
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from atoll.models import EnabledIslandConfig
 
@@ -35,14 +37,18 @@ def render_shim(config: EnabledIslandConfig) -> str:
     assignments = "\n".join(
         f"            {symbol} = _atoll_mod.{symbol}" for symbol in config.symbols
     )
+    sidecar_relative = _relative_path_text(config.source_path.parent, config.sidecar_path)
+    artifact_relative = _relative_path_text(config.source_path.parent, _artifact_dir(config))
     return "\n".join(
         [
             _begin_marker(config.source_module),
             "# This block is managed by Atoll. Do not edit manually.",
             "try:",
-            "    import importlib as _atoll_importlib",
             "    import importlib.machinery as _atoll_machinery",
+            "    import importlib.util as _atoll_util",
             "    import os as _atoll_os",
+            "    import pathlib as _atoll_pathlib",
+            "    import sys as _atoll_sys",
             "",
             "    __atoll_status__ = {",
             f'        "source_module": "{config.source_module}",',
@@ -54,23 +60,58 @@ def render_shim(config: EnabledIslandConfig) -> str:
             '        "error": None,',
             "    }",
             "",
+            "    _atoll_added_artifact_path = False",
+            "    _atoll_artifact_dir_text = None",
+            "",
             '    if _atoll_os.getenv("ATOLL_DISABLE") != "1":',
             "        try:",
-            f'            _atoll_mod = _atoll_importlib.import_module("{config.sidecar_module}")',
-            '            _atoll_origin = getattr(_atoll_mod, "__file__", "") or ""',
-            "            _atoll_compiled = any(",
-            "                _atoll_origin.endswith(_suffix)",
-            "                for _suffix in _atoll_machinery.EXTENSION_SUFFIXES",
+            "            _atoll_source_dir = _atoll_pathlib.Path(__file__).resolve().parent",
+            "            _atoll_sidecar_path = (",
+            f'                _atoll_source_dir / "{sidecar_relative}"',
+            "            ).resolve()",
+            "            _atoll_artifact_dir = (",
+            f'                _atoll_source_dir / "{artifact_relative}"',
+            "            ).resolve()",
+            "            _atoll_compiled_paths = tuple(",
+            "                sorted(",
+            "                    _atoll_candidate",
+            "                    for _atoll_suffix in _atoll_machinery.EXTENSION_SUFFIXES",
+            "                    for _atoll_candidate in _atoll_artifact_dir.rglob(",
+            '                        f"{_atoll_sidecar_path.stem}*{_atoll_suffix}"',
+            "                    )",
+            "                )",
             "            )",
-            "",
+            "            _atoll_compiled = bool(_atoll_compiled_paths)",
             "            if (",
             '                _atoll_os.getenv("ATOLL_REQUIRE_COMPILED") == "1"',
             "                and not _atoll_compiled",
             "            ):",
             "                raise ImportError(",
-            f'                    "Atoll sidecar {config.sidecar_module} imported, "',
-            '                    "but it is not a compiled extension"',
+            "                    "
+            f'"Atoll sidecar {config.sidecar_module} has no compiled extension"',
             "                )",
+            "            _atoll_origin_path = (",
+            "                _atoll_compiled_paths[0] if _atoll_compiled else _atoll_sidecar_path",
+            "            )",
+            "            _atoll_origin = str(_atoll_origin_path)",
+            "            if _atoll_compiled:",
+            "                _atoll_artifact_dir_text = str(_atoll_artifact_dir)",
+            "                if _atoll_artifact_dir_text not in _atoll_sys.path:",
+            "                    _atoll_sys.path.insert(0, _atoll_artifact_dir_text)",
+            "                    _atoll_added_artifact_path = True",
+            "            _atoll_spec = _atoll_util.spec_from_file_location(",
+            f'                "{config.sidecar_module}", _atoll_origin_path',
+            "            )",
+            "            if _atoll_spec is None or _atoll_spec.loader is None:",
+            "                raise ImportError(",
+            f'                    "Atoll sidecar {config.sidecar_module} cannot be loaded"',
+            "                )",
+            "            _atoll_mod = _atoll_util.module_from_spec(_atoll_spec)",
+            f'            _atoll_sys.modules["{config.sidecar_module}"] = _atoll_mod',
+            "            _atoll_spec.loader.exec_module(_atoll_mod)",
+            "            if _atoll_added_artifact_path and _atoll_artifact_dir_text is not None:",
+            "                _atoll_sys.path.remove(_atoll_artifact_dir_text)",
+            "                _atoll_added_artifact_path = False",
             "",
             assignments,
             "",
@@ -79,7 +120,12 @@ def render_shim(config: EnabledIslandConfig) -> str:
             '                "compiled": _atoll_compiled,',
             '                "origin": _atoll_origin,',
             "            })",
-            "        except ImportError as _atoll_error:",
+            "        except Exception as _atoll_error:",
+            "            if _atoll_added_artifact_path and _atoll_artifact_dir_text is not None:",
+            "                try:",
+            "                    _atoll_sys.path.remove(_atoll_artifact_dir_text)",
+            "                except ValueError:",
+            "                    pass",
             '            __atoll_status__["error"] = repr(_atoll_error)',
             "            if (",
             '                _atoll_os.getenv("ATOLL_STRICT") == "1"',
@@ -88,9 +134,25 @@ def render_shim(config: EnabledIslandConfig) -> str:
             "                raise",
             "finally:",
             "    for _atoll_name in (",
-            '        "_atoll_importlib",',
+            '        "_atoll_added_artifact_path",',
+            '        "_atoll_artifact_dir",',
+            '        "_atoll_artifact_dir_text",',
+            '        "_atoll_candidate",',
+            '        "_atoll_compiled",',
+            '        "_atoll_compiled_paths",',
+            '        "_atoll_error",',
             '        "_atoll_machinery",',
+            '        "_atoll_mod",',
             '        "_atoll_os",',
+            '        "_atoll_origin",',
+            '        "_atoll_origin_path",',
+            '        "_atoll_pathlib",',
+            '        "_atoll_sidecar_path",',
+            '        "_atoll_source_dir",',
+            '        "_atoll_spec",',
+            '        "_atoll_suffix",',
+            '        "_atoll_sys",',
+            '        "_atoll_util",',
             "    ):",
             "        globals().pop(_atoll_name, None)",
             _end_marker(config.source_module),
@@ -147,3 +209,13 @@ def _begin_marker(module: str) -> str:
 
 def _end_marker(module: str) -> str:
     return f"# END ATOLL MANAGED: {module}"
+
+
+def _artifact_dir(config: EnabledIslandConfig) -> Path:
+    if config.sidecar_path.parent.name == "sidecars":
+        return config.sidecar_path.parent.parent / "artifacts"
+    return config.sidecar_path.parent
+
+
+def _relative_path_text(start: Path, path: Path) -> str:
+    return os.path.relpath(os.fspath(path.resolve()), start=os.fspath(start.resolve()))

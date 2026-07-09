@@ -11,20 +11,38 @@ uv run atoll scan .
 ```
 
 The scan command writes `.atoll/report.json` and `.atoll/report.md`.
+Candidate scores are 0-100 scan-only heuristics for how promising an island looks, while
+candidate risk describes extraction risk. A `low` risk candidate still needs build and verify.
 
 ## Sidecars
 
 ```bash
-uv run atoll enable app.ranking --symbols score_user,rank_candidates
-uv run atoll enable app.ranking --symbols score_user,rank_candidates --build
-uv run atoll generate --check
-uv run atoll verify
-uv run atoll build --clean-first --inplace
-uv run atoll verify --require-compiled
+uv run atoll compile app.ranking
+uv run atoll compile
 ```
 
-Atoll writes configuration to `.atoll.toml`, generated modules like `_ranking_atoll.py`, and
-managed shim blocks marked with `BEGIN ATOLL MANAGED`.
+`compile` enables all scan candidates, builds them, and verifies compiled routing. Pass a module
+name to limit the operation to one source module.
+
+Atoll writes configuration to `.atoll.toml`, compiled extensions to `.atoll/artifacts`,
+compilation summaries to `.atoll/compilation-report.json` and
+`.atoll/compilation-report.md`, and managed shim blocks marked with `BEGIN ATOLL MANAGED`
+inside source modules. Generated Python sidecars in `.atoll/sidecars`, native compiler scratch
+files, and mypy's internal mypyc cache in `.atoll/build` are disposable build inputs; successful
+`compile` runs remove them and list the cleanup in the compilation report.
+Build failures keep terminal output short and write full mypyc diagnostics to
+`.atoll/build/mypyc.log`.
+Run build commands inside the target project's Python environment because mypyc uses the active
+interpreter and installed dependencies.
+
+Lower-level commands remain available for debugging:
+
+```bash
+uv run atoll enable app.ranking --all-candidates
+uv run atoll generate --check
+uv run atoll build --clean-first
+uv run atoll verify --require-compiled
+```
 
 ## Explain And Trial
 

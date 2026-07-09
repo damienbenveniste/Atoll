@@ -3,24 +3,34 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from atoll.models import (
     Blocker,
     BlockerSeverity,
+    CompileAttempt,
     Confidence,
     ConstantKind,
     DependencyKind,
     DiagnosticSeverity,
+    EnabledIslandConfig,
     IslandRisk,
     ModuleScan,
     MypyDiagnostic,
     ScanResult,
     SymbolId,
     SymbolKind,
+    VerifyResult,
     Visibility,
 )
+
+_STRONG_SCORE = 90
+_GOOD_SCORE = 80
+_POSSIBLE_SCORE = 70
+_ATOLL_PART_INDEX = 0
+_ATOLL_GENERATED_INPUT_DIR_INDEX = 1
 
 
 class BlockerReport(TypedDict):
@@ -93,7 +103,10 @@ class IslandCandidateReport(TypedDict):
     required_local_symbols: list[str]
     rejected_symbols: list[str]
     score: int
+    score_label: str
+    score_summary: str
     risk: IslandRisk
+    risk_summary: str
     reasons: list[str]
 
 
@@ -132,6 +145,81 @@ class ScanReport(TypedDict):
     source_roots: list[str]
     summary: SummaryReport
     modules: list[ModuleReport]
+
+
+CompilationOperation = Literal["build", "compile"]
+
+
+class CompilationSummaryReport(TypedDict):
+    islands: int
+    symbols: int
+    artifacts: int
+    support_artifacts: int
+    verified: int
+    verify_failures: int
+    duration_seconds: float
+
+
+class CompilationBuildReport(TypedDict):
+    success: bool
+    command: list[str]
+    duration_seconds: float
+    stdout: str
+    stderr: str
+    artifacts: list[str]
+    support_artifacts: list[str]
+
+
+class CompilationCleanupReport(TypedDict):
+    removed: list[str]
+
+
+class CompilationVerifySymbolReport(TypedDict):
+    symbol: str
+    rebound: bool
+
+
+class CompilationVerifyReport(TypedDict):
+    active: bool
+    compiled: bool
+    origin: str | None
+    symbols: list[CompilationVerifySymbolReport]
+    error: str | None
+
+
+class CompilationIslandReport(TypedDict):
+    source_module: str
+    source_path: str
+    generated_module: str
+    symbols: list[str]
+    artifacts: list[str]
+    verification: CompilationVerifyReport | None
+
+
+class CompilationReport(TypedDict):
+    version: int
+    tool: str
+    operation: CompilationOperation
+    project_root: str
+    module_filter: str | None
+    success: bool
+    summary: CompilationSummaryReport
+    build: CompilationBuildReport
+    cleanup: CompilationCleanupReport
+    islands: list[CompilationIslandReport]
+
+
+@dataclass(frozen=True, slots=True)
+class CompilationReportInput:
+    """Inputs needed to render one compilation report."""
+
+    root: Path
+    operation: CompilationOperation
+    module_filter: str | None
+    islands: tuple[EnabledIslandConfig, ...]
+    build: CompileAttempt
+    verification: tuple[VerifyResult, ...] = ()
+    cleanup_removed: tuple[Path, ...] = ()
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -188,9 +276,143 @@ def render_markdown_report(report: ScanReport) -> str:
         f"- Hard blockers: {report['summary']['hard_blockers']}",
         f"- Soft blockers: {report['summary']['soft_blockers']}",
         "",
+        "## How To Read Candidates",
+        "",
+        "- Score is a 0-100 heuristic for how promising the island looks before compilation.",
+        "- Risk is extraction risk: `low` means Atoll saw only high-confidence dependencies.",
+        "- Candidates are predictions; `atoll build` and `atoll verify` prove them.",
+        "",
     ]
     for module in report["modules"]:
         lines.extend(_markdown_module(module))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def build_compilation_report(report_input: CompilationReportInput) -> CompilationReport:
+    """Convert a build or compile attempt into a stable compilation report."""
+    verify_by_module = {result.source_module: result for result in report_input.verification}
+    artifact_paths = tuple(report_input.build.artifact_paths)
+    island_artifacts = {
+        island.source_module: _island_artifacts(island, artifact_paths)
+        for island in report_input.islands
+    }
+    mapped_artifacts = {
+        artifact for artifacts in island_artifacts.values() for artifact in artifacts
+    }
+    support_artifacts = tuple(path for path in artifact_paths if path not in mapped_artifacts)
+    verify_failures = sum(result.error is not None for result in report_input.verification)
+    success = report_input.build.success and verify_failures == 0
+    return {
+        "version": 1,
+        "tool": "atoll",
+        "operation": report_input.operation,
+        "project_root": str(report_input.root.resolve()),
+        "module_filter": report_input.module_filter,
+        "success": success,
+        "summary": {
+            "islands": len(report_input.islands),
+            "symbols": sum(len(island.symbols) for island in report_input.islands),
+            "artifacts": len(artifact_paths),
+            "support_artifacts": len(support_artifacts),
+            "verified": len(report_input.verification),
+            "verify_failures": verify_failures,
+            "duration_seconds": report_input.build.duration_seconds,
+        },
+        "build": {
+            "success": report_input.build.success,
+            "command": _build_command_report(report_input.root, report_input.build.command),
+            "duration_seconds": report_input.build.duration_seconds,
+            "stdout": report_input.build.stdout,
+            "stderr": report_input.build.stderr,
+            "artifacts": [_path_text(report_input.root, path) for path in artifact_paths],
+            "support_artifacts": [
+                _path_text(report_input.root, path) for path in support_artifacts
+            ],
+        },
+        "cleanup": {
+            "removed": [
+                *_generated_input_cleanup_reports(report_input.root, report_input.cleanup_removed),
+                *[
+                    _path_text(report_input.root, path)
+                    for path in report_input.cleanup_removed
+                    if not _is_generated_input_path(report_input.root, path)
+                ],
+            ],
+        },
+        "islands": [
+            {
+                "source_module": island.source_module,
+                "source_path": _path_text(report_input.root, island.source_path),
+                "generated_module": island.sidecar_module,
+                "symbols": list(island.symbols),
+                "artifacts": [
+                    _path_text(report_input.root, path)
+                    for path in island_artifacts[island.source_module]
+                ],
+                "verification": _compilation_verify_report(
+                    verify_by_module.get(island.source_module)
+                ),
+            }
+            for island in report_input.islands
+        ],
+    }
+
+
+def write_compilation_json_report(path: Path, report: CompilationReport) -> None:
+    """Write a machine-readable compilation report."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{json.dumps(report, indent=2, sort_keys=True)}\n", encoding="utf-8")
+
+
+def write_compilation_markdown_report(path: Path, report: CompilationReport) -> None:
+    """Write a human-readable compilation report."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_compilation_markdown_report(report), encoding="utf-8")
+
+
+def render_compilation_markdown_report(report: CompilationReport) -> str:
+    """Render a concise Markdown report for a build or compile attempt."""
+    status = "success" if report["success"] else "failed"
+    module_filter = report["module_filter"] or "all enabled modules"
+    lines = [
+        "# Atoll Compilation Report",
+        "",
+        "## Summary",
+        "",
+        f"- Operation: {report['operation']}",
+        f"- Status: {status}",
+        f"- Module filter: {module_filter}",
+        f"- Islands: {report['summary']['islands']}",
+        f"- Symbols: {report['summary']['symbols']}",
+        f"- Artifacts: {report['summary']['artifacts']}",
+        f"- Support artifacts: {report['summary']['support_artifacts']}",
+        f"- Verified islands: {report['summary']['verified']}",
+        f"- Verification failures: {report['summary']['verify_failures']}",
+        f"- Build duration: {report['summary']['duration_seconds']:.3f}s",
+        "",
+        "## Build",
+        "",
+        f"- Success: {_yes_no(report['build']['success'])}",
+        f"- Command: `{' '.join(report['build']['command'])}`",
+    ]
+    if report["build"]["stderr"]:
+        lines.append(f"- Error: `{_first_line(report['build']['stderr'])}`")
+    if report["build"]["artifacts"]:
+        lines.extend(["", "### Artifacts", ""])
+        lines.extend(f"- `{artifact}`" for artifact in report["build"]["artifacts"])
+    if report["build"]["support_artifacts"]:
+        lines.extend(["", "### Support Artifacts", ""])
+        lines.extend(f"- `{artifact}`" for artifact in report["build"]["support_artifacts"])
+    lines.extend(["", "## Cleanup", ""])
+    if report["cleanup"]["removed"]:
+        lines.extend(f"- Removed `{path}`" for path in report["cleanup"]["removed"])
+    else:
+        lines.append("- Removed: none")
+    lines.extend(["", "## Islands", ""])
+    if not report["islands"]:
+        lines.append("- None")
+    for island in report["islands"]:
+        lines.extend(_compilation_markdown_island(island))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -268,7 +490,10 @@ def _module_report(module: ModuleScan) -> ModuleReport:
                 ],
                 "rejected_symbols": [symbol.stable_id for symbol in candidate.rejected_symbols],
                 "score": candidate.score,
+                "score_label": score_label(candidate.score),
+                "score_summary": score_summary(candidate.score),
                 "risk": candidate.risk,
+                "risk_summary": risk_summary(candidate.risk),
                 "reasons": list(candidate.reasons),
             }
             for candidate in module.island_candidates
@@ -312,6 +537,40 @@ def _edge_dst_text(dst: SymbolId | str) -> str:
     return dst
 
 
+def score_label(score: int) -> str:
+    """Return a short label for a candidate score."""
+    if score >= _STRONG_SCORE:
+        return "strong"
+    if score >= _GOOD_SCORE:
+        return "good"
+    if score >= _POSSIBLE_SCORE:
+        return "possible"
+    return "weak"
+
+
+def score_summary(score: int) -> str:
+    """Explain a candidate score in user-facing language."""
+    label = score_label(score)
+    if label == "strong":
+        detail = "very promising scan-only candidate"
+    elif label == "good":
+        detail = "promising scan-only candidate"
+    elif label == "possible":
+        detail = "worth trying, but less compelling"
+    else:
+        detail = "below Atoll's normal recommendation threshold"
+    return f"{score}/100, {detail}"
+
+
+def risk_summary(risk: IslandRisk) -> str:
+    """Explain candidate extraction risk in user-facing language."""
+    if risk == "low":
+        return "low extraction risk; only high-confidence internal dependencies were seen"
+    if risk == "medium":
+        return "medium extraction risk; a low-confidence dependency needs trial validation"
+    return "high extraction risk; expect manual review before enabling"
+
+
 def _markdown_module(module: ModuleReport) -> list[str]:
     lines = [f"## {module['module']}", ""]
     if not module["symbols"]:
@@ -325,7 +584,7 @@ def _markdown_module(module: ModuleReport) -> list[str]:
         lines.extend(["", "Candidates:"])
         for candidate in module["island_candidates"]:
             symbols = ", ".join(f"`{symbol}`" for symbol in candidate["symbols"])
-            lines.append(f"- score {candidate['score']} ({candidate['risk']}): {symbols}")
+            lines.append(f"- {candidate['score_summary']}; {candidate['risk_summary']}: {symbols}")
     if module["poison_radii"]:
         lines.extend(["", "Poison residue:"])
         for radius in module["poison_radii"]:
@@ -333,3 +592,117 @@ def _markdown_module(module: ModuleReport) -> list[str]:
             lines.append(f"- `{radius['poison']}` impacts: {impacted}")
     lines.append("")
     return lines
+
+
+def _island_artifacts(
+    island: EnabledIslandConfig,
+    artifact_paths: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    return tuple(
+        path for path in artifact_paths if path.name.startswith(f"{island.sidecar_path.stem}.")
+    )
+
+
+def _compilation_verify_report(result: VerifyResult | None) -> CompilationVerifyReport | None:
+    if result is None:
+        return None
+    return {
+        "active": result.active,
+        "compiled": result.compiled,
+        "origin": result.origin,
+        "symbols": [{"symbol": symbol, "rebound": rebound} for symbol, rebound in result.symbols],
+        "error": result.error,
+    }
+
+
+def _compilation_markdown_island(island: CompilationIslandReport) -> list[str]:
+    verification = island["verification"]
+    if verification is None:
+        verify_status = "not run"
+    elif verification["error"] is None:
+        verify_status = "ok"
+    else:
+        verify_status = f"failed: {verification['error']}"
+    lines = [
+        f"### {island['source_module']}",
+        "",
+        f"- Source: `{island['source_path']}`",
+        f"- Generated module: `{island['generated_module']}`",
+        f"- Symbols: {', '.join(island['symbols'])}",
+        f"- Verification: {verify_status}",
+    ]
+    if island["artifacts"]:
+        lines.append("- Artifacts:")
+        lines.extend(f"  - `{artifact}`" for artifact in island["artifacts"])
+    else:
+        lines.append("- Artifacts: none")
+    lines.append("")
+    return lines
+
+
+def _path_text(root: Path, path: Path) -> str:
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    try:
+        return resolved_path.relative_to(resolved_root).as_posix()
+    except ValueError:
+        return str(resolved_path)
+
+
+def _yes_no(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def _first_line(value: str) -> str:
+    return next((line for line in value.splitlines() if line.strip()), "")
+
+
+def _build_command_report(root: Path, command: tuple[str, ...]) -> list[str]:
+    reported: list[str] = []
+    generated_inputs = 0
+    for item in command:
+        if _is_generated_input_text(root, item):
+            generated_inputs += 1
+            continue
+        if generated_inputs:
+            reported.append(_generated_inputs_label(generated_inputs))
+            generated_inputs = 0
+        reported.append(item)
+    if generated_inputs:
+        reported.append(_generated_inputs_label(generated_inputs))
+    return reported
+
+
+def _generated_input_cleanup_reports(
+    root: Path,
+    paths: tuple[Path, ...],
+) -> list[str]:
+    count = sum(_is_generated_input_path(root, path) for path in paths)
+    return [_generated_inputs_label(count)] if count else []
+
+
+def _generated_inputs_label(count: int) -> str:
+    suffix = "" if count == 1 else "s"
+    return f"<{count} generated Python build input{suffix}>"
+
+
+def _is_generated_input_text(root: Path, value: str) -> bool:
+    if ".atoll/sidecars/" in value or value == ".atoll/sidecars":
+        return True
+    try:
+        return _is_generated_input_path(root, Path(value))
+    except OSError:
+        return False
+
+
+def _is_generated_input_path(root: Path, path: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    parts = relative.parts
+    return (
+        len(parts) > _ATOLL_GENERATED_INPUT_DIR_INDEX
+        and parts[_ATOLL_PART_INDEX] == ".atoll"
+        and parts[_ATOLL_GENERATED_INPUT_DIR_INDEX] == "sidecars"
+    )

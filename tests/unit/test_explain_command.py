@@ -22,6 +22,20 @@ def test_explain_symbol_with_dependency_edges() -> None:
     assert "calls/high: app.ranking::normalize_features" in output
 
 
+def test_explain_module_describes_candidate_score_and_risk() -> None:
+    """Module explanations spell out score and risk meaning."""
+    output = execute_explain(
+        ExplainOptions(root=FIXTURE_ROOT, target="app.ranking", mypy_enabled=False)
+    )
+
+    assert "90/100, very promising scan-only candidate" in output
+    assert "low extraction risk" in output
+    assert "symbols:" in output
+    assert "normalize_features" in output
+    assert "score_user" in output
+    assert "rank_candidates" in output
+
+
 def test_explain_missing_module_and_symbol_fail() -> None:
     """Invalid explain targets fail with useful errors."""
     with pytest.raises(ValueError, match="module not found"):

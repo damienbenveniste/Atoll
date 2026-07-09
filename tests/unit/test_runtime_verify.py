@@ -24,8 +24,8 @@ def _config(tmp_path: Path, module_source: str, symbols: tuple[str, ...]) -> Pro
             EnabledIslandConfig(
                 source_module="app.ranking",
                 source_path=source_path,
-                sidecar_module="app._ranking_atoll",
-                sidecar_path=package / "_ranking_atoll.py",
+                sidecar_module="app._atoll_app_ranking",
+                sidecar_path=tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py",
                 symbols=symbols,
             ),
         ),
@@ -75,7 +75,7 @@ def test_verify_reports_bad_compiled_origin(tmp_path: Path) -> None:
         tmp_path,
         "def score_user() -> int:\n"
         "    return 1\n"
-        "score_user.__module__ = 'app._ranking_atoll'\n"
+        "score_user.__module__ = 'app._atoll_app_ranking'\n"
         "__atoll_status__ = {'active': True, 'compiled': True, 'origin': 'x.py'}\n",
         ("score_user",),
     )

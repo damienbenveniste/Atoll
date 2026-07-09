@@ -82,7 +82,7 @@ def execute_trial(options: TrialOptions) -> TrialCommandResult:
     try:
         overlay_source_roots = _copy_source_roots(project, overlay_root)
         overlay_islands = tuple(
-            _prepare_overlay_island(selection, project, overlay_source_roots)
+            _prepare_overlay_island(selection, project, overlay_root, overlay_source_roots)
             for selection in selections
         )
         write_atoll_config(overlay_root, overlay_islands)
@@ -199,6 +199,7 @@ def _copy_source_roots(
 def _prepare_overlay_island(
     selection: _Selection,
     project: DiscoveredProject,
+    overlay_root: Path,
     overlay_source_roots: tuple[Path, ...],
 ) -> EnabledIslandConfig:
     overlay_module = _overlay_module(selection.module, project, overlay_source_roots)
@@ -208,10 +209,11 @@ def _prepare_overlay_island(
         source_module=selection.module.name,
         source_path=overlay_module.path,
         sidecar_module=sidecar_module,
-        sidecar_path=expected_sidecar_path(scan, sidecar_module),
+        sidecar_path=expected_sidecar_path(overlay_root, sidecar_module),
         symbols=selection.symbols,
     )
     generation = generate_sidecar(scan, island)
+    island.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
     island.sidecar_path.write_text(generation.source_text, encoding="utf-8")
     source_text = island.source_path.read_text(encoding="utf-8")
     island.source_path.write_text(

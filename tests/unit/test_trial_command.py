@@ -97,7 +97,7 @@ def test_trial_reports_verify_failure(
         return (
             VerifyResult(
                 source_module="app.ranking",
-                sidecar_module="app._ranking_atoll",
+                sidecar_module="app._atoll_app_ranking",
                 active=False,
                 compiled=False,
                 origin=None,

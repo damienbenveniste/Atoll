@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.machinery
+import os
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,18 @@ class FakeBuildExt:
             self.artifact_path.write_text("", encoding="utf-8")
 
 
+class FakeBuildExtWithSupport(FakeBuildExt):
+    """Build stand-in that writes a primary and support extension artifact."""
+
+    support_path: Path | None = None
+
+    def run(self) -> None:
+        """Pretend mypyc emitted a sidecar extension and a helper extension."""
+        super().run()
+        if self.support_path is not None:
+            self.support_path.write_text("", encoding="utf-8")
+
+
 def test_build_sidecars_succeeds_for_empty_input(tmp_path: Path) -> None:
     """Building with no enabled sidecars is a no-op success."""
     result = mypyc_backend.build_sidecars(
@@ -47,15 +60,17 @@ def test_build_sidecars_detects_generated_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A successful backend run returns extension artifacts next to sidecars."""
-    sidecar = tmp_path / "_ranking_atoll.py"
+    """A successful backend run returns extension artifacts from `.atoll/artifacts`."""
+    sidecar = tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
+    sidecar.parent.mkdir(parents=True)
     sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
-    FakeBuildExt.artifact_path = sidecar.with_name(
+    FakeBuildExt.artifact_path = (tmp_path / ".atoll" / "artifacts").joinpath(
         f"{sidecar.stem}{importlib.machinery.EXTENSION_SUFFIXES[0]}"
     )
 
-    def fake_mypycify(paths: list[str]) -> list[object]:
-        assert paths == [sidecar.name]
+    def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
+        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
         return []
 
     monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
@@ -73,6 +88,86 @@ def test_build_sidecars_detects_generated_artifact(
     assert result.artifact_paths == (FakeBuildExt.artifact_path,)
 
 
+def test_build_sidecars_reports_support_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful backend run includes helper extensions written by mypyc."""
+    sidecar = tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
+    artifact_dir = tmp_path / ".atoll" / "artifacts"
+    FakeBuildExtWithSupport.artifact_path = artifact_dir.joinpath(
+        f"{sidecar.stem}{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    )
+    FakeBuildExtWithSupport.support_path = artifact_dir.joinpath(
+        f"fixture__mypyc{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    )
+
+    def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
+        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        return []
+
+    monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
+    monkeypatch.setattr(mypyc_backend, "build_ext", FakeBuildExtWithSupport)
+
+    result = mypyc_backend.build_sidecars(
+        (sidecar,),
+        project_root=tmp_path,
+        build_dir=tmp_path / ".atoll" / "build",
+        source_roots=(tmp_path,),
+    )
+
+    assert result.success is True
+    assert result.artifact_paths == (
+        FakeBuildExtWithSupport.artifact_path,
+        FakeBuildExtWithSupport.support_path,
+    )
+
+
+def test_build_sidecars_adds_source_roots_to_mypy_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sidecars outside source roots still let mypyc resolve target package imports."""
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    sidecar = tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
+    FakeBuildExt.artifact_path = (tmp_path / ".atoll" / "artifacts").joinpath(
+        f"{sidecar.stem}{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    )
+    seen_mypy_path: list[str | None] = []
+    seen_cache_dir: list[str | None] = []
+    monkeypatch.setenv("MYPYPATH", "existing")
+    monkeypatch.setenv("MYPY_CACHE_DIR", "existing_cache")
+
+    def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
+        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        seen_mypy_path.append(os.environ.get("MYPYPATH"))
+        seen_cache_dir.append(os.environ.get("MYPY_CACHE_DIR"))
+        return []
+
+    monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
+    monkeypatch.setattr(mypyc_backend, "build_ext", FakeBuildExt)
+
+    result = mypyc_backend.build_sidecars(
+        (sidecar,),
+        project_root=tmp_path,
+        build_dir=tmp_path / ".atoll" / "build",
+        source_roots=(source_root,),
+    )
+
+    assert result.success is True
+    assert seen_mypy_path == [f"{source_root.resolve()}{os.pathsep}existing"]
+    assert seen_cache_dir == [str(tmp_path / ".atoll" / "build" / "mypy_cache")]
+    assert os.environ["MYPYPATH"] == "existing"
+    assert os.environ["MYPY_CACHE_DIR"] == "existing_cache"
+
+
 def test_build_sidecars_classifies_build_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -81,7 +176,8 @@ def test_build_sidecars_classifies_build_failure(
     sidecar = tmp_path / "_ranking_atoll.py"
     sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
 
-    def failing_mypycify(paths: list[str]) -> list[object]:
+    def failing_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
         raise RuntimeError(f"mypy type issue in {paths[0]}")
 
     monkeypatch.setattr(mypyc_backend, "mypycify", failing_mypycify)
@@ -97,6 +193,41 @@ def test_build_sidecars_classifies_build_failure(
     assert result.stderr.startswith("MYPYC_TYPE_ERROR")
 
 
+def test_build_sidecars_captures_mypyc_system_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """mypyc diagnostic output is summarized instead of leaking to the terminal."""
+    sidecar = tmp_path / "_ranking_atoll.py"
+    sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
+
+    def failing_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        print(f"{paths[0]}:1: error: fixture type failure  [misc]")
+        print("dep.py:1: error: Cannot find implementation or library stub  [import-not-found]")
+        raise SystemExit(1)
+
+    monkeypatch.setattr(mypyc_backend, "mypycify", failing_mypycify)
+
+    result = mypyc_backend.build_sidecars(
+        (sidecar,),
+        project_root=tmp_path,
+        build_dir=tmp_path / ".atoll" / "build",
+        source_roots=(tmp_path,),
+    )
+
+    captured = capsys.readouterr()
+    log_path = tmp_path / ".atoll" / "build" / "mypyc.log"
+    assert captured.out == ""
+    assert result.success is False
+    assert result.stderr.startswith("MYPYC_TYPE_ERROR")
+    assert "Captured 2 mypyc error line(s)." in result.stderr
+    assert str(log_path) in result.stderr
+    assert "target project's environment" in result.stderr
+    assert "fixture type failure" in log_path.read_text(encoding="utf-8")
+
+
 def test_build_sidecars_classifies_native_build_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -105,7 +236,8 @@ def test_build_sidecars_classifies_native_build_failure(
     sidecar = tmp_path / "_ranking_atoll.py"
     sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
 
-    def failing_mypycify(paths: list[str]) -> list[object]:
+    def failing_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
         raise RuntimeError(f"compiler missing for {paths[0]}")
 
     monkeypatch.setattr(mypyc_backend, "mypycify", failing_mypycify)
@@ -129,8 +261,9 @@ def test_build_sidecars_handles_external_source_without_artifact(
     sidecar = tmp_path.parent / "_external_atoll.py"
     sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
 
-    def fake_mypycify(paths: list[str]) -> list[object]:
+    def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
         assert paths == [str(sidecar)]
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
         return []
 
     monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)

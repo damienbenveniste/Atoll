@@ -34,7 +34,13 @@ def test_scan_command_writes_reports(tmp_path: Path) -> None:
     assert report["summary"]["island_candidates"] == 1
     assert report["summary"]["hard_blockers"] == 1
     assert report["modules"][1]["island_candidates"][0]["risk"] == "low"
-    assert markdown_path.read_text(encoding="utf-8").startswith("# Atoll Scan Report")
+    candidate = report["modules"][1]["island_candidates"][0]
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert candidate["score_summary"].endswith("very promising scan-only candidate")
+    assert candidate["risk_summary"].startswith("low extraction risk")
+    assert markdown.startswith("# Atoll Scan Report")
+    assert "Score is a 0-100 heuristic" in markdown
+    assert "low extraction risk" in markdown
 
 
 def test_cli_without_command_prints_help(capsys: pytest.CaptureFixture[str]) -> None:

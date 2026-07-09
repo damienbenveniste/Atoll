@@ -11,9 +11,9 @@ from atoll.models import EnabledIslandConfig
 def _island(tmp_path: Path) -> EnabledIslandConfig:
     return EnabledIslandConfig(
         source_module="app.ranking",
-        source_path=tmp_path / "ranking.py",
-        sidecar_module="app._ranking_atoll",
-        sidecar_path=tmp_path / "_ranking_atoll.py",
+        source_path=tmp_path / "src" / "app" / "ranking.py",
+        sidecar_module="app._atoll_app_ranking",
+        sidecar_path=tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py",
         symbols=("score_user", "rank_candidates"),
     )
 

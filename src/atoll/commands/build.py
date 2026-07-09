@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from atoll.backends.mypyc import build_sidecars
+from atoll.commands.generate import GenerateOptions, execute_generate
 from atoll.models import CompileAttempt
 from atoll.project import discover_project
 
@@ -26,6 +27,12 @@ def execute_build(options: BuildOptions) -> CompileAttempt:
     build_dir = project.config.root / ".atoll" / "build"
     if options.clean_first and build_dir.exists():
         shutil.rmtree(build_dir)
+    execute_generate(
+        GenerateOptions(
+            root=project.config.root,
+            module_name=options.module_name,
+        )
+    )
     sidecars = tuple(
         island.sidecar_path
         for island in project.config.islands

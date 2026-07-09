@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,14 @@ from atoll.models import (
 )
 
 _GENERATOR_VERSION = "atoll-sidecar-v1"
+_TYPING_IMPORT_MODULES = frozenset(
+    {
+        "collections",
+        "collections.abc",
+        "typing",
+        "typing_extensions",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +34,8 @@ class SidecarPlan:
     """Concrete source fragments copied into a generated sidecar."""
 
     imports: tuple[ImportRecord, ...]
+    extra_typing_names: tuple[str, ...]
+    type_checking_names: tuple[str, ...]
     constants: tuple[ConstantRecord, ...]
     symbols: tuple[SymbolRecord, ...]
     included_symbol_names: tuple[str, ...]
@@ -72,34 +83,47 @@ def build_sidecar_plan(
         if record.source_text == "from __future__ import annotations"
         or any(name in referenced_names for name in record.imported_names)
     )
+    type_checking_names = _type_checking_names(
+        referenced_names=referenced_names,
+        imported_names={name for record in imports for name in record.imported_names},
+        module_symbols=module.symbols,
+        included_names=included_names,
+    )
     constants = tuple(
         constant
         for constant in module.constants
         if constant.name in referenced_names and constant.kind == "literal_constant"
     )
     source_lines = module.module.path.read_text(encoding="utf-8").splitlines()
+    copied_sources, extra_typing_names = _copied_sources(
+        source_lines=source_lines,
+        symbols=included_symbols,
+        erased_type_arg_names=_erased_type_arg_names(imports),
+        imported_names={name for record in imports for name in record.imported_names},
+    )
     return SidecarPlan(
         imports=imports,
+        extra_typing_names=extra_typing_names,
+        type_checking_names=type_checking_names,
         constants=constants,
         symbols=included_symbols,
         included_symbol_names=tuple(symbol.id.qualname for symbol in included_symbols),
-        copied_sources=tuple(
-            "\n".join(source_lines[symbol.lineno - 1 : symbol.end_lineno])
-            for symbol in included_symbols
-        ),
+        copied_sources=copied_sources,
     )
 
 
 def default_sidecar_module(source_module: str) -> str:
-    """Return Atoll's default sidecar module name for a source module."""
-    package, _, module_name = source_module.rpartition(".")
-    sidecar_name = f"_{module_name}_atoll"
+    """Return Atoll's default unique sidecar module name for a source module."""
+    normalized = "".join(character if character.isalnum() else "_" for character in source_module)
+    sidecar_name = f"_atoll_{normalized}"
+    package, _, _ = source_module.rpartition(".")
     return f"{package}.{sidecar_name}" if package else sidecar_name
 
 
-def expected_sidecar_path(module: ModuleScan, sidecar_module: str) -> Path:
-    """Return the source path for a sidecar next to its source module."""
-    return module.module.path.parent / f"{sidecar_module.rsplit('.', maxsplit=1)[-1]}.py"
+def expected_sidecar_path(root: Path, sidecar_module: str) -> Path:
+    """Return the generated sidecar source path under Atoll's private directory."""
+    sidecar_name = sidecar_module.rsplit(".", maxsplit=1)[-1]
+    return root.resolve() / ".atoll" / "sidecars" / f"{sidecar_name}.py"
 
 
 def _validate_exported_symbols(
@@ -145,6 +169,13 @@ def _render_sidecar(
     ):
         lines.append("from __future__ import annotations")
     lines.extend(record.source_text for record in plan.imports)
+    if plan.extra_typing_names:
+        lines.append(f"from typing import {', '.join(plan.extra_typing_names)}")
+    if plan.type_checking_names:
+        if not any("TYPE_CHECKING" in record.imported_names for record in plan.imports):
+            lines.append("from typing import TYPE_CHECKING")
+        names = ", ".join(plan.type_checking_names)
+        lines.extend(["", "if TYPE_CHECKING:", f"    from {config.source_module} import {names}"])
     if plan.imports or lines[-1] != "":
         lines.append("")
     lines.extend(constant.source_text for constant in plan.constants)
@@ -175,6 +206,10 @@ def _source_hash(plan: SidecarPlan, config: EnabledIslandConfig) -> str:
     digest.update(config.sidecar_module.encode())
     for record in plan.imports:
         digest.update(record.source_text.encode())
+    for name in plan.extra_typing_names:
+        digest.update(name.encode())
+    for name in plan.type_checking_names:
+        digest.update(name.encode())
     for constant in plan.constants:
         digest.update(constant.source_text.encode())
     for symbol in plan.symbols:
@@ -182,3 +217,139 @@ def _source_hash(plan: SidecarPlan, config: EnabledIslandConfig) -> str:
     for copied_source in plan.copied_sources:
         digest.update(copied_source.encode())
     return digest.hexdigest()
+
+
+def _copied_sources(
+    *,
+    source_lines: list[str],
+    symbols: tuple[SymbolRecord, ...],
+    erased_type_arg_names: set[str],
+    imported_names: set[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    copied_sources: list[str] = []
+    extra_typing_names: set[str] = set()
+    for symbol in symbols:
+        source = "\n".join(source_lines[symbol.lineno - 1 : symbol.end_lineno])
+        transformed_source, added_typing_names = _render_mypyc_friendly_source(
+            source,
+            erased_type_arg_names=erased_type_arg_names,
+        )
+        copied_sources.append(transformed_source)
+        extra_typing_names.update(added_typing_names - imported_names)
+    return tuple(copied_sources), tuple(sorted(extra_typing_names))
+
+
+def _render_mypyc_friendly_source(
+    source: str,
+    *,
+    erased_type_arg_names: set[str],
+) -> tuple[str, set[str]]:
+    tree = ast.parse(source)
+    transformer = _MypycSidecarTransformer(erased_type_arg_names)
+    transformed = transformer.visit(tree)
+    ast.fix_missing_locations(transformed)
+    return ast.unparse(transformed), transformer.extra_typing_names
+
+
+def _erased_type_arg_names(imports: tuple[ImportRecord, ...]) -> set[str]:
+    names: set[str] = set()
+    for record in imports:
+        if record.module is None:
+            continue
+        if record.module in _TYPING_IMPORT_MODULES:
+            continue
+        names.update(record.imported_names)
+    return names
+
+
+def _type_checking_names(
+    *,
+    referenced_names: set[str],
+    imported_names: set[str],
+    module_symbols: tuple[SymbolRecord, ...],
+    included_names: set[str],
+) -> tuple[str, ...]:
+    local_classes = {
+        symbol.id.qualname
+        for symbol in module_symbols
+        if symbol.kind == "class" and "." not in symbol.id.qualname
+    }
+    return tuple(
+        sorted(
+            name
+            for name in referenced_names
+            if name in local_classes and name not in imported_names and name not in included_names
+        )
+    )
+
+
+class _MypycSidecarTransformer(ast.NodeTransformer):
+    def __init__(self, erased_type_arg_names: set[str]) -> None:
+        self._erased_type_arg_names = erased_type_arg_names
+        self.extra_typing_names: set[str] = set()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        self.generic_visit(node)
+        self._normalize_function(node)
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+        self.generic_visit(node)
+        self._normalize_function(node)
+        return node
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
+        self.generic_visit(node)
+        if isinstance(node.value, ast.Name) and node.value.id in self._erased_type_arg_names:
+            return node.value
+        return node
+
+    def _normalize_function(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        if node.returns is None:
+            node.returns = ast.Name(id="Any", ctx=ast.Load())
+            self.extra_typing_names.add("Any")
+        elif _annotation_allows_none(node.returns) and not _last_statement_exits(node.body):
+            node.body.append(ast.Return(value=ast.Constant(value=None)))
+
+
+def _annotation_allows_none(node: ast.expr) -> bool:
+    if isinstance(node, ast.Constant):
+        return node.value is None
+    if isinstance(node, ast.Name):
+        return node.id == "None"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _annotation_allows_none(node.left) or _annotation_allows_none(node.right)
+    if isinstance(node, ast.Subscript) and _is_optional(node.value):
+        return True
+    if isinstance(node, ast.Subscript) and _is_union(node.value):
+        return _slice_allows_none(node.slice)
+    return False
+
+
+def _is_optional(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "Optional"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "Optional"
+    return False
+
+
+def _is_union(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "Union"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "Union"
+    return False
+
+
+def _slice_allows_none(node: ast.expr) -> bool:
+    if isinstance(node, ast.Tuple):
+        return any(_annotation_allows_none(element) for element in node.elts)
+    return _annotation_allows_none(node)
+
+
+def _last_statement_exits(body: list[ast.stmt]) -> bool:
+    return bool(body) and isinstance(body[-1], ast.Return | ast.Raise)

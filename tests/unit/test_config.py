@@ -11,8 +11,8 @@ def test_write_and_load_atoll_config(tmp_path: Path) -> None:
     island = EnabledIslandConfig(
         source_module="app.ranking",
         source_path=tmp_path / "src" / "app" / "ranking.py",
-        sidecar_module="app._ranking_atoll",
-        sidecar_path=tmp_path / "src" / "app" / "_ranking_atoll.py",
+        sidecar_module="app._atoll_app_ranking",
+        sidecar_path=tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py",
         symbols=("score_user", "rank_candidates"),
     )
 
@@ -28,8 +28,8 @@ def test_disable_island_marks_config_entry_disabled(tmp_path: Path) -> None:
     island = EnabledIslandConfig(
         source_module="app.ranking",
         source_path=tmp_path / "src" / "app" / "ranking.py",
-        sidecar_module="app._ranking_atoll",
-        sidecar_path=tmp_path / "src" / "app" / "_ranking_atoll.py",
+        sidecar_module="app._atoll_app_ranking",
+        sidecar_path=tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py",
         symbols=("score_user",),
     )
     write_atoll_config(tmp_path, (island,))

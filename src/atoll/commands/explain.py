@@ -11,6 +11,7 @@ from atoll.analysis.type_readiness import attach_mypy_diagnostics
 from atoll.backends.mypy import run_mypy
 from atoll.models import ModuleScan, SymbolId, SymbolRecord
 from atoll.project import discover_project
+from atoll.report import risk_summary, score_summary
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +56,8 @@ def _module_explanation(module: ModuleScan) -> str:
         lines.append("Candidates:")
         for candidate in module.island_candidates:
             symbols = ", ".join(symbol.qualname for symbol in candidate.symbols)
-            lines.append(f"- score {candidate.score} ({candidate.risk}): {symbols}")
+            lines.append(f"- {score_summary(candidate.score)}; {risk_summary(candidate.risk)}")
+            lines.append(f"  symbols: {symbols}")
             lines.append(f"  reasons: {', '.join(candidate.reasons)}")
     if module.poison_radii:
         lines.extend(["", "Poison residue:"])

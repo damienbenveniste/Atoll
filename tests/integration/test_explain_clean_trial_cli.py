@@ -37,12 +37,13 @@ def test_explain_command_reports_module_and_symbol(
 
 def test_clean_command_removes_cache_and_compiled_artifacts(tmp_path: Path) -> None:
     """`atoll clean --all` removes cache/build dirs and compiled sidecar artifacts."""
-    sidecar_path = tmp_path / "src" / "app" / "_ranking_atoll.py"
+    sidecar_path = tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
     sidecar_path.parent.mkdir(parents=True)
     sidecar_path.write_text("", encoding="utf-8")
-    artifact = sidecar_path.with_name(
+    artifact = (tmp_path / ".atoll" / "artifacts").joinpath(
         f"{sidecar_path.stem}{importlib.machinery.EXTENSION_SUFFIXES[0]}"
     )
+    artifact.parent.mkdir(parents=True)
     artifact.write_text("", encoding="utf-8")
     cache_dir = tmp_path / ".atoll" / "cache"
     build_dir = tmp_path / ".atoll" / "build"
@@ -54,7 +55,7 @@ def test_clean_command_removes_cache_and_compiled_artifacts(tmp_path: Path) -> N
             EnabledIslandConfig(
                 source_module="app.ranking",
                 source_path=tmp_path / "src" / "app" / "ranking.py",
-                sidecar_module="app._ranking_atoll",
+                sidecar_module="app._atoll_app_ranking",
                 sidecar_path=sidecar_path,
                 symbols=("score_user",),
             ),

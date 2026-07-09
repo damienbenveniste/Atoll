@@ -53,8 +53,10 @@ def _remove_dir(path: Path) -> Path:
 
 def _compiled_artifacts(root: Path) -> tuple[Path, ...]:
     artifacts: set[Path] = set()
+    artifact_dir = root / ".atoll" / "artifacts"
     for island in load_enabled_islands(root):
         for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            artifacts.update(artifact_dir.rglob(f"{island.sidecar_path.stem}*{suffix}"))
             artifacts.update(
                 island.sidecar_path.parent.glob(f"{island.sidecar_path.stem}*{suffix}")
             )
