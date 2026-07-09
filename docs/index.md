@@ -20,42 +20,40 @@ are hard blockers because mypyc changes Python frame semantics.
 
 ```bash
 uv run atoll compile app.ranking
-uv run atoll compile app.ranking --test "pytest tests"
 uv run atoll compile
 ```
 
-`compile` enables all scan candidates, builds them, and verifies compiled routing. Pass a module
-name to limit the operation to one source module. Routing verification proves that managed shims
-import compiled extensions and rebound configured symbols; it does not prove semantic equivalence.
-Use `--test` to run pytest with `ATOLL_REQUIRE_COMPILED=1`.
+`compile` copies the target package into an Atoll build area, inserts shims only in that copy,
+compiles the copied sidecars, and writes both an install tree and a platform wheel. Pass a module
+name to limit the operation to one source module. The original source files are left untouched.
 
-Atoll writes configuration to `.atoll.toml`, compiled extensions to `.atoll/artifacts`,
-compilation summaries to `.atoll/compilation-report.json` and
-`.atoll/compilation-report.md`, and managed shim blocks marked with `BEGIN ATOLL MANAGED`
-inside source modules. Generated Python sidecars in `.atoll/sidecars`, native compiler scratch
-files, and mypy's internal mypyc cache in `.atoll/build` are disposable build inputs; successful
-`compile` runs remove them and list the cleanup in the compilation report.
-If the semantic test gate fails, Atoll leaves generated build inputs in place for debugging and
-marks the compilation report failed.
+The install tree is written to `.atoll/dist/install` by default, and the wheel is written to
+`.atoll/dist/*.whl`. Use `--output` to place those generated artifacts somewhere else.
 Build failures keep terminal output short and write full mypyc diagnostics to
 `.atoll/build/mypyc.log`.
 Run build commands inside the target project's Python environment because mypyc uses the active
 interpreter and installed dependencies.
 
-## Installable Artifacts
+## In-Place Compile
 
-Use `compile --no-source-edit` when you want compiled islands without modifying the source
-checkout. It copies the target package into an Atoll build area, inserts shims only in that copy,
-compiles the copied sidecars, and writes both an install tree and a platform wheel.
+Use `--in-place` only when you intentionally want Atoll to modify the checkout with managed shim
+blocks marked `BEGIN ATOLL MANAGED`. In-place compile writes configuration to `.atoll.toml`,
+compiled extensions to `.atoll/artifacts`, and compilation summaries to
+`.atoll/compilation-report.json` and `.atoll/compilation-report.md`.
 
 ```bash
-uv run atoll compile app.ranking --no-source-edit --output .atoll/dist
-uv pip install --force-reinstall .atoll/dist/*.whl
+uv run atoll compile app.ranking --in-place
+uv run atoll compile app.ranking --in-place --test "pytest tests"
 ```
 
-The original source files are left untouched. The install tree is written to `.atoll/dist/install`
-by default, and the wheel contains the shimmed modules plus the compiled native artifacts. The
-older `atoll package` command remains available as a compatibility alias.
+Routing verification proves that managed shims import compiled extensions and rebound configured
+symbols; it does not prove semantic equivalence. Use `--test` with `--in-place` to run pytest with
+`ATOLL_REQUIRE_COMPILED=1`. Generated Python sidecars in `.atoll/sidecars`, native compiler
+scratch files, and mypy's internal mypyc cache in `.atoll/build` are disposable build inputs;
+successful in-place compile runs remove them and list the cleanup in the compilation report.
+If the semantic test gate fails, Atoll leaves generated build inputs in place for debugging and
+marks the compilation report failed. The older `atoll package` command remains available as a
+compatibility alias for source-clean artifacts.
 
 Lower-level commands remain available for debugging:
 

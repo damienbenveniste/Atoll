@@ -155,6 +155,7 @@ def test_compile_command_enables_builds_and_verifies_candidates(tmp_path: Path) 
             "app.ranking",
             "--root",
             str(project_root),
+            "--in-place",
             "--test",
             "pytest tests -q",
         ]
@@ -245,7 +246,15 @@ def test_compile_command_reports_test_gate_failure(
     monkeypatch.setattr("atoll.cli.run_pytest_command", fake_run_pytest_command)
 
     exit_code = main(
-        ["compile", "app.ranking", "--root", str(project_root), "--test", "pytest tests"]
+        [
+            "compile",
+            "app.ranking",
+            "--root",
+            str(project_root),
+            "--in-place",
+            "--test",
+            "pytest tests",
+        ]
     )
 
     assert exit_code == 1
@@ -268,7 +277,7 @@ def test_compile_command_reports_no_candidates(
     """The one-step compile command reports when scan finds nothing to compile."""
     (tmp_path / "src" / "pkg").mkdir(parents=True)
 
-    exit_code = main(["compile", "--root", str(tmp_path)])
+    exit_code = main(["compile", "--root", str(tmp_path), "--in-place"])
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -298,7 +307,7 @@ def test_compile_command_reports_build_failure(
 
     monkeypatch.setattr("atoll.cli.execute_build", fake_execute_build)
 
-    exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
+    exit_code = main(["compile", "app.ranking", "--root", str(project_root), "--in-place"])
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -347,7 +356,7 @@ def test_compile_command_reports_verify_failure(
     monkeypatch.setattr("atoll.cli.execute_build", fake_execute_build)
     monkeypatch.setattr("atoll.cli.execute_verify", fake_execute_verify)
 
-    exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
+    exit_code = main(["compile", "app.ranking", "--root", str(project_root), "--in-place"])
 
     assert exit_code == 1
     report = _compilation_report(project_root)

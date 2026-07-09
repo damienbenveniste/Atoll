@@ -17,12 +17,12 @@ FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXIT_USAGE = 2
 
 
-def test_compile_no_source_edit_builds_install_tree_and_wheel_without_source_edits(
+def test_compile_builds_install_tree_and_wheel_without_source_edits(
     tmp_path: Path,
 ) -> None:
-    """`atoll compile --no-source-edit` compiles without patching the checkout."""
+    """`atoll compile` compiles without patching the checkout by default."""
     project_root = tmp_path / "simple_project"
-    output_dir = tmp_path / "out"
+    output_dir = project_root / ".atoll" / "dist"
     shutil.copytree(FIXTURE_ROOT, project_root)
     source_path = project_root / "src" / "app" / "ranking.py"
     original_source = source_path.read_text(encoding="utf-8")
@@ -33,9 +33,6 @@ def test_compile_no_source_edit_builds_install_tree_and_wheel_without_source_edi
             "app.ranking",
             "--root",
             str(project_root),
-            "--no-source-edit",
-            "--output",
-            str(output_dir),
         ]
     )
 
@@ -96,7 +93,7 @@ def test_package_command_reports_no_candidates(
     assert "scan found no candidate islands" in captured.out
 
 
-def test_compile_no_source_edit_reports_no_candidates(
+def test_compile_reports_no_candidates_from_source_clean_default(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -104,35 +101,37 @@ def test_compile_no_source_edit_reports_no_candidates(
     (tmp_path / "src" / "pkg").mkdir(parents=True)
     (tmp_path / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
 
-    exit_code = main(["compile", "--root", str(tmp_path), "--no-source-edit"])
+    exit_code = main(["compile", "--root", str(tmp_path)])
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "scan found no candidate islands" in captured.out
 
 
-def test_compile_output_requires_no_source_edit(
+def test_compile_in_place_rejects_output(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """`compile --output` only applies to the source-clean artifact mode."""
-    exit_code = main(["compile", "--root", str(tmp_path), "--output", str(tmp_path / "out")])
+    exit_code = main(
+        ["compile", "--root", str(tmp_path), "--in-place", "--output", str(tmp_path / "out")]
+    )
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_USAGE
-    assert "--output requires --no-source-edit" in captured.out
+    assert "--output cannot be used with --in-place" in captured.out
 
 
-def test_compile_no_source_edit_rejects_test_gate(
+def test_compile_source_clean_default_rejects_test_gate(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The semantic test gate remains scoped to in-place compile mode."""
-    exit_code = main(["compile", "--root", str(tmp_path), "--no-source-edit", "--test", "pytest"])
+    exit_code = main(["compile", "--root", str(tmp_path), "--test", "pytest"])
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_USAGE
-    assert "--test cannot be used with --no-source-edit" in captured.out
+    assert "--test requires --in-place" in captured.out
 
 
 def _extension_artifacts(directory: Path, stem: str) -> tuple[Path, ...]:

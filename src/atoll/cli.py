@@ -166,21 +166,27 @@ def _add_compile_parser(subparsers: _Subparsers) -> None:
         help="optional source module to compile",
     )
     compile_cmd.add_argument("--root", type=Path, default=Path(), help="project root")
+    mode = compile_cmd.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--in-place",
+        action="store_true",
+        help="modify source files with Atoll shims before compiling",
+    )
+    mode.add_argument(
+        "--no-source-edit",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     compile_cmd.add_argument(
         "--test",
         default=None,
-        help='pytest command to run after compiled routing, for example "pytest tests"',
-    )
-    compile_cmd.add_argument(
-        "--no-source-edit",
-        action="store_true",
-        help="compile a copied install tree and wheel without modifying source files",
+        help='pytest command to run after --in-place compiled routing, for example "pytest tests"',
     )
     compile_cmd.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="output directory for --no-source-edit install tree and wheel",
+        help="output directory for source-clean install tree and wheel",
     )
 
 
@@ -338,7 +344,7 @@ def _run_compile(args: argparse.Namespace) -> int:
     if option_error is not None:
         print(option_error)
         return 2
-    if args.no_source_edit:
+    if not args.in_place:
         return _run_source_clean_artifact_build(
             root=args.root,
             module_name=args.module,
@@ -422,10 +428,10 @@ def _run_inplace_compile(args: argparse.Namespace) -> int:
 
 
 def _compile_option_error(args: argparse.Namespace) -> str | None:
-    if args.no_source_edit and args.test is not None:
-        return "--test cannot be used with --no-source-edit"
-    if not args.no_source_edit and args.output is not None:
-        return "--output requires --no-source-edit"
+    if not args.in_place and args.test is not None:
+        return "--test requires --in-place"
+    if args.in_place and args.output is not None:
+        return "--output cannot be used with --in-place"
     if args.test is None:
         return None
     try:
