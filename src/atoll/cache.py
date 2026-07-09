@@ -16,21 +16,28 @@ from typing import Literal, TypedDict, cast
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.models import (
+    BindingKind,
     Blocker,
     BlockerSeverity,
     ConstantKind,
     ConstantRecord,
+    ExecutionKind,
+    FieldRecord,
     ImportRecord,
     ModuleId,
     ModuleScan,
+    ParameterKind,
+    ParameterRecord,
     ProjectConfig,
     SymbolId,
     SymbolKind,
     SymbolRecord,
+    TypeParameterKind,
+    TypeParameterRecord,
     Visibility,
 )
 
-SCANNER_VERSION = "1"
+SCANNER_VERSION = "5"
 
 
 class CacheStats(TypedDict):
@@ -76,6 +83,32 @@ class ConstantCacheEntry(TypedDict):
     end_lineno: int
 
 
+class ParameterCacheEntry(TypedDict):
+    """Cached exact source parameter facts for typed-region planning."""
+
+    name: str
+    kind: ParameterKind
+    annotation: str | None
+    default_source: str | None
+
+
+class FieldCacheEntry(TypedDict):
+    """Cached typed class field facts for class-region planning."""
+
+    name: str
+    annotation: str
+    default_source: str | None
+    class_variable: bool
+
+
+class TypeParameterCacheEntry(TypedDict):
+    """Cached exact type-parameter declaration and structured identity."""
+
+    name: str
+    kind: TypeParameterKind
+    declaration: str
+
+
 class SymbolCacheEntry(TypedDict):
     """Cached AST facts for a function, class, or simple method.
 
@@ -101,6 +134,21 @@ class SymbolCacheEntry(TypedDict):
     uses_globals: list[str]
     local_names: list[str]
     referenced_names: list[str]
+    owner_class: str | None
+    binding_kind: BindingKind
+    execution_kind: ExecutionKind
+    type_parameters: list[str]
+    parameters: list[ParameterCacheEntry]
+    return_annotation: str | None
+    annotation_names: list[str]
+    called_paths: list[str]
+    base_names: list[str]
+    fields: list[FieldCacheEntry]
+    declaration_start_lineno: int | None
+    scope_type_parameters: list[str]
+    type_parameter_records: list[TypeParameterCacheEntry]
+    scope_type_parameter_records: list[TypeParameterCacheEntry]
+    any_annotation_sources: list[str]
     blockers: list[BlockerCacheEntry]
 
 
@@ -267,6 +315,41 @@ def _symbol_to_cache(symbol: SymbolRecord) -> SymbolCacheEntry:
         "uses_globals": list(symbol.uses_globals),
         "local_names": list(symbol.local_names),
         "referenced_names": list(symbol.referenced_names),
+        "owner_class": symbol.owner_class,
+        "binding_kind": symbol.binding_kind,
+        "execution_kind": symbol.execution_kind,
+        "type_parameters": list(symbol.type_parameters),
+        "parameters": [
+            {
+                "name": parameter.name,
+                "kind": parameter.kind,
+                "annotation": parameter.annotation,
+                "default_source": parameter.default_source,
+            }
+            for parameter in symbol.parameters
+        ],
+        "return_annotation": symbol.return_annotation,
+        "annotation_names": list(symbol.annotation_names),
+        "called_paths": list(symbol.called_paths),
+        "base_names": list(symbol.base_names),
+        "fields": [
+            {
+                "name": field.name,
+                "annotation": field.annotation,
+                "default_source": field.default_source,
+                "class_variable": field.class_variable,
+            }
+            for field in symbol.fields
+        ],
+        "declaration_start_lineno": symbol.declaration_start_lineno,
+        "scope_type_parameters": list(symbol.scope_type_parameters),
+        "type_parameter_records": [
+            _type_parameter_to_cache(record) for record in symbol.type_parameter_records
+        ],
+        "scope_type_parameter_records": [
+            _type_parameter_to_cache(record) for record in symbol.scope_type_parameter_records
+        ],
+        "any_annotation_sources": list(symbol.any_annotation_sources),
         "blockers": [_blocker_to_cache(blocker) for blocker in symbol.blockers],
     }
 
@@ -290,6 +373,57 @@ def _symbol_from_cache(entry: SymbolCacheEntry) -> SymbolRecord:
         local_names=tuple(entry["local_names"]),
         referenced_names=tuple(entry["referenced_names"]),
         blockers=tuple(_blocker_from_cache(blocker) for blocker in entry["blockers"]),
+        owner_class=entry["owner_class"],
+        binding_kind=entry["binding_kind"],
+        execution_kind=entry["execution_kind"],
+        type_parameters=tuple(entry["type_parameters"]),
+        parameters=tuple(
+            ParameterRecord(
+                name=parameter["name"],
+                kind=parameter["kind"],
+                annotation=parameter["annotation"],
+                default_source=parameter["default_source"],
+            )
+            for parameter in entry["parameters"]
+        ),
+        return_annotation=entry["return_annotation"],
+        annotation_names=tuple(entry["annotation_names"]),
+        called_paths=tuple(entry["called_paths"]),
+        base_names=tuple(entry["base_names"]),
+        fields=tuple(
+            FieldRecord(
+                name=field["name"],
+                annotation=field["annotation"],
+                default_source=field["default_source"],
+                class_variable=field["class_variable"],
+            )
+            for field in entry["fields"]
+        ),
+        declaration_start_lineno=entry["declaration_start_lineno"],
+        scope_type_parameters=tuple(entry["scope_type_parameters"]),
+        type_parameter_records=tuple(
+            _type_parameter_from_cache(record) for record in entry["type_parameter_records"]
+        ),
+        scope_type_parameter_records=tuple(
+            _type_parameter_from_cache(record) for record in entry["scope_type_parameter_records"]
+        ),
+        any_annotation_sources=tuple(entry["any_annotation_sources"]),
+    )
+
+
+def _type_parameter_to_cache(record: TypeParameterRecord) -> TypeParameterCacheEntry:
+    return {
+        "name": record.name,
+        "kind": record.kind,
+        "declaration": record.declaration,
+    }
+
+
+def _type_parameter_from_cache(entry: TypeParameterCacheEntry) -> TypeParameterRecord:
+    return TypeParameterRecord(
+        name=entry["name"],
+        kind=entry["kind"],
+        declaration=entry["declaration"],
     )
 
 

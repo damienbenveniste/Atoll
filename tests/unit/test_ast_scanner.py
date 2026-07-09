@@ -161,6 +161,242 @@ def test_scan_records_import_aliases_constants_classes_and_methods(tmp_path: Pat
     assert symbols["Worker.helper"].decorators == ("staticmethod",)
 
 
+def test_scan_populates_extended_function_class_and_method_facts(tmp_path: Path) -> None:
+    """Extended symbol facts preserve source-level callable and class shape."""
+    module_path = tmp_path / "extended.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "import typing as typ",
+                "",
+                "class Base:",
+                "    pass",
+                "",
+                "def fallback() -> int:",
+                "    return 1",
+                "",
+                "class Box[T](Base):",
+                "    count: int = 0",
+                "    label: typ.ClassVar[str] = 'box'",
+                "",
+                "    def method(self, item: list[T], value: int = fallback()) -> T:",
+                "        return helper(item)",
+                "",
+                "    @staticmethod",
+                "    def util(value: typ.Any) -> None:",
+                "        return None",
+                "",
+                "    @classmethod",
+                "    async def build(cls, value: dict[str, T]) -> Box[T]:",
+                "        return cls()",
+                "",
+                "def outer[T](first: T, /, second: int = 1, *items: str, "
+                "flag: bool = True, **kwargs: object) -> T:",
+                "    def nested() -> int:",
+                "        yield 1",
+                "        hidden()",
+                "    return first",
+                "",
+                "def shaped[T: (str, bytes), *Ts, **P](value: T) -> T:",
+                "    return value",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="extended", path=module_path))
+    symbols = {symbol.id.qualname: symbol for symbol in scan.symbols}
+
+    assert symbols["Box"].binding_kind == "class"
+    assert symbols["Box"].execution_kind == "class"
+    assert symbols["Box"].type_parameters == ("T",)
+    assert symbols["Box"].base_names == ("Base",)
+    assert [
+        (field.name, field.annotation, field.default_source, field.class_variable)
+        for field in symbols["Box"].fields
+    ] == [
+        ("count", "int", "0", False),
+        ("label", "typ.ClassVar[str]", "'box'", True),
+    ]
+
+    method = symbols["Box.method"]
+    assert method.owner_class == "Box"
+    assert method.binding_kind == "instance_method"
+    assert method.execution_kind == "sync"
+    assert method.return_annotation == "T"
+    assert method.called_names == ("fallback", "helper")
+    assert method.called_paths == ("fallback", "helper")
+    assert method.annotation_names == ("list", "T", "int")
+    assert [
+        (parameter.name, parameter.kind, parameter.annotation, parameter.default_source)
+        for parameter in method.parameters
+    ] == [
+        ("self", "positional", None, None),
+        ("item", "positional", "list[T]", None),
+        ("value", "positional", "int", "fallback()"),
+    ]
+
+    assert symbols["Box.util"].binding_kind == "staticmethod"
+    assert symbols["Box.util"].declaration_start_lineno is not None
+    assert symbols["Box.util"].declaration_start_lineno < symbols["Box.util"].lineno
+    assert symbols["Box.util"].has_any_annotation is True
+    assert symbols["Box.util"].annotation_names == ("typ.Any", "typ", "None")
+    assert symbols["Box.build"].binding_kind == "classmethod"
+    assert symbols["Box.build"].execution_kind == "coroutine"
+    assert symbols["Box.build"].return_annotation == "Box[T]"
+
+    outer = symbols["outer"]
+    assert outer.owner_class is None
+    assert outer.binding_kind == "module"
+    assert outer.execution_kind == "sync"
+    assert outer.type_parameters == ("T",)
+    assert [
+        (record.name, record.kind, record.declaration) for record in outer.type_parameter_records
+    ] == [
+        ("T", "type_var", "T"),
+    ]
+    assert outer.called_names == ()
+    assert outer.called_paths == ()
+    assert [
+        (parameter.name, parameter.kind, parameter.annotation, parameter.default_source)
+        for parameter in outer.parameters
+    ] == [
+        ("first", "positional_only", "T", None),
+        ("second", "positional", "int", "1"),
+        ("items", "vararg", "str", None),
+        ("flag", "keyword_only", "bool", "True"),
+        ("kwargs", "kwarg", "object", None),
+    ]
+    assert [
+        (record.name, record.kind, record.declaration)
+        for record in symbols["shaped"].type_parameter_records
+    ] == [
+        ("T", "type_var", "T: (str, bytes)"),
+        ("Ts", "type_var_tuple", "*Ts"),
+        ("P", "param_spec", "**P"),
+    ]
+
+
+def test_scan_detects_execution_kinds_without_nested_symbol_bodies(tmp_path: Path) -> None:
+    """Generator and coroutine shape belongs only to the scanned symbol body."""
+    module_path = tmp_path / "execution.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "def sync() -> int:",
+                "    def nested():",
+                "        yield 1",
+                "    return 1",
+                "",
+                "def generator() -> int:",
+                "    yield from range(3)",
+                "",
+                "async def coroutine() -> int:",
+                "    return 1",
+                "",
+                "async def async_generator() -> int:",
+                "    yield 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="execution", path=module_path))
+    symbols = {symbol.id.qualname: symbol for symbol in scan.symbols}
+
+    assert symbols["sync"].execution_kind == "sync"
+    assert symbols["generator"].execution_kind == "generator"
+    assert symbols["coroutine"].execution_kind == "coroutine"
+    assert symbols["async_generator"].execution_kind == "async_generator"
+
+
+def test_scan_has_any_annotation_detects_real_any_import_forms(tmp_path: Path) -> None:
+    """Any detection recognizes typing aliases, strings, and qualified references."""
+    module_path = tmp_path / "any_annotations.py"
+    typing_any_import = f"from typing import {chr(65)}ny as TypingAny"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                typing_any_import,
+                "import typing as typ",
+                "import typing_extensions as tx",
+                "",
+                "class LocalAny:",
+                "    pass",
+                "",
+                "def direct(value: TypingAny) -> int:",
+                "    return 1",
+                "",
+                "def qualified(value: typ.Any) -> int:",
+                "    return 1",
+                "",
+                "def extension(value: tx.Any) -> int:",
+                "    return 1",
+                "",
+                "def stringed(value: 'list[typ.Any]') -> int:",
+                "    return 1",
+                "",
+                "def local(value: LocalAny) -> int:",
+                "    return 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="any_annotations", path=module_path))
+    symbols = {symbol.id.qualname: symbol for symbol in scan.symbols}
+
+    assert symbols["direct"].has_any_annotation is True
+    assert symbols["direct"].any_annotation_sources == ("TypingAny",)
+    assert symbols["qualified"].has_any_annotation is True
+    assert symbols["extension"].has_any_annotation is True
+    assert symbols["stringed"].has_any_annotation is True
+    assert symbols["local"].has_any_annotation is False
+    assert symbols["local"].any_annotation_sources == ()
+
+
+def test_scan_retains_legacy_typevars_as_scope_parameters(tmp_path: Path) -> None:
+    """Imported TypeVar factories produce explicit scope bindings for users."""
+    module_path = tmp_path / "legacy_typevars.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from typing import Generic, TypeVar as TV",
+                "import typing_extensions as tx",
+                "",
+                "T = TV('T')",
+                "P = tx.ParamSpec('P')",
+                "",
+                "def identity(value: T) -> T:",
+                "    return value",
+                "",
+                "class Box(Generic[T]):",
+                "    def get(self, value: T) -> T:",
+                "        return value",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="legacy_typevars", path=module_path))
+    symbols = {symbol.id.qualname: symbol for symbol in scan.symbols}
+
+    assert symbols["identity"].type_parameters == ()
+    assert symbols["identity"].scope_type_parameters == ("T",)
+    assert [
+        (record.name, record.kind, record.declaration)
+        for record in symbols["identity"].scope_type_parameter_records
+    ] == [("T", "type_var", "T = TV('T')")]
+    assert symbols["Box"].scope_type_parameters == ("T",)
+    assert symbols["Box.get"].scope_type_parameters == ("T",)
+
+
 def test_scan_raises_for_syntax_errors(tmp_path: Path) -> None:
     """Syntax errors are surfaced to the caller during scanning."""
     module_path = tmp_path / "broken.py"

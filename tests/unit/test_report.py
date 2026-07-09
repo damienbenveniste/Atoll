@@ -26,6 +26,8 @@ from atoll.report import (
     score_summary,
 )
 
+REPORT_SCHEMA_VERSION = 2
+
 
 @pytest.mark.parametrize(
     ("score", "expected"),
@@ -283,6 +285,9 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
     markdown = render_compilation_markdown_report(report)
 
     assert report["mode"] == "source-clean"
+    assert report["version"] == REPORT_SCHEMA_VERSION
+    assert report["summary"]["typed_regions"] == 0
+    assert report["typed_regions"] == []
     assert report["wheel_path"] == ".atoll/dist/app-0+atoll-cp312.whl"
     assert report["cleanup"]["removed"] == [".atoll/dist/build"]
     assert report["cleanup"]["kept"] == [".atoll/dist/install"]

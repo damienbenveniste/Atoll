@@ -345,6 +345,8 @@ def test_compile_rejects_typevar_erased_functions_before_mypyc(
     assert report["success"] is False
     assert report["summary"]["preflight_blockers"] == 0
     assert report["summary"]["symbols"] == 0
+    assert report["summary"]["typed_regions"] == 1
+    assert report["typed_regions"][0]["decisions"][0]["action"] == "fallback"
     assert report["summary"]["native_rejected_symbols"] == REJECTED_SYMBOL_COUNT
     assert report["build"]["command"] == []
     assert not tuple(output_dir.glob("*.whl"))

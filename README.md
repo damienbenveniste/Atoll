@@ -17,7 +17,8 @@ scaffold-guard validate
 
 Atoll currently implements the analysis side of the V1 implementation plan:
 project discovery, AST scanning, import/constant/symbol extraction, dynamic blocker detection,
-mypy diagnostic mapping, same-module dependency edges, conservative island candidates,
+mypy diagnostic mapping, same-module dependency edges, backend-neutral typed regions,
+conservative island candidates,
 poison-residue reporting, JSON/Markdown reports, generated sidecars, managed shims,
 mypyc builds, and runtime verification.
 
@@ -26,6 +27,11 @@ uv run atoll scan . --source-root src
 ```
 
 Reports are written to `.atoll/report.json` and `.atoll/report.md`.
+
+Report schema v2 records exact callable annotations, type parameters, class ownership,
+descriptor and execution kinds, class fields, and connected typed regions. These regions preserve
+source typing for later backend assessment; the current compile path continues to use the legacy
+island pipeline, so typed regions are analysis output only.
 
 Use `--no-mypy` to skip mypy diagnostics during a scan.
 

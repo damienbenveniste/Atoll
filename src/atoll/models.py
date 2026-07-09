@@ -12,14 +12,43 @@ from pathlib import Path
 from typing import Literal
 
 Backend = Literal["mypyc"]
+BindingKind = Literal["module", "class", "instance_method", "staticmethod", "classmethod"]
 BlockerSeverity = Literal["hard", "soft", "info"]
 CompileCacheStatus = Literal["disabled", "hit", "miss", "partial"]
 Confidence = Literal["high", "medium", "low"]
 ConstantKind = Literal["literal_constant", "runtime_dynamic", "unknown"]
-DependencyKind = Literal["calls", "uses_global", "inherits", "decorated_by", "imports", "unknown"]
+DependencyKind = Literal[
+    "calls",
+    "calls_method",
+    "uses_global",
+    "inherits",
+    "decorated_by",
+    "imports",
+    "annotation",
+    "unknown",
+]
+DependencyRole = Literal["runtime", "typing", "facade"]
 DiagnosticSeverity = Literal["error", "note"]
+ExecutionKind = Literal["sync", "generator", "coroutine", "async_generator", "class"]
 IslandRisk = Literal["low", "medium", "high"]
+LossAction = Literal["preserve", "specialize", "box", "fallback", "reject"]
+ParameterKind = Literal[
+    "positional_only",
+    "positional",
+    "vararg",
+    "keyword_only",
+    "kwarg",
+]
 SymbolKind = Literal["function", "class", "method"]
+TypeParameterKind = Literal["type_var", "param_spec", "type_var_tuple"]
+TypeBindingSource = Literal[
+    "parameter",
+    "return",
+    "field",
+    "base",
+    "type_parameter",
+    "import",
+]
 Visibility = Literal["public", "private"]
 
 
@@ -158,6 +187,45 @@ class ConstantRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ParameterRecord:
+    """Exact source-level parameter facts retained for typed-region planning.
+
+    Annotation and default text are preserved rather than interpreted so a
+    backend can make its own semantic decision without inheriting an earlier
+    lossy rewrite. `default_source` is absent for required parameters.
+    """
+
+    name: str
+    kind: ParameterKind
+    annotation: str | None
+    default_source: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FieldRecord:
+    """Typed class field declaration retained for class-region planning."""
+
+    name: str
+    annotation: str
+    default_source: str | None
+    class_variable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TypeParameterRecord:
+    """Exact declaration of one PEP 695 or legacy typing parameter.
+
+    `declaration` retains the complete source expression, including bounds,
+    constraints, variance keywords, and defaults. `name` and `kind` provide the
+    structured identity needed for scope and specialization decisions.
+    """
+
+    name: str
+    kind: TypeParameterKind
+    declaration: str
+
+
+@dataclass(frozen=True, slots=True)
 class SymbolRecord:
     """AST-derived facts for one function, class, or simple method.
 
@@ -185,6 +253,108 @@ class SymbolRecord:
     referenced_names: tuple[str, ...]
     blockers: tuple[Blocker, ...]
     mypy_diagnostics: tuple[MypyDiagnostic, ...] = field(default_factory=tuple)
+    owner_class: str | None = None
+    binding_kind: BindingKind = "module"
+    execution_kind: ExecutionKind = "sync"
+    type_parameters: tuple[str, ...] = ()
+    parameters: tuple[ParameterRecord, ...] = ()
+    return_annotation: str | None = None
+    annotation_names: tuple[str, ...] = ()
+    called_paths: tuple[str, ...] = ()
+    base_names: tuple[str, ...] = ()
+    fields: tuple[FieldRecord, ...] = ()
+    declaration_start_lineno: int | None = None
+    scope_type_parameters: tuple[str, ...] = ()
+    type_parameter_records: tuple[TypeParameterRecord, ...] = ()
+    scope_type_parameter_records: tuple[TypeParameterRecord, ...] = ()
+    any_annotation_sources: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BindingTarget:
+    """One source binding that a compiled region promises to replace.
+
+    `source` is always the public source identity. `compiled_name` is private
+    backend output and may differ for lowered methods or specializations.
+    """
+
+    source: SymbolId
+    compiled_name: str
+    kind: BindingKind
+    owner_class: str | None
+    execution_kind: ExecutionKind
+    required: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class TypeBinding:
+    """Preserved or concretized type evidence used by a typed region."""
+
+    name: str
+    annotation: str
+    source: TypeBindingSource
+    concrete: bool
+    substitutions: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LoweringDecision:
+    """Auditable decision about how one typed-region fact will be lowered."""
+
+    target: str
+    action: LossAction
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class RegionMember:
+    """Unlowered source declaration owned by a backend-neutral typed region."""
+
+    id: SymbolId
+    kind: SymbolKind
+    owner_class: str | None
+    binding_kind: BindingKind
+    execution_kind: ExecutionKind
+    source_text: str
+    type_parameters: tuple[str, ...]
+    type_parameter_records: tuple[TypeParameterRecord, ...]
+    scope_type_parameters: tuple[str, ...]
+    scope_type_parameter_records: tuple[TypeParameterRecord, ...]
+    parameters: tuple[ParameterRecord, ...]
+    return_annotation: str | None
+    fields: tuple[FieldRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RegionDependency:
+    """Typed-region dependency retaining runtime versus annotation intent."""
+
+    src: SymbolId
+    dst: SymbolId | str
+    kind: DependencyKind
+    confidence: Confidence
+    role: DependencyRole
+    type_only: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TypedRegion:
+    """Backend-neutral connected source region before any type-losing rewrite.
+
+    Region IDs and hashes are deterministic for the retained source and
+    dependency evidence. Instances are safe to cache, compare, and pass to
+    backend assessment without reading or importing target-project code.
+    """
+
+    id: str
+    source_module: ModuleId
+    members: tuple[RegionMember, ...]
+    dependencies: tuple[RegionDependency, ...]
+    type_bindings: tuple[TypeBinding, ...]
+    bindings: tuple[BindingTarget, ...]
+    decisions: tuple[LoweringDecision, ...]
+    source_hash: str
+    atomic_class: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +502,7 @@ class ModuleScan:
     dependency_edges: tuple[DependencyEdge, ...] = field(default_factory=tuple)
     island_candidates: tuple[IslandCandidate, ...] = field(default_factory=tuple)
     poison_radii: tuple[PoisonRadius, ...] = field(default_factory=tuple)
+    typed_regions: tuple[TypedRegion, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)

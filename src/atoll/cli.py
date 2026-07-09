@@ -725,6 +725,7 @@ def _write_source_clean_compile_report(
             skipped_modules=_package_skipped_module_inputs(result.skipped),
             preflight_blockers=_package_preflight_blocker_inputs(result.preflight_skipped),
             native_readiness=result.native_readiness,
+            typed_regions=result.typed_regions,
         )
     )
     json_path = result.project_root / ".atoll" / "compile-report.json"

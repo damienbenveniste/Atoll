@@ -16,6 +16,15 @@ def test_scan_modules_with_cache_hits_on_second_run(tmp_path: Path) -> None:
     """A repeated scan reuses cached AST facts when hashes match."""
     project_root = tmp_path / "simple_project"
     shutil.copytree(FIXTURE_ROOT, project_root)
+    ranking_path = project_root / "src" / "app" / "ranking.py"
+    ranking_path.write_text(
+        ranking_path.read_text(encoding="utf-8")
+        + "\nfrom typing import TypeVar as TV\n"
+        + "T = TV('T', bound=int)\n\n"
+        + "def identity(value: T) -> T:\n"
+        + "    return value\n",
+        encoding="utf-8",
+    )
     project = discover_project(project_root)
 
     first_scans, first_stats = scan_modules_with_cache(project.config, project.modules)
@@ -24,6 +33,22 @@ def test_scan_modules_with_cache_hits_on_second_run(tmp_path: Path) -> None:
     assert first_stats == {"hits": 0, "misses": 3}
     assert second_stats == {"hits": 3, "misses": 0}
     assert [scan.module.name for scan in first_scans] == [scan.module.name for scan in second_scans]
+    cached_ranking = next(scan for scan in second_scans if scan.module.name == "app.ranking")
+    cached_score = next(
+        symbol for symbol in cached_ranking.symbols if symbol.id.qualname == "score_user"
+    )
+    assert cached_score.execution_kind == "sync"
+    assert [parameter.annotation for parameter in cached_score.parameters] == [
+        "User",
+        "list[Event]",
+    ]
+    assert cached_score.return_annotation == "Score"
+    assert cached_score.scope_type_parameters == ()
+    cached_identity = next(
+        symbol for symbol in cached_ranking.symbols if symbol.id.qualname == "identity"
+    )
+    assert cached_identity.scope_type_parameters == ("T",)
+    assert cached_identity.scope_type_parameter_records[0].declaration == ("T = TV('T', bound=int)")
     assert (project_root / ".atoll" / "cache" / "index.json").exists()
 
 

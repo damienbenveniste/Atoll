@@ -40,6 +40,7 @@ from atoll.models import (
     EnabledIslandConfig,
     ModuleId,
     ModuleScan,
+    TypedRegion,
 )
 from atoll.project import DiscoveredProject, discover_project
 
@@ -93,6 +94,7 @@ class PackageCommandResult:
     skipped: tuple[PackageBuildFailure, ...] = ()
     preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
     native_readiness: tuple[NativeReadiness, ...] = ()
+    typed_regions: tuple[TypedRegion, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +172,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     )
     scan_started = time.perf_counter()
     scans = _selected_scans(project, options.module_name)
+    typed_regions = tuple(region for scan in scans for region in scan.typed_regions)
     _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
     preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
     selected = _selected_modules(scans)
@@ -180,7 +183,10 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     )
     if not selected:
         return _failed_result(
-            project.config.root, options.output_dir, "scan found no candidate islands"
+            project.config.root,
+            options.output_dir,
+            "scan found no candidate islands",
+            typed_regions=typed_regions,
         )
 
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
@@ -229,9 +235,9 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         return _no_native_ready_result(
             project=project,
             build_root=build_root,
-            install_root=install_root,
             native_readiness=native_readiness,
             preflight_skipped=preflight_skipped,
+            typed_regions=typed_regions,
         )
     outcome = _build_package_islands(
         islands,
@@ -262,6 +268,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             skipped=outcome.skipped,
             preflight_skipped=preflight_skipped,
             native_readiness=native_readiness,
+            typed_regions=typed_regions,
         )
 
     payload_started = time.perf_counter()
@@ -310,6 +317,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         skipped=outcome.skipped,
         preflight_skipped=preflight_skipped,
         native_readiness=native_readiness,
+        typed_regions=typed_regions,
     )
 
 
@@ -317,12 +325,13 @@ def _no_native_ready_result(
     *,
     project: DiscoveredProject,
     build_root: Path,
-    install_root: Path,
     native_readiness: tuple[NativeReadiness, ...],
     preflight_skipped: tuple[PackagePreflightFailure, ...],
+    typed_regions: tuple[TypedRegion, ...],
 ) -> PackageCommandResult:
     """Return a clean failure without invoking mypyc or retaining a stale wheel."""
     output_dir = build_root.parent
+    install_root = output_dir / "install"
     _remove_failed_wheels(project, output_dir)
     cleanup_removed = (*_remove_tree(build_root), *_remove_tree(install_root))
     error = (
@@ -349,6 +358,7 @@ def _no_native_ready_result(
         error=error,
         preflight_skipped=preflight_skipped,
         native_readiness=native_readiness,
+        typed_regions=typed_regions,
     )
 
 
@@ -358,6 +368,7 @@ def _failed_result(
     error: str,
     *,
     preflight_skipped: tuple[PackagePreflightFailure, ...] = (),
+    typed_regions: tuple[TypedRegion, ...] = (),
 ) -> PackageCommandResult:
     resolved_output_dir = _resolve_output_dir(root, output_dir)
     return PackageCommandResult(
@@ -377,6 +388,7 @@ def _failed_result(
         ),
         error=error,
         preflight_skipped=preflight_skipped,
+        typed_regions=typed_regions,
     )
 
 

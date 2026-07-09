@@ -15,6 +15,7 @@ from typing import Literal, TypedDict
 
 from atoll.analysis.native_readiness import NativeReadiness
 from atoll.models import (
+    BindingKind,
     Blocker,
     BlockerSeverity,
     CompileAttempt,
@@ -22,15 +23,22 @@ from atoll.models import (
     Confidence,
     ConstantKind,
     DependencyKind,
+    DependencyRole,
     DiagnosticSeverity,
     EnabledIslandConfig,
+    ExecutionKind,
     IslandRisk,
+    LossAction,
     ModuleScan,
     MypyDiagnostic,
+    ParameterKind,
     PytestRunResult,
     ScanResult,
     SymbolId,
     SymbolKind,
+    TypedRegion,
+    TypeParameterKind,
+    TypeParameterRecord,
     VerifyResult,
     Visibility,
 )
@@ -91,8 +99,49 @@ class SymbolReport(TypedDict):
     uses_globals: list[str]
     local_names: list[str]
     referenced_names: list[str]
+    owner_class: str | None
+    binding_kind: BindingKind
+    execution_kind: ExecutionKind
+    type_parameters: list[str]
+    parameters: list[ParameterReport]
+    return_annotation: str | None
+    annotation_names: list[str]
+    called_paths: list[str]
+    base_names: list[str]
+    fields: list[FieldReport]
+    declaration_start_lineno: int | None
+    scope_type_parameters: list[str]
+    type_parameter_records: list[TypeParameterReport]
+    scope_type_parameter_records: list[TypeParameterReport]
+    any_annotation_sources: list[str]
     blockers: list[BlockerReport]
     mypy_diagnostics: list[MypyDiagnosticReport]
+
+
+class ParameterReport(TypedDict):
+    """Exact source parameter evidence retained by typed-region analysis."""
+
+    name: str
+    kind: ParameterKind
+    annotation: str | None
+    default_source: str | None
+
+
+class FieldReport(TypedDict):
+    """Typed class field evidence retained for class-region planning."""
+
+    name: str
+    annotation: str
+    default_source: str | None
+    class_variable: bool
+
+
+class TypeParameterReport(TypedDict):
+    """Exact type-parameter declaration retained for backend assessment."""
+
+    name: str
+    kind: TypeParameterKind
+    declaration: str
 
 
 class MypyDiagnosticReport(TypedDict):
@@ -141,6 +190,76 @@ class PoisonRadiusReport(TypedDict):
     reason: str
 
 
+class RegionMemberReport(TypedDict):
+    """One unlowered declaration included in a typed region."""
+
+    id: str
+    kind: SymbolKind
+    owner_class: str | None
+    binding_kind: BindingKind
+    execution_kind: ExecutionKind
+    type_parameters: list[str]
+    scope_type_parameters: list[str]
+    type_parameter_records: list[TypeParameterReport]
+    scope_type_parameter_records: list[TypeParameterReport]
+    parameters: list[ParameterReport]
+    return_annotation: str | None
+    fields: list[FieldReport]
+
+
+class RegionDependencyReport(TypedDict):
+    """Dependency retained with runtime versus type-only intent."""
+
+    src: str
+    dst: str
+    kind: DependencyKind
+    confidence: Confidence
+    role: DependencyRole
+    type_only: bool
+
+
+class TypeBindingReport(TypedDict):
+    """Source type evidence retained before backend lowering."""
+
+    name: str
+    annotation: str
+    source: str
+    concrete: bool
+    substitutions: list[list[str]]
+
+
+class LoweringDecisionReport(TypedDict):
+    """Auditable region-level preservation or fallback decision."""
+
+    target: str
+    action: LossAction
+    reason: str
+
+
+class BindingTargetReport(TypedDict):
+    """Descriptor-aware source binding promised by a typed region."""
+
+    source: str
+    compiled_name: str
+    kind: BindingKind
+    owner_class: str | None
+    execution_kind: ExecutionKind
+    required: bool
+
+
+class TypedRegionReport(TypedDict):
+    """Backend-neutral typed region serialized in scan reports."""
+
+    id: str
+    source_hash: str
+    atomic_class: bool
+    members: list[RegionMemberReport]
+    dependencies: list[RegionDependencyReport]
+    type_bindings: list[TypeBindingReport]
+    bindings: list[BindingTargetReport]
+    decisions: list[LoweringDecisionReport]
+
+
 class ModuleReport(TypedDict):
     """Complete scan report section for one discovered Python module."""
 
@@ -155,6 +274,7 @@ class ModuleReport(TypedDict):
     dependency_edges: list[DependencyEdgeReport]
     island_candidates: list[IslandCandidateReport]
     poison_radii: list[PoisonRadiusReport]
+    typed_regions: list[TypedRegionReport]
 
 
 class SummaryReport(TypedDict):
@@ -163,6 +283,7 @@ class SummaryReport(TypedDict):
     modules_scanned: int
     symbols_scanned: int
     island_candidates: int
+    typed_regions: int
     hard_blockers: int
     soft_blockers: int
 
@@ -202,6 +323,7 @@ class CompilationSummaryReport(TypedDict):
     """Aggregate build, verification, test, and cleanup counts for compilation."""
 
     islands: int
+    typed_regions: int
     symbols: int
     native_ready_symbols: int
     native_rejected_symbols: int
@@ -314,6 +436,7 @@ class CompilationReport(TypedDict):
     skipped_modules: list[CompilationSkippedModuleReport]
     preflight_blockers: list[CompilationPreflightBlockerReport]
     native_readiness: list[CompilationNativeReadinessReport]
+    typed_regions: list[TypedRegionReport]
     islands: list[CompilationIslandReport]
 
 
@@ -367,6 +490,7 @@ class CompilationReportInput:
     skipped_modules: tuple[CompilationSkippedModuleInput, ...] = ()
     preflight_blockers: tuple[CompilationPreflightBlockerInput, ...] = ()
     native_readiness: tuple[NativeReadiness, ...] = ()
+    typed_regions: tuple[TypedRegion, ...] = ()
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -383,7 +507,7 @@ def build_scan_report(result: ScanResult) -> ScanReport:
     hard_count = sum(blocker.severity == "hard" for blocker in all_blockers)
     soft_count = sum(blocker.severity == "soft" for blocker in all_blockers)
     return {
-        "version": 1,
+        "version": 2,
         "tool": "atoll",
         "project_root": str(result.config.root),
         "source_roots": [str(path) for path in result.config.source_roots],
@@ -391,6 +515,7 @@ def build_scan_report(result: ScanResult) -> ScanReport:
             "modules_scanned": len(result.modules),
             "symbols_scanned": sum(len(module.symbols) for module in result.modules),
             "island_candidates": sum(len(module.island_candidates) for module in result.modules),
+            "typed_regions": sum(len(module.typed_regions) for module in result.modules),
             "hard_blockers": hard_count,
             "soft_blockers": soft_count,
         },
@@ -424,6 +549,7 @@ def render_markdown_report(report: ScanReport) -> str:
         f"- Modules scanned: {report['summary']['modules_scanned']}",
         f"- Symbols scanned: {report['summary']['symbols_scanned']}",
         f"- Island candidates: {report['summary']['island_candidates']}",
+        f"- Typed regions: {report['summary']['typed_regions']}",
         f"- Hard blockers: {report['summary']['hard_blockers']}",
         f"- Soft blockers: {report['summary']['soft_blockers']}",
         "",
@@ -458,7 +584,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     test_failures = int(report_input.tests is not None and not report_input.tests.success)
     success = report_input.build.success and verify_failures == 0 and test_failures == 0
     return {
-        "version": 1,
+        "version": 2,
         "tool": "atoll",
         "operation": report_input.operation,
         "mode": report_input.mode,
@@ -472,6 +598,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         ),
         "summary": {
             "islands": len(report_input.islands),
+            "typed_regions": len(report_input.typed_regions),
             "symbols": sum(len(island.symbols) for island in report_input.islands),
             "native_ready_symbols": sum(
                 readiness.eligible for readiness in report_input.native_readiness
@@ -551,6 +678,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             }
             for readiness in report_input.native_readiness
         ],
+        "typed_regions": [_typed_region_report(region) for region in report_input.typed_regions],
         "islands": [
             {
                 "source_module": island.source_module,
@@ -597,6 +725,7 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         f"- Module filter: {module_filter}",
         f"- Wheel: {_optional_path(report['wheel_path'])}",
         f"- Islands: {report['summary']['islands']}",
+        f"- Typed regions: {report['summary']['typed_regions']}",
         f"- Symbols: {report['summary']['symbols']}",
         f"- Native-ready scan candidates: {report['summary']['native_ready_symbols']}",
         f"- Rejected scan candidates: {report['summary']['native_rejected_symbols']}",
@@ -633,6 +762,12 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         )
     else:
         lines.append("- Not evaluated for this compilation mode.")
+    if report["typed_regions"]:
+        lines.extend(["", "### Planned Regions", ""])
+        lines.extend(
+            f"- `{region['id']}`: " + ", ".join(member["id"] for member in region["members"])
+            for region in report["typed_regions"]
+        )
     lines.extend(
         [
             "",
@@ -751,6 +886,41 @@ def _module_report(module: ModuleScan) -> ModuleReport:
                 "uses_globals": list(symbol.uses_globals),
                 "local_names": list(symbol.local_names),
                 "referenced_names": list(symbol.referenced_names),
+                "owner_class": symbol.owner_class,
+                "binding_kind": symbol.binding_kind,
+                "execution_kind": symbol.execution_kind,
+                "type_parameters": list(symbol.type_parameters),
+                "parameters": [
+                    {
+                        "name": parameter.name,
+                        "kind": parameter.kind,
+                        "annotation": parameter.annotation,
+                        "default_source": parameter.default_source,
+                    }
+                    for parameter in symbol.parameters
+                ],
+                "return_annotation": symbol.return_annotation,
+                "annotation_names": list(symbol.annotation_names),
+                "called_paths": list(symbol.called_paths),
+                "base_names": list(symbol.base_names),
+                "fields": [
+                    {
+                        "name": field.name,
+                        "annotation": field.annotation,
+                        "default_source": field.default_source,
+                        "class_variable": field.class_variable,
+                    }
+                    for field in symbol.fields
+                ],
+                "declaration_start_lineno": symbol.declaration_start_lineno,
+                "scope_type_parameters": list(symbol.scope_type_parameters),
+                "type_parameter_records": [
+                    _type_parameter_report(record) for record in symbol.type_parameter_records
+                ],
+                "scope_type_parameter_records": [
+                    _type_parameter_report(record) for record in symbol.scope_type_parameter_records
+                ],
+                "any_annotation_sources": list(symbol.any_annotation_sources),
                 "blockers": [_blocker_report(blocker) for blocker in symbol.blockers],
                 "mypy_diagnostics": [
                     _mypy_diagnostic_report(diagnostic) for diagnostic in symbol.mypy_diagnostics
@@ -799,6 +969,100 @@ def _module_report(module: ModuleScan) -> ModuleReport:
             }
             for radius in module.poison_radii
         ],
+        "typed_regions": [_typed_region_report(region) for region in module.typed_regions],
+    }
+
+
+def _typed_region_report(region: TypedRegion) -> TypedRegionReport:
+    return {
+        "id": region.id,
+        "source_hash": region.source_hash,
+        "atomic_class": region.atomic_class,
+        "members": [
+            {
+                "id": member.id.stable_id,
+                "kind": member.kind,
+                "owner_class": member.owner_class,
+                "binding_kind": member.binding_kind,
+                "execution_kind": member.execution_kind,
+                "type_parameters": list(member.type_parameters),
+                "scope_type_parameters": list(member.scope_type_parameters),
+                "type_parameter_records": [
+                    _type_parameter_report(record) for record in member.type_parameter_records
+                ],
+                "scope_type_parameter_records": [
+                    _type_parameter_report(record) for record in member.scope_type_parameter_records
+                ],
+                "parameters": [
+                    {
+                        "name": parameter.name,
+                        "kind": parameter.kind,
+                        "annotation": parameter.annotation,
+                        "default_source": parameter.default_source,
+                    }
+                    for parameter in member.parameters
+                ],
+                "return_annotation": member.return_annotation,
+                "fields": [
+                    {
+                        "name": field.name,
+                        "annotation": field.annotation,
+                        "default_source": field.default_source,
+                        "class_variable": field.class_variable,
+                    }
+                    for field in member.fields
+                ],
+            }
+            for member in region.members
+        ],
+        "dependencies": [
+            {
+                "src": dependency.src.stable_id,
+                "dst": _edge_dst_text(dependency.dst),
+                "kind": dependency.kind,
+                "confidence": dependency.confidence,
+                "role": dependency.role,
+                "type_only": dependency.type_only,
+            }
+            for dependency in region.dependencies
+        ],
+        "type_bindings": [
+            {
+                "name": binding.name,
+                "annotation": binding.annotation,
+                "source": binding.source,
+                "concrete": binding.concrete,
+                "substitutions": [list(item) for item in binding.substitutions],
+            }
+            for binding in region.type_bindings
+        ],
+        "bindings": [
+            {
+                "source": binding.source.stable_id,
+                "compiled_name": binding.compiled_name,
+                "kind": binding.kind,
+                "owner_class": binding.owner_class,
+                "execution_kind": binding.execution_kind,
+                "required": binding.required,
+            }
+            for binding in region.bindings
+        ],
+        "decisions": [
+            {
+                "target": decision.target,
+                "action": decision.action,
+                "reason": decision.reason,
+            }
+            for decision in region.decisions
+        ],
+    }
+
+
+def _type_parameter_report(record: TypeParameterRecord) -> TypeParameterReport:
+    return {
+        "name": record.name,
+        "kind": record.kind,
+        "declaration": record.declaration,
     }
 
 
@@ -883,6 +1147,12 @@ def _markdown_module(module: ModuleReport) -> list[str]:
         for radius in module["poison_radii"]:
             impacted = ", ".join(radius["impacted"]) or "none"
             lines.append(f"- `{radius['poison']}` impacts: {impacted}")
+    if module["typed_regions"]:
+        lines.extend(["", "Typed regions:"])
+        for region in module["typed_regions"]:
+            members = ", ".join(f"`{member['id']}`" for member in region["members"])
+            mode = "atomic class" if region["atomic_class"] else "member region"
+            lines.append(f"- `{region['id']}` ({mode}): {members}")
     lines.append("")
     return lines
 

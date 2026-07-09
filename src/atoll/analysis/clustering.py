@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from atoll.analysis.call_graph import build_dependency_edges
+from atoll.analysis.typed_regions import build_typed_regions
 from atoll.models import (
     Blocker,
     ConstantRecord,
@@ -43,11 +44,13 @@ def enrich_island_analysis(module: ModuleScan) -> ModuleScan:
     module_with_blockers = replace(module_with_blockers, symbols=symbols)
     candidates = _cluster_candidates(module_with_blockers, edges)
     poison_radii = _poison_radii(module_with_blockers, edges, candidates)
+    typed_regions = build_typed_regions(module_with_blockers, edges)
     return replace(
         module_with_blockers,
         dependency_edges=edges,
         island_candidates=candidates,
         poison_radii=poison_radii,
+        typed_regions=typed_regions,
     )
 
 
