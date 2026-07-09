@@ -25,7 +25,8 @@ from packaging import tags
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.analysis.native_readiness import NativeReadiness, analyze_native_readiness
-from atoll.backends.mypyc import build_sidecars
+from atoll.backends.mypyc import MYPYC_BACKEND, build_sidecars
+from atoll.generation.region_shim import RegionShimConfig, insert_or_replace_region_shim
 from atoll.generation.shim import insert_or_replace_shim, remove_shim
 from atoll.generation.sidecar import (
     SIDECAR_GENERATOR_VERSION,
@@ -33,13 +34,25 @@ from atoll.generation.sidecar import (
     expected_sidecar_path,
     generate_sidecar,
 )
+from atoll.generation.typed_region import (
+    TypedRegionGeneration,
+    generate_typed_method_region,
+)
 from atoll.models import (
+    ArtifactRecord,
+    BackendAssessment,
+    BackendCompileContext,
+    BackendLoweringRequest,
+    BindingTarget,
     Blocker,
+    CompilationUnit,
     CompileAttempt,
     CompilePhaseTiming,
     EnabledIslandConfig,
+    LoweringDecision,
     ModuleId,
     ModuleScan,
+    SymbolId,
     TypedRegion,
 )
 from atoll.project import DiscoveredProject, discover_project
@@ -95,6 +108,11 @@ class PackageCommandResult:
     preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
     native_readiness: tuple[NativeReadiness, ...] = ()
     typed_regions: tuple[TypedRegion, ...] = ()
+    compiled_regions: tuple[TypedRegion, ...] = ()
+    compiled_bindings: tuple[BindingTarget, ...] = ()
+    backend_assessments: tuple[BackendAssessment, ...] = ()
+    artifact_records: tuple[ArtifactRecord, ...] = ()
+    region_skipped: tuple[PackageRegionBuildFailure, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +132,15 @@ class PackagePreflightFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class PackageRegionBuildFailure:
+    """One typed region retained as interpreted after backend failure."""
+
+    region: TypedRegion
+    assessment: BackendAssessment
+    build: CompileAttempt
+
+
+@dataclass(frozen=True, slots=True)
 class _ProjectMetadata:
     name: str
     version: str
@@ -125,6 +152,56 @@ class _ProjectMetadata:
 class _SelectedModule:
     scan: ModuleScan
     symbols: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectedTypedRegion:
+    """One typed region and method subset selected for the mypyc vertical slice."""
+
+    scan: ModuleScan
+    region: TypedRegion
+    assessment: BackendAssessment
+    members: tuple[SymbolId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedTypedRegion:
+    """Generated unit plus its staged runtime binding contract."""
+
+    generation: TypedRegionGeneration
+    assessment: BackendAssessment
+    unit: CompilationUnit
+    shim: RegionShimConfig
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedRegionBuildOutcome:
+    """Per-region backend results aggregated for source-clean packaging."""
+
+    successful: tuple[_PreparedTypedRegion, ...]
+    build: CompileAttempt
+    artifacts: tuple[ArtifactRecord, ...]
+    skipped: tuple[PackageRegionBuildFailure, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedRegionBuildContext:
+    """Filesystem, cache, and progress boundaries shared by region builds."""
+
+    build_root: Path
+    staged_source_roots: tuple[Path, ...]
+    cache_dir: Path
+    progress: PackageProgress | None
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedRegionPackageContext:
+    """Selected analysis evidence carried into source-clean region packaging."""
+
+    selected: tuple[_SelectedTypedRegion, ...]
+    typed_regions: tuple[TypedRegion, ...]
+    preflight_skipped: tuple[PackagePreflightFailure, ...]
+    native_readiness: tuple[NativeReadiness, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,19 +251,26 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     scans = _selected_scans(project, options.module_name)
     typed_regions = tuple(region for scan in scans for region in scan.typed_regions)
     _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
-    preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
     selected = _selected_modules(scans)
-    selected_symbols = sum(len(selected_module.symbols) for selected_module in selected)
-    _progress(
-        options.progress,
-        f"selected {len(selected)} candidate module(s), {selected_symbols} symbol(s)",
-    )
-    if not selected:
+    selected_typed_regions = _selected_typed_method_regions(scans)
+    _progress_compile_selection(options.progress, selected, selected_typed_regions)
+    if not selected and not selected_typed_regions:
         return _failed_result(
             project.config.root,
             options.output_dir,
             "scan found no candidate islands",
             typed_regions=typed_regions,
+        )
+    if not selected:
+        return _execute_typed_region_package(
+            options=options,
+            project=project,
+            context=_TypedRegionPackageContext(
+                selected=selected_typed_regions,
+                typed_regions=typed_regions,
+                preflight_skipped=(),
+                native_readiness=(),
+            ),
         )
 
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
@@ -203,7 +287,10 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     sidecar_started = time.perf_counter()
     _progress(
         options.progress,
-        f"analyzing {selected_symbols} generated candidate symbol(s) for native readiness",
+        (
+            f"analyzing {sum(len(module.symbols) for module in selected)} generated "
+            "candidate symbol(s) for native readiness"
+        ),
     )
     prepared_modules = tuple(
         _prepare_staged_island(
@@ -232,12 +319,16 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         ),
     )
     if not islands:
-        return _no_native_ready_result(
+        return _handle_no_native_islands(
+            options=options,
             project=project,
             build_root=build_root,
-            native_readiness=native_readiness,
-            preflight_skipped=preflight_skipped,
-            typed_regions=typed_regions,
+            context=_TypedRegionPackageContext(
+                selected=selected_typed_regions,
+                typed_regions=typed_regions,
+                preflight_skipped=(),
+                native_readiness=native_readiness,
+            ),
         )
     outcome = _build_package_islands(
         islands,
@@ -266,7 +357,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             cleanup_removed=cleanup_removed,
             cleanup_kept=(build_root,),
             skipped=outcome.skipped,
-            preflight_skipped=preflight_skipped,
+            preflight_skipped=(),
             native_readiness=native_readiness,
             typed_regions=typed_regions,
         )
@@ -315,10 +406,382 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         cleanup_kept=cleanup_kept,
         report_artifact_paths=report_artifact_paths,
         skipped=outcome.skipped,
-        preflight_skipped=preflight_skipped,
+        preflight_skipped=(),
         native_readiness=native_readiness,
         typed_regions=typed_regions,
     )
+
+
+def _handle_no_native_islands(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    build_root: Path,
+    context: _TypedRegionPackageContext,
+) -> PackageCommandResult:
+    """Try selected method regions before reporting no native-ready work."""
+    if context.selected:
+        _progress(
+            options.progress,
+            "no function islands passed native readiness; trying typed method regions",
+        )
+        return _execute_typed_region_package(
+            options=options,
+            project=project,
+            context=context,
+        )
+    return _no_native_ready_result(
+        project=project,
+        build_root=build_root,
+        native_readiness=context.native_readiness,
+        preflight_skipped=context.preflight_skipped,
+        typed_regions=context.typed_regions,
+    )
+
+
+def _execute_typed_region_package(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    context: _TypedRegionPackageContext,
+) -> PackageCommandResult:
+    """Build the first source-clean method-region vertical slice.
+
+    Generation and shims live only in copied build roots. Regions compile
+    independently so one backend rejection leaves successful regions available
+    in the wheel while preserving the original implementation as fallback.
+    """
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    build_root = output_dir / "build"
+    install_root = output_dir / "install"
+    _progress(options.progress, f"resetting temporary build roots in {output_dir}")
+    _reset_dir(build_root)
+    _reset_dir(install_root)
+
+    copy_started = time.perf_counter()
+    _progress(options.progress, "copying source roots into temporary build tree")
+    staged_source_roots = _copy_source_roots(project, build_root)
+    _progress(options.progress, f"copied source roots in {_duration(copy_started)}")
+
+    generation_started = time.perf_counter()
+    prepared: list[_PreparedTypedRegion] = []
+    preparation_failures: list[PackageRegionBuildFailure] = []
+    for selection in context.selected:
+        try:
+            prepared.append(
+                _prepare_typed_region(
+                    project=project,
+                    build_root=build_root,
+                    staged_source_roots=staged_source_roots,
+                    selection=selection,
+                )
+            )
+        except (SyntaxError, ValueError) as lowering_error:
+            preparation_failures.append(
+                PackageRegionBuildFailure(
+                    region=selection.region,
+                    assessment=selection.assessment,
+                    build=_failed_region_attempt(f"typed-region lowering failed: {lowering_error}"),
+                )
+            )
+    _progress(
+        options.progress,
+        (
+            f"lowered {len(prepared)} typed region(s); "
+            f"kept {len(preparation_failures)} as fallback in {_duration(generation_started)}"
+        ),
+    )
+    if not prepared:
+        result_error = "No selected typed regions could be lowered for a compiler backend."
+        _remove_failed_wheels(project, output_dir)
+        cleanup_removed = _remove_tree(install_root)
+        return PackageCommandResult(
+            success=False,
+            project_root=project.config.root,
+            output_dir=output_dir,
+            install_root=install_root,
+            wheel_path=None,
+            islands=(),
+            build=_failed_region_attempt(result_error),
+            cleanup_removed=cleanup_removed,
+            cleanup_kept=(build_root,),
+            error=result_error,
+            preflight_skipped=context.preflight_skipped,
+            native_readiness=context.native_readiness,
+            typed_regions=context.typed_regions,
+            backend_assessments=tuple(selection.assessment for selection in context.selected),
+            region_skipped=tuple(preparation_failures),
+        )
+
+    outcome = _build_typed_regions(
+        prepared=tuple(prepared),
+        context=_TypedRegionBuildContext(
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            cache_dir=project.config.cache_dir / "mypy" / "source-clean",
+            progress=options.progress,
+        ),
+        initial_failures=tuple(preparation_failures),
+    )
+    if not outcome.successful:
+        _progress(options.progress, "all typed-region builds failed; keeping diagnostics")
+        _remove_failed_wheels(project, output_dir)
+        cleanup_removed = _remove_tree(install_root)
+        return PackageCommandResult(
+            success=False,
+            project_root=project.config.root,
+            output_dir=output_dir,
+            install_root=install_root,
+            wheel_path=None,
+            islands=(),
+            build=outcome.build,
+            cleanup_removed=cleanup_removed,
+            cleanup_kept=(build_root,),
+            error=outcome.build.stderr,
+            preflight_skipped=context.preflight_skipped,
+            native_readiness=context.native_readiness,
+            typed_regions=context.typed_regions,
+            backend_assessments=tuple(selection.assessment for selection in context.selected),
+            artifact_records=outcome.artifacts,
+            region_skipped=outcome.skipped,
+        )
+
+    payload_started = time.perf_counter()
+    _progress(options.progress, "binding compiled methods in staged source modules")
+    successful_shims = tuple(item.shim for item in outcome.successful)
+    _insert_region_shims(successful_shims)
+    _place_region_artifacts(successful_shims, outcome.build.artifact_paths)
+    report_artifact_paths = _source_clean_report_artifact_paths(
+        project.config.root,
+        outcome.build.artifact_paths,
+    )
+    for item in prepared:
+        item.generation.source_path.unlink(missing_ok=True)
+    _copy_install_payload(staged_source_roots, install_root)
+    _copy_atoll_artifacts(staged_source_roots, install_root)
+    _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
+
+    metadata = _project_metadata(project.config.root)
+    wheel_started = time.perf_counter()
+    _progress(options.progress, f"writing wheel to {output_dir}")
+    wheel_path = _write_wheel(
+        install_root=install_root,
+        output_dir=output_dir,
+        metadata=metadata,
+    )
+    _progress(options.progress, f"wrote wheel in {_duration(wheel_started)}")
+
+    cleanup_started = time.perf_counter()
+    _progress(options.progress, "cleaning temporary build outputs")
+    cleanup_removed_paths = [build_root]
+    shutil.rmtree(build_root)
+    cleanup_kept: tuple[Path, ...] = ()
+    if not options.keep_install_tree:
+        cleanup_removed_paths.append(install_root)
+        shutil.rmtree(install_root)
+    else:
+        cleanup_kept = (install_root,)
+    _progress(options.progress, f"cleaned temporary outputs in {_duration(cleanup_started)}")
+
+    successful_regions = tuple(item.generation.region for item in outcome.successful)
+    successful_bindings = tuple(
+        binding for item in outcome.successful for binding in item.generation.bindings
+    )
+    return PackageCommandResult(
+        success=True,
+        project_root=project.config.root,
+        output_dir=output_dir,
+        install_root=install_root,
+        wheel_path=wheel_path,
+        islands=(),
+        build=outcome.build,
+        install_tree_kept=options.keep_install_tree,
+        cleanup_removed=tuple(cleanup_removed_paths),
+        cleanup_kept=cleanup_kept,
+        report_artifact_paths=report_artifact_paths,
+        preflight_skipped=context.preflight_skipped,
+        native_readiness=context.native_readiness,
+        typed_regions=context.typed_regions,
+        compiled_regions=successful_regions,
+        compiled_bindings=successful_bindings,
+        backend_assessments=tuple(selection.assessment for selection in context.selected),
+        artifact_records=outcome.artifacts,
+        region_skipped=outcome.skipped,
+    )
+
+
+def _prepare_typed_region(
+    *,
+    project: DiscoveredProject,
+    build_root: Path,
+    staged_source_roots: tuple[Path, ...],
+    selection: _SelectedTypedRegion,
+) -> _PreparedTypedRegion:
+    staged_module = _staged_module(selection.scan.module, project, staged_source_roots)
+    staged_scan = enrich_island_analysis(scan_module(staged_module))
+    staged_region = next(
+        region for region in staged_scan.typed_regions if region.id == selection.region.id
+    )
+    logical_module = _typed_region_module_name(staged_region)
+    generated_path = build_root / f"{logical_module}.py"
+    generation = generate_typed_method_region(
+        staged_scan,
+        staged_region,
+        selection.members,
+        logical_module=logical_module,
+        output_path=generated_path,
+    )
+    unit = MYPYC_BACKEND.lower(
+        BackendLoweringRequest(
+            region=staged_region,
+            source_path=generated_path,
+            logical_module=logical_module,
+            install_relative_dir=".atoll/artifacts",
+            members=selection.members,
+        )
+    )
+    staged_source_root = _staged_source_root(
+        selection.scan.module,
+        project,
+        staged_source_roots,
+    )
+    return _PreparedTypedRegion(
+        generation=generation,
+        assessment=selection.assessment,
+        unit=unit,
+        shim=RegionShimConfig(
+            source_module=staged_module.name,
+            source_path=staged_module.path,
+            region_id=staged_region.id,
+            backend="mypyc",
+            compiled_module=logical_module,
+            artifact_dir=staged_source_root / ".atoll" / "artifacts",
+            bindings=generation.bindings,
+        ),
+    )
+
+
+def _build_typed_regions(
+    *,
+    prepared: tuple[_PreparedTypedRegion, ...],
+    context: _TypedRegionBuildContext,
+    initial_failures: tuple[PackageRegionBuildFailure, ...],
+) -> _TypedRegionBuildOutcome:
+    successful: list[_PreparedTypedRegion] = []
+    skipped = list(initial_failures)
+    attempts: list[CompileAttempt] = [failure.build for failure in initial_failures]
+    artifacts: list[ArtifactRecord] = []
+    backend_context = BackendCompileContext(
+        project_root=context.build_root,
+        build_dir=context.build_root / ".atoll" / "build",
+        source_roots=context.staged_source_roots,
+        cache_dir=context.cache_dir,
+    )
+    for index, item in enumerate(prepared, start=1):
+        _progress(
+            context.progress,
+            (
+                f"compiling typed region {index}/{len(prepared)} with mypyc: "
+                f"{item.generation.region.id}"
+            ),
+        )
+        result = MYPYC_BACKEND.compile((item.unit,), backend_context)
+        attempts.append(_tag_region_timings(result.attempt, item.generation.region.id))
+        if result.attempt.success:
+            successful.append(item)
+            artifacts.extend(result.artifacts)
+            _progress(context.progress, f"compiled typed region {item.generation.region.id}")
+        else:
+            skipped.append(
+                PackageRegionBuildFailure(
+                    region=item.generation.region,
+                    assessment=item.assessment,
+                    build=result.attempt,
+                )
+            )
+            _progress(
+                context.progress,
+                f"kept typed region {item.generation.region.id} as fallback",
+            )
+    return _TypedRegionBuildOutcome(
+        successful=tuple(successful),
+        build=_aggregate_region_attempts(tuple(attempts), bool(successful)),
+        artifacts=tuple(artifacts),
+        skipped=tuple(skipped),
+    )
+
+
+def _tag_region_timings(attempt: CompileAttempt, region_id: str) -> CompileAttempt:
+    return replace(
+        attempt,
+        phase_timings=tuple(
+            replace(
+                timing,
+                detail=f"{region_id}; {timing.detail}" if timing.detail else region_id,
+            )
+            for timing in attempt.phase_timings
+        ),
+    )
+
+
+def _aggregate_region_attempts(
+    attempts: tuple[CompileAttempt, ...],
+    success: bool,
+) -> CompileAttempt:
+    return CompileAttempt(
+        success=success,
+        command=("mypyc", "typed-region-build"),
+        stdout="\n".join(attempt.stdout for attempt in attempts if attempt.stdout),
+        stderr="\n\n".join(attempt.stderr for attempt in attempts if not attempt.success),
+        artifact_paths=tuple(
+            dict.fromkeys(
+                artifact
+                for attempt in attempts
+                if attempt.success
+                for artifact in attempt.artifact_paths
+            )
+        ),
+        duration_seconds=sum(attempt.duration_seconds for attempt in attempts),
+        phase_timings=tuple(timing for attempt in attempts for timing in attempt.phase_timings),
+    )
+
+
+def _failed_region_attempt(error: str) -> CompileAttempt:
+    return CompileAttempt(
+        success=False,
+        command=(),
+        stdout="",
+        stderr=error,
+        artifact_paths=(),
+        duration_seconds=0.0,
+    )
+
+
+def _insert_region_shims(configs: tuple[RegionShimConfig, ...]) -> None:
+    configs_by_path: dict[Path, list[RegionShimConfig]] = {}
+    for config in configs:
+        configs_by_path.setdefault(config.source_path, []).append(config)
+    for source_path, module_configs in configs_by_path.items():
+        source_text = source_path.read_text(encoding="utf-8")
+        source_path.write_text(
+            insert_or_replace_region_shim(source_text, tuple(module_configs)).new_text,
+            encoding="utf-8",
+        )
+
+
+def _place_region_artifacts(
+    configs: tuple[RegionShimConfig, ...],
+    artifact_paths: tuple[Path, ...],
+) -> None:
+    for artifact_dir in sorted({config.artifact_dir for config in configs}):
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        for artifact in artifact_paths:
+            _copy_if_different(artifact, artifact_dir / artifact.name)
+
+
+def _typed_region_module_name(region: TypedRegion) -> str:
+    module = re.sub(r"[^A-Za-z0-9_]", "_", region.source_module.name)
+    return f"_atoll_region_{module}_{region.source_hash[:12]}"
 
 
 def _no_native_ready_result(
@@ -402,6 +865,23 @@ def _remove_tree(path: Path) -> tuple[Path, ...]:
 def _progress(progress: PackageProgress | None, message: str) -> None:
     if progress is not None:
         progress(message)
+
+
+def _progress_compile_selection(
+    progress: PackageProgress | None,
+    selected_modules: tuple[_SelectedModule, ...],
+    selected_regions: tuple[_SelectedTypedRegion, ...],
+) -> None:
+    function_count = sum(len(module.symbols) for module in selected_modules)
+    method_count = sum(len(region.members) for region in selected_regions)
+    _progress(
+        progress,
+        (
+            f"selected {len(selected_modules)} candidate module(s), {function_count} "
+            f"function(s), and {len(selected_regions)} typed method region(s), "
+            f"{method_count} method(s)"
+        ),
+    )
 
 
 def _duration(started: float) -> str:
@@ -957,6 +1437,53 @@ def _selected_modules(
         if symbols:
             selected.append(_SelectedModule(scan=scan, symbols=symbols))
     return tuple(selected)
+
+
+def _selected_typed_method_regions(
+    scans: tuple[ModuleScan, ...],
+) -> tuple[_SelectedTypedRegion, ...]:
+    selected: list[_SelectedTypedRegion] = []
+    for scan in scans:
+        for region in scan.typed_regions:
+            assessment = MYPYC_BACKEND.assess(region)
+            supported = set(assessment.supported_members)
+            decisions = {decision.target: decision for decision in region.decisions}
+            members = tuple(
+                member.id
+                for member in region.members
+                if member.id in supported
+                and member.kind == "method"
+                and member.binding_kind in {"instance_method", "staticmethod", "classmethod"}
+                and member.execution_kind in {"sync", "generator", "coroutine"}
+                and not member.id.qualname.rsplit(".", 1)[-1].startswith("__")
+                and decisions[member.id.stable_id].action == "preserve"
+                and not _owner_requires_fallback(
+                    member.owner_class,
+                    region.source_module.name,
+                    decisions,
+                )
+            )
+            if members:
+                selected.append(
+                    _SelectedTypedRegion(
+                        scan=scan,
+                        region=region,
+                        assessment=assessment,
+                        members=members,
+                    )
+                )
+    return tuple(selected)
+
+
+def _owner_requires_fallback(
+    owner_class: str | None,
+    module_name: str,
+    decisions: dict[str, LoweringDecision],
+) -> bool:
+    if owner_class is None:
+        return True
+    decision = decisions.get(f"{module_name}::{owner_class}")
+    return decision is not None and decision.action in {"fallback", "reject"}
 
 
 def _candidate_symbols(scan: ModuleScan) -> tuple[str, ...]:

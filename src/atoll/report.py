@@ -15,7 +15,11 @@ from typing import Literal, TypedDict
 
 from atoll.analysis.native_readiness import NativeReadiness
 from atoll.models import (
+    ArtifactRecord,
+    Backend,
+    BackendAssessment,
     BindingKind,
+    BindingTarget,
     Blocker,
     BlockerSeverity,
     CompileAttempt,
@@ -324,6 +328,7 @@ class CompilationSummaryReport(TypedDict):
 
     islands: int
     typed_regions: int
+    compiled_regions: int
     symbols: int
     native_ready_symbols: int
     native_rejected_symbols: int
@@ -418,6 +423,27 @@ class CompilationIslandReport(TypedDict):
     verification: CompilationVerifyReport | None
 
 
+class CompilationCompiledBindingReport(TypedDict):
+    """One method binding that a compiled region promises at runtime."""
+
+    source: str
+    compiled_name: str
+    kind: BindingKind
+    owner_class: str | None
+    execution_kind: ExecutionKind
+    required: bool
+
+
+class CompilationCompiledRegionReport(TypedDict):
+    """Backend, binding, and artifact evidence for one successful region."""
+
+    id: str
+    source_module: str
+    backend: Backend | None
+    bindings: list[CompilationCompiledBindingReport]
+    artifacts: list[str]
+
+
 class CompilationReport(TypedDict):
     """Top-level stable JSON report for build and source-clean compile commands."""
 
@@ -437,6 +463,7 @@ class CompilationReport(TypedDict):
     preflight_blockers: list[CompilationPreflightBlockerReport]
     native_readiness: list[CompilationNativeReadinessReport]
     typed_regions: list[TypedRegionReport]
+    compiled_regions: list[CompilationCompiledRegionReport]
     islands: list[CompilationIslandReport]
 
 
@@ -491,6 +518,10 @@ class CompilationReportInput:
     preflight_blockers: tuple[CompilationPreflightBlockerInput, ...] = ()
     native_readiness: tuple[NativeReadiness, ...] = ()
     typed_regions: tuple[TypedRegion, ...] = ()
+    compiled_regions: tuple[TypedRegion, ...] = ()
+    compiled_bindings: tuple[BindingTarget, ...] = ()
+    backend_assessments: tuple[BackendAssessment, ...] = ()
+    artifact_records: tuple[ArtifactRecord, ...] = ()
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -570,6 +601,7 @@ def render_markdown_report(report: ScanReport) -> str:
 
 def build_compilation_report(report_input: CompilationReportInput) -> CompilationReport:
     """Convert build, verification, and cleanup evidence into a stable report."""
+    compiled_regions = _compiled_region_reports(report_input)
     verify_by_module = {result.source_module: result for result in report_input.verification}
     artifact_paths = tuple(report_input.build.artifact_paths)
     island_artifacts = {
@@ -579,6 +611,14 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     mapped_artifacts = {
         artifact for artifacts in island_artifacts.values() for artifact in artifacts
     }
+    compiled_artifact_names = {
+        Path(record.install_relative_path).name
+        for record in report_input.artifact_records
+        if record.region_id != "__shared__"
+    }
+    mapped_artifacts.update(
+        artifact for artifact in artifact_paths if artifact.name in compiled_artifact_names
+    )
     support_artifacts = tuple(path for path in artifact_paths if path not in mapped_artifacts)
     verify_failures = sum(result.error is not None for result in report_input.verification)
     test_failures = int(report_input.tests is not None and not report_input.tests.success)
@@ -599,7 +639,9 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         "summary": {
             "islands": len(report_input.islands),
             "typed_regions": len(report_input.typed_regions),
-            "symbols": sum(len(island.symbols) for island in report_input.islands),
+            "compiled_regions": len(compiled_regions),
+            "symbols": sum(len(island.symbols) for island in report_input.islands)
+            + len(report_input.compiled_bindings),
             "native_ready_symbols": sum(
                 readiness.eligible for readiness in report_input.native_readiness
             ),
@@ -679,6 +721,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             for readiness in report_input.native_readiness
         ],
         "typed_regions": [_typed_region_report(region) for region in report_input.typed_regions],
+        "compiled_regions": compiled_regions,
         "islands": [
             {
                 "source_module": island.source_module,
@@ -696,6 +739,51 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             for island in report_input.islands
         ],
     }
+
+
+def _compiled_region_reports(
+    report_input: CompilationReportInput,
+) -> list[CompilationCompiledRegionReport]:
+    assessments = {
+        assessment.region_id: assessment for assessment in report_input.backend_assessments
+    }
+    reports: list[CompilationCompiledRegionReport] = []
+    for region in report_input.compiled_regions:
+        member_ids = {member.id for member in region.members}
+        bindings = tuple(
+            binding for binding in report_input.compiled_bindings if binding.source in member_ids
+        )
+        records = tuple(
+            record for record in report_input.artifact_records if record.region_id == region.id
+        )
+        assessment = assessments.get(region.id)
+        backend: Backend | None
+        if assessment is not None:
+            backend = assessment.backend
+        elif records:
+            backend = records[0].backend
+        else:
+            backend = None
+        reports.append(
+            {
+                "id": region.id,
+                "source_module": region.source_module.name,
+                "backend": backend,
+                "bindings": [
+                    {
+                        "source": binding.source.stable_id,
+                        "compiled_name": binding.compiled_name,
+                        "kind": binding.kind,
+                        "owner_class": binding.owner_class,
+                        "execution_kind": binding.execution_kind,
+                        "required": binding.required,
+                    }
+                    for binding in bindings
+                ],
+                "artifacts": sorted(record.install_relative_path for record in records),
+            }
+        )
+    return reports
 
 
 def write_compilation_json_report(path: Path, report: CompilationReport) -> None:
@@ -726,6 +814,7 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         f"- Wheel: {_optional_path(report['wheel_path'])}",
         f"- Islands: {report['summary']['islands']}",
         f"- Typed regions: {report['summary']['typed_regions']}",
+        f"- Compiled regions: {report['summary']['compiled_regions']}",
         f"- Symbols: {report['summary']['symbols']}",
         f"- Native-ready scan candidates: {report['summary']['native_ready_symbols']}",
         f"- Rejected scan candidates: {report['summary']['native_rejected_symbols']}",
@@ -768,6 +857,7 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
             f"- `{region['id']}`: " + ", ".join(member["id"] for member in region["members"])
             for region in report["typed_regions"]
         )
+    _append_compiled_regions_markdown(lines, report["compiled_regions"])
     lines.extend(
         [
             "",
@@ -812,6 +902,25 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
     for island in report["islands"]:
         lines.extend(_compilation_markdown_island(island))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _compiled_region_markdown(region: CompilationCompiledRegionReport) -> str:
+    backend = region["backend"] or "unknown backend"
+    bindings = ", ".join(
+        f"{binding['source']} ({binding['kind']})" for binding in region["bindings"]
+    )
+    artifacts = ", ".join(region["artifacts"]) or "no recorded artifacts"
+    return f"- `{region['id']}` [{backend}]: {bindings}; artifacts: {artifacts}"
+
+
+def _append_compiled_regions_markdown(
+    lines: list[str],
+    regions: list[CompilationCompiledRegionReport],
+) -> None:
+    if not regions:
+        return
+    lines.extend(["", "### Compiled Regions", ""])
+    lines.extend(_compiled_region_markdown(region) for region in regions)
 
 
 def _append_cleanup_markdown(lines: list[str], cleanup: CompilationCleanupReport) -> None:

@@ -571,9 +571,15 @@ def _run_source_clean_artifact_build(
         _print_compile_report_paths(report_paths)
         print(result.error or result.build.stderr)
         return 1
+    compiled_modules = {
+        *(island.source_module for island in result.islands),
+        *(binding.source.module for binding in result.compiled_bindings),
+    }
+    compiled_symbols = sum(len(island.symbols) for island in result.islands) + len(
+        result.compiled_bindings
+    )
     print(
-        f"Atoll {label} built {len(result.islands)} module(s) "
-        f"and {sum(len(island.symbols) for island in result.islands)} symbol(s)."
+        f"Atoll {label} built {len(compiled_modules)} module(s) and {compiled_symbols} symbol(s)."
     )
     if result.skipped:
         print(f"Skipped {len(result.skipped)} module(s) that mypyc could not build.")
@@ -588,6 +594,15 @@ def _run_source_clean_artifact_build(
             first = preflight_failure.blockers[0]
             location = f"line {first.lineno}" if first.lineno is not None else "module"
             print(f"- {preflight_failure.scan.module.name}: {location}: {first.message}")
+    if result.region_skipped:
+        print(f"Kept {len(result.region_skipped)} typed region(s) as interpreted fallback.")
+        for region_failure in result.region_skipped[:10]:
+            first_line = (
+                region_failure.build.stderr.splitlines()[0]
+                if region_failure.build.stderr
+                else "failed"
+            )
+            print(f"- {region_failure.region.id}: {first_line}")
     if result.install_tree_kept:
         print(f"Install tree: {result.install_root}")
     print(f"Wheel: {result.wheel_path}")
@@ -722,10 +737,17 @@ def _write_source_clean_compile_report(
             wheel_path=result.wheel_path,
             cleanup_removed=result.cleanup_removed,
             cleanup_kept=result.cleanup_kept,
-            skipped_modules=_package_skipped_module_inputs(result.skipped),
+            skipped_modules=(
+                *_package_skipped_module_inputs(result.skipped),
+                *_package_region_skipped_inputs(result),
+            ),
             preflight_blockers=_package_preflight_blocker_inputs(result.preflight_skipped),
             native_readiness=result.native_readiness,
             typed_regions=result.typed_regions,
+            compiled_regions=result.compiled_regions,
+            compiled_bindings=result.compiled_bindings,
+            backend_assessments=result.backend_assessments,
+            artifact_records=result.artifact_records,
         )
     )
     json_path = result.project_root / ".atoll" / "compile-report.json"
@@ -759,6 +781,18 @@ def _package_skipped_module_inputs(
             reason=failure.build.stderr or "mypy rejected generated island",
         )
         for failure in skipped
+    )
+
+
+def _package_region_skipped_inputs(
+    result: PackageCommandResult,
+) -> tuple[CompilationSkippedModuleInput, ...]:
+    return tuple(
+        CompilationSkippedModuleInput(
+            module=failure.region.source_module.name,
+            reason=failure.build.stderr or "backend rejected typed region",
+        )
+        for failure in result.region_skipped
     )
 
 

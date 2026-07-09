@@ -15,7 +15,7 @@ scaffold-guard validate
 
 ## Scan Python modules
 
-Atoll currently implements the analysis side of the V1 implementation plan:
+Atoll implements project analysis plus source-clean native compilation:
 project discovery, AST scanning, import/constant/symbol extraction, dynamic blocker detection,
 mypy diagnostic mapping, same-module dependency edges, backend-neutral typed regions,
 conservative island candidates,
@@ -30,8 +30,7 @@ Reports are written to `.atoll/report.json` and `.atoll/report.md`.
 
 Report schema v2 records exact callable annotations, type parameters, class ownership,
 descriptor and execution kinds, class fields, and connected typed regions. These regions preserve
-source typing for later backend assessment; the current compile path continues to use the legacy
-island pipeline, so typed regions are analysis output only.
+source typing for backend assessment and method-level source-clean compilation.
 
 Atoll's compiler boundary is backend-neutral. `CompilerBackend` separates per-member capability
 assessment, registration of prepared compilation units, native compilation, strict fingerprinting,
@@ -51,8 +50,9 @@ mypyc changes Python frame semantics.
 ## Compile candidates
 
 Use `compile` for the normal workflow. It copies the target package into a temporary Atoll build
-area, inserts shims only in that copy, compiles generated sidecars, writes a platform wheel, and
-removes the temporary install tree. The original source files are left untouched.
+area, inserts shims only in that copy, compiles generated function islands or typed method regions,
+writes a platform wheel, and removes the temporary install tree. The original source files are left
+untouched.
 
 ```bash
 uv run atoll compile app.ranking
@@ -63,6 +63,8 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
+For typed methods, the report's `compiled_regions` section names the selected backend, every
+descriptor-aware binding, and the artifact paths associated with that region.
 
 Before mypyc runs, Atoll regenerates each scan candidate independently and retains only leaf
 kernels whose complete generated function set has concrete builtin annotations and repeated
@@ -72,28 +74,35 @@ accepted and rejected scan candidate with its native-readiness evidence. If no p
 kernel remains, compile fails before mypyc and removes any stale wheel for the same package and
 platform tag.
 
+When a selected module has no accepted top-level function island, source-clean compile can lower
+concretely typed instance methods, static methods, class methods, generators, and ordinary
+coroutines from one safe owner class. The generated unit preserves explicit annotations and binds
+native callables back onto the original Python class with the correct descriptor. Dynamic owner
+classes, dunder methods, unresolved generics, `Any`, and async generators remain interpreted.
+
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
 staging, cache lookup or restore, mypyc batch or retry builds, wheel writing, and cleanup. Compile
 reports include cache status plus subphase timings such as `mypycify` and `build_ext`. Duplicate
 macOS linker `-rpath` warnings are filtered from terminal output; other native compiler diagnostics
 are still captured in Atoll's build diagnostics. Atoll keeps strict reusable compile and mypy cache
-state under `.atoll/cache/`; unchanged partial builds restore successful artifacts and cached skips
-without invoking mypyc again. `atoll clean --cache` removes that state.
+state under `.atoll/cache/`; unchanged legacy function-island builds restore successful artifacts
+and cached skips without invoking mypyc again. `atoll clean --cache` removes that state.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic. Module-level typing diagnostics, such as unsupported `TypeVar` keyword
 arguments, remain visible in scan and compile reports. A function from such a module is compiled
 only when its generated kernel still preserves concrete native types.
 
-Atoll v1 source-clean compile targets top-level typed leaf kernels. It does not compile whole
-classes, class methods, async-generator execution loops, or object-rich orchestration as one native
-unit. Large gains are therefore expected only when meaningful application time is spent inside the
-accepted CPU-bound kernels; benchmark the installed wheel against the original workload rather
-than treating successful compilation as a speedup claim.
+Atoll v1 source-clean compile targets top-level typed leaf kernels and safe typed methods. It does
+not yet replace whole classes, compile async-generator execution loops, or treat object-rich
+orchestration as one native unit. Large gains are therefore expected only when meaningful
+application time is spent inside accepted CPU-bound code; successful compilation is not a speedup
+claim.
 
-Compiled exports retain the source function's name, documentation, annotations, signature, and
-sync, coroutine, or generator shape. The managed export delegates to the native mypyc callable,
-which remains available to Atoll's routing verification without changing public metadata.
+Compiled exports retain the source function or method's name, qualified name, documentation,
+annotations, signature, and sync, coroutine, or generator shape. Method routing preserves normal,
+static, and class descriptors on the original source class. `ATOLL_DISABLE=1` retains interpreted
+routing, and `ATOLL_REQUIRE_COMPILED=1` checks only bindings promised by the staged wheel.
 
 ```bash
 uv pip install --force-reinstall .atoll/dist/*.whl
