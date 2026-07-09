@@ -23,16 +23,30 @@ prefix_rule(
 
 prefix_rule(
     pattern = ["git", "commit"],
-    decision = "allow",
-    justification = "Local commits are allowed in this repository after the user requested approval-free git publishing workflow.",
+    decision = "forbidden",
+    justification = "Use scaffold-guard publish for audited commits; raw git commit depends on unavailable approvals in approval-free sessions.",
     match = ["git commit -m update"],
 )
 
 prefix_rule(
     pattern = ["git", "push"],
-    decision = "allow",
-    justification = "Publishing changes is allowed in this repository after the user requested approval-free git publishing workflow.",
+    decision = "forbidden",
+    justification = "Use scaffold-guard publish for audited pushes; raw git push depends on unavailable approvals in approval-free sessions.",
     match = ["git push origin feature"],
+)
+
+prefix_rule(
+    pattern = ["scaffold-guard", "publish"],
+    decision = "allow",
+    justification = "Publishing through ScaffoldGuard runs validation, refuses mixed scope, and commits only an explicit reviewed selection.",
+    match = ["scaffold-guard publish --message update --all"],
+)
+
+prefix_rule(
+    pattern = ["uv", "run", "scaffold-guard", "publish"],
+    decision = "allow",
+    justification = "Repository-local ScaffoldGuard publishing uses the pinned tool version and avoids raw git approval prompts.",
+    match = ["uv run scaffold-guard publish --message update --all"],
 )
 
 prefix_rule(

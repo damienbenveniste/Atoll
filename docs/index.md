@@ -12,17 +12,22 @@ uv run atoll scan .
 
 The scan command writes `.atoll/report.json` and `.atoll/report.md`.
 Candidate scores are 0-100 scan-only heuristics for how promising an island looks, while
-candidate risk describes extraction risk. A `low` risk candidate still needs build and verify.
+candidate risk describes extraction risk. Frame-introspection code such as
+`inspect.currentframe()`, `sys._getframe()`, and direct frame attributes such as `f_locals`
+are hard blockers because mypyc changes Python frame semantics.
 
 ## Sidecars
 
 ```bash
 uv run atoll compile app.ranking
+uv run atoll compile app.ranking --test "pytest tests"
 uv run atoll compile
 ```
 
 `compile` enables all scan candidates, builds them, and verifies compiled routing. Pass a module
-name to limit the operation to one source module.
+name to limit the operation to one source module. Routing verification proves that managed shims
+import compiled extensions and rebound configured symbols; it does not prove semantic equivalence.
+Use `--test` to run pytest with `ATOLL_REQUIRE_COMPILED=1`.
 
 Atoll writes configuration to `.atoll.toml`, compiled extensions to `.atoll/artifacts`,
 compilation summaries to `.atoll/compilation-report.json` and
@@ -30,10 +35,26 @@ compilation summaries to `.atoll/compilation-report.json` and
 inside source modules. Generated Python sidecars in `.atoll/sidecars`, native compiler scratch
 files, and mypy's internal mypyc cache in `.atoll/build` are disposable build inputs; successful
 `compile` runs remove them and list the cleanup in the compilation report.
+If the semantic test gate fails, Atoll leaves generated build inputs in place for debugging and
+marks the compilation report failed.
 Build failures keep terminal output short and write full mypyc diagnostics to
 `.atoll/build/mypyc.log`.
 Run build commands inside the target project's Python environment because mypyc uses the active
 interpreter and installed dependencies.
+
+## Installable Artifacts
+
+Use `package` when you want compiled islands without modifying the source checkout. It copies the
+target package into an Atoll build area, inserts shims only in that copy, compiles the copied
+sidecars, and writes both an install tree and a platform wheel.
+
+```bash
+uv run atoll package app.ranking --output .atoll/dist
+uv pip install --force-reinstall .atoll/dist/*.whl
+```
+
+The original source files are left untouched. The install tree is written to `.atoll/dist/install`
+by default, and the wheel contains the shimmed modules plus the compiled native artifacts.
 
 Lower-level commands remain available for debugging:
 

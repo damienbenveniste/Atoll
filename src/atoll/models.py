@@ -204,6 +204,15 @@ class VerifyResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PytestRunResult:
+    """Result from a target-project pytest gate."""
+
+    command: tuple[str, ...]
+    exit_code: int
+    success: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ModuleScan:
     """Complete first-pass scan result for one Python module."""
 

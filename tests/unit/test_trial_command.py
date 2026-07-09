@@ -128,6 +128,59 @@ def test_trial_reports_bad_candidate_input(tmp_path: Path) -> None:
     assert "candidate must look like" in str(result.error)
 
 
+def test_trial_supports_flat_source_root_overlays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flat projects copy root contents into the overlay instead of over the overlay root."""
+    module_path = tmp_path / "ranking.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "def score(value: int) -> int:",
+                "    return value + 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_build_sidecars(
+        paths: tuple[Path, ...],
+        *,
+        project_root: Path,
+        build_dir: Path,
+        source_roots: tuple[Path, ...] = (),
+    ) -> CompileAttempt:
+        assert paths
+        assert project_root.exists()
+        assert build_dir
+        assert source_roots == (project_root,)
+        assert (project_root / "ranking.py").exists()
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=(),
+            duration_seconds=0.0,
+        )
+
+    def fake_verify_islands(*args: object, **kwargs: object) -> tuple[VerifyResult, ...]:
+        assert args
+        assert kwargs
+        return ()
+
+    monkeypatch.setattr(trial_command, "build_sidecars", fake_build_sidecars)
+    monkeypatch.setattr(trial_command, "verify_islands", fake_verify_islands)
+
+    result = execute_trial(TrialOptions(root=tmp_path, candidate="ranking::score"))
+
+    assert result.success is True
+
+
 def test_trial_reports_unsupported_test_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

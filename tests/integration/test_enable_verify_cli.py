@@ -13,7 +13,7 @@ import pytest
 from atoll.cli import main
 from atoll.commands.build import BuildOptions
 from atoll.config import load_enabled_islands
-from atoll.models import CompileAttempt, VerifyResult
+from atoll.models import CompileAttempt, PytestRunResult, VerifyResult
 from atoll.report import CompilationReport
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
@@ -149,7 +149,16 @@ def test_compile_command_enables_builds_and_verifies_candidates(tmp_path: Path) 
     project_root = tmp_path / "simple_project"
     shutil.copytree(FIXTURE_ROOT, project_root)
 
-    exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
+    exit_code = main(
+        [
+            "compile",
+            "app.ranking",
+            "--root",
+            str(project_root),
+            "--test",
+            "pytest tests -q",
+        ]
+    )
 
     sidecar_path = project_root / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
     source_path = project_root / "src" / "app" / "ranking.py"
@@ -177,6 +186,13 @@ def test_compile_command_enables_builds_and_verifies_candidates(tmp_path: Path) 
     assert report["summary"]["symbols"] == len(islands[0].symbols)
     assert report["summary"]["verified"] == 1
     assert report["summary"]["verify_failures"] == 0
+    assert report["summary"]["semantic_tests_run"] is True
+    assert report["summary"]["semantic_test_failures"] == 0
+    assert report["tests"] == {
+        "command": ["pytest", "tests", "-q"],
+        "exit_code": 0,
+        "success": True,
+    }
     assert report["islands"][0]["source_module"] == "app.ranking"
     assert report["islands"][0]["verification"] is not None
     assert report["cleanup"]["removed"] == [
@@ -184,6 +200,65 @@ def test_compile_command_enables_builds_and_verifies_candidates(tmp_path: Path) 
         ".atoll/build",
     ]
     assert (project_root / ".atoll" / "compilation-report.md").exists()
+
+
+def test_compile_command_reports_test_gate_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`atoll compile --test` fails the compile report when target tests fail."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+
+    def fake_execute_build(options: BuildOptions) -> CompileAttempt:
+        assert options.module_name == "app.ranking"
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=(tmp_path / "fixture.so",),
+            duration_seconds=0.0,
+        )
+
+    def fake_execute_verify(*args: object, **kwargs: object) -> tuple[VerifyResult, ...]:
+        assert args
+        assert kwargs == {}
+        return (
+            VerifyResult(
+                source_module="app.ranking",
+                sidecar_module="app._atoll_app_ranking",
+                active=True,
+                compiled=True,
+                origin=str(tmp_path / "fixture.so"),
+                symbols=(("score_user", True),),
+            ),
+        )
+
+    def fake_run_pytest_command(*args: object, **kwargs: object) -> PytestRunResult:
+        assert args == ("pytest tests",)
+        assert kwargs["require_compiled"] is True
+        return PytestRunResult(command=("pytest", "tests"), exit_code=1, success=False)
+
+    monkeypatch.setattr("atoll.cli.execute_build", fake_execute_build)
+    monkeypatch.setattr("atoll.cli.execute_verify", fake_execute_verify)
+    monkeypatch.setattr("atoll.cli.run_pytest_command", fake_run_pytest_command)
+
+    exit_code = main(
+        ["compile", "app.ranking", "--root", str(project_root), "--test", "pytest tests"]
+    )
+
+    assert exit_code == 1
+    report = _compilation_report(project_root)
+    assert report["success"] is False
+    assert report["summary"]["semantic_tests_run"] is True
+    assert report["summary"]["semantic_test_failures"] == 1
+    assert report["tests"] == {
+        "command": ["pytest", "tests"],
+        "exit_code": 1,
+        "success": False,
+    }
+    assert report["cleanup"]["removed"] == []
 
 
 def test_compile_command_reports_no_candidates(

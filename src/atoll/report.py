@@ -19,6 +19,7 @@ from atoll.models import (
     IslandRisk,
     ModuleScan,
     MypyDiagnostic,
+    PytestRunResult,
     ScanResult,
     SymbolId,
     SymbolKind,
@@ -157,6 +158,8 @@ class CompilationSummaryReport(TypedDict):
     support_artifacts: int
     verified: int
     verify_failures: int
+    semantic_tests_run: bool
+    semantic_test_failures: int
     duration_seconds: float
 
 
@@ -172,6 +175,12 @@ class CompilationBuildReport(TypedDict):
 
 class CompilationCleanupReport(TypedDict):
     removed: list[str]
+
+
+class CompilationTestReport(TypedDict):
+    command: list[str]
+    exit_code: int
+    success: bool
 
 
 class CompilationVerifySymbolReport(TypedDict):
@@ -205,6 +214,7 @@ class CompilationReport(TypedDict):
     success: bool
     summary: CompilationSummaryReport
     build: CompilationBuildReport
+    tests: CompilationTestReport | None
     cleanup: CompilationCleanupReport
     islands: list[CompilationIslandReport]
 
@@ -219,6 +229,7 @@ class CompilationReportInput:
     islands: tuple[EnabledIslandConfig, ...]
     build: CompileAttempt
     verification: tuple[VerifyResult, ...] = ()
+    tests: PytestRunResult | None = None
     cleanup_removed: tuple[Path, ...] = ()
 
 
@@ -280,7 +291,10 @@ def render_markdown_report(report: ScanReport) -> str:
         "",
         "- Score is a 0-100 heuristic for how promising the island looks before compilation.",
         "- Risk is extraction risk: `low` means Atoll saw only high-confidence dependencies.",
-        "- Candidates are predictions; `atoll build` and `atoll verify` prove them.",
+        (
+            "- Candidates are predictions; `atoll build` and `atoll verify` prove "
+            "compiled routing, while target tests prove exercised semantics."
+        ),
         "",
     ]
     for module in report["modules"]:
@@ -301,7 +315,8 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     }
     support_artifacts = tuple(path for path in artifact_paths if path not in mapped_artifacts)
     verify_failures = sum(result.error is not None for result in report_input.verification)
-    success = report_input.build.success and verify_failures == 0
+    test_failures = int(report_input.tests is not None and not report_input.tests.success)
+    success = report_input.build.success and verify_failures == 0 and test_failures == 0
     return {
         "version": 1,
         "tool": "atoll",
@@ -316,6 +331,8 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             "support_artifacts": len(support_artifacts),
             "verified": len(report_input.verification),
             "verify_failures": verify_failures,
+            "semantic_tests_run": report_input.tests is not None,
+            "semantic_test_failures": test_failures,
             "duration_seconds": report_input.build.duration_seconds,
         },
         "build": {
@@ -329,6 +346,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
                 _path_text(report_input.root, path) for path in support_artifacts
             ],
         },
+        "tests": _compilation_test_report(report_input.tests),
         "cleanup": {
             "removed": [
                 *_generated_input_cleanup_reports(report_input.root, report_input.cleanup_removed),
@@ -388,7 +406,16 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         f"- Support artifacts: {report['summary']['support_artifacts']}",
         f"- Verified islands: {report['summary']['verified']}",
         f"- Verification failures: {report['summary']['verify_failures']}",
+        f"- Semantic tests: {_semantic_test_summary(report['tests'])}",
         f"- Build duration: {report['summary']['duration_seconds']:.3f}s",
+        "",
+        "## Verification Scope",
+        "",
+        (
+            "Atoll runtime verification proves managed shims import compiled extensions "
+            "and rebound configured symbols. It does not prove semantic equivalence "
+            "unless the semantic test gate below passed."
+        ),
         "",
         "## Build",
         "",
@@ -403,6 +430,17 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
     if report["build"]["support_artifacts"]:
         lines.extend(["", "### Support Artifacts", ""])
         lines.extend(f"- `{artifact}`" for artifact in report["build"]["support_artifacts"])
+    lines.extend(["", "## Test Gate", ""])
+    if report["tests"] is None:
+        lines.append("- Not run")
+    else:
+        lines.extend(
+            [
+                f"- Command: `{' '.join(report['tests']['command'])}`",
+                f"- Exit code: {report['tests']['exit_code']}",
+                f"- Success: {_yes_no(report['tests']['success'])}",
+            ]
+        )
     lines.extend(["", "## Cleanup", ""])
     if report["cleanup"]["removed"]:
         lines.extend(f"- Removed `{path}`" for path in report["cleanup"]["removed"])
@@ -613,6 +651,24 @@ def _compilation_verify_report(result: VerifyResult | None) -> CompilationVerify
         "symbols": [{"symbol": symbol, "rebound": rebound} for symbol, rebound in result.symbols],
         "error": result.error,
     }
+
+
+def _compilation_test_report(result: PytestRunResult | None) -> CompilationTestReport | None:
+    if result is None:
+        return None
+    return {
+        "command": list(result.command),
+        "exit_code": result.exit_code,
+        "success": result.success,
+    }
+
+
+def _semantic_test_summary(result: CompilationTestReport | None) -> str:
+    if result is None:
+        return "not run"
+    if result["success"]:
+        return f"passed (`{' '.join(result['command'])}`)"
+    return f"failed (`{' '.join(result['command'])}`, exit code {result['exit_code']})"
 
 
 def _compilation_markdown_island(island: CompilationIslandReport) -> list[str]:

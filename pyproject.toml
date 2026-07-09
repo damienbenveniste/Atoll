@@ -16,20 +16,14 @@ atoll = "atoll.cli:main"
 
 [dependency-groups]
 dev = [
-    "scaffold-guard>=0.1.0",
+    "scaffold-guard>=0.1.3",
     "mkdocs>=1.6.0",
     "mkdocs-material>=9.6.0",
-
     "pytest>=8.4.0",
     "pytest-cov>=6.2.0",
-
     "pyright>=1.1.400",
-
     "types-setuptools>=69",
-
-
     "ruff>=0.12.0",
-
 ]
 
 [build-system]

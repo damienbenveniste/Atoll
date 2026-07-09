@@ -15,6 +15,33 @@ _HARDCODED_CALL_BLOCKERS = {
     "vars": ("DYN_LOCALS", "vars() prevents safe extraction"),
     "__import__": ("DYN_IMPORT_CALL", "__import__() prevents safe extraction"),
 }
+_FRAME_CALL_BLOCKERS: dict[tuple[str, ...], str] = {
+    ("inspect", "currentframe"): "inspect.currentframe() depends on Python frame semantics",
+    ("inspect", "stack"): "inspect.stack() depends on Python frame semantics",
+    ("inspect", "getouterframes"): "inspect.getouterframes() depends on Python frame semantics",
+    ("inspect", "getinnerframes"): "inspect.getinnerframes() depends on Python frame semantics",
+    ("sys", "_getframe"): "sys._getframe() depends on Python frame semantics",
+}
+_BARE_FRAME_CALL_BLOCKERS = {
+    "currentframe": "currentframe() depends on Python frame semantics",
+    "_getframe": "_getframe() depends on Python frame semantics",
+    "getouterframes": "getouterframes() depends on Python frame semantics",
+    "getinnerframes": "getinnerframes() depends on Python frame semantics",
+}
+_FRAME_ATTRIBUTE_BLOCKERS = frozenset(
+    {
+        "f_back",
+        "f_builtins",
+        "f_code",
+        "f_globals",
+        "f_lasti",
+        "f_lineno",
+        "f_locals",
+        "f_trace",
+        "f_trace_lines",
+        "f_trace_opcodes",
+    }
+)
 _GETATTR_MIN_ARGS = 2
 
 
@@ -105,6 +132,16 @@ class _BlockerVisitor(ast.NodeVisitor):
         self._record_call_blocker(node)
         self.generic_visit(node)
 
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in _FRAME_ATTRIBUTE_BLOCKERS:
+            self._append(
+                "hard",
+                "FRAME_ATTRIBUTE_INTROSPECTION",
+                f"frame attribute {node.attr!r} changes under compiled execution",
+                node.lineno,
+            )
+        self.generic_visit(node)
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._record_nested_symbol(node)
 
@@ -119,6 +156,20 @@ class _BlockerVisitor(ast.NodeVisitor):
         if function_name in _HARDCODED_CALL_BLOCKERS:
             code, message = _HARDCODED_CALL_BLOCKERS[function_name]
             self._append("hard", code, message, node.lineno)
+        elif (call_path := _call_path(node.func)) in _FRAME_CALL_BLOCKERS:
+            self._append(
+                "hard",
+                "FRAME_INTROSPECTION",
+                _FRAME_CALL_BLOCKERS[call_path],
+                node.lineno,
+            )
+        elif isinstance(node.func, ast.Name) and function_name in _BARE_FRAME_CALL_BLOCKERS:
+            self._append(
+                "hard",
+                "FRAME_INTROSPECTION",
+                _BARE_FRAME_CALL_BLOCKERS[function_name],
+                node.lineno,
+            )
         elif function_name == "getattr":
             self._record_getattr(node)
         elif function_name == "setattr":
@@ -227,6 +278,18 @@ def _call_name(node: ast.AST) -> str:
     if isinstance(node, ast.Attribute):
         return node.attr
     return ast.unparse(node)
+
+
+def _call_path(node: ast.AST) -> tuple[str, ...]:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+        return tuple(reversed(parts))
+    return ()
 
 
 def _is_importlib_import_module(node: ast.AST) -> bool:

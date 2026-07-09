@@ -31,15 +31,21 @@ Use `--no-mypy` to skip mypy diagnostics during a scan.
 
 Candidate scores are 0-100 scan-only heuristics for how promising a sidecar island looks.
 Candidate risk is extraction risk: `low` means Atoll only saw high-confidence internal
-dependencies. Build and verify remain the proof.
+dependencies. Frame-introspection code such as `inspect.currentframe()`, `sys._getframe()`,
+and direct frame attributes such as `f_locals` are hard blockers because mypyc changes
+Python frame semantics.
 
 ## Compile candidates
 
 Use `compile` for the normal workflow. It enables all scan candidates for the selected module,
 builds them with mypyc, and verifies that runtime routing uses the compiled extension.
+Routing verification proves that managed shims import compiled extensions and rebound configured
+symbols; it does not prove semantic equivalence. Add `--test` to run the target project's pytest
+suite with `ATOLL_REQUIRE_COMPILED=1`.
 
 ```bash
 uv run atoll compile app.ranking
+uv run atoll compile app.ranking --test "pytest tests"
 uv run atoll compile
 ```
 
@@ -48,7 +54,22 @@ compilation reports in `.atoll/compilation-report.json` and `.atoll/compilation-
 Source modules only receive the managed shim block marked with `BEGIN ATOLL MANAGED`.
 Generated Python sidecars in `.atoll/sidecars`, native compiler scratch files, and mypy's
 internal mypyc cache in `.atoll/build` are disposable build inputs; successful `compile` runs
-remove them and record the cleanup in the compilation report.
+remove them and record the cleanup in the compilation report. If `--test` fails, Atoll leaves
+the generated build inputs in place for debugging and marks the report failed.
+
+## Build installable artifacts
+
+Use `package` when you want compiled islands without modifying the source checkout. It copies the
+target package into an Atoll build area, inserts shims only in that copy, compiles the copied
+sidecars, and writes both an install tree and a platform wheel.
+
+```bash
+uv run atoll package app.ranking --output .atoll/dist
+uv pip install --force-reinstall .atoll/dist/*.whl
+```
+
+The original source files are left untouched. The install tree is written to `.atoll/dist/install`
+by default, and the wheel contains the shimmed modules plus the compiled native artifacts.
 
 Build failures print a concise summary and write full mypyc diagnostics to `.atoll/build/mypyc.log`.
 Run `atoll build` inside the target project's Python environment, since mypyc imports and

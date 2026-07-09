@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from atoll.analysis.ast_scanner import scan_module
+from atoll.analysis.clustering import enrich_island_analysis
 from atoll.models import ModuleId
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
@@ -84,3 +85,69 @@ def test_module_level_monkey_patch_is_recorded(tmp_path: Path) -> None:
     scan = scan_module(ModuleId(name="monkey", path=module_path))
 
     assert [blocker.code for blocker in scan.blockers] == ["DYN_MODULE_MONKEYPATCH"]
+
+
+def test_frame_introspection_gets_hard_blockers(tmp_path: Path) -> None:
+    """Frame APIs and frame attributes are unsafe for compiled sidecars."""
+    module_path = tmp_path / "frames.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "import inspect",
+                "import sys",
+                "",
+                "def inspect_frame(obj: object) -> object | None:",
+                "    frame = inspect.currentframe()",
+                "    if frame is None:",
+                "        return sys._getframe()",
+                "    return frame.f_back.f_locals.get('obj')",
+                "",
+                "def inspect_stack() -> object:",
+                "    return inspect.stack()[0]",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="frames", path=module_path))
+    blockers_by_symbol = {
+        symbol.id.qualname: {blocker.code for blocker in symbol.blockers} for symbol in scan.symbols
+    }
+
+    assert blockers_by_symbol["inspect_frame"] == {
+        "FRAME_ATTRIBUTE_INTROSPECTION",
+        "FRAME_INTROSPECTION",
+    }
+    assert blockers_by_symbol["inspect_stack"] == {"FRAME_INTROSPECTION"}
+
+
+def test_blocked_local_call_dependency_is_rejected(tmp_path: Path) -> None:
+    """Functions calling hard-blocked local helpers are not candidate islands."""
+    module_path = tmp_path / "blocked_dep.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "import inspect",
+                "",
+                "def unsafe() -> object | None:",
+                "    return inspect.currentframe()",
+                "",
+                "def wrapper() -> object | None:",
+                "    return unsafe()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = enrich_island_analysis(scan_module(ModuleId(name="blocked_dep", path=module_path)))
+    blockers_by_symbol = {
+        symbol.id.qualname: {blocker.code for blocker in symbol.blockers} for symbol in scan.symbols
+    }
+
+    assert blockers_by_symbol["unsafe"] == {"FRAME_INTROSPECTION"}
+    assert blockers_by_symbol["wrapper"] == {"LOCAL_BLOCKED_DEP"}
+    assert scan.island_candidates == ()

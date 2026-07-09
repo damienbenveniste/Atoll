@@ -28,6 +28,8 @@ def enrich_island_analysis(module: ModuleScan) -> ModuleScan:
     symbols = _attach_dynamic_global_blockers(module)
     module_with_blockers = replace(module, symbols=symbols)
     edges = build_dependency_edges(module_with_blockers)
+    symbols = _attach_blocked_local_call_blockers(module_with_blockers, edges)
+    module_with_blockers = replace(module_with_blockers, symbols=symbols)
     candidates = _cluster_candidates(module_with_blockers, edges)
     poison_radii = _poison_radii(module_with_blockers, edges, candidates)
     return replace(
@@ -83,6 +85,42 @@ def _is_dynamic_global(
     if name in constants:
         return constants[name].kind != "literal_constant"
     return True
+
+
+def _attach_blocked_local_call_blockers(
+    module: ModuleScan,
+    edges: tuple[DependencyEdge, ...],
+) -> tuple[SymbolRecord, ...]:
+    by_id = {symbol.id: symbol for symbol in module.symbols}
+    blockers_by_id = {symbol.id: list(symbol.blockers) for symbol in module.symbols}
+    blocked = {
+        symbol.id
+        for symbol in module.symbols
+        if any(blocker.severity == "hard" for blocker in symbol.blockers)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for edge in edges:
+            if edge.kind != "calls" or not isinstance(edge.dst, SymbolId):
+                continue
+            if edge.src in blocked or edge.dst not in blocked:
+                continue
+            source = by_id[edge.src]
+            blockers_by_id[edge.src].append(
+                Blocker(
+                    severity="hard",
+                    code="LOCAL_BLOCKED_DEP",
+                    message=f"calls blocked local symbol {edge.dst.qualname!r}",
+                    lineno=edge.lineno or source.lineno,
+                    symbol=source.id,
+                )
+            )
+            blocked.add(edge.src)
+            changed = True
+    return tuple(
+        replace(symbol, blockers=tuple(blockers_by_id[symbol.id])) for symbol in module.symbols
+    )
 
 
 def _cluster_candidates(

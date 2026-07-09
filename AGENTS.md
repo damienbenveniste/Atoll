@@ -93,6 +93,11 @@ scaffold-guard check
 - Keep diffs focused and reviewable.
 - Keep `uv.lock` synchronized with `pyproject.toml` changes once a lockfile exists.
 - Do not commit generated caches, build output, or local virtual environments.
+- When the user asks to commit, push, or publish from an approval-free Codex
+  session, use `uv run scaffold-guard publish --message "<message>" --all` after
+  reviewing the dirty scope, or use repeated `--file PATH` options for an exact
+  scope. Use `--push-only` only when the working tree is clean. Do not rely on
+  raw `git commit` or `git push` as the approval-free path.
 
 ## Final Response Requirements
 

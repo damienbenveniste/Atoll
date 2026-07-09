@@ -2,13 +2,8 @@
 
 from __future__ import annotations
 
-import importlib
-import os
-import shlex
 import shutil
-import sys
 import tempfile
-from contextlib import chdir
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +22,7 @@ from atoll.models import (
     VerifyResult,
 )
 from atoll.project import DiscoveredProject, discover_project
+from atoll.runtime.test_runner import run_pytest_command
 from atoll.runtime.verify import verify_islands
 
 
@@ -126,13 +122,19 @@ def execute_trial(options: TrialOptions) -> TrialCommandResult:
                 ),
                 options,
             )
-        test_exit = _run_test_command(options.test_command, options.root, overlay_source_roots)
+        test_exit = _run_test_command(
+            options.test_command,
+            options.root,
+            overlay_source_roots,
+            require_compiled=options.require_compiled,
+        )
         benchmark_exit = None
         if test_exit in (None, 0):
             benchmark_exit = _run_test_command(
                 options.benchmark_command,
                 options.root,
                 overlay_source_roots,
+                require_compiled=options.require_compiled,
             )
         return _trial_result(
             TrialCommandResult(
@@ -191,7 +193,10 @@ def _copy_source_roots(
     overlay_roots: list[Path] = []
     for source_root in project.config.source_roots:
         destination = overlay_root / _relative_source_root(project.config.root, source_root)
-        shutil.copytree(source_root, destination, ignore=_copy_ignore)
+        if destination.resolve() == overlay_root.resolve():
+            _copytree_contents(source_root, destination)
+        else:
+            shutil.copytree(source_root, destination, ignore=_copy_ignore)
         overlay_roots.append(destination)
     return tuple(overlay_roots)
 
@@ -226,38 +231,18 @@ def _run_test_command(
     command: str | None,
     root: Path,
     overlay_source_roots: tuple[Path, ...],
+    *,
+    require_compiled: bool,
 ) -> int | None:
     if command is None:
         return None
-    args = _pytest_args(command)
-    original_path = list(sys.path)
-    original_pythonpath = os.environ.get("PYTHONPATH")
-    sys.path[:0] = [str(path) for path in overlay_source_roots]
-    os.environ["PYTHONPATH"] = os.pathsep.join(
-        [
-            *(str(path) for path in overlay_source_roots),
-            *(original_pythonpath or "").split(os.pathsep),
-        ]
+    result = run_pytest_command(
+        command,
+        root=root,
+        source_roots=overlay_source_roots,
+        require_compiled=require_compiled,
     )
-    try:
-        with chdir(root):
-            pytest = importlib.import_module("pytest")
-            return int(pytest.main(args))
-    finally:
-        sys.path[:] = original_path
-        if original_pythonpath is None:
-            os.environ.pop("PYTHONPATH", None)
-        else:
-            os.environ["PYTHONPATH"] = original_pythonpath
-
-
-def _pytest_args(command: str) -> list[str]:
-    parts = shlex.split(command)
-    if parts[:1] == ["pytest"]:
-        return parts[1:]
-    if parts[:3] == ["python", "-m", "pytest"]:
-        return parts[3:]
-    raise ValueError("trial currently supports pytest commands only")
+    return result.exit_code
 
 
 def _trial_result(result: TrialCommandResult, options: TrialOptions) -> TrialCommandResult:
@@ -312,6 +297,7 @@ def _relative_source_root(root: Path, source_root: Path) -> Path:
 
 def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
     ignored = {
+        ".git",
         ".atoll",
         ".mypy_cache",
         ".pytest_cache",
@@ -321,6 +307,18 @@ def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
         "dist",
     }
     return {name for name in names if name in ignored or name.endswith((".so", ".pyd"))}
+
+
+def _copytree_contents(source: Path, destination: Path) -> None:
+    ignored_names = _copy_ignore(str(source), [item.name for item in source.iterdir()])
+    for item in source.iterdir():
+        if item.name in ignored_names:
+            continue
+        target = destination / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, ignore=_copy_ignore)
+        else:
+            shutil.copy2(item, target)
 
 
 def _verify_error(results: tuple[VerifyResult, ...]) -> str | None:

@@ -6,6 +6,7 @@ import argparse
 import shutil
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Protocol
 
 from atoll.commands.build import BuildOptions, execute_build
 from atoll.commands.clean import CleanOptions, execute_clean
@@ -19,10 +20,11 @@ from atoll.commands.enable import (
 )
 from atoll.commands.explain import ExplainOptions, execute_explain
 from atoll.commands.generate import GenerateOptions, execute_generate
+from atoll.commands.package import PackageOptions, execute_package
 from atoll.commands.scan import ScanOptions, execute_scan
 from atoll.commands.trial import TrialOptions, execute_trial
 from atoll.commands.verify import VerifyOptions, execute_verify
-from atoll.models import CompileAttempt, EnabledIslandConfig, VerifyResult
+from atoll.models import CompileAttempt, EnabledIslandConfig, PytestRunResult, VerifyResult
 from atoll.project import discover_project
 from atoll.report import (
     CompilationReportInput,
@@ -30,6 +32,16 @@ from atoll.report import (
     write_compilation_json_report,
     write_compilation_markdown_report,
 )
+from atoll.runtime.test_runner import parse_pytest_command, run_pytest_command
+
+
+class _Subparsers(Protocol):
+    def add_parser(
+        self,
+        name: str,
+        *,
+        help: str | None = None,
+    ) -> argparse.ArgumentParser: ...
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -93,6 +105,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="optional source module to compile",
     )
     compile_cmd.add_argument("--root", type=Path, default=Path(), help="project root")
+    compile_cmd.add_argument(
+        "--test",
+        default=None,
+        help='pytest command to run after compiled routing, for example "pytest tests"',
+    )
     disable = subparsers.add_parser("disable", help="disable an Atoll island")
     disable.add_argument("module", help="source module to disable")
     disable.add_argument("--root", type=Path, default=Path(), help="project root")
@@ -107,6 +124,7 @@ def _build_parser() -> argparse.ArgumentParser:
     build.add_argument("--module", default=None, help="limit build to one source module")
     build.add_argument("--clean-first", action="store_true", help="remove Atoll build cache first")
     build.add_argument("--inplace", action="store_true", default=True, help=argparse.SUPPRESS)
+    _add_package_parser(subparsers)
     verify = subparsers.add_parser("verify", help="verify Atoll managed routing")
     verify.add_argument("--root", type=Path, default=Path(), help="project root")
     verify.add_argument("--module", default=None, help="limit verification to one source module")
@@ -149,6 +167,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="do not require compiled extension routing after build",
     )
     return parser
+
+
+def _add_package_parser(subparsers: _Subparsers) -> None:
+    package = subparsers.add_parser(
+        "package",
+        help="build an installable compiled artifact without modifying source files",
+    )
+    package.add_argument(
+        "module",
+        nargs="?",
+        default=None,
+        help="optional source module to package",
+    )
+    package.add_argument("--root", type=Path, default=Path(), help="project root")
+    package.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="output directory for install tree and wheel",
+    )
 
 
 def _run_scan(args: argparse.Namespace) -> int:
@@ -281,6 +319,8 @@ def _print_enable_result(result: EnableCommandResult, *, yes: bool) -> None:
 
 
 def _run_compile(args: argparse.Namespace) -> int:
+    if not _validate_compile_test_command(args.test):
+        return 2
     try:
         enable_result = execute_enable_all(
             EnableAllOptions(root=args.root, module_name=args.module, yes=True)
@@ -314,14 +354,23 @@ def _run_compile(args: argparse.Namespace) -> int:
         return 1
     print(f"Atoll build succeeded: {len(build_result.artifact_paths)} artifact(s)")
 
+    project = discover_project(args.root)
     verify_results = execute_verify(
         VerifyOptions(root=args.root, module_name=args.module, require_compiled=True)
     )
     verify_failures = _print_verify_results(verify_results)
-    project_root = discover_project(args.root).config.root
+    project_root = project.config.root
     islands = tuple(enabled.island for enabled in enable_result.enabled)
+    test_result = (
+        None
+        if verify_failures
+        else _run_compile_test_gate(args.test, project_root, project.config.source_roots)
+    )
+    test_failed = test_result is not None and not test_result.success
     cleanup_removed = (
-        _cleanup_successful_compile_outputs(project_root, islands) if not verify_failures else ()
+        _cleanup_successful_compile_outputs(project_root, islands)
+        if not verify_failures and not test_failed
+        else ()
     )
     report_paths = _write_compilation_report(
         CompilationReportInput(
@@ -331,14 +380,57 @@ def _run_compile(args: argparse.Namespace) -> int:
             islands=islands,
             build=build_result,
             verification=verify_results,
+            tests=test_result,
             cleanup_removed=cleanup_removed,
         )
     )
     _print_compilation_report_paths(report_paths)
     if verify_failures:
         return 1
-    print("Atoll compile succeeded.")
+    if test_failed:
+        return 1
+    _print_compile_success(test_result)
     return 0
+
+
+def _validate_compile_test_command(command: str | None) -> bool:
+    if command is None:
+        return True
+    try:
+        parse_pytest_command(command)
+    except ValueError as error:
+        print(error)
+        return False
+    return True
+
+
+def _run_compile_test_gate(
+    command: str | None,
+    project_root: Path,
+    source_roots: tuple[Path, ...],
+) -> PytestRunResult | None:
+    if command is None:
+        return None
+    result = run_pytest_command(
+        command,
+        root=project_root,
+        source_roots=source_roots,
+        require_compiled=True,
+    )
+    if result.success:
+        print(f"Atoll semantic test gate passed: {' '.join(result.command)}")
+    else:
+        print(
+            f"Atoll semantic test gate failed: {' '.join(result.command)} exited {result.exit_code}"
+        )
+    return result
+
+
+def _print_compile_success(test_result: PytestRunResult | None) -> None:
+    if test_result is None:
+        print("Atoll compile succeeded: compiled routing verified; semantic tests not run.")
+        return
+    print("Atoll compile succeeded: compiled routing and semantic test gate passed.")
 
 
 def _run_disable(args: argparse.Namespace) -> int:
@@ -375,6 +467,22 @@ def _run_build(args: argparse.Namespace) -> int:
     )
     _print_compilation_report_paths(report_paths)
     return _build_exit_code(result)
+
+
+def _run_package(args: argparse.Namespace) -> int:
+    result = execute_package(
+        PackageOptions(root=args.root, module_name=args.module, output_dir=args.output)
+    )
+    if not result.success:
+        print(result.error or result.build.stderr)
+        return 1
+    print(
+        f"Atoll package built {len(result.islands)} module(s) "
+        f"and {sum(len(island.symbols) for island in result.islands)} symbol(s)."
+    )
+    print(f"Install tree: {result.install_root}")
+    print(f"Wheel: {result.wheel_path}")
+    return 0
 
 
 def _build_exit_code(result: CompileAttempt) -> int:
@@ -519,6 +627,7 @@ _COMMAND_HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
     "compile": _run_compile,
     "disable": _run_disable,
     "build": _run_build,
+    "package": _run_package,
     "verify": _run_verify,
     "explain": _run_explain,
     "clean": _run_clean,
