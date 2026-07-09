@@ -149,6 +149,7 @@ class ScanReport(TypedDict):
 
 
 CompilationOperation = Literal["build", "compile"]
+CompilationMode = Literal["in-place", "source-clean"]
 
 
 class CompilationSummaryReport(TypedDict):
@@ -156,6 +157,8 @@ class CompilationSummaryReport(TypedDict):
     symbols: int
     artifacts: int
     support_artifacts: int
+    skipped_modules: int
+    preflight_blockers: int
     verified: int
     verify_failures: int
     semantic_tests_run: bool
@@ -175,6 +178,20 @@ class CompilationBuildReport(TypedDict):
 
 class CompilationCleanupReport(TypedDict):
     removed: list[str]
+    kept: list[str]
+
+
+class CompilationSkippedModuleReport(TypedDict):
+    module: str
+    reason: str
+
+
+class CompilationPreflightBlockerReport(TypedDict):
+    module: str
+    path: str
+    line: int | None
+    code: str
+    message: str
 
 
 class CompilationTestReport(TypedDict):
@@ -209,14 +226,37 @@ class CompilationReport(TypedDict):
     version: int
     tool: str
     operation: CompilationOperation
+    mode: CompilationMode
     project_root: str
     module_filter: str | None
     success: bool
+    wheel_path: str | None
     summary: CompilationSummaryReport
     build: CompilationBuildReport
     tests: CompilationTestReport | None
     cleanup: CompilationCleanupReport
+    skipped_modules: list[CompilationSkippedModuleReport]
+    preflight_blockers: list[CompilationPreflightBlockerReport]
     islands: list[CompilationIslandReport]
+
+
+@dataclass(frozen=True, slots=True)
+class CompilationSkippedModuleInput:
+    """A selected source-clean module skipped after mypyc rejected its island."""
+
+    module: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CompilationPreflightBlockerInput:
+    """A known module-level mypyc blocker detected before compilation."""
+
+    module: str
+    path: Path
+    line: int | None
+    code: str
+    message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,9 +268,14 @@ class CompilationReportInput:
     module_filter: str | None
     islands: tuple[EnabledIslandConfig, ...]
     build: CompileAttempt
+    mode: CompilationMode = "in-place"
+    wheel_path: Path | None = None
     verification: tuple[VerifyResult, ...] = ()
     tests: PytestRunResult | None = None
     cleanup_removed: tuple[Path, ...] = ()
+    cleanup_kept: tuple[Path, ...] = ()
+    skipped_modules: tuple[CompilationSkippedModuleInput, ...] = ()
+    preflight_blockers: tuple[CompilationPreflightBlockerInput, ...] = ()
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -321,14 +366,22 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         "version": 1,
         "tool": "atoll",
         "operation": report_input.operation,
+        "mode": report_input.mode,
         "project_root": str(report_input.root.resolve()),
         "module_filter": report_input.module_filter,
         "success": success,
+        "wheel_path": (
+            _path_text(report_input.root, report_input.wheel_path)
+            if report_input.wheel_path is not None
+            else None
+        ),
         "summary": {
             "islands": len(report_input.islands),
             "symbols": sum(len(island.symbols) for island in report_input.islands),
             "artifacts": len(artifact_paths),
             "support_artifacts": len(support_artifacts),
+            "skipped_modules": len(report_input.skipped_modules),
+            "preflight_blockers": len(report_input.preflight_blockers),
             "verified": len(report_input.verification),
             "verify_failures": verify_failures,
             "semantic_tests_run": report_input.tests is not None,
@@ -356,7 +409,22 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
                     if not _is_generated_input_path(report_input.root, path)
                 ],
             ],
+            "kept": [_path_text(report_input.root, path) for path in report_input.cleanup_kept],
         },
+        "skipped_modules": [
+            {"module": skipped.module, "reason": skipped.reason}
+            for skipped in report_input.skipped_modules
+        ],
+        "preflight_blockers": [
+            {
+                "module": blocker.module,
+                "path": _path_text(report_input.root, blocker.path),
+                "line": blocker.line,
+                "code": blocker.code,
+                "message": blocker.message,
+            }
+            for blocker in report_input.preflight_blockers
+        ],
         "islands": [
             {
                 "source_module": island.source_module,
@@ -398,12 +466,16 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         "## Summary",
         "",
         f"- Operation: {report['operation']}",
+        f"- Mode: {report['mode']}",
         f"- Status: {status}",
         f"- Module filter: {module_filter}",
+        f"- Wheel: {_optional_path(report['wheel_path'])}",
         f"- Islands: {report['summary']['islands']}",
         f"- Symbols: {report['summary']['symbols']}",
         f"- Artifacts: {report['summary']['artifacts']}",
         f"- Support artifacts: {report['summary']['support_artifacts']}",
+        f"- Skipped modules: {report['summary']['skipped_modules']}",
+        f"- Preflight blockers: {report['summary']['preflight_blockers']}",
         f"- Verified islands: {report['summary']['verified']}",
         f"- Verification failures: {report['summary']['verify_failures']}",
         f"- Semantic tests: {_semantic_test_summary(report['tests'])}",
@@ -411,11 +483,7 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         "",
         "## Verification Scope",
         "",
-        (
-            "Atoll runtime verification proves managed shims import compiled extensions "
-            "and rebound configured symbols. It does not prove semantic equivalence "
-            "unless the semantic test gate below passed."
-        ),
+        _verification_scope_text(report["mode"]),
         "",
         "## Build",
         "",
@@ -441,17 +509,44 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
                 f"- Success: {_yes_no(report['tests']['success'])}",
             ]
         )
-    lines.extend(["", "## Cleanup", ""])
-    if report["cleanup"]["removed"]:
-        lines.extend(f"- Removed `{path}`" for path in report["cleanup"]["removed"])
-    else:
-        lines.append("- Removed: none")
+    _append_cleanup_markdown(lines, report["cleanup"])
+    _append_source_clean_skip_markdown(lines, report)
     lines.extend(["", "## Islands", ""])
     if not report["islands"]:
         lines.append("- None")
     for island in report["islands"]:
         lines.extend(_compilation_markdown_island(island))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _append_cleanup_markdown(lines: list[str], cleanup: CompilationCleanupReport) -> None:
+    lines.extend(["", "## Cleanup", ""])
+    lines.extend(
+        [f"- Removed `{path}`" for path in cleanup["removed"]]
+        if cleanup["removed"]
+        else ["- Removed: none"]
+    )
+    lines.extend(
+        [f"- Kept `{path}`" for path in cleanup["kept"]] if cleanup["kept"] else ["- Kept: none"]
+    )
+
+
+def _append_source_clean_skip_markdown(lines: list[str], report: CompilationReport) -> None:
+    if report["skipped_modules"]:
+        lines.extend(["", "## Skipped Modules", ""])
+        lines.extend(
+            f"- `{skipped['module']}`: {_first_line(skipped['reason'])}"
+            for skipped in report["skipped_modules"]
+        )
+    if report["preflight_blockers"]:
+        lines.extend(["", "## Preflight Blockers", ""])
+        lines.extend(
+            (
+                f"- `{blocker['module']}` ({blocker['path']}"
+                f"{_line_suffix(blocker['line'])}): {blocker['message']}"
+            )
+            for blocker in report["preflight_blockers"]
+        )
 
 
 def _module_report(module: ModuleScan) -> ModuleReport:
@@ -671,6 +766,20 @@ def _semantic_test_summary(result: CompilationTestReport | None) -> str:
     return f"failed (`{' '.join(result['command'])}`, exit code {result['exit_code']})"
 
 
+def _verification_scope_text(mode: CompilationMode) -> str:
+    if mode == "source-clean":
+        return (
+            "Source-clean compile builds a wheel from a temporary copy of the target source. "
+            "It does not edit the checkout or prove semantic equivalence; install the wheel "
+            "and run the target test suite to validate runtime behavior."
+        )
+    return (
+        "Atoll runtime verification proves managed shims import compiled extensions "
+        "and rebound configured symbols. It does not prove semantic equivalence "
+        "unless the semantic test gate below passed."
+    )
+
+
 def _compilation_markdown_island(island: CompilationIslandReport) -> list[str]:
     verification = island["verification"]
     if verification is None:
@@ -703,6 +812,14 @@ def _path_text(root: Path, path: Path) -> str:
         return resolved_path.relative_to(resolved_root).as_posix()
     except ValueError:
         return str(resolved_path)
+
+
+def _optional_path(path: str | None) -> str:
+    return f"`{path}`" if path is not None else "none"
+
+
+def _line_suffix(line: int | None) -> str:
+    return f":{line}" if line is not None else ""
 
 
 def _yes_no(value: bool) -> str:

@@ -36,8 +36,10 @@ def test_explain_module_describes_candidate_score_and_risk() -> None:
     assert "rank_candidates" in output
 
 
-def test_explain_module_lists_module_blockers(tmp_path: Path) -> None:
-    """Module-level blockers are visible when they suppress candidate islands."""
+def test_explain_module_lists_module_blockers_without_suppressing_candidates(
+    tmp_path: Path,
+) -> None:
+    """Module-level typing blockers are visible without hiding clean candidates."""
     package = tmp_path / "src" / "pkg"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
@@ -49,8 +51,12 @@ def test_explain_module_lists_module_blockers(tmp_path: Path) -> None:
                 "",
                 "T = TypeVar('T', infer_variance=True)",
                 "",
-                "def candidate(value: int) -> int:",
+                "def helper(value: int) -> int:",
                 "    return value + 1",
+                "",
+                "def candidate(value: int) -> int:",
+                "    adjusted = helper(value)",
+                "    return adjusted",
                 "",
             ]
         ),
@@ -59,7 +65,8 @@ def test_explain_module_lists_module_blockers(tmp_path: Path) -> None:
 
     output = execute_explain(ExplainOptions(root=tmp_path, target="pkg.mod", mypy_enabled=False))
 
-    assert "Candidate islands: 0" in output
+    assert "Candidate islands: 1" in output
+    assert "candidate" in output
     assert "Module blockers:" in output
     assert "MYPYC_UNSUPPORTED_TYPEVAR" in output
     assert "infer_variance" in output

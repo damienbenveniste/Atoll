@@ -59,6 +59,32 @@ def test_scan_records_symbol_references_and_globals() -> None:
     assert "features" in score_user.local_names
 
 
+def test_scan_keeps_annotation_names_out_of_runtime_globals(tmp_path: Path) -> None:
+    """Type-only names are copied for sidecars without becoming runtime dependencies."""
+    module_path = tmp_path / "typed.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from typing_extensions import TypeVar",
+                "",
+                "T = TypeVar('T', default=str)",
+                "",
+                "def identity(value: T) -> T:",
+                "    return value",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="typed", path=module_path))
+    identity = scan.symbols[0]
+
+    assert "T" in identity.referenced_names
+    assert identity.uses_globals == ()
+
+
 def test_scan_records_import_aliases_constants_classes_and_methods(tmp_path: Path) -> None:
     """Scanner records V1 facts across imports, constants, classes, and methods."""
     module_path = tmp_path / "sample.py"

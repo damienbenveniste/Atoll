@@ -16,7 +16,7 @@ candidate risk describes extraction risk. Frame-introspection code such as
 `inspect.currentframe()`, `sys._getframe()`, and direct frame attributes such as `f_locals`
 are hard blockers because mypyc changes Python frame semantics.
 
-## Sidecars
+## Compile
 
 ```bash
 uv run atoll compile app.ranking
@@ -28,18 +28,18 @@ copy, compiles generated sidecars, writes a platform wheel, and removes the temp
 Pass a module name to limit the operation to one source module. The original source files are left
 untouched.
 
-The wheel is written to `.atoll/dist/*.whl` by default. Use `--output` to place generated wheel
-artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the temporary
-install tree for debugging.
+The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
+`.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
+wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
+temporary install tree for debugging; the report marks that tree as retained.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic.
-Known project-level mypyc blockers, such as unsupported `TypeVar` keyword arguments, are reported
-before the compiler runs.
-Build failures keep terminal output short and write full mypyc diagnostics to
-`.atoll/build/mypyc.log`.
-Run build commands inside the target project's Python environment because mypyc uses the active
-interpreter and installed dependencies.
+Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
+scan and compile reports, but Atoll still tries clean candidate functions from those modules.
+Source-clean build failures keep terminal output short, write `.atoll/compile-report.*`, and list
+any retained diagnostic scratch path in the report. Run compile commands inside the target
+project's Python environment because mypyc uses the active interpreter and installed dependencies.
 
 ## In-Place Compile
 

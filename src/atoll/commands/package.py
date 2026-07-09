@@ -38,8 +38,6 @@ _GENERATED_DIR_NAMES = frozenset(
         "site-packages",
     }
 )
-_MYPYC_PREFLIGHT_BLOCKERS = frozenset({"MYPYC_UNSUPPORTED_TYPEVAR"})
-_MAX_PREFLIGHT_BLOCKERS = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,12 +55,15 @@ class PackageCommandResult:
     """Result from building a source-clean Atoll package artifact."""
 
     success: bool
+    project_root: Path
     output_dir: Path
     install_root: Path
     wheel_path: Path | None
     islands: tuple[EnabledIslandConfig, ...]
     build: CompileAttempt
     install_tree_kept: bool = False
+    cleanup_removed: tuple[Path, ...] = ()
+    cleanup_kept: tuple[Path, ...] = ()
     error: str | None = None
     skipped: tuple[PackageBuildFailure, ...] = ()
     preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
@@ -99,12 +100,6 @@ class _SelectedModule:
 
 
 @dataclass(frozen=True, slots=True)
-class _ModuleBlocker:
-    scan: ModuleScan
-    blocker: Blocker
-
-
-@dataclass(frozen=True, slots=True)
 class _PackageBuildOutcome:
     successful: tuple[EnabledIslandConfig, ...]
     build: CompileAttempt
@@ -115,24 +110,9 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     """Build an install tree and wheel containing Atoll compiled islands."""
     project = discover_project(options.root)
     scans = _selected_scans(project, options.module_name)
-    preflight_skipped = _mypyc_preflight_failures(scans)
-    buildable_scans = _buildable_scans(scans, preflight_skipped)
-    if options.module_name is not None and preflight_skipped:
-        return _failed_result(
-            project.config.root,
-            options.output_dir,
-            _format_mypyc_preflight_error(_module_blockers(preflight_skipped)),
-            preflight_skipped=preflight_skipped,
-        )
-    selected = _selected_modules(buildable_scans)
+    preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
+    selected = _selected_modules(scans)
     if not selected:
-        if preflight_skipped:
-            return _failed_result(
-                project.config.root,
-                options.output_dir,
-                _format_mypyc_preflight_error(_module_blockers(preflight_skipped)),
-                preflight_skipped=preflight_skipped,
-            )
         return _failed_result(
             project.config.root, options.output_dir, "scan found no candidate islands"
         )
@@ -159,14 +139,18 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         allow_partial=options.module_name is None,
     )
     if not outcome.build.success:
+        cleanup_removed = _remove_tree(install_root)
         return PackageCommandResult(
             success=False,
+            project_root=project.config.root,
             output_dir=output_dir,
             install_root=install_root,
             wheel_path=None,
             islands=outcome.successful,
             build=outcome.build,
             error=outcome.build.stderr,
+            cleanup_removed=cleanup_removed,
+            cleanup_kept=(build_root,),
             skipped=outcome.skipped,
             preflight_skipped=preflight_skipped,
         )
@@ -181,17 +165,25 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         output_dir=output_dir,
         metadata=metadata,
     )
+    cleanup_removed_paths = [build_root]
     shutil.rmtree(build_root)
+    cleanup_kept: tuple[Path, ...] = ()
     if not options.keep_install_tree:
+        cleanup_removed_paths.append(install_root)
         shutil.rmtree(install_root)
+    else:
+        cleanup_kept = (install_root,)
     return PackageCommandResult(
         success=True,
+        project_root=project.config.root,
         output_dir=output_dir,
         install_root=install_root,
         wheel_path=wheel_path,
         islands=outcome.successful,
         build=outcome.build,
         install_tree_kept=options.keep_install_tree,
+        cleanup_removed=tuple(cleanup_removed_paths),
+        cleanup_kept=cleanup_kept,
         skipped=outcome.skipped,
         preflight_skipped=preflight_skipped,
     )
@@ -207,6 +199,7 @@ def _failed_result(
     resolved_output_dir = _resolve_output_dir(root, output_dir)
     return PackageCommandResult(
         success=False,
+        project_root=root,
         output_dir=resolved_output_dir,
         install_root=resolved_output_dir / "install",
         wheel_path=None,
@@ -222,6 +215,13 @@ def _failed_result(
         error=error,
         preflight_skipped=preflight_skipped,
     )
+
+
+def _remove_tree(path: Path) -> tuple[Path, ...]:
+    if not path.exists():
+        return ()
+    shutil.rmtree(path)
+    return (path,)
 
 
 def _build_package_islands(
@@ -350,60 +350,6 @@ def _selected_modules(
         if symbols:
             selected.append(_SelectedModule(scan=scan, symbols=symbols))
     return tuple(selected)
-
-
-def _mypyc_preflight_failures(scans: tuple[ModuleScan, ...]) -> tuple[PackagePreflightFailure, ...]:
-    return tuple(
-        PackagePreflightFailure(scan=scan, blockers=blockers)
-        for scan in scans
-        if (
-            blockers := tuple(
-                blocker
-                for blocker in scan.blockers
-                if blocker.severity == "hard" and blocker.code in _MYPYC_PREFLIGHT_BLOCKERS
-            )
-        )
-    )
-
-
-def _buildable_scans(
-    scans: tuple[ModuleScan, ...],
-    skipped: tuple[PackagePreflightFailure, ...],
-) -> tuple[ModuleScan, ...]:
-    skipped_modules = {failure.scan.module.name for failure in skipped}
-    return tuple(scan for scan in scans if scan.module.name not in skipped_modules)
-
-
-def _module_blockers(skipped: tuple[PackagePreflightFailure, ...]) -> tuple[_ModuleBlocker, ...]:
-    return tuple(
-        _ModuleBlocker(scan=failure.scan, blocker=blocker)
-        for failure in skipped
-        for blocker in failure.blockers
-    )
-
-
-def _format_mypyc_preflight_error(blockers: tuple[_ModuleBlocker, ...]) -> str:
-    shown = blockers[:_MAX_PREFLIGHT_BLOCKERS]
-    lines = [
-        "Atoll cannot compile the selected project because mypy/mypyc rejects typing constructs "
-        "used before generated islands can be built.",
-        "Unsupported typing blockers:",
-    ]
-    lines.extend(_format_mypyc_preflight_blocker(item) for item in shown)
-    remaining = len(blockers) - len(shown)
-    if remaining > 0:
-        lines.append(f"... {remaining} more blocker(s)")
-    lines.append(
-        "This is a target-project typing compatibility issue, not an Atoll source-edit issue."
-    )
-    return "\n".join(lines)
-
-
-def _format_mypyc_preflight_blocker(item: _ModuleBlocker) -> str:
-    location = str(item.scan.module.path)
-    if item.blocker.lineno is not None:
-        location = f"{location}:{item.blocker.lineno}"
-    return f"- {location}: {item.blocker.message}"
 
 
 def _candidate_symbols(scan: ModuleScan) -> tuple[str, ...]:

@@ -73,6 +73,7 @@ def _function_record(
     arg_count, annotated_arg_count = _argument_counts(node)
     blockers = detect_function_blockers(node, symbol)
     referenced_names = tuple(sorted(collector.referenced_names))
+    runtime_referenced_names = tuple(sorted(collector.runtime_referenced_names))
     local_names = tuple(sorted(collector.local_names))
     return SymbolRecord(
         id=symbol,
@@ -88,7 +89,7 @@ def _function_record(
         has_return_annotation=node.returns is not None,
         has_any_annotation=annotated_arg_count > 0 or node.returns is not None,
         called_names=tuple(sorted(collector.called_names)),
-        uses_globals=_global_names(referenced_names, local_names),
+        uses_globals=_global_names(runtime_referenced_names, local_names),
         local_names=local_names,
         referenced_names=referenced_names,
         blockers=blockers,
@@ -257,23 +258,43 @@ class _FunctionNameCollector(ast.NodeVisitor):
         self.called_names: set[str] = set()
         self.local_names: set[str] = set()
         self.referenced_names: set[str] = set()
+        self.runtime_referenced_names: set[str] = set()
+        self._in_annotation = False
 
     def collect(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
-            self.visit(argument)
+        self._collect_arguments(node)
+        self._collect_defaults(node)
+        self._collect_decorators(node)
+        self._collect_return_annotation(node)
+        for child in node.body:
+            self.visit(child)
+
+    def _collect_arguments(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for argument in _function_args(node):
+            self.local_names.add(argument.arg)
+            if argument.annotation is not None:
+                self._visit_annotation(argument.annotation)
         if node.args.vararg is not None:
-            self.visit(node.args.vararg)
+            self.local_names.add(node.args.vararg.arg)
+            if node.args.vararg.annotation is not None:
+                self._visit_annotation(node.args.vararg.annotation)
         if node.args.kwarg is not None:
-            self.visit(node.args.kwarg)
+            self.local_names.add(node.args.kwarg.arg)
+            if node.args.kwarg.annotation is not None:
+                self._visit_annotation(node.args.kwarg.annotation)
+
+    def _collect_defaults(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for default in (*node.args.defaults, *node.args.kw_defaults):
             if default is not None:
                 self.visit(default)
+
+    def _collect_decorators(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for decorator in node.decorator_list:
             self.visit(decorator)
+
+    def _collect_return_annotation(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         if node.returns is not None:
-            self.visit(node.returns)
-        for child in node.body:
-            self.visit(child)
+            self._visit_annotation(node.returns)
 
     def visit_arg(self, node: ast.arg) -> None:
         self.local_names.add(node.arg)
@@ -282,6 +303,8 @@ class _FunctionNameCollector(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Load):
             self.referenced_names.add(node.id)
+            if not self._in_annotation:
+                self.runtime_referenced_names.add(node.id)
         elif isinstance(node.ctx, ast.Store | ast.Del):
             self.local_names.add(node.id)
 
@@ -298,6 +321,22 @@ class _FunctionNameCollector(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.local_names.add(node.name)
+
+    def _visit_annotation(self, node: ast.expr) -> None:
+        was_in_annotation = self._in_annotation
+        self._in_annotation = True
+        try:
+            self.visit(node)
+        finally:
+            self._in_annotation = was_in_annotation
+
+
+def _function_args(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.arg, ...]:
+    return (
+        *node.args.posonlyargs,
+        *node.args.args,
+        *node.args.kwonlyargs,
+    )
 
 
 class _ClassNameCollector(ast.NodeVisitor):

@@ -14,7 +14,9 @@ from atoll.models import (
     VerifyResult,
 )
 from atoll.report import (
+    CompilationPreflightBlockerInput,
     CompilationReportInput,
+    CompilationSkippedModuleInput,
     build_compilation_report,
     render_compilation_markdown_report,
     risk_summary,
@@ -185,3 +187,66 @@ def test_compilation_report_includes_semantic_test_gate(tmp_path: Path) -> None:
     assert report["summary"]["semantic_test_failures"] == 1
     assert "Semantic tests: failed (`pytest tests`, exit code 1)" in markdown
     assert "- Command: `pytest tests`" in markdown
+
+
+def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path) -> None:
+    """Source-clean reports explain wheel output, cleanup, and skipped modules."""
+    source_path = tmp_path / "src" / "app" / "ranking.py"
+    wheel_path = tmp_path / ".atoll" / "dist" / "app-0+atoll-cp312.whl"
+    island = EnabledIslandConfig(
+        source_module="app.ranking",
+        source_path=source_path,
+        sidecar_module="app._atoll_app_ranking",
+        sidecar_path=(
+            tmp_path / ".atoll" / "dist" / "build" / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
+        ),
+        symbols=("score_user",),
+    )
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            mode="source-clean",
+            module_filter=None,
+            islands=(island,),
+            build=CompileAttempt(
+                success=True,
+                command=("mypyc", str(island.sidecar_path), "build_ext"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.25,
+            ),
+            wheel_path=wheel_path,
+            cleanup_removed=(tmp_path / ".atoll" / "dist" / "build",),
+            cleanup_kept=(tmp_path / ".atoll" / "dist" / "install",),
+            skipped_modules=(
+                CompilationSkippedModuleInput(
+                    module="app.bad",
+                    reason="MYPYC_TYPE_ERROR: bad failed",
+                ),
+            ),
+            preflight_blockers=(
+                CompilationPreflightBlockerInput(
+                    module="app.blocked",
+                    path=tmp_path / "src" / "app" / "blocked.py",
+                    line=4,
+                    code="MYPYC_UNSUPPORTED_TYPEVAR",
+                    message="TypeVar keyword(s) default are rejected by mypyc",
+                ),
+            ),
+        )
+    )
+
+    markdown = render_compilation_markdown_report(report)
+
+    assert report["mode"] == "source-clean"
+    assert report["wheel_path"] == ".atoll/dist/app-0+atoll-cp312.whl"
+    assert report["cleanup"]["removed"] == [".atoll/dist/build"]
+    assert report["cleanup"]["kept"] == [".atoll/dist/install"]
+    assert report["summary"]["skipped_modules"] == 1
+    assert report["summary"]["preflight_blockers"] == 1
+    assert "Source-clean compile builds a wheel" in markdown
+    assert "- Wheel: `.atoll/dist/app-0+atoll-cp312.whl`" in markdown
+    assert "## Skipped Modules" in markdown
+    assert "`app.blocked` (src/app/blocked.py:4)" in markdown

@@ -20,14 +20,22 @@ from atoll.commands.enable import (
 )
 from atoll.commands.explain import ExplainOptions, execute_explain
 from atoll.commands.generate import GenerateOptions, execute_generate
-from atoll.commands.package import PackageOptions, execute_package
+from atoll.commands.package import (
+    PackageBuildFailure,
+    PackageCommandResult,
+    PackageOptions,
+    PackagePreflightFailure,
+    execute_package,
+)
 from atoll.commands.scan import ScanOptions, execute_scan
 from atoll.commands.trial import TrialOptions, execute_trial
 from atoll.commands.verify import VerifyOptions, execute_verify
 from atoll.models import CompileAttempt, EnabledIslandConfig, PytestRunResult, VerifyResult
 from atoll.project import discover_project
 from atoll.report import (
+    CompilationPreflightBlockerInput,
     CompilationReportInput,
+    CompilationSkippedModuleInput,
     build_compilation_report,
     write_compilation_json_report,
     write_compilation_markdown_report,
@@ -157,7 +165,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _add_compile_parser(subparsers: _Subparsers) -> None:
     compile_cmd = subparsers.add_parser(
         "compile",
-        help="enable, build, and verify discovered candidates",
+        help="build source-clean compiled wheel artifacts",
     )
     compile_cmd.add_argument(
         "module",
@@ -166,16 +174,10 @@ def _add_compile_parser(subparsers: _Subparsers) -> None:
         help="optional source module to compile",
     )
     compile_cmd.add_argument("--root", type=Path, default=Path(), help="project root")
-    mode = compile_cmd.add_mutually_exclusive_group()
-    mode.add_argument(
+    compile_cmd.add_argument(
         "--in-place",
         action="store_true",
         help="modify source files with Atoll shims before compiling",
-    )
-    mode.add_argument(
-        "--no-source-edit",
-        action="store_true",
-        help=argparse.SUPPRESS,
     )
     compile_cmd.add_argument(
         "--test",
@@ -198,7 +200,7 @@ def _add_compile_parser(subparsers: _Subparsers) -> None:
 def _add_package_parser(subparsers: _Subparsers) -> None:
     package = subparsers.add_parser(
         "package",
-        help="build an installable compiled artifact without modifying source files",
+        help=argparse.SUPPRESS,
     )
     package.add_argument(
         "module",
@@ -525,7 +527,7 @@ def _run_package(args: argparse.Namespace) -> int:
         module_name=args.module,
         output_dir=args.output,
         keep_install_tree=args.keep_install_tree,
-        label="package",
+        label="source-clean compile",
     )
 
 
@@ -545,7 +547,9 @@ def _run_source_clean_artifact_build(
             keep_install_tree=keep_install_tree,
         )
     )
+    report_paths = _write_source_clean_compile_report(result, module_name=module_name)
     if not result.success:
+        _print_compile_report_paths(report_paths)
         print(result.error or result.build.stderr)
         return 1
     print(
@@ -568,6 +572,7 @@ def _run_source_clean_artifact_build(
     if result.install_tree_kept:
         print(f"Install tree: {result.install_root}")
     print(f"Wheel: {result.wheel_path}")
+    _print_compile_report_paths(report_paths)
     return 0
 
 
@@ -660,9 +665,82 @@ def _write_compilation_report(report_input: CompilationReportInput) -> tuple[Pat
     return json_path, markdown_path
 
 
+def _write_source_clean_compile_report(
+    result: PackageCommandResult,
+    *,
+    module_name: str | None,
+) -> tuple[Path, Path]:
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=result.project_root,
+            operation="compile",
+            mode="source-clean",
+            module_filter=module_name,
+            islands=result.islands,
+            build=_source_clean_report_build(result),
+            wheel_path=result.wheel_path,
+            cleanup_removed=result.cleanup_removed,
+            cleanup_kept=result.cleanup_kept,
+            skipped_modules=_package_skipped_module_inputs(result.skipped),
+            preflight_blockers=_package_preflight_blocker_inputs(result.preflight_skipped),
+        )
+    )
+    json_path = result.project_root / ".atoll" / "compile-report.json"
+    markdown_path = result.project_root / ".atoll" / "compile-report.md"
+    write_compilation_json_report(json_path, report)
+    write_compilation_markdown_report(markdown_path, report)
+    return json_path, markdown_path
+
+
+def _source_clean_report_build(result: PackageCommandResult) -> CompileAttempt:
+    if not result.success:
+        return result.build
+    return CompileAttempt(
+        success=result.build.success,
+        command=result.build.command,
+        stdout=result.build.stdout,
+        stderr=result.build.stderr,
+        artifact_paths=(),
+        duration_seconds=result.build.duration_seconds,
+    )
+
+
+def _package_skipped_module_inputs(
+    skipped: tuple[PackageBuildFailure, ...],
+) -> tuple[CompilationSkippedModuleInput, ...]:
+    return tuple(
+        CompilationSkippedModuleInput(
+            module=failure.island.source_module,
+            reason=failure.build.stderr or "mypy rejected generated island",
+        )
+        for failure in skipped
+    )
+
+
+def _package_preflight_blocker_inputs(
+    skipped: tuple[PackagePreflightFailure, ...],
+) -> tuple[CompilationPreflightBlockerInput, ...]:
+    return tuple(
+        CompilationPreflightBlockerInput(
+            module=failure.scan.module.name,
+            path=failure.scan.module.path,
+            line=blocker.lineno,
+            code=blocker.code,
+            message=blocker.message,
+        )
+        for failure in skipped
+        for blocker in failure.blockers
+    )
+
+
 def _print_compilation_report_paths(paths: tuple[Path, Path]) -> None:
     json_path, markdown_path = paths
     print(f"Compilation reports: {json_path}, {markdown_path}")
+
+
+def _print_compile_report_paths(paths: tuple[Path, Path]) -> None:
+    json_path, markdown_path = paths
+    print(f"Compile reports: {json_path}, {markdown_path}")
 
 
 def _cleanup_successful_build_scratch(root: Path) -> tuple[Path, ...]:

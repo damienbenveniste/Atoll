@@ -145,6 +145,9 @@ def test_package_reports_build_failure_without_source_edits(
     assert result.wheel_path is None
     assert source_path.read_text(encoding="utf-8") == original_source
     assert (output_dir / "build").exists()
+    assert not (output_dir / "install").exists()
+    assert result.cleanup_removed == (output_dir / "install",)
+    assert result.cleanup_kept == (output_dir / "build",)
 
 
 def test_package_whole_project_retries_and_skips_failed_islands(
@@ -211,6 +214,8 @@ def test_package_whole_project_retries_and_skips_failed_islands(
     bad_text = (output_dir / "install" / "app" / "bad.py").read_text(encoding="utf-8")
     assert result.success is True
     assert result.install_tree_kept is True
+    assert result.cleanup_removed == (output_dir / "build",)
+    assert result.cleanup_kept == (output_dir / "install",)
     assert tuple(island.source_module for island in result.islands) == ("app.good",)
     assert tuple(failure.island.source_module for failure in result.skipped) == ("app.bad",)
     assert "Initial batch build failed; retried islands individually" in result.build.stdout
@@ -272,17 +277,19 @@ def test_package_whole_project_reports_zero_successful_retries_concisely(
     assert result.error is not None
     assert result.error.startswith("No selected islands compiled")
     assert result.error.count("MYPYC_TYPE_ERROR") == 1
+    assert result.cleanup_removed == (output_dir / "install",)
+    assert result.cleanup_kept == (output_dir / "build",)
     assert tuple(failure.island.source_module for failure in result.skipped) == (
         "app.first",
         "app.second",
     )
 
 
-def test_package_preflight_reports_mypyc_unsupported_typevar_for_selected_module(
+def test_package_attempts_typevar_blocked_selected_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Module-specific package mode reports known mypyc typing blockers before building."""
+    """Module-level TypeVar blockers do not prevent trying clean candidate sidecars."""
     project_root = tmp_path / "project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -295,18 +302,34 @@ def test_package_preflight_reports_mypyc_unsupported_typevar_for_selected_module
                 "",
                 "T = TypeVar('T', infer_variance=True)",
                 "",
-                "def candidate(value: int) -> int:",
+                "def helper(value: int) -> int:",
                 "    return value + 1",
+                "",
+                "def candidate(value: int) -> int:",
+                "    adjusted = helper(value)",
+                "    return adjusted",
                 "",
             ]
         ),
         encoding="utf-8",
     )
 
-    def unexpected_build_sidecars(*_args: object, **_kwargs: object) -> CompileAttempt:
-        raise AssertionError("mypy build should not run after preflight blockers")
+    build_calls: list[tuple[Path, ...]] = []
 
-    monkeypatch.setattr(package_command, "build_sidecars", unexpected_build_sidecars)
+    def failing_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        assert kwargs
+        paths = cast(tuple[Path, ...], args[0])
+        build_calls.append(paths)
+        return CompileAttempt(
+            success=False,
+            command=("mypyc", *(str(path) for path in paths)),
+            stdout="",
+            stderr="MYPYC_TYPE_ERROR: generated sidecar failed",
+            artifact_paths=(),
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", failing_build_sidecars)
 
     result = package_command.execute_package(
         package_command.PackageOptions(
@@ -317,18 +340,19 @@ def test_package_preflight_reports_mypyc_unsupported_typevar_for_selected_module
     )
 
     assert result.success is False
-    assert result.error is not None
-    assert "mypy/mypyc rejects typing constructs" in result.error
-    assert "typing_features.py:4" in result.error
-    assert "infer_variance" in result.error
-    assert not (output_dir / "build").exists()
+    assert build_calls
+    assert result.error == "MYPYC_TYPE_ERROR: generated sidecar failed"
+    assert result.preflight_skipped == ()
+    assert (output_dir / "build").exists()
+    assert result.cleanup_removed == (output_dir / "install",)
+    assert result.cleanup_kept == (output_dir / "build",)
 
 
-def test_package_whole_project_skips_mypyc_unsupported_typevar_modules(
+def test_package_whole_project_attempts_typevar_blocked_modules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Whole-project package mode skips known preflight blockers and keeps clean islands."""
+    """Whole-project package mode tries clean candidates in modules with TypeVar blockers."""
     project_root = tmp_path / "project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -343,8 +367,12 @@ def test_package_whole_project_skips_mypyc_unsupported_typevar_modules(
                 "",
                 "T = TypeVar('T', default=str)",
                 "",
-                "def candidate(value: int) -> int:",
+                "def helper(value: int) -> int:",
                 "    return value + 1",
+                "",
+                "def candidate(value: int) -> int:",
+                "    adjusted = helper(value)",
+                "    return adjusted",
                 "",
             ]
         ),
@@ -381,16 +409,19 @@ def test_package_whole_project_skips_mypyc_unsupported_typevar_modules(
 
     assert result.success is True
     assert result.install_tree_kept is True
-    assert tuple(island.source_module for island in result.islands) == ("app.ranking",)
-    assert tuple(failure.scan.module.name for failure in result.preflight_skipped) == (
+    assert result.cleanup_removed == (output_dir / "build",)
+    assert result.cleanup_kept == (output_dir / "install",)
+    assert {island.source_module for island in result.islands} == {
         "app.blocked",
-    )
+        "app.ranking",
+    }
+    assert result.preflight_skipped == ()
     assert "# BEGIN ATOLL MANAGED: app.ranking" in (
         output_dir / "install" / "app" / "ranking.py"
     ).read_text(encoding="utf-8")
-    assert "# BEGIN ATOLL MANAGED" not in (output_dir / "install" / "app" / "blocked.py").read_text(
-        encoding="utf-8"
-    )
+    assert "# BEGIN ATOLL MANAGED: app.blocked" in (
+        output_dir / "install" / "app" / "blocked.py"
+    ).read_text(encoding="utf-8")
     assert clean_source.read_text(encoding="utf-8") == original_clean_source
 
 

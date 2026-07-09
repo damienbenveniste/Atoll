@@ -46,13 +46,15 @@ uv run atoll compile app.ranking
 uv run atoll compile
 ```
 
-The wheel is written to `.atoll/dist/*.whl` by default. Use `--output` to place generated wheel
-artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the temporary
-install tree for debugging.
+The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
+`.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
+wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
+temporary install tree for debugging; the report marks that tree as retained.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
-mypyc diagnostic. Known project-level mypyc blockers, such as unsupported `TypeVar` keyword
-arguments, are reported before the compiler runs.
+mypyc diagnostic. Module-level typing diagnostics, such as unsupported `TypeVar` keyword
+arguments, remain visible in scan and compile reports, but Atoll still tries clean candidate
+functions from those modules.
 
 ```bash
 uv pip install --force-reinstall .atoll/dist/*.whl
@@ -77,9 +79,10 @@ runs remove them and record the cleanup in the compilation report. If `--test` f
 the generated build inputs in place for debugging and marks the report failed. The older
 `atoll package` command remains available as a compatibility alias for source-clean artifacts.
 
-Build failures print a concise summary and write full mypyc diagnostics to `.atoll/build/mypyc.log`.
-Run `atoll build` inside the target project's Python environment, since mypyc imports and
-type-checks the generated sidecars with the active interpreter and installed dependencies.
+Source-clean build failures print a concise summary, write `.atoll/compile-report.*`, and list any
+retained diagnostic scratch path in the report. Run compile commands inside the target project's
+Python environment, since mypyc imports and type-checks the generated sidecars with the active
+interpreter and installed dependencies.
 
 Lower-level commands remain available when you need to inspect or repair one step:
 

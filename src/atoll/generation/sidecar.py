@@ -18,7 +18,7 @@ from atoll.models import (
     SymbolRecord,
 )
 
-_GENERATOR_VERSION = "atoll-sidecar-v1"
+_GENERATOR_VERSION = "atoll-sidecar-v2"
 _TYPING_IMPORT_MODULES = frozenset(
     {
         "collections",
@@ -27,6 +27,12 @@ _TYPING_IMPORT_MODULES = frozenset(
         "typing_extensions",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _TypingAliases:
+    typevar_names: frozenset[str]
+    typing_module_names: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +105,7 @@ def build_sidecar_plan(
         source_lines=source_lines,
         symbols=included_symbols,
         erased_type_arg_names=_erased_type_arg_names(imports),
+        erased_annotation_names=_erased_annotation_names(module.imports, module.constants),
         imported_names={name for record in imports for name in record.imported_names},
     )
     return SidecarPlan(
@@ -224,6 +231,7 @@ def _copied_sources(
     source_lines: list[str],
     symbols: tuple[SymbolRecord, ...],
     erased_type_arg_names: set[str],
+    erased_annotation_names: set[str],
     imported_names: set[str],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     copied_sources: list[str] = []
@@ -233,6 +241,7 @@ def _copied_sources(
         transformed_source, added_typing_names = _render_mypyc_friendly_source(
             source,
             erased_type_arg_names=erased_type_arg_names,
+            erased_annotation_names=erased_annotation_names,
         )
         copied_sources.append(transformed_source)
         extra_typing_names.update(added_typing_names - imported_names)
@@ -243,9 +252,13 @@ def _render_mypyc_friendly_source(
     source: str,
     *,
     erased_type_arg_names: set[str],
+    erased_annotation_names: set[str],
 ) -> tuple[str, set[str]]:
     tree = ast.parse(source)
-    transformer = _MypycSidecarTransformer(erased_type_arg_names)
+    transformer = _MypycSidecarTransformer(
+        erased_type_arg_names=erased_type_arg_names,
+        erased_annotation_names=erased_annotation_names,
+    )
     transformed = transformer.visit(tree)
     ast.fix_missing_locations(transformed)
     return ast.unparse(transformed), transformer.extra_typing_names
@@ -260,6 +273,87 @@ def _erased_type_arg_names(imports: tuple[ImportRecord, ...]) -> set[str]:
             continue
         names.update(record.imported_names)
     return names
+
+
+def _erased_annotation_names(
+    imports: tuple[ImportRecord, ...],
+    constants: tuple[ConstantRecord, ...],
+) -> set[str]:
+    return {
+        constant.name for constant in constants if constant.kind != "literal_constant"
+    } | _module_typevar_names(imports, constants)
+
+
+def _module_typevar_names(
+    imports: tuple[ImportRecord, ...],
+    constants: tuple[ConstantRecord, ...],
+) -> set[str]:
+    aliases = _typing_aliases(imports)
+    if not aliases.typevar_names and not aliases.typing_module_names:
+        return set()
+    return {
+        constant.name
+        for constant in constants
+        if _is_typevar_assignment(constant.source_text, aliases)
+    }
+
+
+def _typing_aliases(imports: tuple[ImportRecord, ...]) -> _TypingAliases:
+    typevar_names: set[str] = set()
+    typing_module_names: set[str] = set()
+    for record in imports:
+        try:
+            tree = ast.parse(record.source_text)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in _TYPING_IMPORT_MODULES:
+                        typing_module_names.add(alias.asname or alias.name)
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.module in _TYPING_IMPORT_MODULES
+                and node.level == 0
+            ):
+                for alias in node.names:
+                    if alias.name == "TypeVar":
+                        typevar_names.add(alias.asname or alias.name)
+    return _TypingAliases(
+        typevar_names=frozenset(typevar_names),
+        typing_module_names=frozenset(typing_module_names),
+    )
+
+
+def _is_typevar_assignment(source_text: str, aliases: _TypingAliases) -> bool:
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError:
+        return False
+    return any(
+        _is_typevar_call(_assignment_value(node), aliases)
+        for node in tree.body
+        if isinstance(node, ast.Assign | ast.AnnAssign)
+    )
+
+
+def _assignment_value(node: ast.Assign | ast.AnnAssign) -> ast.expr | None:
+    if isinstance(node, ast.Assign):
+        return node.value
+    return node.value
+
+
+def _is_typevar_call(node: ast.expr | None, aliases: _TypingAliases) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Name):
+        return node.func.id in aliases.typevar_names
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "TypeVar"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in aliases.typing_module_names
+    )
 
 
 def _type_checking_names(
@@ -284,8 +378,14 @@ def _type_checking_names(
 
 
 class _MypycSidecarTransformer(ast.NodeTransformer):
-    def __init__(self, erased_type_arg_names: set[str]) -> None:
+    def __init__(
+        self,
+        *,
+        erased_type_arg_names: set[str],
+        erased_annotation_names: set[str],
+    ) -> None:
         self._erased_type_arg_names = erased_type_arg_names
+        self._erased_annotation_names = erased_annotation_names
         self.extra_typing_names: set[str] = set()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
@@ -308,11 +408,45 @@ class _MypycSidecarTransformer(ast.NodeTransformer):
         self,
         node: ast.FunctionDef | ast.AsyncFunctionDef,
     ) -> None:
+        self._sanitize_function_annotations(node)
         if node.returns is None:
             node.returns = ast.Name(id="Any", ctx=ast.Load())
             self.extra_typing_names.add("Any")
         elif _annotation_allows_none(node.returns) and not _last_statement_exits(node.body):
             node.body.append(ast.Return(value=ast.Constant(value=None)))
+
+    def _sanitize_function_annotations(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        for argument in _function_args(node):
+            if argument.annotation is not None:
+                argument.annotation = self._sanitize_annotation(argument.annotation)
+        if node.args.vararg is not None and node.args.vararg.annotation is not None:
+            node.args.vararg.annotation = self._sanitize_annotation(node.args.vararg.annotation)
+        if node.args.kwarg is not None and node.args.kwarg.annotation is not None:
+            node.args.kwarg.annotation = self._sanitize_annotation(node.args.kwarg.annotation)
+        if node.returns is not None:
+            node.returns = self._sanitize_annotation(node.returns)
+
+    def _sanitize_annotation(self, annotation: ast.expr) -> ast.expr:
+        sanitizer = _TypeVarAnnotationSanitizer(self._erased_annotation_names)
+        sanitized = sanitizer.visit(annotation)
+        if sanitizer.replaced:
+            self.extra_typing_names.add("Any")
+        return sanitized if isinstance(sanitized, ast.expr) else annotation
+
+
+class _TypeVarAnnotationSanitizer(ast.NodeTransformer):
+    def __init__(self, erased_annotation_names: set[str]) -> None:
+        self._erased_annotation_names = erased_annotation_names
+        self.replaced = False
+
+    def visit_Name(self, node: ast.Name) -> ast.expr:
+        if node.id not in self._erased_annotation_names:
+            return node
+        self.replaced = True
+        return ast.copy_location(ast.Name(id="Any", ctx=ast.Load()), node)
 
 
 def _annotation_allows_none(node: ast.expr) -> bool:
@@ -327,6 +461,14 @@ def _annotation_allows_none(node: ast.expr) -> bool:
     if isinstance(node, ast.Subscript) and _is_union(node.value):
         return _slice_allows_none(node.slice)
     return False
+
+
+def _function_args(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.arg, ...]:
+    return (
+        *node.args.posonlyargs,
+        *node.args.args,
+        *node.args.kwonlyargs,
+    )
 
 
 def _is_optional(node: ast.expr) -> bool:

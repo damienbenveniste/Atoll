@@ -153,8 +153,8 @@ def test_blocked_local_call_dependency_is_rejected(tmp_path: Path) -> None:
     assert scan.island_candidates == ()
 
 
-def test_mypyc_unsupported_typevar_keywords_block_module_candidates(tmp_path: Path) -> None:
-    """TypeVar features rejected by mypyc block generated island builds up front."""
+def test_mypyc_unsupported_typevar_keywords_do_not_erase_candidates(tmp_path: Path) -> None:
+    """TypeVar diagnostics stay visible without hiding clean candidate functions."""
     module_path = tmp_path / "typing_features.py"
     module_path.write_text(
         "\n".join(
@@ -164,8 +164,12 @@ def test_mypyc_unsupported_typevar_keywords_block_module_candidates(tmp_path: Pa
                 "",
                 "T = TV('T', infer_variance=True, default=str)",
                 "",
-                "def candidate(value: int) -> int:",
+                "def helper(value: int) -> int:",
                 "    return value + 1",
+                "",
+                "def candidate(value: int) -> int:",
+                "    adjusted = helper(value)",
+                "    return adjusted",
                 "",
             ]
         ),
@@ -176,4 +180,6 @@ def test_mypyc_unsupported_typevar_keywords_block_module_candidates(tmp_path: Pa
 
     assert [blocker.code for blocker in scan.blockers] == ["MYPYC_UNSUPPORTED_TYPEVAR"]
     assert "default, infer_variance" in scan.blockers[0].message
-    assert scan.island_candidates == ()
+    assert [
+        [symbol.qualname for symbol in candidate.symbols] for candidate in scan.island_candidates
+    ] == [["candidate", "helper"]]

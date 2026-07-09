@@ -24,6 +24,16 @@ def _ranking_scan() -> tuple[ModuleId, ModuleScan]:
     return module, enrich_island_analysis(scan_module(module))
 
 
+def _imports_from_typing(source: str, name: str) -> bool:
+    tree = ast.parse(source)
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "typing"
+        and any(alias.name == name for alias in node.names)
+        for node in tree.body
+    )
+
+
 def test_sidecar_plan_expands_same_module_helpers() -> None:
     """Selected exported symbols include clean same-module helper functions."""
     _, scan = _ranking_scan()
@@ -138,6 +148,124 @@ def test_generate_sidecar_simplifies_runtime_import_generics_for_mypyc(
     assert "def make_box(value: int) -> Any:" in generation.source_text
     assert "return Box(value)" in generation.source_text
     assert "Box[int]" not in generation.source_text
+
+
+def test_generate_sidecar_erases_typevar_annotations_for_mypyc(
+    tmp_path: Path,
+) -> None:
+    """Generated sidecars erase TypeVar-only annotations that mypyc rejects."""
+    module_path = tmp_path / "sample.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from typing_extensions import TypeVar as TV",
+                "",
+                "T = TV('T', infer_variance=True, default=str)",
+                "",
+                "def helper(value: T) -> T:",
+                "    return value",
+                "",
+                "def identity(value: T) -> T:",
+                "    return helper(value)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    module = ModuleId(name="sample", path=module_path)
+    scan = enrich_island_analysis(scan_module(module))
+    island = EnabledIslandConfig(
+        source_module=module.name,
+        source_path=module.path,
+        sidecar_module="sample_atoll",
+        sidecar_path=tmp_path / "sample_atoll.py",
+        symbols=("identity",),
+    )
+
+    generation = generate_sidecar(scan, island)
+
+    assert _imports_from_typing(generation.source_text, "Any")
+    assert "def helper(value: Any) -> Any:" in generation.source_text
+    assert "def identity(value: Any) -> Any:" in generation.source_text
+    assert "TV(" not in generation.source_text
+    assert "TypeVar" not in generation.source_text
+
+
+def test_generate_sidecar_erases_local_type_alias_annotations_for_mypyc(
+    tmp_path: Path,
+) -> None:
+    """Generated sidecars erase local runtime type aliases from annotations."""
+    module_path = tmp_path / "sample.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from typing import TypeAlias",
+                "",
+                "NodeID: TypeAlias = str",
+                "",
+                "def normalize(value: NodeID) -> NodeID:",
+                "    return value",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    module = ModuleId(name="sample", path=module_path)
+    scan = enrich_island_analysis(scan_module(module))
+    island = EnabledIslandConfig(
+        source_module=module.name,
+        source_path=module.path,
+        sidecar_module="sample_atoll",
+        sidecar_path=tmp_path / "sample_atoll.py",
+        symbols=("normalize",),
+    )
+
+    generation = generate_sidecar(scan, island)
+
+    assert _imports_from_typing(generation.source_text, "Any")
+    assert "def normalize(value: Any) -> Any:" in generation.source_text
+    assert "NodeID" not in generation.source_text
+
+
+def test_generate_sidecar_erases_typing_module_typevar_annotations(
+    tmp_path: Path,
+) -> None:
+    """TypeVars created through a typing module alias are also erased in annotations."""
+    module_path = tmp_path / "sample.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "import typing as t",
+                "",
+                "T: object = t.TypeVar('T', infer_variance=True)",
+                "",
+                "def choose(*items: T, **mapping: T) -> T | None:",
+                "    if items:",
+                "        return items[0]",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    module = ModuleId(name="sample", path=module_path)
+    scan = enrich_island_analysis(scan_module(module))
+    island = EnabledIslandConfig(
+        source_module=module.name,
+        source_path=module.path,
+        sidecar_module="sample_atoll",
+        sidecar_path=tmp_path / "sample_atoll.py",
+        symbols=("choose",),
+    )
+
+    generation = generate_sidecar(scan, island)
+
+    assert _imports_from_typing(generation.source_text, "Any")
+    assert "def choose(*items: Any, **mapping: Any) -> Any | None:" in generation.source_text
+    assert generation.source_text.count("return None") == 1
+    assert "t.TypeVar" not in generation.source_text
 
 
 def test_generate_sidecar_makes_optional_fallthrough_explicit_for_mypyc(

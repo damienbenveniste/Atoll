@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.machinery
+import json
 import shutil
 import zipfile
 from pathlib import Path
@@ -23,6 +24,8 @@ from atoll.runtime.verify import verify_islands
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXIT_USAGE = 2
+RANKING_SYMBOL_COUNT = 3
+TYPEVAR_FIXTURE_SYMBOL_COUNT = 2
 
 
 def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
@@ -40,12 +43,25 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
 
     captured = capsys.readouterr()
     wheel_path = next(output_dir.glob("*.whl"))
+    report_json_path = project_root / ".atoll" / "compile-report.json"
+    report_markdown_path = project_root / ".atoll" / "compile-report.md"
+    report = json.loads(report_json_path.read_text(encoding="utf-8"))
     assert exit_code == 0
     assert source_path.read_text(encoding="utf-8") == original_source
     assert "# BEGIN ATOLL MANAGED" not in original_source
     assert not (output_dir / "build").exists()
     assert not (output_dir / "install").exists()
+    assert report_markdown_path.exists()
+    assert not (project_root / ".atoll" / "compilation-report.json").exists()
+    assert report["mode"] == "source-clean"
+    assert report["wheel_path"] == f".atoll/dist/{wheel_path.name}"
+    assert report["summary"]["islands"] == 1
+    assert report["summary"]["symbols"] == RANKING_SYMBOL_COUNT
+    assert report["cleanup"]["removed"] == [".atoll/dist/build", ".atoll/dist/install"]
+    assert report["cleanup"]["kept"] == []
+    assert "Source-clean compile builds a wheel" in report_markdown_path.read_text(encoding="utf-8")
     assert "Install tree:" not in captured.out
+    assert "Compile reports:" in captured.out
     with zipfile.ZipFile(wheel_path) as wheel:
         names = set(wheel.namelist())
     assert "app/ranking.py" in names
@@ -78,6 +94,7 @@ def test_compile_can_keep_install_tree_for_debugging(
     install_root = output_dir / "install"
     install_source = install_root / "app" / "ranking.py"
     wheel_path = next(output_dir.glob("*.whl"))
+    report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
     assert exit_code == 0
     assert source_path.read_text(encoding="utf-8") == original_source
     assert "# BEGIN ATOLL MANAGED" not in original_source
@@ -85,6 +102,8 @@ def test_compile_can_keep_install_tree_for_debugging(
     assert not (output_dir / "build").exists()
     assert not (install_root / "app" / "_atoll_app_ranking.py").exists()
     assert _extension_artifacts(install_root / ".atoll" / "artifacts", "_atoll_app_ranking")
+    assert report["cleanup"]["removed"] == [".atoll/dist/build"]
+    assert report["cleanup"]["kept"] == [".atoll/dist/install"]
 
     result = verify_islands(
         ProjectConfig(
@@ -132,8 +151,11 @@ def test_package_command_reports_no_candidates(
     exit_code = main(["package", "--root", str(tmp_path), "--output", str(tmp_path / "out")])
 
     captured = capsys.readouterr()
+    report = json.loads((tmp_path / ".atoll" / "compile-report.json").read_text())
     assert exit_code == 1
     assert "scan found no candidate islands" in captured.out
+    assert report["success"] is False
+    assert report["build"]["stderr"] == "scan found no candidate islands"
 
 
 def test_compile_reports_no_candidates_from_source_clean_default(
@@ -179,6 +201,7 @@ def test_compile_reports_preflight_skipped_modules(
     def fake_execute_package(*_args: object, **_kwargs: object) -> PackageCommandResult:
         return PackageCommandResult(
             success=True,
+            project_root=tmp_path,
             output_dir=tmp_path / "out",
             install_root=tmp_path / "out" / "install",
             wheel_path=tmp_path / "out" / "pkg-0-atoll.whl",
@@ -199,16 +222,19 @@ def test_compile_reports_preflight_skipped_modules(
     exit_code = main(["compile", "--root", str(tmp_path)])
 
     captured = capsys.readouterr()
+    report = json.loads((tmp_path / ".atoll" / "compile-report.json").read_text())
     assert exit_code == 0
     assert "Skipped 1 module(s) with known mypyc typing blockers." in captured.out
     assert "- pkg.blocked: line 4: TypeVar keyword(s) default are rejected by mypyc" in captured.out
+    assert report["summary"]["preflight_blockers"] == 1
+    assert report["preflight_blockers"][0]["module"] == "pkg.blocked"
 
 
-def test_compile_reports_mypyc_preflight_blockers(
+def test_compile_attempts_clean_function_in_typevar_blocked_module(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Source-clean compile surfaces known mypyc blockers without retry noise."""
+    """Module-level TypeVar blockers do not prevent compiling unrelated clean functions."""
     (tmp_path / "src" / "pkg").mkdir(parents=True)
     (tmp_path / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "src" / "pkg" / "mod.py").write_text(
@@ -219,8 +245,12 @@ def test_compile_reports_mypyc_preflight_blockers(
                 "",
                 "T = TypeVar('T', default=str)",
                 "",
-                "def candidate(value: int) -> int:",
-                "    return value + 1",
+                "def helper(value: T) -> T:",
+                "    return value",
+                "",
+                "def candidate(value: T) -> T:",
+                "    adjusted = helper(value)",
+                "    return adjusted",
                 "",
             ]
         ),
@@ -230,10 +260,13 @@ def test_compile_reports_mypyc_preflight_blockers(
     exit_code = main(["compile", "--root", str(tmp_path)])
 
     captured = capsys.readouterr()
-    assert exit_code == 1
-    assert "mypy/mypyc rejects typing constructs" in captured.out
-    assert "mod.py:4" in captured.out
-    assert "default" in captured.out
+    report = json.loads((tmp_path / ".atoll" / "compile-report.json").read_text())
+    assert exit_code == 0
+    assert "Atoll source-clean compile built 1 module(s) and 2 symbol(s)." in captured.out
+    assert "mypy/mypyc rejects typing constructs" not in captured.out
+    assert report["success"] is True
+    assert report["summary"]["preflight_blockers"] == 0
+    assert report["summary"]["symbols"] == TYPEVAR_FIXTURE_SYMBOL_COUNT
 
 
 def test_compile_in_place_rejects_output(
