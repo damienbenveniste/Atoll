@@ -25,10 +25,40 @@ FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXIT_USAGE = 2
 
 
-def test_compile_builds_install_tree_and_wheel_without_source_edits(
+def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`atoll compile` keeps the checkout and output directory clean by default."""
+    project_root = tmp_path / "simple_project"
+    output_dir = project_root / ".atoll" / "dist"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    source_path = project_root / "src" / "app" / "ranking.py"
+    original_source = source_path.read_text(encoding="utf-8")
+
+    exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
+
+    captured = capsys.readouterr()
+    wheel_path = next(output_dir.glob("*.whl"))
+    assert exit_code == 0
+    assert source_path.read_text(encoding="utf-8") == original_source
+    assert "# BEGIN ATOLL MANAGED" not in original_source
+    assert not (output_dir / "build").exists()
+    assert not (output_dir / "install").exists()
+    assert "Install tree:" not in captured.out
+    with zipfile.ZipFile(wheel_path) as wheel:
+        names = set(wheel.namelist())
+    assert "app/ranking.py" in names
+    assert any(
+        name.startswith(".atoll/artifacts/_atoll_app_ranking") and name.endswith(".so")
+        for name in names
+    )
+
+
+def test_compile_can_keep_install_tree_for_debugging(
     tmp_path: Path,
 ) -> None:
-    """`atoll compile` compiles without patching the checkout by default."""
+    """`--keep-install-tree` preserves the generated tree for direct routing checks."""
     project_root = tmp_path / "simple_project"
     output_dir = project_root / ".atoll" / "dist"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -41,6 +71,7 @@ def test_compile_builds_install_tree_and_wheel_without_source_edits(
             "app.ranking",
             "--root",
             str(project_root),
+            "--keep-install-tree",
         ]
     )
 
@@ -217,6 +248,18 @@ def test_compile_in_place_rejects_output(
     captured = capsys.readouterr()
     assert exit_code == EXIT_USAGE
     assert "--output cannot be used with --in-place" in captured.out
+
+
+def test_compile_in_place_rejects_keep_install_tree(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--keep-install-tree` only applies to source-clean artifact mode."""
+    exit_code = main(["compile", "--root", str(tmp_path), "--in-place", "--keep-install-tree"])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE
+    assert "--keep-install-tree cannot be used with --in-place" in captured.out
 
 
 def test_compile_source_clean_default_rejects_test_gate(

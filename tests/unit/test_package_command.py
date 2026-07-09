@@ -200,12 +200,17 @@ def test_package_whole_project_retries_and_skips_failed_islands(
     monkeypatch.setattr(package_command, "build_sidecars", mixed_build_sidecars)
 
     result = package_command.execute_package(
-        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+        package_command.PackageOptions(
+            root=project_root,
+            output_dir=output_dir,
+            keep_install_tree=True,
+        )
     )
 
     good_text = (output_dir / "install" / "app" / "good.py").read_text(encoding="utf-8")
     bad_text = (output_dir / "install" / "app" / "bad.py").read_text(encoding="utf-8")
     assert result.success is True
+    assert result.install_tree_kept is True
     assert tuple(island.source_module for island in result.islands) == ("app.good",)
     assert tuple(failure.island.source_module for failure in result.skipped) == ("app.bad",)
     assert "Initial batch build failed; retried islands individually" in result.build.stdout
@@ -256,7 +261,11 @@ def test_package_whole_project_reports_zero_successful_retries_concisely(
     monkeypatch.setattr(package_command, "build_sidecars", failing_build_sidecars)
 
     result = package_command.execute_package(
-        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+        package_command.PackageOptions(
+            root=project_root,
+            output_dir=output_dir,
+            keep_install_tree=True,
+        )
     )
 
     assert result.success is False
@@ -363,10 +372,15 @@ def test_package_whole_project_skips_mypyc_unsupported_typevar_modules(
     monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
 
     result = package_command.execute_package(
-        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+        package_command.PackageOptions(
+            root=project_root,
+            output_dir=output_dir,
+            keep_install_tree=True,
+        )
     )
 
     assert result.success is True
+    assert result.install_tree_kept is True
     assert tuple(island.source_module for island in result.islands) == ("app.ranking",)
     assert tuple(failure.scan.module.name for failure in result.preflight_skipped) == (
         "app.blocked",

@@ -186,7 +186,12 @@ def _add_compile_parser(subparsers: _Subparsers) -> None:
         "--output",
         type=Path,
         default=None,
-        help="output directory for source-clean install tree and wheel",
+        help="output directory for source-clean wheel artifacts",
+    )
+    compile_cmd.add_argument(
+        "--keep-install-tree",
+        action="store_true",
+        help="keep the temporary source-clean install tree for debugging",
     )
 
 
@@ -206,7 +211,12 @@ def _add_package_parser(subparsers: _Subparsers) -> None:
         "--output",
         type=Path,
         default=None,
-        help="output directory for install tree and wheel",
+        help="output directory for source-clean wheel artifacts",
+    )
+    package.add_argument(
+        "--keep-install-tree",
+        action="store_true",
+        help="keep the temporary source-clean install tree for debugging",
     )
 
 
@@ -349,6 +359,7 @@ def _run_compile(args: argparse.Namespace) -> int:
             root=args.root,
             module_name=args.module,
             output_dir=args.output,
+            keep_install_tree=args.keep_install_tree,
             label="source-clean compile",
         )
     return _run_inplace_compile(args)
@@ -432,6 +443,8 @@ def _compile_option_error(args: argparse.Namespace) -> str | None:
         return "--test requires --in-place"
     if args.in_place and args.output is not None:
         return "--output cannot be used with --in-place"
+    if args.in_place and args.keep_install_tree:
+        return "--keep-install-tree cannot be used with --in-place"
     if args.test is None:
         return None
     try:
@@ -511,6 +524,7 @@ def _run_package(args: argparse.Namespace) -> int:
         root=args.root,
         module_name=args.module,
         output_dir=args.output,
+        keep_install_tree=args.keep_install_tree,
         label="package",
     )
 
@@ -520,10 +534,16 @@ def _run_source_clean_artifact_build(
     root: Path,
     module_name: str | None,
     output_dir: Path | None,
+    keep_install_tree: bool,
     label: str,
 ) -> int:
     result = execute_package(
-        PackageOptions(root=root, module_name=module_name, output_dir=output_dir)
+        PackageOptions(
+            root=root,
+            module_name=module_name,
+            output_dir=output_dir,
+            keep_install_tree=keep_install_tree,
+        )
     )
     if not result.success:
         print(result.error or result.build.stderr)
@@ -545,7 +565,8 @@ def _run_source_clean_artifact_build(
             first = preflight_failure.blockers[0]
             location = f"line {first.lineno}" if first.lineno is not None else "module"
             print(f"- {preflight_failure.scan.module.name}: {location}: {first.message}")
-    print(f"Install tree: {result.install_root}")
+    if result.install_tree_kept:
+        print(f"Install tree: {result.install_root}")
     print(f"Wheel: {result.wheel_path}")
     return 0
 

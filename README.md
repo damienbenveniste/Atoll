@@ -37,18 +37,18 @@ Python frame semantics.
 
 ## Compile candidates
 
-Use `compile` for the normal workflow. It copies the target package into an Atoll build area,
-inserts shims only in that copy, compiles the copied sidecars, and writes both an install tree and
-a platform wheel. The original source files are left untouched.
+Use `compile` for the normal workflow. It copies the target package into a temporary Atoll build
+area, inserts shims only in that copy, compiles generated sidecars, writes a platform wheel, and
+removes the temporary install tree. The original source files are left untouched.
 
 ```bash
 uv run atoll compile app.ranking
 uv run atoll compile
 ```
 
-The install tree is written to `.atoll/dist/install` by default, with compiled runtime artifacts
-under `.atoll/dist/install/.atoll/artifacts`; the wheel is written to `.atoll/dist/*.whl`.
-Use `--output` to place those generated artifacts somewhere else.
+The wheel is written to `.atoll/dist/*.whl` by default. Use `--output` to place generated wheel
+artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the temporary
+install tree for debugging.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic. Known project-level mypyc blockers, such as unsupported `TypeVar` keyword

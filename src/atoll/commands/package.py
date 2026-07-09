@@ -49,6 +49,7 @@ class PackageOptions:
     root: Path
     module_name: str | None = None
     output_dir: Path | None = None
+    keep_install_tree: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +62,7 @@ class PackageCommandResult:
     wheel_path: Path | None
     islands: tuple[EnabledIslandConfig, ...]
     build: CompileAttempt
+    install_tree_kept: bool = False
     error: str | None = None
     skipped: tuple[PackageBuildFailure, ...] = ()
     preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
@@ -180,6 +182,8 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         metadata=metadata,
     )
     shutil.rmtree(build_root)
+    if not options.keep_install_tree:
+        shutil.rmtree(install_root)
     return PackageCommandResult(
         success=True,
         output_dir=output_dir,
@@ -187,6 +191,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         wheel_path=wheel_path,
         islands=outcome.successful,
         build=outcome.build,
+        install_tree_kept=options.keep_install_tree,
         skipped=outcome.skipped,
         preflight_skipped=preflight_skipped,
     )
