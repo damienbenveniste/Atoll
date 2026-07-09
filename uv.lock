@@ -62,6 +62,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "mypy" },
+    { name = "packaging" },
     { name = "setuptools" },
     { name = "wheel" },
 ]
@@ -81,6 +82,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mypy", specifier = ">=1.17.0" },
+    { name = "packaging", specifier = ">=24" },
     { name = "setuptools", specifier = ">=69" },
     { name = "wheel", specifier = ">=0.43" },
 ]

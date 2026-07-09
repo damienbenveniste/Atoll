@@ -24,7 +24,7 @@ from atoll.models import (
     SymbolRecord,
 )
 
-SIDECAR_GENERATOR_VERSION = "atoll-sidecar-v3"
+SIDECAR_GENERATOR_VERSION = "atoll-sidecar-v6"
 _TYPING_IMPORT_MODULES = frozenset(
     {
         "collections",
@@ -51,6 +51,7 @@ class SidecarPlan:
     """
 
     imports: tuple[ImportRecord, ...]
+    dynamic_imports: tuple[str, ...]
     extra_typing_names: tuple[str, ...]
     type_checking_names: tuple[str, ...]
     constants: tuple[ConstantRecord, ...]
@@ -115,28 +116,35 @@ def build_sidecar_plan(
         for constant in module.constants
         if constant.name in referenced_names and constant.kind == "literal_constant"
     )
+    erased_annotation_names = (
+        _erased_annotation_names(module.imports, module.constants)
+        | _erased_type_arg_names(raw_imports)
+        | _local_annotation_only_names(
+            referenced_names=referenced_names,
+            module_symbols=module.symbols,
+            included_names=included_names,
+        )
+    )
     source_lines = module.module.path.read_text(encoding="utf-8").splitlines()
     copied_sources, added_typing_names = _copied_sources(
         source_lines=source_lines,
         symbols=included_symbols,
         erased_type_arg_names=_erased_type_arg_names(raw_imports),
-        erased_annotation_names=_erased_annotation_names(module.imports, module.constants)
-        | _erased_type_arg_names(raw_imports),
+        erased_annotation_names=erased_annotation_names,
     )
     runtime_names = _runtime_referenced_names(copied_sources, constants)
-    imports = _runtime_imports(raw_imports, runtime_names)
-    imported_names = {name for record in imports for name in record.imported_names}
-    extra_typing_names = tuple(sorted(set(added_typing_names) - imported_names))
-    type_checking_names = _type_checking_names(
-        referenced_names=referenced_names,
-        imported_names=imported_names,
-        module_symbols=module.symbols,
-        included_names=included_names,
+    imports, dynamic_imports = _split_runtime_imports(
+        _runtime_imports(raw_imports, runtime_names),
+        source_package=module.module.name.split(".", maxsplit=1)[0],
     )
+    imported_names = {name for record in imports for name in record.imported_names}
+    imported_names.update(_dynamic_imported_names(dynamic_imports))
+    extra_typing_names = tuple(sorted(set(added_typing_names) - imported_names))
     return SidecarPlan(
         imports=imports,
+        dynamic_imports=dynamic_imports,
         extra_typing_names=extra_typing_names,
-        type_checking_names=type_checking_names,
+        type_checking_names=(),
         constants=constants,
         symbols=included_symbols,
         included_symbol_names=tuple(symbol.id.qualname for symbol in included_symbols),
@@ -201,6 +209,10 @@ def _render_sidecar(
     ):
         lines.append("from __future__ import annotations")
     lines.extend(record.source_text for record in plan.imports)
+    if plan.dynamic_imports:
+        lines.append("import importlib as _atoll_importlib")
+        lines.extend(plan.dynamic_imports)
+        lines.append("del _atoll_importlib")
     if plan.extra_typing_names:
         lines.append(f"from typing import {', '.join(plan.extra_typing_names)}")
     if plan.type_checking_names:
@@ -238,6 +250,8 @@ def _source_hash(plan: SidecarPlan, config: EnabledIslandConfig) -> str:
     digest.update(config.sidecar_module.encode())
     for record in plan.imports:
         digest.update(record.source_text.encode())
+    for source in plan.dynamic_imports:
+        digest.update(source.encode())
     for name in plan.extra_typing_names:
         digest.update(name.encode())
     for name in plan.type_checking_names:
@@ -296,6 +310,84 @@ def _runtime_imports(
         if record.source_text == "from __future__ import annotations"
         or any(name in runtime_names for name in record.imported_names)
     )
+
+
+def _split_runtime_imports(
+    imports: tuple[ImportRecord, ...],
+    *,
+    source_package: str,
+) -> tuple[tuple[ImportRecord, ...], tuple[str, ...]]:
+    """Keep safe imports static and hide same-package imports behind runtime lookups.
+
+    mypyc type-checks normal `from package.module import Name` statements before
+    compiling the sidecar. For source-clean islands this can pull an entire
+    target package into mypyc and fail on typing constructs unrelated to the
+    selected functions. Dynamic bindings preserve the runtime objects while
+    making those names `Any` to the sidecar type checker.
+    """
+    static_imports: list[ImportRecord] = []
+    dynamic_imports: list[str] = []
+    for record in imports:
+        dynamic = _dynamic_import_lines(record, source_package=source_package)
+        if dynamic:
+            dynamic_imports.extend(dynamic)
+        else:
+            static_imports.append(record)
+    return tuple(static_imports), tuple(dynamic_imports)
+
+
+def _dynamic_import_lines(
+    record: ImportRecord,
+    *,
+    source_package: str,
+) -> tuple[str, ...]:
+    if not _should_dynamic_import(record, source_package=source_package):
+        return ()
+    try:
+        tree = ast.parse(record.source_text)
+    except SyntaxError:
+        return ()
+    node = tree.body[0] if tree.body else None
+    if not isinstance(node, ast.ImportFrom) or node.module is None:
+        return ()
+    module_var = f"_atoll_import_{hashlib.sha256(node.module.encode()).hexdigest()[:12]}"
+    lines = [f'{module_var} = _atoll_importlib.import_module("{node.module}")']
+    for alias in node.names:
+        if alias.name == "*":
+            return ()
+        bound_name = alias.asname or alias.name
+        lines.append(f'{bound_name} = getattr({module_var}, "{alias.name}")')
+    lines.append(f"del {module_var}")
+    return tuple(lines)
+
+
+def _should_dynamic_import(
+    record: ImportRecord,
+    *,
+    source_package: str,
+) -> bool:
+    if record.level != 0 or record.module is None:
+        return False
+    if record.source_text == "from __future__ import annotations":
+        return False
+    if record.module in _TYPING_IMPORT_MODULES:
+        return False
+    return record.module == source_package or record.module.startswith(f"{source_package}.")
+
+
+def _dynamic_imported_names(dynamic_imports: tuple[str, ...]) -> set[str]:
+    names: set[str] = set()
+    for source in dynamic_imports:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name) and not target.id.startswith("_atoll_"):
+                    names.add(target.id)
+    return names
 
 
 def _render_mypyc_friendly_source(
@@ -375,6 +467,22 @@ def _typing_aliases(imports: tuple[ImportRecord, ...]) -> _TypingAliases:
     )
 
 
+def _local_annotation_only_names(
+    *,
+    referenced_names: set[str],
+    module_symbols: tuple[SymbolRecord, ...],
+    included_names: set[str],
+) -> set[str]:
+    local_classes = {
+        symbol.id.qualname
+        for symbol in module_symbols
+        if symbol.kind == "class" and "." not in symbol.id.qualname
+    }
+    return {
+        name for name in referenced_names if name in local_classes and name not in included_names
+    }
+
+
 def _is_typevar_assignment(source_text: str, aliases: _TypingAliases) -> bool:
     try:
         tree = ast.parse(source_text)
@@ -403,27 +511,6 @@ def _is_typevar_call(node: ast.expr | None, aliases: _TypingAliases) -> bool:
         and node.func.attr == "TypeVar"
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id in aliases.typing_module_names
-    )
-
-
-def _type_checking_names(
-    *,
-    referenced_names: set[str],
-    imported_names: set[str],
-    module_symbols: tuple[SymbolRecord, ...],
-    included_names: set[str],
-) -> tuple[str, ...]:
-    local_classes = {
-        symbol.id.qualname
-        for symbol in module_symbols
-        if symbol.kind == "class" and "." not in symbol.id.qualname
-    }
-    return tuple(
-        sorted(
-            name
-            for name in referenced_names
-            if name in local_classes and name not in imported_names and name not in included_names
-        )
     )
 
 
@@ -463,6 +550,19 @@ class _MypycSidecarTransformer(ast.NodeTransformer):
         self.generic_visit(node)
         if isinstance(node.value, ast.Name) and node.value.id in self._erased_type_arg_names:
             return node.value
+        return node
+
+    def visit_Call(self, node: ast.Call) -> ast.Call:
+        self.generic_visit(node)
+        if isinstance(node.func, ast.Subscript) and _contains_name(
+            node.func.slice, self._erased_type_arg_names
+        ):
+            node.func = node.func.value
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
+        self.generic_visit(node)
+        node.annotation = self._sanitize_annotation(node.annotation)
         return node
 
     def _normalize_function(
@@ -556,6 +656,10 @@ def _slice_allows_none(node: ast.expr) -> bool:
     if isinstance(node, ast.Tuple):
         return any(_annotation_allows_none(element) for element in node.elts)
     return _annotation_allows_none(node)
+
+
+def _contains_name(node: ast.AST, names: set[str]) -> bool:
+    return any(child.id in names for child in ast.walk(node) if isinstance(child, ast.Name))
 
 
 def _last_statement_exits(body: list[ast.stmt]) -> bool:

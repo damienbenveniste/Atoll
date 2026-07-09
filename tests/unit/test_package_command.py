@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 import pytest
+from packaging import tags
 
 from atoll.commands import package as package_command
 from atoll.models import CompileAttempt, CompilePhaseTiming, EnabledIslandConfig, ModuleId
@@ -18,6 +19,7 @@ from atoll.project import DiscoveredProject, discover_project
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXPECTED_REBUILDS = 2
+EXPECTED_PARTIAL_CACHE_BACKEND_CALLS = 3
 
 
 class _Metadata(Protocol):
@@ -46,6 +48,10 @@ class _WriteWheel(Protocol):
         output_dir: Path,
         metadata: _Metadata,
     ) -> Path: ...
+
+
+class _CacheLookup(Protocol):
+    hit: bool
 
 
 def _package_attr(name: str) -> object:
@@ -81,6 +87,11 @@ _cached_artifact_paths = cast(
     Callable[[Path, dict[str, object]], tuple[Path, ...] | None],
     _package_attr("_cached_artifact_paths"),
 )
+_cached_manifest_modules = cast(
+    Callable[[dict[str, object]], tuple[tuple[str, ...], tuple[str, ...]] | None],
+    _package_attr("_cached_manifest_modules"),
+)
+_compile_cache_hit = cast(Callable[..., _CacheLookup], _package_attr("_compile_cache_hit"))
 _find_module = cast(
     Callable[[tuple[ModuleId, ...], str], ModuleId],
     _package_attr("_find_module"),
@@ -110,11 +121,13 @@ _staged_module = cast(
     Callable[[ModuleId, DiscoveredProject, tuple[Path, ...]], ModuleId],
     _package_attr("_staged_module"),
 )
+_store_compile_cache = cast(Callable[..., None], _package_attr("_store_compile_cache"))
 _string = cast(Callable[[object], str | None], _package_attr("_string"))
 _wheel_payload = cast(
     Callable[[Path], tuple[tuple[str, Path], ...]],
     _package_attr("_wheel_payload"),
 )
+_wheel_tag = cast(Callable[[], str], _package_attr("_wheel_tag"))
 _write_wheel = cast(_WriteWheel, _package_attr("_write_wheel"))
 
 
@@ -348,6 +361,87 @@ def test_package_reuses_compile_cache_for_unchanged_inputs(
         )
 
 
+def test_package_reuses_partial_compile_cache_for_unchanged_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partial source-clean builds cache successful artifacts and cached skips."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    ranking_source = project_root / "src" / "app" / "ranking.py"
+    extra_source = project_root / "src" / "app" / "extra.py"
+    extra_source.write_text(ranking_source.read_text(encoding="utf-8"), encoding="utf-8")
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    calls = 0
+
+    def partial_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        nonlocal calls
+        assert kwargs
+        calls += 1
+        paths = cast(tuple[Path, ...], args[0])
+        if len(paths) > 1:
+            return CompileAttempt(
+                success=False,
+                command=("mypyc",),
+                stdout="",
+                stderr="batch failed",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            )
+        assert paths
+        path = paths[0]
+        if "extra" in path.stem:
+            return CompileAttempt(
+                success=False,
+                command=("mypyc",),
+                stdout="",
+                stderr="extra failed",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            )
+        artifact = tmp_path / f"{path.stem}{suffix}"
+        artifact.write_text("binary", encoding="utf-8")
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=(artifact,),
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", partial_build_sidecars)
+
+    first = package_command.execute_package(
+        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+    )
+    second = package_command.execute_package(
+        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+    )
+
+    assert first.success is True
+    assert first.build.cache_status == "partial"
+    assert len(first.skipped) == 1
+    assert second.success is True
+    assert second.build.cache_status == "hit"
+    assert len(second.skipped) == 1
+    assert "cached skip" in second.skipped[0].build.stderr
+    assert calls == EXPECTED_PARTIAL_CACHE_BACKEND_CALLS
+    assert tuple(timing.name for timing in second.build.phase_timings) == (
+        "cache_lookup",
+        "cache_restore",
+    )
+    assert second.wheel_path is not None
+    with zipfile.ZipFile(second.wheel_path) as wheel:
+        names = set(wheel.namelist())
+    assert any(name.startswith(".atoll/artifacts/_atoll_app_ranking") for name in names)
+    assert "app/extra.py" in names
+    with zipfile.ZipFile(second.wheel_path) as wheel:
+        extra_text = wheel.read("app/extra.py").decode()
+    assert "BEGIN ATOLL MANAGED" not in extra_text
+
+
 def test_package_cache_invalidates_when_source_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -522,6 +616,61 @@ def test_compile_cache_manifest_helpers_reject_invalid_entries(tmp_path: Path) -
         entry_root,
         {"artifacts": [{"name": "module.so", "sha256": digest}]},
     ) == (artifact,)
+    assert _cached_manifest_modules({}) is None
+    assert _cached_manifest_modules({"successful_modules": ["app.a"]}) is None
+    assert (
+        _cached_manifest_modules({"successful_modules": ["app.a", 1], "skipped_modules": []})
+        is None
+    )
+    assert (
+        _cached_manifest_modules({"successful_modules": ["app.a"], "skipped_modules": ["app.a"]})
+        is None
+    )
+    assert _cached_manifest_modules(
+        {"successful_modules": ["app.a"], "skipped_modules": ["app.b"]}
+    ) == (("app.a",), ("app.b",))
+
+    stale_lookup = _compile_cache_hit(
+        key="abc",
+        lookup_started=0.0,
+        artifact_paths=(tmp_path / "missing.so",),
+        successful_modules=("app.a",),
+        skipped_modules=(),
+    )
+    assert stale_lookup.hit is False
+
+
+def test_store_compile_cache_handles_empty_and_existing_temp_dirs(tmp_path: Path) -> None:
+    """Compile cache storage ignores empty artifacts and replaces stale temp dirs."""
+    cache_root = tmp_path / "cache"
+    _store_compile_cache(
+        cache_root=cache_root,
+        key="empty",
+        artifact_paths=(),
+        successful_modules=(),
+        skipped_modules=(),
+    )
+    assert not cache_root.exists()
+
+    artifact = tmp_path / "module.so"
+    artifact.write_text("binary", encoding="utf-8")
+    stale_temp = cache_root / "abc.tmp"
+    stale_temp.mkdir(parents=True)
+    (stale_temp / "stale").write_text("old", encoding="utf-8")
+
+    _store_compile_cache(
+        cache_root=cache_root,
+        key="abc",
+        artifact_paths=(artifact,),
+        successful_modules=("app.a",),
+        skipped_modules=("app.b",),
+    )
+
+    manifest = _read_cache_manifest(cache_root / "abc" / "manifest.json")
+    assert manifest is not None
+    assert manifest["successful_modules"] == ["app.a"]
+    assert manifest["skipped_modules"] == ["app.b"]
+    assert not stale_temp.exists()
 
 
 def test_package_whole_project_reports_zero_successful_retries_concisely(
@@ -824,6 +973,7 @@ def test_wheel_writer_replaces_existing_wheel_and_records_metadata(tmp_path: Pat
     with zipfile.ZipFile(second) as wheel:
         names = set(wheel.namelist())
         metadata_text = wheel.read("demo_project-1.0_rc1.dist-info/METADATA").decode()
+        wheel_text = wheel.read("demo_project-1.0_rc1.dist-info/WHEEL").decode()
     assert _wheel_payload(install_root) == (
         ("pkg/__init__.py", package_dir / "__init__.py"),
         ("pkg/mod.py", package_dir / "mod.py"),
@@ -833,6 +983,8 @@ def test_wheel_writer_replaces_existing_wheel_and_records_metadata(tmp_path: Pat
     assert "demo_project-1.0_rc1.dist-info/RECORD" in names
     assert "Requires-Python: >=3.12" in metadata_text
     assert "Requires-Dist: requests>=2" in metadata_text
+    assert f"Tag: {_wheel_tag()}" in wheel_text
+    assert _wheel_tag() in {str(tag) for tag in tags.sys_tags()}
 
 
 def test_project_metadata_falls_back_for_missing_or_dynamic_version(tmp_path: Path) -> None:

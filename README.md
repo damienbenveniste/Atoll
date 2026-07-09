@@ -55,7 +55,8 @@ staging, cache lookup or restore, mypyc batch or retry builds, wheel writing, an
 reports include cache status plus subphase timings such as `mypycify` and `build_ext`. Duplicate
 macOS linker `-rpath` warnings are filtered from terminal output; other native compiler diagnostics
 are still captured in Atoll's build diagnostics. Atoll keeps strict reusable compile and mypy cache
-state under `.atoll/cache/`; `atoll clean --cache` removes it.
+state under `.atoll/cache/`; unchanged partial builds restore successful artifacts and cached skips
+without invoking mypyc again. `atoll clean --cache` removes that state.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic. Module-level typing diagnostics, such as unsupported `TypeVar` keyword

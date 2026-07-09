@@ -11,7 +11,6 @@ import json
 import re
 import shutil
 import sys
-import sysconfig
 import time
 import tomllib
 import zipfile
@@ -20,6 +19,8 @@ from dataclasses import dataclass, replace
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import cast
+
+from packaging import tags
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
@@ -56,7 +57,7 @@ _GENERATED_DIR_NAMES = frozenset(
         "site-packages",
     }
 )
-_COMPILE_CACHE_VERSION = 1
+_COMPILE_CACHE_VERSION = 2
 _CACHE_INPUT_SUFFIXES = frozenset({".py", ".pyi", ".toml"})
 _CACHE_INPUT_NAMES = frozenset({"py.typed"})
 
@@ -144,6 +145,8 @@ class _CompileCacheLookup:
     key: str
     hit: bool
     artifact_paths: tuple[Path, ...]
+    successful_modules: tuple[str, ...]
+    skipped_modules: tuple[str, ...]
     phase_timings: tuple[CompilePhaseTiming, ...]
 
 
@@ -344,23 +347,49 @@ def _lookup_compile_cache(
     artifacts = _cached_artifact_paths(entry_root, manifest)
     if artifacts is None:
         return _compile_cache_miss(key, lookup_started, "stale")
+    cached_modules = _cached_manifest_modules(manifest)
+    if cached_modules is None:
+        return _compile_cache_miss(key, lookup_started, "stale")
+    successful_modules, skipped_modules = cached_modules
+    current_modules = {island.source_module for island in islands}
+    if set(successful_modules) | set(skipped_modules) != current_modules:
+        return _compile_cache_miss(key, lookup_started, "selection mismatch")
+    return _compile_cache_hit(
+        key=key,
+        lookup_started=lookup_started,
+        artifact_paths=artifacts,
+        successful_modules=successful_modules,
+        skipped_modules=skipped_modules,
+    )
+
+
+def _compile_cache_hit(
+    *,
+    key: str,
+    lookup_started: float,
+    artifact_paths: tuple[Path, ...],
+    successful_modules: tuple[str, ...],
+    skipped_modules: tuple[str, ...],
+) -> _CompileCacheLookup:
     lookup_timing = CompilePhaseTiming(
         name="cache_lookup",
         duration_seconds=time.perf_counter() - lookup_started,
-        detail="hit",
+        detail="hit" if not skipped_modules else "partial hit",
     )
     restore_started = time.perf_counter()
-    restored = tuple(path for path in artifacts if path.exists())
+    restored = tuple(path for path in artifact_paths if path.exists())
     restore_timing = CompilePhaseTiming(
         name="cache_restore",
         duration_seconds=time.perf_counter() - restore_started,
         detail=f"{len(restored)} artifact(s)",
     )
-    if len(restored) != len(artifacts):
+    if len(restored) != len(artifact_paths):
         return _CompileCacheLookup(
             key=key,
             hit=False,
             artifact_paths=(),
+            successful_modules=(),
+            skipped_modules=(),
             phase_timings=(
                 lookup_timing,
                 CompilePhaseTiming(
@@ -374,6 +403,8 @@ def _lookup_compile_cache(
         key=key,
         hit=True,
         artifact_paths=restored,
+        successful_modules=successful_modules,
+        skipped_modules=skipped_modules,
         phase_timings=(lookup_timing, restore_timing),
     )
 
@@ -387,6 +418,8 @@ def _compile_cache_miss(
         key=key,
         hit=False,
         artifact_paths=(),
+        successful_modules=(),
+        skipped_modules=(),
         phase_timings=(
             CompilePhaseTiming(
                 name="cache_lookup",
@@ -433,11 +466,40 @@ def _cached_artifact_paths(
     return tuple(paths)
 
 
+def _cached_manifest_modules(
+    manifest: dict[str, object],
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    successful = _string_tuple_manifest_field(manifest, "successful_modules")
+    skipped = _string_tuple_manifest_field(manifest, "skipped_modules")
+    if successful is None or skipped is None:
+        return None
+    if set(successful) & set(skipped):
+        return None
+    return successful, skipped
+
+
+def _string_tuple_manifest_field(
+    manifest: dict[str, object],
+    field: str,
+) -> tuple[str, ...] | None:
+    raw = manifest.get(field)
+    if not isinstance(raw, list):
+        return None
+    values: list[str] = []
+    for item in cast(list[object], raw):
+        if not isinstance(item, str):
+            return None
+        values.append(item)
+    return tuple(values)
+
+
 def _store_compile_cache(
     *,
     cache_root: Path,
     key: str,
     artifact_paths: tuple[Path, ...],
+    successful_modules: tuple[str, ...],
+    skipped_modules: tuple[str, ...],
 ) -> None:
     if not artifact_paths:
         return
@@ -457,6 +519,8 @@ def _store_compile_cache(
         "version": _COMPILE_CACHE_VERSION,
         "key": key,
         "artifacts": manifest_artifacts,
+        "successful_modules": list(successful_modules),
+        "skipped_modules": list(skipped_modules),
     }
     (temp_root / "manifest.json").write_text(
         f"{json.dumps(manifest, indent=2, sort_keys=True)}\n",
@@ -563,12 +627,29 @@ def _build_package_islands(
     if cache_lookup.hit:
         _progress(context.progress, f"compile cache hit: {cache_lookup.key[:12]}")
         _progress_phase_timings(context.progress, cache_lookup.phase_timings)
+        successful_modules = set(cache_lookup.successful_modules)
+        skipped_modules = set(cache_lookup.skipped_modules)
+        successful_islands = tuple(
+            island for island in islands if island.source_module in successful_modules
+        )
+        skipped = tuple(
+            _cached_skipped_failure(island, cache_lookup.key)
+            for island in islands
+            if island.source_module in skipped_modules
+        )
+        for failure in skipped:
+            _remove_staged_island(failure.island)
         return _PackageBuildOutcome(
-            successful=islands,
+            successful=successful_islands,
             build=CompileAttempt(
                 success=True,
                 command=("atoll", "compile-cache", "restore", cache_lookup.key[:12]),
-                stdout="compile cache hit",
+                stdout=(
+                    "compile cache hit"
+                    if not skipped
+                    else f"compile cache hit; restored {len(successful_islands)} island(s), "
+                    f"kept {len(skipped)} cached skip(s)"
+                ),
                 stderr="",
                 artifact_paths=cache_lookup.artifact_paths,
                 duration_seconds=sum(
@@ -577,7 +658,7 @@ def _build_package_islands(
                 phase_timings=cache_lookup.phase_timings,
                 cache_status="hit",
             ),
-            skipped=(),
+            skipped=skipped,
         )
     _progress(context.progress, f"compile cache miss: {cache_lookup.key[:12]}")
     batch_started = time.perf_counter()
@@ -600,6 +681,8 @@ def _build_package_islands(
             cache_root=context.target_project.config.cache_dir / "compile",
             key=cache_lookup.key,
             artifact_paths=batch.artifact_paths,
+            successful_modules=tuple(island.source_module for island in islands),
+            skipped_modules=(),
         )
         batch = replace(
             batch,
@@ -622,10 +705,50 @@ def _build_package_islands(
         context.progress,
         f"mypyc batch failed in {_duration(batch_started)}; retrying islands individually",
     )
-    return _build_package_islands_individually(
+    outcome = _build_package_islands_individually(
         islands,
         context,
         batch_failure=batch,
+    )
+    if not outcome.build.success:
+        return outcome
+    cache_store_started = time.perf_counter()
+    _store_compile_cache(
+        cache_root=context.target_project.config.cache_dir / "compile",
+        key=cache_lookup.key,
+        artifact_paths=outcome.build.artifact_paths,
+        successful_modules=tuple(island.source_module for island in outcome.successful),
+        skipped_modules=tuple(failure.island.source_module for failure in outcome.skipped),
+    )
+    return _PackageBuildOutcome(
+        successful=outcome.successful,
+        build=replace(
+            outcome.build,
+            phase_timings=(
+                *outcome.build.phase_timings,
+                CompilePhaseTiming(
+                    name="cache_store",
+                    duration_seconds=time.perf_counter() - cache_store_started,
+                    detail="stored partial",
+                ),
+            ),
+        ),
+        skipped=outcome.skipped,
+    )
+
+
+def _cached_skipped_failure(island: EnabledIslandConfig, key: str) -> PackageBuildFailure:
+    return PackageBuildFailure(
+        island=island,
+        build=CompileAttempt(
+            success=False,
+            command=("atoll", "compile-cache", "skip", key[:12]),
+            stdout="",
+            stderr=f"cached skip: previous mypyc build failed for {island.source_module}",
+            artifact_paths=(),
+            duration_seconds=0.0,
+            cache_status="hit",
+        ),
     )
 
 
@@ -992,9 +1115,7 @@ def _project_metadata(root: Path) -> _ProjectMetadata:
 
 
 def _wheel_tag() -> str:
-    python_tag = _python_tag()
-    platform_tag = sysconfig.get_platform().replace("-", "_").replace(".", "_")
-    return f"{python_tag}-{python_tag}-{platform_tag}"
+    return str(next(tags.sys_tags()))
 
 
 def _python_tag() -> str:

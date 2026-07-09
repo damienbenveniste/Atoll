@@ -74,7 +74,7 @@ def test_generate_sidecar_renders_atoll_metadata() -> None:
 def test_generate_sidecar_imports_same_module_annotation_classes(
     tmp_path: Path,
 ) -> None:
-    """Type-only same-module class references are preserved for mypyc checking."""
+    """Type-only same-module class references are erased to avoid source imports."""
     module_path = tmp_path / "sample.py"
     module_path.write_text(
         "\n".join(
@@ -103,8 +103,10 @@ def test_generate_sidecar_imports_same_module_annotation_classes(
 
     generation = generate_sidecar(scan, island)
 
-    assert "from typing import TYPE_CHECKING" in generation.source_text
-    assert "if TYPE_CHECKING:\n    from sample import Row" in generation.source_text
+    assert _imports_from_typing(generation.source_text, "Any")
+    assert "from typing import TYPE_CHECKING" not in generation.source_text
+    assert "from sample import Row" not in generation.source_text
+    assert "def wrap(row: Any) -> list[Any]:" in generation.source_text
     assert "class Row" not in generation.source_text
 
 
@@ -264,6 +266,50 @@ def test_generate_sidecar_prunes_annotation_only_imports_for_mypyc(
     assert "from runtime.boxes import Box" in generation.source_text
     assert _imports_from_typing(generation.source_text, "Any")
     assert "def wrap(value: Any) -> Any:" in generation.source_text
+
+
+def test_generate_sidecar_uses_dynamic_imports_for_same_package_runtime_names(
+    tmp_path: Path,
+) -> None:
+    """Same-package runtime imports are hidden from mypyc's static import graph."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    module_path = package / "sample.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from pkg.heavy import Box, Thing as Alias",
+                "",
+                "def wrap(value: int):",
+                "    values: dict[Box, list[Alias]] = {}",
+                "    values[Box(Alias(value))] = []",
+                "    return set[Box](values)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    module = ModuleId(name="pkg.sample", path=module_path)
+    scan = enrich_island_analysis(scan_module(module))
+    island = EnabledIslandConfig(
+        source_module=module.name,
+        source_path=module.path,
+        sidecar_module="pkg.sample_atoll",
+        sidecar_path=package / "sample_atoll.py",
+        symbols=("wrap",),
+    )
+
+    generation = generate_sidecar(scan, island)
+
+    assert "from pkg.heavy import Box" not in generation.source_text
+    assert "import importlib as _atoll_importlib" in generation.source_text
+    assert '_atoll_importlib.import_module("pkg.heavy")' in generation.source_text
+    assert "Box = getattr(_atoll_import_" in generation.source_text
+    assert "Alias = getattr(_atoll_import_" in generation.source_text
+    assert "values: dict[Any, list[Any]] = {}" in generation.source_text
+    assert "return set(values)" in generation.source_text
 
 
 def test_generate_sidecar_erases_typing_module_typevar_annotations(
