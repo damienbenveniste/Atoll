@@ -1,4 +1,10 @@
-"""Managed shim insertion and removal for Atoll-enabled modules."""
+"""Managed shim insertion and removal for Atoll-enabled modules.
+
+The shim is the runtime switch between original Python definitions and generated
+sidecars. It is marker-delimited so commands can replace it safely, and it
+records status in `__atoll_status__` for verification without requiring users to
+inspect generated code.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +18,12 @@ from atoll.models import EnabledIslandConfig
 
 @dataclass(frozen=True, slots=True)
 class ShimEdit:
-    """Result of rendering a shim edit for a source module."""
+    """Preview and applied text for a managed shim edit.
+
+    Commands use this immutable object for dry-run output and file writes. The
+    unified diff is derived from the old and new source text and is safe to show
+    to users before any mutation occurs.
+    """
 
     old_text: str
     new_text: str
@@ -20,19 +31,34 @@ class ShimEdit:
 
 
 def insert_or_replace_shim(source_text: str, config: EnabledIslandConfig) -> ShimEdit:
-    """Append or replace the managed Atoll shim for `config`."""
+    """Append or replace the managed Atoll shim for `config`.
+
+    Existing balanced markers are replaced in place; missing markers append a new
+    managed block. Unbalanced or duplicate markers raise `ValueError` so commands
+    do not overwrite ambiguous user code.
+    """
     new_text = _replace_block(source_text, config, render_shim(config))
     return _edit(source_text, new_text, config.source_path.name)
 
 
 def remove_shim(source_text: str, config: EnabledIslandConfig) -> ShimEdit:
-    """Remove the managed Atoll shim for `config` if present."""
+    """Remove the managed Atoll shim for `config` if present.
+
+    Missing markers are treated as a no-op. Marker imbalance still raises because
+    it means Atoll cannot determine a safe deletion range.
+    """
     new_text = _replace_block(source_text, config, "")
     return _edit(source_text, new_text, config.source_path.name)
 
 
 def render_shim(config: EnabledIslandConfig) -> str:
-    """Render a marker-delimited Atoll managed shim."""
+    """Render the marker-delimited runtime shim for one enabled island.
+
+    The shim prefers compiled artifacts when present, falls back to the generated
+    Python sidecar otherwise, and honors `ATOLL_DISABLE`, `ATOLL_STRICT`, and
+    `ATOLL_REQUIRE_COMPILED`. It keeps transient helper names out of the module
+    namespace after import.
+    """
     status_symbols = tuple(config.symbols)
     assignments = "\n".join(
         f"            {symbol} = _atoll_mod.{symbol}" for symbol in config.symbols

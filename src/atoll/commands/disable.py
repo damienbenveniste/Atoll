@@ -1,4 +1,9 @@
-"""Implementation of the `atoll disable` command."""
+"""Implementation of the `atoll disable` command.
+
+Disabling removes the managed shim from the source module and marks the island
+disabled in configuration. Generated sidecar source is retained unless the caller
+explicitly requests deletion.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +17,7 @@ from atoll.models import EnabledIslandConfig
 
 @dataclass(frozen=True, slots=True)
 class DisableOptions:
-    """User-facing options for disabling an Atoll island."""
+    """User-facing options for disabling one configured Atoll island."""
 
     root: Path
     module_name: str
@@ -22,7 +27,7 @@ class DisableOptions:
 
 @dataclass(frozen=True, slots=True)
 class DisableCommandResult:
-    """Files and generated text from a disable operation."""
+    """Prepared or applied edits from disabling one island."""
 
     island: EnabledIslandConfig
     shim_edit: ShimEdit
@@ -30,7 +35,11 @@ class DisableCommandResult:
 
 
 def execute_disable(options: DisableOptions) -> DisableCommandResult:
-    """Remove a managed shim and mark an Atoll island disabled."""
+    """Remove a managed shim and mark an Atoll island disabled.
+
+    In dry-run mode the source text diff is prepared but no files or
+    configuration are changed. A missing configured island raises `ValueError`.
+    """
     root = options.root.resolve()
     island = _find_island(load_enabled_islands(root), options.module_name)
     source_text = island.source_path.read_text(encoding="utf-8")

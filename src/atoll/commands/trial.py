@@ -1,4 +1,10 @@
-"""Implementation of the `atoll trial` command."""
+"""Implementation of the `atoll trial` command.
+
+Trial mode copies source roots into a temporary overlay, inserts Atoll shims
+there, compiles sidecars, verifies runtime routing, and optionally runs target
+pytest commands with the overlay first on `PYTHONPATH`. The original project
+tree is not modified.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +34,7 @@ from atoll.runtime.verify import verify_islands
 
 @dataclass(frozen=True, slots=True)
 class TrialOptions:
-    """User-facing options for overlay trial mode."""
+    """User-facing options for selecting and validating overlay candidates."""
 
     root: Path
     candidate: str | None = None
@@ -41,7 +47,11 @@ class TrialOptions:
 
 @dataclass(frozen=True, slots=True)
 class TrialCommandResult:
-    """Outcome of a trial run."""
+    """Outcome of a temporary overlay trial run.
+
+    The overlay path is returned for diagnostics. Unless `keep_temp` is set, the
+    path will already have been removed after command completion.
+    """
 
     success: bool
     overlay_root: Path
@@ -52,7 +62,12 @@ class TrialCommandResult:
 
 
 def execute_trial(options: TrialOptions) -> TrialCommandResult:
-    """Run selected Atoll islands in a temporary compiled overlay."""
+    """Run selected Atoll islands in a temporary compiled overlay.
+
+    Errors are converted into result objects so the CLI can report a failed trial
+    without losing overlay context. Test and benchmark commands run only after
+    compilation and verification succeed.
+    """
     try:
         project = discover_project(options.root)
         selections = _select_islands(project, options)

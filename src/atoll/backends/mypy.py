@@ -1,4 +1,9 @@
-"""Subprocess integration for mypy diagnostics."""
+"""Subprocess integration for mypy diagnostics.
+
+Atoll uses mypy as a readiness signal for mypyc compilation. This module runs
+mypy through its public API, parses line-oriented diagnostics, and resolves paths
+before the analysis layer maps errors back to scanned symbols.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +24,12 @@ _MYPY_LINE_RE = re.compile(
 
 @dataclass(frozen=True, slots=True)
 class MypyRun:
-    """Raw and parsed result from a mypy subprocess run."""
+    """Raw and parsed result from a mypy invocation.
+
+    The return code and captured streams are preserved for diagnostics, while
+    `diagnostics` contains only lines that match mypy's expected diagnostic
+    format.
+    """
 
     command: tuple[str, ...]
     returncode: int
@@ -29,7 +39,12 @@ class MypyRun:
 
 
 def run_mypy(config: ProjectConfig) -> MypyRun:
-    """Run mypy over configured source roots and parse diagnostics."""
+    """Run mypy over configured source roots and parse diagnostics.
+
+    If the project root contains `pyproject.toml`, that file is passed as the
+    mypy config. The working directory is temporarily changed to the project root
+    so relative diagnostic paths can be resolved consistently.
+    """
     args = (
         *(str(path) for path in config.source_roots),
         "--show-column-numbers",
@@ -54,7 +69,12 @@ def run_mypy(config: ProjectConfig) -> MypyRun:
 
 
 def parse_mypy_output(output: str, *, cwd: Path) -> tuple[MypyDiagnostic, ...]:
-    """Parse mypy's line-oriented diagnostic output."""
+    """Parse mypy's line-oriented diagnostic output.
+
+    Non-diagnostic lines are ignored so callers can pass full stdout safely.
+    Returned paths are absolute and columns are optional because mypy may omit
+    column numbers for some messages.
+    """
     diagnostics: list[MypyDiagnostic] = []
     for line in output.splitlines():
         match = _MYPY_LINE_RE.match(line)

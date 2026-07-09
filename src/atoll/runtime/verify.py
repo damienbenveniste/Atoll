@@ -1,4 +1,9 @@
-"""Verify that Atoll-managed source modules route to sidecars."""
+"""Verify that Atoll-managed source modules route to sidecars.
+
+Runtime verification imports configured source modules in an isolated import
+path context and inspects the managed shim status. It clears cached modules
+before each import so stale bindings do not hide routing failures.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +24,12 @@ def verify_islands(
     module_name: str | None = None,
     require_compiled: bool = False,
 ) -> tuple[VerifyResult, ...]:
-    """Verify configured enabled islands by importing the source modules."""
+    """Verify configured enabled islands by importing their source modules.
+
+    `module_name` narrows the check to one source module. When `require_compiled`
+    is true, active pure-Python sidecars are reported as failures even if symbols
+    are rebound correctly.
+    """
     enabled = tuple(
         island
         for island in config.islands

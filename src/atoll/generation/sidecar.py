@@ -1,4 +1,10 @@
-"""Generate pure-Python Atoll sidecar modules."""
+"""Generate pure-Python Atoll sidecar modules.
+
+Sidecars copy selected top-level functions plus only the imports, literal
+constants, and type-only references those functions need. The generated Python
+is later compiled by mypyc, so this module also normalizes annotations and
+returns to avoid known mypyc rejection paths.
+"""
 
 from __future__ import annotations
 
@@ -37,7 +43,12 @@ class _TypingAliases:
 
 @dataclass(frozen=True, slots=True)
 class SidecarPlan:
-    """Concrete source fragments copied into a generated sidecar."""
+    """Concrete source fragments copied into a generated sidecar.
+
+    Plans are deterministic products of an enriched module scan and the requested
+    export list. They keep source fragments separate from rendering metadata so
+    stale-file checks can hash the same evidence that is written to disk.
+    """
 
     imports: tuple[ImportRecord, ...]
     extra_typing_names: tuple[str, ...]
@@ -49,7 +60,12 @@ class SidecarPlan:
 
 
 def generate_sidecar(module: ModuleScan, config: EnabledIslandConfig) -> SidecarGeneration:
-    """Generate a pure-Python sidecar for `config` from a scanned source module."""
+    """Generate deterministic sidecar source for one enabled island.
+
+    The source is not written here; callers decide whether they are checking,
+    previewing, or applying changes. Unknown exported symbols raise `ValueError`
+    during plan construction.
+    """
     plan = build_sidecar_plan(module, config.symbols)
     source_hash = _source_hash(plan, config)
     source = _render_sidecar(config, plan, source_hash)
@@ -62,7 +78,7 @@ def generate_sidecar(module: ModuleScan, config: EnabledIslandConfig) -> Sidecar
 
 
 def write_sidecar(generation: SidecarGeneration) -> None:
-    """Write a generated sidecar source file."""
+    """Write generated sidecar source, creating the sidecar directory if needed."""
     generation.config.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
     generation.config.sidecar_path.write_text(generation.source_text, encoding="utf-8")
 
@@ -71,7 +87,12 @@ def build_sidecar_plan(
     module: ModuleScan,
     exported_symbols: tuple[str, ...],
 ) -> SidecarPlan:
-    """Select imports, constants, and symbols required for a sidecar."""
+    """Select imports, constants, copied symbols, and type-only names.
+
+    The selected symbol set expands through direct same-module function calls so
+    exported functions do not lose local helpers. Dynamic constants and erased
+    annotation-only names are deliberately handled outside the runtime payload.
+    """
     top_level_functions = {
         symbol.id.qualname: symbol for symbol in module.symbols if symbol.kind == "function"
     }
@@ -407,27 +428,38 @@ def _type_checking_names(
 
 
 class _MypycSidecarTransformer(ast.NodeTransformer):
+    """Rewrite copied function source into a mypyc-friendly sidecar form.
+
+    The transformer preserves runtime statements while erasing type constructs
+    that are valid in the source project but rejected or unavailable in the
+    generated sidecar context.
+    """
+
     def __init__(
         self,
         *,
         erased_type_arg_names: set[str],
         erased_annotation_names: set[str],
     ) -> None:
+        """Store erased names and collect extra typing imports needed later."""
         self._erased_type_arg_names = erased_type_arg_names
         self._erased_annotation_names = erased_annotation_names
         self.extra_typing_names: set[str] = set()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        """Normalize a synchronous function after visiting its body."""
         self.generic_visit(node)
         self._normalize_function(node)
         return node
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+        """Normalize an async function after visiting its body."""
         self.generic_visit(node)
         self._normalize_function(node)
         return node
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
+        """Erase subscripts for imported runtime types that are not in sidecars."""
         self.generic_visit(node)
         if isinstance(node.value, ast.Name) and node.value.id in self._erased_type_arg_names:
             return node.value
@@ -467,11 +499,15 @@ class _MypycSidecarTransformer(ast.NodeTransformer):
 
 
 class _TypeVarAnnotationSanitizer(ast.NodeTransformer):
+    """Replace erased annotation-only names with `Any` in copied signatures."""
+
     def __init__(self, erased_annotation_names: set[str]) -> None:
+        """Track names that should not survive in generated annotations."""
         self._erased_annotation_names = erased_annotation_names
         self.replaced = False
 
     def visit_Name(self, node: ast.Name) -> ast.expr:
+        """Return `Any` for erased annotation names while preserving location."""
         if node.id not in self._erased_annotation_names:
             return node
         self.replaced = True

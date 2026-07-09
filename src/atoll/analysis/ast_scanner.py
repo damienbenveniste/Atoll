@@ -1,4 +1,10 @@
-"""AST scanner for Atoll's first-pass module analysis."""
+"""AST scanner for Atoll's first-pass module analysis.
+
+The scanner reads source text, never imports project modules, and records only
+facts that can be derived from Python syntax. Later phases decide whether those
+facts are safe enough for sidecar extraction, so this module favors conservative
+boundaries over speculative call resolution.
+"""
 
 from __future__ import annotations
 
@@ -26,7 +32,13 @@ _BUILTIN_NAMES = frozenset(dir(builtins))
 
 
 def scan_module(module: ModuleId) -> ModuleScan:
-    """Parse and scan one Python module."""
+    """Parse one Python file and return its first-pass scan facts.
+
+    The scan includes top-level imports, literal/dynamic constant
+    classifications, functions/classes/simple methods, module blockers, and
+    executable statement locations. It deliberately omits mypy diagnostics and
+    candidate scoring because those depend on later enrichment phases.
+    """
     source = module.path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(module.path), type_comments=True)
     lines = source.splitlines()
@@ -254,7 +266,16 @@ def _is_top_level_executable_statement(node: ast.stmt) -> bool:
 
 
 class _FunctionNameCollector(ast.NodeVisitor):
+    """Collect local, referenced, called, and runtime-only names for a function.
+
+    Annotation references are tracked separately from runtime references so type
+    hints do not create false global dependencies for sidecar extraction.
+    Nested functions and classes are treated as local bindings rather than
+    traversed bodies because Atoll V1 does not extract nested symbols.
+    """
+
     def __init__(self) -> None:
+        """Initialize independent name sets for one function definition."""
         self.called_names: set[str] = set()
         self.local_names: set[str] = set()
         self.referenced_names: set[str] = set()
@@ -262,6 +283,7 @@ class _FunctionNameCollector(ast.NodeVisitor):
         self._in_annotation = False
 
     def collect(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        """Collect names from a function without visiting its decorator wrapper."""
         self._collect_arguments(node)
         self._collect_defaults(node)
         self._collect_decorators(node)
@@ -297,10 +319,12 @@ class _FunctionNameCollector(ast.NodeVisitor):
             self._visit_annotation(node.returns)
 
     def visit_arg(self, node: ast.arg) -> None:
+        """Record argument names as local bindings while preserving annotations."""
         self.local_names.add(node.arg)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
+        """Classify loaded names as references and stored names as locals."""
         if isinstance(node.ctx, ast.Load):
             self.referenced_names.add(node.id)
             if not self._in_annotation:
@@ -309,17 +333,21 @@ class _FunctionNameCollector(ast.NodeVisitor):
             self.local_names.add(node.id)
 
     def visit_Call(self, node: ast.Call) -> None:
+        """Record directly named calls for conservative same-module edges."""
         if isinstance(node.func, ast.Name):
             self.called_names.add(node.func.id)
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """Treat nested functions as local bindings and do not traverse them."""
         self.local_names.add(node.name)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        """Treat nested async functions as local bindings and do not traverse them."""
         self.local_names.add(node.name)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """Treat nested classes as local bindings and do not traverse them."""
         self.local_names.add(node.name)
 
     def _visit_annotation(self, node: ast.expr) -> None:
@@ -340,11 +368,20 @@ def _function_args(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.ar
 
 
 class _ClassNameCollector(ast.NodeVisitor):
+    """Collect names referenced by class decorators, bases, and keyword bases.
+
+    The collector does not visit the class body because method bodies are scanned
+    as separate symbols. This keeps class-level dependency facts limited to the
+    inheritance and decorator boundary.
+    """
+
     def __init__(self) -> None:
+        """Initialize the local and referenced name sets for one class."""
         self.local_names: set[str] = set()
         self.referenced_names: set[str] = set()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """Visit only the class header and decorator expressions."""
         for decorator in node.decorator_list:
             self.visit(decorator)
         for base in node.bases:
@@ -353,5 +390,6 @@ class _ClassNameCollector(ast.NodeVisitor):
             self.visit(keyword.value)
 
     def visit_Name(self, node: ast.Name) -> None:
+        """Record names loaded by class headers as references."""
         if isinstance(node.ctx, ast.Load):
             self.referenced_names.add(node.id)

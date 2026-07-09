@@ -1,4 +1,10 @@
-"""Implementation of the `atoll build` command."""
+"""Implementation of the `atoll build` command.
+
+The build command regenerates enabled sidecars, optionally clears Atoll build
+state, and compiles sidecar sources into the project-local artifact directory.
+It does not modify user source except through the generation step's managed
+sidecar outputs.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +20,7 @@ from atoll.project import discover_project
 
 @dataclass(frozen=True, slots=True)
 class BuildOptions:
-    """User-facing options for building enabled sidecars."""
+    """User-facing options for building enabled sidecars in place."""
 
     root: Path
     module_name: str | None = None
@@ -22,7 +28,12 @@ class BuildOptions:
 
 
 def execute_build(options: BuildOptions) -> CompileAttempt:
-    """Compile enabled Atoll sidecars in place."""
+    """Compile enabled Atoll sidecars after refreshing generated source.
+
+    `module_name` narrows the build to one configured source module. When
+    `clean_first` is set, only Atoll's build directory is removed before
+    compilation; source files and configuration are left intact.
+    """
     project = discover_project(options.root)
     build_dir = project.config.root / ".atoll" / "build"
     if options.clean_first and build_dir.exists():

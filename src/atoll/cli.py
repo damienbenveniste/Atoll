@@ -1,4 +1,10 @@
-"""Command-line interface for Atoll."""
+"""Command-line interface for Atoll.
+
+The CLI translates parsed arguments into typed command option objects and keeps
+user-facing printing at the boundary. Command modules own behavior and return
+structured results; this module owns parser wiring, exit codes, summaries, and
+report file emission after build/package workflows.
+"""
 
 from __future__ import annotations
 
@@ -46,16 +52,24 @@ from atoll.runtime.test_runner import parse_pytest_command, run_pytest_command
 
 
 class _Subparsers(Protocol):
+    """Small parser protocol used by helper functions that register subcommands."""
+
     def add_parser(
         self,
         name: str,
         *,
         help: str | None = None,
-    ) -> argparse.ArgumentParser: ...
+    ) -> argparse.ArgumentParser:
+        """Create and return an argparse parser for one subcommand."""
+        ...
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the Atoll command-line interface."""
+    """Run the Atoll command-line interface and return a process exit code.
+
+    `argv` is accepted for tests and programmatic callers. When no subcommand is
+    provided, help is printed and the command fails with exit code 1.
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
     handler = _COMMAND_HANDLERS.get(args.command)
@@ -584,6 +598,7 @@ def _source_clean_progress_reporter() -> Callable[[str], None]:
     started = time.perf_counter()
 
     def progress(message: str) -> None:
+        """Print elapsed source-clean compile progress messages to stderr."""
         elapsed = time.perf_counter() - started
         print(f"Atoll compile [{elapsed:6.2f}s] {message}", file=sys.stderr)
 

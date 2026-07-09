@@ -1,4 +1,10 @@
-"""Detection of dynamic Python patterns that block safe sidecar extraction."""
+"""Detect dynamic Python patterns that block safe sidecar extraction.
+
+Atoll relies on mypyc-generated sidecars, so runtime reflection, frame access,
+dynamic imports, and module/class monkey-patching are treated conservatively.
+The blockers produced here explain why a symbol is excluded before build-time
+or runtime verification has a chance to fail less clearly.
+"""
 
 from __future__ import annotations
 
@@ -52,7 +58,12 @@ def detect_function_blockers(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     symbol: SymbolId,
 ) -> tuple[Blocker, ...]:
-    """Return blockers found inside a function or method definition."""
+    """Return blockers found inside a function or method definition.
+
+    The visitor checks executable body statements for dynamic behavior, then
+    separately adds annotation, decorator, and async-function blockers. Nested
+    definitions are reported as unsupported instead of traversed as candidates.
+    """
     visitor = _BlockerVisitor(symbol)
     for child in node.body:
         visitor.visit(child)
@@ -73,7 +84,12 @@ def detect_function_blockers(
 
 
 def detect_class_blockers(node: ast.ClassDef, symbol: SymbolId) -> tuple[Blocker, ...]:
-    """Return conservative blockers for a top-level class definition."""
+    """Return conservative blockers for a top-level class definition.
+
+    Atoll V1 records classes for dependency analysis, but extraction focuses on
+    functions. Dynamic class construction such as metaclasses or custom
+    attribute hooks is therefore reported early as a hard boundary.
+    """
     return (
         *_decorator_blockers(node.decorator_list, symbol),
         *_metaclass_blockers(node, symbol),
@@ -82,7 +98,12 @@ def detect_class_blockers(node: ast.ClassDef, symbol: SymbolId) -> tuple[Blocker
 
 
 def module_level_blockers(nodes: Iterable[ast.stmt], module: str) -> tuple[Blocker, ...]:
-    """Detect obvious top-level monkey-patching statements."""
+    """Detect module-level statements that make native extraction unsafe.
+
+    The detector flags top-level attribute assignment as monkey-patching and
+    records mypyc-incompatible `TypeVar` keyword usage before compilation. It
+    intentionally avoids executing imports or evaluating constants.
+    """
     node_tuple = tuple(nodes)
     monkey_patch_blockers = tuple(
         Blocker(
@@ -129,15 +150,20 @@ def _dynamic_class_method_blockers(node: ast.ClassDef, symbol: SymbolId) -> tupl
 
 
 class _BlockerVisitor(ast.NodeVisitor):
+    """Collect body-level blockers for one function-like symbol."""
+
     def __init__(self, symbol: SymbolId) -> None:
+        """Bind all emitted blockers to the source symbol being inspected."""
         self.symbol = symbol
         self.blockers: list[Blocker] = []
 
     def visit_Call(self, node: ast.Call) -> None:
+        """Record blockers caused by dynamic calls before visiting arguments."""
         self._record_call_blocker(node)
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        """Flag direct access to frame attributes under compiled execution."""
         if node.attr in _FRAME_ATTRIBUTE_BLOCKERS:
             self._append(
                 "hard",
@@ -148,12 +174,15 @@ class _BlockerVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """Report nested functions without descending into their bodies."""
         self._record_nested_symbol(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        """Report nested async functions as unsupported extraction boundaries."""
         self._record_nested_symbol(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """Report nested classes without scanning their class bodies."""
         self._record_nested_symbol(node)
 
     def _record_call_blocker(self, node: ast.Call) -> None:
@@ -299,12 +328,20 @@ def _typing_aliases(nodes: Iterable[ast.stmt]) -> _TypingAliases:
 
 
 class _ModuleTypeVarVisitor(ast.NodeVisitor):
+    """Find module-level TypeVar calls that mypyc rejects.
+
+    Function bodies are skipped because this visitor is concerned with module
+    setup expressions that can break compilation before sidecar code is reached.
+    """
+
     def __init__(self, module: str, aliases: _TypingAliases) -> None:
+        """Initialize a module-scoped visitor with known typing aliases."""
         self.module = module
         self.aliases = aliases
         self.blockers: list[Blocker] = []
 
     def visit_Call(self, node: ast.Call) -> None:
+        """Record unsupported TypeVar keyword arguments at module scope."""
         unsupported = _unsupported_typevar_keywords(node, self.aliases)
         if unsupported:
             keywords = ", ".join(unsupported)
@@ -320,9 +357,11 @@ class _ModuleTypeVarVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """Skip function bodies while scanning module-level TypeVar declarations."""
         _ = node
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        """Skip async function bodies while scanning module-level declarations."""
         _ = node
 
 

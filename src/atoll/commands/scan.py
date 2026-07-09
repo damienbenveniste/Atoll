@@ -1,4 +1,9 @@
-"""Implementation of the `atoll scan` command."""
+"""Implementation of the `atoll scan` command.
+
+Scan discovers modules, reuses cached AST facts when safe, enriches results with
+type and candidate analysis, and writes both JSON and Markdown reports. It does
+not generate or compile sidecars.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +21,7 @@ from atoll.report import ScanReport, build_scan_report, write_json_report, write
 
 @dataclass(frozen=True, slots=True)
 class ScanOptions:
-    """User-facing options for a scan run."""
+    """User-facing options controlling project discovery and report paths."""
 
     root: Path
     source_roots: tuple[Path, ...] = ()
@@ -28,7 +33,7 @@ class ScanOptions:
 
 @dataclass(frozen=True, slots=True)
 class ScanCommandResult:
-    """Artifacts produced by `atoll scan`."""
+    """Analysis result, report payload, written paths, and cache stats."""
 
     result: ScanResult
     report: ScanReport
@@ -38,7 +43,12 @@ class ScanCommandResult:
 
 
 def execute_scan(options: ScanOptions) -> ScanCommandResult:
-    """Run project discovery, AST scanning, and report generation."""
+    """Run project discovery, AST scanning, enrichment, and report generation.
+
+    `source_roots` and `max_files` constrain discovery. Mypy can be disabled for
+    faster scans, but candidate readiness will then exclude type-checker
+    diagnostics from blocker decisions.
+    """
     discovered = discover_project(
         options.root,
         source_roots=options.source_roots,

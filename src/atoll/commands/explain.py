@@ -1,4 +1,9 @@
-"""Implementation of the `atoll explain` command."""
+"""Implementation of the `atoll explain` command.
+
+Explain runs the same analysis stack as scan for one module, then renders a
+targeted Markdown explanation for either the module or a single symbol. It is a
+read-only command and does not write reports.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +21,7 @@ from atoll.report import risk_summary, score_summary
 
 @dataclass(frozen=True, slots=True)
 class ExplainOptions:
-    """User-facing options for explanation output."""
+    """User-facing options for module or symbol explanation output."""
 
     root: Path
     target: str
@@ -24,7 +29,11 @@ class ExplainOptions:
 
 
 def execute_explain(options: ExplainOptions) -> str:
-    """Explain a module or symbol using current Atoll analysis."""
+    """Explain a module or symbol using current Atoll analysis.
+
+    The target is `module` or `module::symbol`. When mypy is enabled, diagnostics
+    are attached before scoring so the explanation matches scan behavior.
+    """
     module_name, symbol_name = _split_target(options.target)
     module = _analyze_module(options.root, module_name, mypy_enabled=options.mypy_enabled)
     if symbol_name is not None:

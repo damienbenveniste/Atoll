@@ -1,4 +1,9 @@
-"""Read and write Atoll project configuration."""
+"""Read and write Atoll project configuration.
+
+Atoll accepts island definitions from `.atoll.toml` and `pyproject.toml`, then
+writes its managed minimal configuration back to `.atoll.toml`. Invalid or
+incomplete island entries are ignored rather than failing discovery.
+"""
 
 from __future__ import annotations
 
@@ -24,7 +29,12 @@ def load_enabled_islands(root: Path) -> tuple[EnabledIslandConfig, ...]:
 
 
 def write_atoll_config(root: Path, islands: tuple[EnabledIslandConfig, ...]) -> Path:
-    """Write Atoll's minimal `.atoll.toml` configuration."""
+    """Write Atoll's minimal `.atoll.toml` configuration.
+
+    The file is fully rewritten from the supplied island tuple, so callers must
+    preserve entries they do not intend to remove. Paths are emitted relative to
+    the project root when possible.
+    """
     path = root / CONFIG_PATH
     lines = [
         "[tool.atoll]",
@@ -71,7 +81,11 @@ def upsert_enabled_island(
 
 
 def disable_island(root: Path, source_module: str) -> tuple[EnabledIslandConfig, ...]:
-    """Mark one configured island disabled."""
+    """Mark one configured island disabled and rewrite configuration.
+
+    Non-matching islands are preserved exactly. If the module is not configured,
+    the resulting config is unchanged apart from normal rewrite formatting.
+    """
     islands = tuple(
         EnabledIslandConfig(
             source_module=island.source_module,

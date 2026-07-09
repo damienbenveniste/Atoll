@@ -1,4 +1,10 @@
-"""Programmatic mypyc build backend for generated Atoll sidecars."""
+"""Programmatic mypyc build backend for generated Atoll sidecars.
+
+The backend invokes mypyc and setuptools in-process so command handlers can
+capture structured build evidence. It isolates mypy cache and import-path state
+around each build and records native stderr because mypyc can write diagnostics
+outside Python's normal `sys.stderr` object.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +36,12 @@ def build_sidecars(
     source_roots: tuple[Path, ...] = (),
     cache_dir: Path | None = None,
 ) -> CompileAttempt:
-    """Compile generated sidecar source files in place using mypyc."""
+    """Compile generated sidecar source files into Atoll's artifact directory.
+
+    Empty input is a successful no-op. Build failures are converted into
+    `CompileAttempt` values with classified diagnostics instead of escaping as
+    exceptions through CLI command handlers.
+    """
     start = time.perf_counter()
     if not paths:
         return CompileAttempt(
@@ -134,12 +145,16 @@ def _phase_timing(active_phase: tuple[str, float]) -> CompilePhaseTiming:
 
 
 class _NativeStderrCapture:
+    """Capture writes to file descriptor 2 during in-process native builds."""
+
     def __init__(self) -> None:
+        """Initialize the saved descriptor, temporary file, and captured buffer."""
         self._saved_fd: int | None = None
         self._file: BinaryIO | None = None
         self._captured = ""
 
     def __enter__(self) -> _NativeStderrCapture:
+        """Redirect native stderr to a temporary file for the build duration."""
         sys.stderr.flush()
         self._file = tempfile.TemporaryFile(mode="w+b")
         self._saved_fd = os.dup(2)
@@ -152,6 +167,7 @@ class _NativeStderrCapture:
         exc: object,
         traceback: object,
     ) -> None:
+        """Restore native stderr and load captured bytes as replacement text."""
         _ = (exc_type, exc, traceback)
         sys.stderr.flush()
         if self._saved_fd is not None:
@@ -166,6 +182,7 @@ class _NativeStderrCapture:
             self._file = None
 
     def output(self) -> str:
+        """Return captured native stderr after the context has exited."""
         return self._captured
 
 

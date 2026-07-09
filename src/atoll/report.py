@@ -1,4 +1,10 @@
-"""Report rendering for Atoll scan results."""
+"""Report schema conversion and Markdown rendering for Atoll commands.
+
+This module is the boundary between internal dataclasses and user-visible JSON
+or Markdown artifacts. TypedDict classes define stable report shapes, while the
+rendering functions keep paths relative where possible and avoid importing or
+executing target-project code.
+"""
 
 from __future__ import annotations
 
@@ -36,6 +42,8 @@ _ATOLL_GENERATED_INPUT_DIR_INDEX = 1
 
 
 class BlockerReport(TypedDict):
+    """Serialized blocker shown in scan and symbol reports."""
+
     severity: BlockerSeverity
     code: str
     message: str
@@ -44,6 +52,8 @@ class BlockerReport(TypedDict):
 
 
 class ImportReport(TypedDict):
+    """Serialized top-level import with original source text preserved."""
+
     source_text: str
     imported_names: list[str]
     module: str | None
@@ -53,6 +63,8 @@ class ImportReport(TypedDict):
 
 
 class ConstantReport(TypedDict):
+    """Serialized top-level assignment and its extraction safety classification."""
+
     name: str
     kind: ConstantKind
     source_text: str
@@ -61,6 +73,8 @@ class ConstantReport(TypedDict):
 
 
 class SymbolReport(TypedDict):
+    """Serialized AST, blocker, and type-checker facts for one symbol."""
+
     id: str
     qualname: str
     kind: SymbolKind
@@ -81,6 +95,8 @@ class SymbolReport(TypedDict):
 
 
 class MypyDiagnosticReport(TypedDict):
+    """Serialized mypy diagnostic after optional symbol range mapping."""
+
     path: str
     line: int
     column: int | None
@@ -91,6 +107,8 @@ class MypyDiagnosticReport(TypedDict):
 
 
 class DependencyEdgeReport(TypedDict):
+    """Serialized same-module dependency or external boundary edge evidence."""
+
     src: str
     dst: str
     kind: DependencyKind
@@ -99,6 +117,8 @@ class DependencyEdgeReport(TypedDict):
 
 
 class IslandCandidateReport(TypedDict):
+    """Serialized island recommendation with score, risk, and dependency context."""
+
     symbols: list[str]
     required_imports: list[str]
     required_constants: list[str]
@@ -113,12 +133,16 @@ class IslandCandidateReport(TypedDict):
 
 
 class PoisonRadiusReport(TypedDict):
+    """Serialized explanation of a rejected symbol's impact on candidates."""
+
     poison: str
     impacted: list[str]
     reason: str
 
 
 class ModuleReport(TypedDict):
+    """Complete scan report section for one discovered Python module."""
+
     module: str
     path: str
     imports: list[ImportReport]
@@ -133,6 +157,8 @@ class ModuleReport(TypedDict):
 
 
 class SummaryReport(TypedDict):
+    """Aggregate scan counts used by JSON and Markdown summaries."""
+
     modules_scanned: int
     symbols_scanned: int
     island_candidates: int
@@ -141,6 +167,8 @@ class SummaryReport(TypedDict):
 
 
 class ScanReport(TypedDict):
+    """Top-level stable JSON report emitted by `atoll scan`."""
+
     version: int
     tool: str
     project_root: str
@@ -154,6 +182,8 @@ CompilationMode = Literal["in-place", "source-clean"]
 
 
 class CompilationSummaryReport(TypedDict):
+    """Aggregate build, verification, test, and cleanup counts for compilation."""
+
     islands: int
     symbols: int
     artifacts: int
@@ -168,6 +198,8 @@ class CompilationSummaryReport(TypedDict):
 
 
 class CompilationBuildReport(TypedDict):
+    """Serialized mypyc build command, diagnostics, and produced artifacts."""
+
     success: bool
     command: list[str]
     duration_seconds: float
@@ -186,16 +218,22 @@ class CompilationPhaseTimingReport(TypedDict):
 
 
 class CompilationCleanupReport(TypedDict):
+    """Paths removed or intentionally kept after a build or package operation."""
+
     removed: list[str]
     kept: list[str]
 
 
 class CompilationSkippedModuleReport(TypedDict):
+    """Source-clean module skipped because its island failed compilation."""
+
     module: str
     reason: str
 
 
 class CompilationPreflightBlockerReport(TypedDict):
+    """Module-level blocker that prevented a source-clean module build attempt."""
+
     module: str
     path: str
     line: int | None
@@ -204,17 +242,23 @@ class CompilationPreflightBlockerReport(TypedDict):
 
 
 class CompilationTestReport(TypedDict):
+    """Target-project semantic test command and process exit status."""
+
     command: list[str]
     exit_code: int
     success: bool
 
 
 class CompilationVerifySymbolReport(TypedDict):
+    """Runtime verification result for one exported symbol rebound by a shim."""
+
     symbol: str
     rebound: bool
 
 
 class CompilationVerifyReport(TypedDict):
+    """Runtime routing state for one compiled or pure-Python sidecar."""
+
     active: bool
     compiled: bool
     origin: str | None
@@ -223,6 +267,8 @@ class CompilationVerifyReport(TypedDict):
 
 
 class CompilationIslandReport(TypedDict):
+    """Compilation report section for one enabled source island."""
+
     source_module: str
     source_path: str
     generated_module: str
@@ -232,6 +278,8 @@ class CompilationIslandReport(TypedDict):
 
 
 class CompilationReport(TypedDict):
+    """Top-level stable JSON report for build and source-clean compile commands."""
+
     version: int
     tool: str
     operation: CompilationOperation
@@ -251,7 +299,11 @@ class CompilationReport(TypedDict):
 
 @dataclass(frozen=True, slots=True)
 class CompilationSkippedModuleInput:
-    """A selected source-clean module skipped after mypyc rejected its island."""
+    """Internal input for a selected module skipped after mypyc rejection.
+
+    This keeps source-clean packaging failures separate from preflight blockers:
+    the module reached compilation, but no usable artifact was produced.
+    """
 
     module: str
     reason: str
@@ -259,7 +311,11 @@ class CompilationSkippedModuleInput:
 
 @dataclass(frozen=True, slots=True)
 class CompilationPreflightBlockerInput:
-    """A known module-level mypyc blocker detected before compilation."""
+    """Internal input for a known module-level mypyc blocker.
+
+    Preflight blockers are emitted before running mypyc so the report can explain
+    why a module was not attempted at all.
+    """
 
     module: str
     path: Path
@@ -270,7 +326,12 @@ class CompilationPreflightBlockerInput:
 
 @dataclass(frozen=True, slots=True)
 class CompilationReportInput:
-    """Inputs needed to render one compilation report."""
+    """All command evidence needed to render one compilation report.
+
+    The renderer derives success from build, verification, and optional semantic
+    test evidence instead of trusting a caller-supplied status. Paths are kept as
+    `Path` objects until rendering so they can be normalized relative to `root`.
+    """
 
     root: Path
     operation: CompilationOperation
@@ -288,7 +349,7 @@ class CompilationReportInput:
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
-    """Convert scan dataclasses into a stable JSON report shape."""
+    """Convert enriched scan dataclasses into the stable scan JSON shape."""
     module_reports = [_module_report(module) for module in result.modules]
     all_blockers = [
         blocker
@@ -317,19 +378,23 @@ def build_scan_report(result: ScanResult) -> ScanReport:
 
 
 def write_json_report(path: Path, report: ScanReport) -> None:
-    """Write `report` as formatted JSON."""
+    """Write a scan report as sorted, formatted JSON.
+
+    Parent directories are created automatically. The function performs no schema
+    validation beyond the `ScanReport` type shape used by callers.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{json.dumps(report, indent=2, sort_keys=True)}\n", encoding="utf-8")
 
 
 def write_markdown_report(path: Path, report: ScanReport) -> None:
-    """Write a human-readable scan report."""
+    """Write the human-readable scan report next to JSON artifacts."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_markdown_report(report), encoding="utf-8")
 
 
 def render_markdown_report(report: ScanReport) -> str:
-    """Render a concise Markdown scan report."""
+    """Render a concise Markdown scan report for users reviewing candidates."""
     lines = [
         "# Atoll Scan Report",
         "",
@@ -357,7 +422,7 @@ def render_markdown_report(report: ScanReport) -> str:
 
 
 def build_compilation_report(report_input: CompilationReportInput) -> CompilationReport:
-    """Convert a build or compile attempt into a stable compilation report."""
+    """Convert build, verification, and cleanup evidence into a stable report."""
     verify_by_module = {result.source_module: result for result in report_input.verification}
     artifact_paths = tuple(report_input.build.artifact_paths)
     island_artifacts = {
@@ -463,13 +528,13 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
 
 
 def write_compilation_json_report(path: Path, report: CompilationReport) -> None:
-    """Write a machine-readable compilation report."""
+    """Write a machine-readable compilation report as sorted JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{json.dumps(report, indent=2, sort_keys=True)}\n", encoding="utf-8")
 
 
 def write_compilation_markdown_report(path: Path, report: CompilationReport) -> None:
-    """Write a human-readable compilation report."""
+    """Write the human-readable compilation report for CLI workflows."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_compilation_markdown_report(report), encoding="utf-8")
 
@@ -708,7 +773,7 @@ def score_label(score: int) -> str:
 
 
 def score_summary(score: int) -> str:
-    """Explain a candidate score in user-facing language."""
+    """Explain a scan-only candidate score in user-facing language."""
     label = score_label(score)
     if label == "strong":
         detail = "very promising scan-only candidate"
@@ -722,7 +787,7 @@ def score_summary(score: int) -> str:
 
 
 def risk_summary(risk: IslandRisk) -> str:
-    """Explain candidate extraction risk in user-facing language."""
+    """Explain candidate extraction risk in user-facing scan report language."""
     if risk == "low":
         return "low extraction risk; only high-confidence internal dependencies were seen"
     if risk == "medium":
