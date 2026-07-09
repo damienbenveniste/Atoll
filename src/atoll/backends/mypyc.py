@@ -17,7 +17,7 @@ from mypyc.build import mypycify
 from setuptools import Distribution
 from setuptools.command.build_ext import build_ext
 
-from atoll.models import CompileAttempt
+from atoll.models import CompileAttempt, CompilePhaseTiming
 
 _MAX_DIAGNOSTIC_LINES = 20
 
@@ -28,6 +28,7 @@ def build_sidecars(
     project_root: Path,
     build_dir: Path,
     source_roots: tuple[Path, ...] = (),
+    cache_dir: Path | None = None,
 ) -> CompileAttempt:
     """Compile generated sidecar source files in place using mypyc."""
     start = time.perf_counter()
@@ -50,18 +51,23 @@ def build_sidecars(
     stdout = io.StringIO()
     stderr = io.StringIO()
     native_stderr = _NativeStderrCapture()
+    phase_timings: list[CompilePhaseTiming] = []
+    active_phase: tuple[str, float] | None = None
     try:
         with (
             chdir(project_root),
-            _mypy_environment(source_roots, build_dir / "mypy_cache"),
+            _mypy_environment(source_roots, cache_dir or build_dir / "mypy_cache"),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
             native_stderr,
         ):
+            active_phase = ("mypycify", time.perf_counter())
             ext_modules = mypycify(
                 [_source_arg(path, project_root) for path in paths],
                 target_dir=str(build_dir / "generated"),
             )
+            phase_timings.append(_phase_timing(active_phase))
+            active_phase = ("build_ext", time.perf_counter())
             distribution = Distribution(
                 _distribution_attrs(
                     project_root=project_root,
@@ -75,7 +81,11 @@ def build_sidecars(
             command_obj.build_temp = str(build_dir / "temp")
             command_obj.ensure_finalized()
             command_obj.run()
+            phase_timings.append(_phase_timing(active_phase))
+            active_phase = None
     except SystemExit as error:
+        if active_phase is not None:
+            phase_timings.append(_phase_timing(active_phase))
         diagnostics = _captured_output(stdout, stderr, native_stderr.output())
         log_path = _write_build_log(build_dir, diagnostics, error)
         return CompileAttempt(
@@ -85,8 +95,11 @@ def build_sidecars(
             stderr=_classify_build_error(error, diagnostics=diagnostics, log_path=log_path),
             artifact_paths=(),
             duration_seconds=time.perf_counter() - start,
+            phase_timings=tuple(phase_timings),
         )
     except Exception as error:
+        if active_phase is not None:
+            phase_timings.append(_phase_timing(active_phase))
         diagnostics = _captured_output(stdout, stderr, native_stderr.output())
         log_path = _write_build_log(build_dir, diagnostics, error)
         return CompileAttempt(
@@ -96,8 +109,11 @@ def build_sidecars(
             stderr=_classify_build_error(error, diagnostics=diagnostics, log_path=log_path),
             artifact_paths=(),
             duration_seconds=time.perf_counter() - start,
+            phase_timings=tuple(phase_timings),
         )
+    artifact_started = time.perf_counter()
     artifacts = _artifact_paths(paths, artifact_dir, previous_artifacts)
+    phase_timings.append(_phase_timing(("artifact_discovery", artifact_started)))
     diagnostics = _captured_output(stdout, stderr, native_stderr.output())
     if diagnostics:
         _write_build_log(build_dir, diagnostics, None)
@@ -108,7 +124,13 @@ def build_sidecars(
         stderr="" if artifacts else "mypyc build completed but no extension artifacts were found",
         artifact_paths=artifacts,
         duration_seconds=time.perf_counter() - start,
+        phase_timings=tuple(phase_timings),
     )
+
+
+def _phase_timing(active_phase: tuple[str, float]) -> CompilePhaseTiming:
+    name, started = active_phase
+    return CompilePhaseTiming(name=name, duration_seconds=time.perf_counter() - started)
 
 
 class _NativeStderrCapture:

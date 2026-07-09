@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import shutil
 import zipfile
@@ -12,10 +13,11 @@ from typing import Protocol, cast
 import pytest
 
 from atoll.commands import package as package_command
-from atoll.models import CompileAttempt, EnabledIslandConfig, ModuleId
+from atoll.models import CompileAttempt, CompilePhaseTiming, EnabledIslandConfig, ModuleId
 from atoll.project import DiscoveredProject, discover_project
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
+EXPECTED_REBUILDS = 2
 
 
 class _Metadata(Protocol):
@@ -66,6 +68,7 @@ _copy_if_different = cast(
     Callable[[Path, Path], None],
     _package_attr("_copy_if_different"),
 )
+_compile_cache_key = cast(Callable[..., str], _package_attr("_compile_cache_key"))
 _copy_source_roots = cast(
     Callable[[DiscoveredProject, Path], tuple[Path, ...]],
     _package_attr("_copy_source_roots"),
@@ -73,6 +76,10 @@ _copy_source_roots = cast(
 _artifact_dir = cast(
     Callable[[EnabledIslandConfig], Path],
     _package_attr("_artifact_dir"),
+)
+_cached_artifact_paths = cast(
+    Callable[[Path, dict[str, object]], tuple[Path, ...] | None],
+    _package_attr("_cached_artifact_paths"),
 )
 _find_module = cast(
     Callable[[tuple[ModuleId, ...], str], ModuleId],
@@ -85,6 +92,10 @@ _mapping = cast(
 _project_metadata = cast(
     Callable[[Path], _Metadata],
     _package_attr("_project_metadata"),
+)
+_read_cache_manifest = cast(
+    Callable[[Path], dict[str, object] | None],
+    _package_attr("_read_cache_manifest"),
 )
 _relative_source_root = cast(
     Callable[[Path, Path], Path],
@@ -269,6 +280,248 @@ def test_package_reports_progress_for_expensive_phases(
     assert any(message.startswith("scanned ") for message in messages)
     assert any(message.startswith("running mypyc batch") for message in messages)
     assert any(message.startswith("writing wheel") for message in messages)
+
+
+def test_package_reuses_compile_cache_for_unchanged_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged second source-clean package build restores cached artifacts."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    calls = 0
+
+    def successful_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        nonlocal calls
+        assert kwargs
+        calls += 1
+        if calls > 1:
+            raise AssertionError("compile cache did not skip mypyc")
+        path = cast(tuple[Path, ...], args[0])[0]
+        artifact = tmp_path / f"{path.stem}{suffix}"
+        artifact.write_text("binary", encoding="utf-8")
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=(artifact,),
+            duration_seconds=0.1,
+            phase_timings=(
+                CompilePhaseTiming(name="mypycify", duration_seconds=0.08),
+                CompilePhaseTiming(name="build_ext", duration_seconds=0.02),
+            ),
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+
+    first = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+    second = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+
+    assert first.success is True
+    assert first.build.cache_status == "miss"
+    assert second.success is True
+    assert second.build.cache_status == "hit"
+    assert calls == 1
+    assert tuple(timing.name for timing in second.build.phase_timings) == (
+        "cache_lookup",
+        "cache_restore",
+    )
+    assert second.wheel_path is not None
+    with zipfile.ZipFile(second.wheel_path) as wheel:
+        assert any(
+            name.startswith(".atoll/artifacts/_atoll_app_ranking") for name in wheel.namelist()
+        )
+
+
+def test_package_cache_invalidates_when_source_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source-clean package cache keys include the target source tree digest."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    calls = 0
+
+    def successful_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        nonlocal calls
+        assert kwargs
+        calls += 1
+        path = cast(tuple[Path, ...], args[0])[0]
+        artifact = tmp_path / f"{path.stem}-{calls}{suffix}"
+        artifact.write_text("binary", encoding="utf-8")
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=(artifact,),
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+
+    first = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+    ranking_source = project_root / "src" / "app" / "ranking.py"
+    ranking_source.write_text(
+        f"{ranking_source.read_text(encoding='utf-8')}\n# cache invalidation\n",
+        encoding="utf-8",
+    )
+    second = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+
+    assert first.build.cache_status == "miss"
+    assert second.build.cache_status == "miss"
+    assert calls == EXPECTED_REBUILDS
+
+
+def test_package_cache_invalidates_when_generator_version_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source-clean package cache keys include the sidecar generator version."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    calls = 0
+
+    def successful_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        nonlocal calls
+        assert kwargs
+        calls += 1
+        path = cast(tuple[Path, ...], args[0])[0]
+        artifact = tmp_path / f"{path.stem}-{calls}{suffix}"
+        artifact.write_text("binary", encoding="utf-8")
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=(artifact,),
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+
+    first = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+    monkeypatch.setattr(package_command, "SIDECAR_GENERATOR_VERSION", "changed")
+    second = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+
+    assert first.build.cache_status == "miss"
+    assert second.build.cache_status == "miss"
+    assert calls == EXPECTED_REBUILDS
+
+
+def test_compile_cache_key_includes_selected_symbols(tmp_path: Path) -> None:
+    """Source-clean compile cache keys distinguish selected island symbol sets."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    sidecar_path = project_root / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
+    sidecar_path.parent.mkdir(parents=True)
+    sidecar_path.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
+    source_path = project_root / "src" / "app" / "ranking.py"
+    base = EnabledIslandConfig(
+        source_module="app.ranking",
+        source_path=source_path,
+        sidecar_module="app._atoll_app_ranking",
+        sidecar_path=sidecar_path,
+        symbols=("score_user",),
+    )
+    expanded = EnabledIslandConfig(
+        source_module="app.ranking",
+        source_path=source_path,
+        sidecar_module="app._atoll_app_ranking",
+        sidecar_path=sidecar_path,
+        symbols=("score_user", "rank_candidates"),
+    )
+
+    assert _compile_cache_key(
+        target_project=project,
+        module_name="app.ranking",
+        islands=(base,),
+    ) != _compile_cache_key(
+        target_project=project,
+        module_name="app.ranking",
+        islands=(expanded,),
+    )
+
+
+def test_compile_cache_manifest_helpers_reject_invalid_entries(tmp_path: Path) -> None:
+    """Compile cache manifests must be present, typed, and digest-matched."""
+    assert _read_cache_manifest(tmp_path / "missing.json") is None
+
+    invalid_json = tmp_path / "invalid.json"
+    invalid_json.write_text("{", encoding="utf-8")
+    assert _read_cache_manifest(invalid_json) is None
+
+    non_mapping_json = tmp_path / "list.json"
+    non_mapping_json.write_text("[]", encoding="utf-8")
+    assert _read_cache_manifest(non_mapping_json) is None
+
+    entry_root = tmp_path / "entry"
+    artifact_root = entry_root / "artifacts"
+    artifact_root.mkdir(parents=True)
+    artifact = artifact_root / "module.so"
+    artifact.write_text("binary", encoding="utf-8")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+    assert _cached_artifact_paths(entry_root, {"artifacts": "bad"}) is None
+    assert _cached_artifact_paths(entry_root, {"artifacts": [1]}) is None
+    assert (
+        _cached_artifact_paths(entry_root, {"artifacts": [{"name": 1, "sha256": digest}]}) is None
+    )
+    assert (
+        _cached_artifact_paths(
+            entry_root,
+            {"artifacts": [{"name": "module.so", "sha256": "bad"}]},
+        )
+        is None
+    )
+    assert _cached_artifact_paths(
+        entry_root,
+        {"artifacts": [{"name": "module.so", "sha256": digest}]},
+    ) == (artifact,)
 
 
 def test_package_whole_project_reports_zero_successful_retries_concisely(

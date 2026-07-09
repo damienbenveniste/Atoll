@@ -57,6 +57,9 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     assert report["wheel_path"] == f".atoll/dist/{wheel_path.name}"
     assert report["summary"]["islands"] == 1
     assert report["summary"]["symbols"] == RANKING_SYMBOL_COUNT
+    assert report["build"]["cache_status"] == "miss"
+    assert any(timing["name"] == "mypycify" for timing in report["build"]["phase_timings"])
+    assert any(timing["name"] == "build_ext" for timing in report["build"]["phase_timings"])
     assert report["cleanup"]["removed"] == [".atoll/dist/build", ".atoll/dist/install"]
     assert report["cleanup"]["kept"] == []
     assert "Source-clean compile builds a wheel" in report_markdown_path.read_text(encoding="utf-8")
@@ -73,6 +76,46 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
         name.startswith(".atoll/artifacts/_atoll_app_ranking") and name.endswith(".so")
         for name in names
     )
+    artifact_names = sorted(
+        name for name in names if name.startswith(".atoll/artifacts/") and name.endswith(".so")
+    )
+    assert report["summary"]["artifacts"] == len(artifact_names)
+    assert sorted(report["build"]["artifacts"]) == artifact_names
+
+
+def test_compile_uses_cache_on_unchanged_second_run(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A repeated source-clean compile restores unchanged artifacts from cache."""
+    project_root = tmp_path / "simple_project"
+    output_dir = project_root / ".atoll" / "dist"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+
+    first_exit = main(["compile", "app.ranking", "--root", str(project_root)])
+    first_report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    first_capture = capsys.readouterr()
+    second_exit = main(["compile", "app.ranking", "--root", str(project_root)])
+    second_capture = capsys.readouterr()
+
+    wheel_path = next(output_dir.glob("*.whl"))
+    second_report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    assert first_exit == 0
+    assert second_exit == 0
+    assert first_report["build"]["cache_status"] == "miss"
+    assert second_report["build"]["cache_status"] == "hit"
+    assert "compile cache miss" in first_capture.err
+    assert "compile cache hit" in second_capture.err
+    assert [timing["name"] for timing in second_report["build"]["phase_timings"]] == [
+        "cache_lookup",
+        "cache_restore",
+    ]
+    assert not (output_dir / "build").exists()
+    assert not (output_dir / "install").exists()
+    with zipfile.ZipFile(wheel_path) as wheel:
+        assert any(
+            name.startswith(".atoll/artifacts/_atoll_app_ranking") for name in wheel.namelist()
+        )
 
 
 def test_compile_can_keep_install_tree_for_debugging(

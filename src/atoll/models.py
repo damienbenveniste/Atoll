@@ -8,6 +8,7 @@ from typing import Literal
 
 Backend = Literal["mypyc"]
 BlockerSeverity = Literal["hard", "soft", "info"]
+CompileCacheStatus = Literal["disabled", "hit", "miss", "partial"]
 Confidence = Literal["high", "medium", "low"]
 ConstantKind = Literal["literal_constant", "runtime_dynamic", "unknown"]
 DependencyKind = Literal["calls", "uses_global", "inherits", "decorated_by", "imports", "unknown"]
@@ -179,6 +180,15 @@ class SidecarGeneration:
 
 
 @dataclass(frozen=True, slots=True)
+class CompilePhaseTiming:
+    """One measured subphase from a native compilation attempt."""
+
+    name: str
+    duration_seconds: float
+    detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CompileAttempt:
     """Result from compiling one or more generated sidecar modules."""
 
@@ -188,6 +198,8 @@ class CompileAttempt:
     stderr: str
     artifact_paths: tuple[Path, ...]
     duration_seconds: float
+    phase_timings: tuple[CompilePhaseTiming, ...] = ()
+    cache_status: CompileCacheStatus = "disabled"
 
 
 @dataclass(frozen=True, slots=True)

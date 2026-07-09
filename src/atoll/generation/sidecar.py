@@ -18,7 +18,7 @@ from atoll.models import (
     SymbolRecord,
 )
 
-_GENERATOR_VERSION = "atoll-sidecar-v2"
+SIDECAR_GENERATOR_VERSION = "atoll-sidecar-v3"
 _TYPING_IMPORT_MODULES = frozenset(
     {
         "collections",
@@ -83,17 +83,11 @@ def build_sidecar_plan(
         if symbol.id.qualname in included_names
     )
     referenced_names = {name for symbol in included_symbols for name in symbol.referenced_names}
-    imports = tuple(
+    raw_imports = tuple(
         record
         for record in module.imports
         if record.source_text == "from __future__ import annotations"
         or any(name in referenced_names for name in record.imported_names)
-    )
-    type_checking_names = _type_checking_names(
-        referenced_names=referenced_names,
-        imported_names={name for record in imports for name in record.imported_names},
-        module_symbols=module.symbols,
-        included_names=included_names,
     )
     constants = tuple(
         constant
@@ -101,12 +95,22 @@ def build_sidecar_plan(
         if constant.name in referenced_names and constant.kind == "literal_constant"
     )
     source_lines = module.module.path.read_text(encoding="utf-8").splitlines()
-    copied_sources, extra_typing_names = _copied_sources(
+    copied_sources, added_typing_names = _copied_sources(
         source_lines=source_lines,
         symbols=included_symbols,
-        erased_type_arg_names=_erased_type_arg_names(imports),
-        erased_annotation_names=_erased_annotation_names(module.imports, module.constants),
-        imported_names={name for record in imports for name in record.imported_names},
+        erased_type_arg_names=_erased_type_arg_names(raw_imports),
+        erased_annotation_names=_erased_annotation_names(module.imports, module.constants)
+        | _erased_type_arg_names(raw_imports),
+    )
+    runtime_names = _runtime_referenced_names(copied_sources, constants)
+    imports = _runtime_imports(raw_imports, runtime_names)
+    imported_names = {name for record in imports for name in record.imported_names}
+    extra_typing_names = tuple(sorted(set(added_typing_names) - imported_names))
+    type_checking_names = _type_checking_names(
+        referenced_names=referenced_names,
+        imported_names=imported_names,
+        module_symbols=module.symbols,
+        included_names=included_names,
     )
     return SidecarPlan(
         imports=imports,
@@ -208,7 +212,7 @@ def _render_sidecar(
 
 def _source_hash(plan: SidecarPlan, config: EnabledIslandConfig) -> str:
     digest = hashlib.sha256()
-    digest.update(_GENERATOR_VERSION.encode())
+    digest.update(SIDECAR_GENERATOR_VERSION.encode())
     digest.update(config.source_module.encode())
     digest.update(config.sidecar_module.encode())
     for record in plan.imports:
@@ -232,7 +236,6 @@ def _copied_sources(
     symbols: tuple[SymbolRecord, ...],
     erased_type_arg_names: set[str],
     erased_annotation_names: set[str],
-    imported_names: set[str],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     copied_sources: list[str] = []
     extra_typing_names: set[str] = set()
@@ -244,8 +247,34 @@ def _copied_sources(
             erased_annotation_names=erased_annotation_names,
         )
         copied_sources.append(transformed_source)
-        extra_typing_names.update(added_typing_names - imported_names)
+        extra_typing_names.update(added_typing_names)
     return tuple(copied_sources), tuple(sorted(extra_typing_names))
+
+
+def _runtime_referenced_names(
+    copied_sources: tuple[str, ...],
+    constants: tuple[ConstantRecord, ...],
+) -> set[str]:
+    names: set[str] = set()
+    for source in (*copied_sources, *(constant.source_text for constant in constants)):
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        names.update(node.id for node in ast.walk(tree) if isinstance(node, ast.Name))
+    return names
+
+
+def _runtime_imports(
+    imports: tuple[ImportRecord, ...],
+    runtime_names: set[str],
+) -> tuple[ImportRecord, ...]:
+    return tuple(
+        record
+        for record in imports
+        if record.source_text == "from __future__ import annotations"
+        or any(name in runtime_names for name in record.imported_names)
+    )
 
 
 def _render_mypyc_friendly_source(

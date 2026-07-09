@@ -51,9 +51,11 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
-staging, mypyc batch or retry builds, wheel writing, and cleanup. Duplicate macOS linker
-`-rpath` warnings are filtered from terminal output; other native compiler diagnostics are still
-captured in Atoll's build diagnostics.
+staging, cache lookup or restore, mypyc batch or retry builds, wheel writing, and cleanup. Compile
+reports include cache status plus subphase timings such as `mypycify` and `build_ext`. Duplicate
+macOS linker `-rpath` warnings are filtered from terminal output; other native compiler diagnostics
+are still captured in Atoll's build diagnostics. Atoll keeps strict reusable compile and mypy cache
+state under `.atoll/cache/`; `atoll clean --cache` removes it.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic. Module-level typing diagnostics, such as unsupported `TypeVar` keyword

@@ -8,6 +8,7 @@ import pytest
 
 from atoll.models import (
     CompileAttempt,
+    CompilePhaseTiming,
     EnabledIslandConfig,
     IslandRisk,
     PytestRunResult,
@@ -94,6 +95,11 @@ def test_compilation_markdown_hides_generated_input_paths(tmp_path: Path) -> Non
                 stderr="",
                 artifact_paths=(artifact_path,),
                 duration_seconds=0.25,
+                phase_timings=(
+                    CompilePhaseTiming(name="cache_lookup", duration_seconds=0.01, detail="miss"),
+                    CompilePhaseTiming(name="mypycify", duration_seconds=0.20),
+                ),
+                cache_status="miss",
             ),
             verification=(
                 VerifyResult(
@@ -124,9 +130,13 @@ def test_compilation_markdown_hides_generated_input_paths(tmp_path: Path) -> Non
     assert report["tests"] is None
     assert report["summary"]["semantic_tests_run"] is False
     assert report["summary"]["semantic_test_failures"] == 0
+    assert report["build"]["cache_status"] == "miss"
+    assert report["build"]["phase_timings"][0]["name"] == "cache_lookup"
     assert "Sidecar" not in markdown
     assert ".atoll/sidecars" not in markdown
     assert "Generated module" in markdown
+    assert "Cache: miss" in markdown
+    assert "mypycify: 0.200s" in markdown
     assert "semantic equivalence" in markdown
     assert "Semantic tests: not run" in markdown
 

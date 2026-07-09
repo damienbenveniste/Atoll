@@ -7,6 +7,7 @@ import csv
 import hashlib
 import importlib.machinery
 import io
+import json
 import re
 import shutil
 import sys
@@ -15,7 +16,8 @@ import time
 import tomllib
 import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import cast
 
@@ -23,8 +25,20 @@ from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.backends.mypyc import build_sidecars
 from atoll.generation.shim import insert_or_replace_shim, remove_shim
-from atoll.generation.sidecar import default_sidecar_module, expected_sidecar_path, generate_sidecar
-from atoll.models import Blocker, CompileAttempt, EnabledIslandConfig, ModuleId, ModuleScan
+from atoll.generation.sidecar import (
+    SIDECAR_GENERATOR_VERSION,
+    default_sidecar_module,
+    expected_sidecar_path,
+    generate_sidecar,
+)
+from atoll.models import (
+    Blocker,
+    CompileAttempt,
+    CompilePhaseTiming,
+    EnabledIslandConfig,
+    ModuleId,
+    ModuleScan,
+)
 from atoll.project import DiscoveredProject, discover_project
 
 PackageProgress = Callable[[str], None]
@@ -42,6 +56,9 @@ _GENERATED_DIR_NAMES = frozenset(
         "site-packages",
     }
 )
+_COMPILE_CACHE_VERSION = 1
+_CACHE_INPUT_SUFFIXES = frozenset({".py", ".pyi", ".toml"})
+_CACHE_INPUT_NAMES = frozenset({"py.typed"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +86,7 @@ class PackageCommandResult:
     install_tree_kept: bool = False
     cleanup_removed: tuple[Path, ...] = ()
     cleanup_kept: tuple[Path, ...] = ()
+    report_artifact_paths: tuple[Path, ...] = ()
     error: str | None = None
     skipped: tuple[PackageBuildFailure, ...] = ()
     preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
@@ -109,6 +127,24 @@ class _PackageBuildOutcome:
     successful: tuple[EnabledIslandConfig, ...]
     build: CompileAttempt
     skipped: tuple[PackageBuildFailure, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PackageBuildContext:
+    target_project: DiscoveredProject
+    module_name: str | None
+    project_root: Path
+    source_roots: tuple[Path, ...]
+    allow_partial: bool
+    progress: PackageProgress | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CompileCacheLookup:
+    key: str
+    hit: bool
+    artifact_paths: tuple[Path, ...]
+    phase_timings: tuple[CompilePhaseTiming, ...]
 
 
 def execute_package(options: PackageOptions) -> PackageCommandResult:
@@ -158,10 +194,14 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     _progress(options.progress, f"generated sidecars in {_duration(sidecar_started)}")
     outcome = _build_package_islands(
         islands,
-        project_root=build_root,
-        source_roots=staged_source_roots,
-        allow_partial=options.module_name is None,
-        progress=options.progress,
+        _PackageBuildContext(
+            target_project=project,
+            module_name=options.module_name,
+            project_root=build_root,
+            source_roots=staged_source_roots,
+            allow_partial=options.module_name is None,
+            progress=options.progress,
+        ),
     )
     if not outcome.build.success:
         _progress(options.progress, "build failed; keeping build tree for diagnostics")
@@ -184,6 +224,10 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     payload_started = time.perf_counter()
     _progress(options.progress, "placing compiled artifacts into install payload")
     _place_compiled_artifacts(outcome.successful, outcome.build.artifact_paths)
+    report_artifact_paths = _source_clean_report_artifact_paths(
+        project.config.root,
+        outcome.build.artifact_paths,
+    )
     _remove_generated_sidecar_sources(outcome.successful)
     _copy_install_payload(staged_source_roots, install_root)
     _copy_atoll_artifacts(staged_source_roots, install_root)
@@ -219,6 +263,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         install_tree_kept=options.keep_install_tree,
         cleanup_removed=tuple(cleanup_removed_paths),
         cleanup_kept=cleanup_kept,
+        report_artifact_paths=report_artifact_paths,
         skipped=outcome.skipped,
         preflight_skipped=preflight_skipped,
     )
@@ -268,69 +313,352 @@ def _duration(started: float) -> str:
     return f"{time.perf_counter() - started:.2f}s"
 
 
+def _progress_phase_timings(
+    progress: PackageProgress | None,
+    timings: tuple[CompilePhaseTiming, ...],
+) -> None:
+    for timing in timings:
+        detail = f" ({timing.detail})" if timing.detail else ""
+        _progress(progress, f"{timing.name} completed in {timing.duration_seconds:.2f}s{detail}")
+
+
+def _lookup_compile_cache(
+    *,
+    target_project: DiscoveredProject,
+    module_name: str | None,
+    islands: tuple[EnabledIslandConfig, ...],
+) -> _CompileCacheLookup:
+    key = _compile_cache_key(
+        target_project=target_project,
+        module_name=module_name,
+        islands=islands,
+    )
+    cache_root = target_project.config.cache_dir / "compile"
+    lookup_started = time.perf_counter()
+    entry_root = cache_root / key
+    manifest = _read_cache_manifest(entry_root / "manifest.json")
+    if manifest is None or manifest.get("version") != _COMPILE_CACHE_VERSION:
+        return _compile_cache_miss(key, lookup_started, "miss")
+    if manifest.get("key") != key:
+        return _compile_cache_miss(key, lookup_started, "key mismatch")
+    artifacts = _cached_artifact_paths(entry_root, manifest)
+    if artifacts is None:
+        return _compile_cache_miss(key, lookup_started, "stale")
+    lookup_timing = CompilePhaseTiming(
+        name="cache_lookup",
+        duration_seconds=time.perf_counter() - lookup_started,
+        detail="hit",
+    )
+    restore_started = time.perf_counter()
+    restored = tuple(path for path in artifacts if path.exists())
+    restore_timing = CompilePhaseTiming(
+        name="cache_restore",
+        duration_seconds=time.perf_counter() - restore_started,
+        detail=f"{len(restored)} artifact(s)",
+    )
+    if len(restored) != len(artifacts):
+        return _CompileCacheLookup(
+            key=key,
+            hit=False,
+            artifact_paths=(),
+            phase_timings=(
+                lookup_timing,
+                CompilePhaseTiming(
+                    name="cache_restore",
+                    duration_seconds=restore_timing.duration_seconds,
+                    detail="stale",
+                ),
+            ),
+        )
+    return _CompileCacheLookup(
+        key=key,
+        hit=True,
+        artifact_paths=restored,
+        phase_timings=(lookup_timing, restore_timing),
+    )
+
+
+def _compile_cache_miss(
+    key: str,
+    lookup_started: float,
+    detail: str,
+) -> _CompileCacheLookup:
+    return _CompileCacheLookup(
+        key=key,
+        hit=False,
+        artifact_paths=(),
+        phase_timings=(
+            CompilePhaseTiming(
+                name="cache_lookup",
+                duration_seconds=time.perf_counter() - lookup_started,
+                detail=detail,
+            ),
+        ),
+    )
+
+
+def _read_cache_manifest(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw = cast(dict[object, object], data)
+    return {str(key): value for key, value in raw.items()}
+
+
+def _cached_artifact_paths(
+    entry_root: Path,
+    manifest: dict[str, object],
+) -> tuple[Path, ...] | None:
+    raw_artifacts = manifest.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        return None
+    paths: list[Path] = []
+    for raw_artifact in cast(list[object], raw_artifacts):
+        if not isinstance(raw_artifact, dict):
+            return None
+        artifact = cast(dict[object, object], raw_artifact)
+        name = artifact.get("name")
+        digest = artifact.get("sha256")
+        if not isinstance(name, str) or not isinstance(digest, str):
+            return None
+        path = entry_root / "artifacts" / name
+        if not path.exists() or _file_digest(path) != digest:
+            return None
+        paths.append(path)
+    return tuple(paths)
+
+
+def _store_compile_cache(
+    *,
+    cache_root: Path,
+    key: str,
+    artifact_paths: tuple[Path, ...],
+) -> None:
+    if not artifact_paths:
+        return
+    cache_root.mkdir(parents=True, exist_ok=True)
+    entry_root = cache_root / key
+    temp_root = cache_root / f"{key}.tmp"
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+    artifact_root = temp_root / "artifacts"
+    artifact_root.mkdir(parents=True)
+    manifest_artifacts: list[dict[str, str]] = []
+    for artifact in artifact_paths:
+        destination = artifact_root / artifact.name
+        shutil.copy2(artifact, destination)
+        manifest_artifacts.append({"name": artifact.name, "sha256": _file_digest(destination)})
+    manifest = {
+        "version": _COMPILE_CACHE_VERSION,
+        "key": key,
+        "artifacts": manifest_artifacts,
+    }
+    (temp_root / "manifest.json").write_text(
+        f"{json.dumps(manifest, indent=2, sort_keys=True)}\n",
+        encoding="utf-8",
+    )
+    if entry_root.exists():
+        shutil.rmtree(entry_root)
+    temp_root.rename(entry_root)
+
+
+def _compile_cache_key(
+    *,
+    target_project: DiscoveredProject,
+    module_name: str | None,
+    islands: tuple[EnabledIslandConfig, ...],
+) -> str:
+    payload = {
+        "version": _COMPILE_CACHE_VERSION,
+        "python_tag": _python_tag(),
+        "wheel_tag": _wheel_tag(),
+        "extension_suffixes": list(importlib.machinery.EXTENSION_SUFFIXES),
+        "atoll_version": _installed_version("atoll"),
+        "mypy_version": _installed_version("mypy"),
+        "setuptools_version": _installed_version("setuptools"),
+        "sidecar_generator_version": SIDECAR_GENERATOR_VERSION,
+        "module_filter": module_name,
+        "source_tree_digest": _source_tree_digest(target_project),
+        "source_roots": [
+            _path_text(target_project.config.root, source_root)
+            for source_root in target_project.config.source_roots
+        ],
+        "islands": [
+            {
+                "source_module": island.source_module,
+                "sidecar_module": island.sidecar_module,
+                "symbols": list(island.symbols),
+                "sidecar_sha256": _file_digest(island.sidecar_path),
+            }
+            for island in islands
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_tree_digest(project: DiscoveredProject) -> str:
+    digest = hashlib.sha256()
+    for path in _cache_input_paths(project):
+        digest.update(_path_text(project.config.root, path).encode())
+        digest.update(b"\0")
+        digest.update(_file_digest(path).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _cache_input_paths(project: DiscoveredProject) -> tuple[Path, ...]:
+    paths: set[Path] = set()
+    pyproject = project.config.root / "pyproject.toml"
+    if pyproject.exists():
+        paths.add(pyproject)
+    for source_root in project.config.source_roots:
+        for path in source_root.rglob("*"):
+            if not path.is_file() or _is_ignored_cache_input(path, source_root):
+                continue
+            if path.suffix in _CACHE_INPUT_SUFFIXES or path.name in _CACHE_INPUT_NAMES:
+                paths.add(path)
+    return tuple(sorted(paths))
+
+
+def _is_ignored_cache_input(path: Path, source_root: Path) -> bool:
+    relative_parts = path.relative_to(source_root).parts
+    return any(
+        part in _GENERATED_DIR_NAMES
+        or part in {".nox", ".tox", ".venv", "venv"}
+        or part.endswith((".egg-info", ".dist-info"))
+        for part in relative_parts
+    )
+
+
+def _installed_version(package: str) -> str:
+    try:
+        return importlib_metadata.version(package)
+    except importlib_metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _build_package_islands(
     islands: tuple[EnabledIslandConfig, ...],
-    *,
-    project_root: Path,
-    source_roots: tuple[Path, ...],
-    allow_partial: bool,
-    progress: PackageProgress | None,
+    context: _PackageBuildContext,
 ) -> _PackageBuildOutcome:
+    cache_lookup = _lookup_compile_cache(
+        target_project=context.target_project,
+        module_name=context.module_name,
+        islands=islands,
+    )
+    if cache_lookup.hit:
+        _progress(context.progress, f"compile cache hit: {cache_lookup.key[:12]}")
+        _progress_phase_timings(context.progress, cache_lookup.phase_timings)
+        return _PackageBuildOutcome(
+            successful=islands,
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "compile-cache", "restore", cache_lookup.key[:12]),
+                stdout="compile cache hit",
+                stderr="",
+                artifact_paths=cache_lookup.artifact_paths,
+                duration_seconds=sum(
+                    timing.duration_seconds for timing in cache_lookup.phase_timings
+                ),
+                phase_timings=cache_lookup.phase_timings,
+                cache_status="hit",
+            ),
+            skipped=(),
+        )
+    _progress(context.progress, f"compile cache miss: {cache_lookup.key[:12]}")
     batch_started = time.perf_counter()
-    _progress(progress, f"running mypyc batch for {len(islands)} island(s)")
+    _progress(context.progress, f"running mypyc batch for {len(islands)} island(s)")
     batch = build_sidecars(
         tuple(island.sidecar_path for island in islands),
-        project_root=project_root,
-        build_dir=project_root / ".atoll" / "build",
-        source_roots=source_roots,
+        project_root=context.project_root,
+        build_dir=context.project_root / ".atoll" / "build",
+        source_roots=context.source_roots,
+        cache_dir=context.target_project.config.cache_dir / "mypy" / "source-clean",
+    )
+    batch = replace(
+        batch,
+        phase_timings=(*cache_lookup.phase_timings, *batch.phase_timings),
+        cache_status="miss",
     )
     if batch.success:
-        _progress(progress, f"mypyc batch succeeded in {_duration(batch_started)}")
+        cache_store_started = time.perf_counter()
+        _store_compile_cache(
+            cache_root=context.target_project.config.cache_dir / "compile",
+            key=cache_lookup.key,
+            artifact_paths=batch.artifact_paths,
+        )
+        batch = replace(
+            batch,
+            phase_timings=(
+                *batch.phase_timings,
+                CompilePhaseTiming(
+                    name="cache_store",
+                    duration_seconds=time.perf_counter() - cache_store_started,
+                    detail="stored",
+                ),
+            ),
+        )
+        _progress_phase_timings(context.progress, batch.phase_timings)
+        _progress(context.progress, f"mypyc batch succeeded in {_duration(batch_started)}")
         return _PackageBuildOutcome(successful=islands, build=batch, skipped=())
-    if not allow_partial or len(islands) <= 1:
-        _progress(progress, f"mypyc batch failed in {_duration(batch_started)}")
+    if not context.allow_partial or len(islands) <= 1:
+        _progress(context.progress, f"mypyc batch failed in {_duration(batch_started)}")
         return _PackageBuildOutcome(successful=(), build=batch, skipped=())
     _progress(
-        progress,
+        context.progress,
         f"mypyc batch failed in {_duration(batch_started)}; retrying islands individually",
     )
     return _build_package_islands_individually(
         islands,
-        project_root=project_root,
-        source_roots=source_roots,
+        context,
         batch_failure=batch,
-        progress=progress,
     )
 
 
 def _build_package_islands_individually(
     islands: tuple[EnabledIslandConfig, ...],
+    context: _PackageBuildContext,
     *,
-    project_root: Path,
-    source_roots: tuple[Path, ...],
     batch_failure: CompileAttempt,
-    progress: PackageProgress | None,
 ) -> _PackageBuildOutcome:
     successful: list[EnabledIslandConfig] = []
     skipped: list[PackageBuildFailure] = []
     attempts: list[CompileAttempt] = []
     for index, island in enumerate(islands, start=1):
         retry_started = time.perf_counter()
-        _progress(progress, f"retrying {island.source_module} ({index}/{len(islands)})")
+        _progress(context.progress, f"retrying {island.source_module} ({index}/{len(islands)})")
         attempt = build_sidecars(
             (island.sidecar_path,),
-            project_root=project_root,
-            build_dir=project_root / ".atoll" / "retry-builds" / island.sidecar_path.stem,
-            source_roots=source_roots,
+            project_root=context.project_root,
+            build_dir=context.project_root / ".atoll" / "retry-builds" / island.sidecar_path.stem,
+            source_roots=context.source_roots,
+            cache_dir=context.target_project.config.cache_dir / "mypy" / "source-clean",
         )
         attempts.append(attempt)
         if attempt.success:
             successful.append(island)
-            _progress(progress, f"compiled {island.source_module} in {_duration(retry_started)}")
+            _progress(
+                context.progress,
+                f"compiled {island.source_module} in {_duration(retry_started)}",
+            )
             continue
         skipped.append(PackageBuildFailure(island=island, build=attempt))
         _remove_staged_island(island)
-        _progress(progress, f"skipped {island.source_module} in {_duration(retry_started)}")
+        _progress(context.progress, f"skipped {island.source_module} in {_duration(retry_started)}")
     combined = _combine_package_attempts(
         batch_failure=batch_failure,
         attempts=tuple(attempts),
@@ -372,6 +700,11 @@ def _combine_package_attempts(
         artifact_paths=artifact_paths,
         duration_seconds=batch_failure.duration_seconds
         + sum(attempt.duration_seconds for attempt in attempts),
+        phase_timings=(
+            *batch_failure.phase_timings,
+            *(timing for attempt in attempts for timing in attempt.phase_timings),
+        ),
+        cache_status="partial",
     )
 
 
@@ -491,6 +824,13 @@ def _place_compiled_artifacts(
         target_dir.mkdir(parents=True, exist_ok=True)
         for artifact in support_artifacts:
             _copy_if_different(artifact, target_dir / artifact.name)
+
+
+def _source_clean_report_artifact_paths(
+    root: Path,
+    artifact_paths: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    return tuple(root / ".atoll" / "artifacts" / artifact.name for artifact in artifact_paths)
 
 
 def _artifact_dir(island: EnabledIslandConfig) -> Path:
@@ -652,9 +992,13 @@ def _project_metadata(root: Path) -> _ProjectMetadata:
 
 
 def _wheel_tag() -> str:
-    python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    python_tag = _python_tag()
     platform_tag = sysconfig.get_platform().replace("-", "_").replace(".", "_")
     return f"{python_tag}-{python_tag}-{platform_tag}"
+
+
+def _python_tag() -> str:
+    return f"cp{sys.version_info.major}{sys.version_info.minor}"
 
 
 def _wheel_safe_name(value: str) -> str:
@@ -760,6 +1104,13 @@ def _find_module(modules: tuple[ModuleId, ...], module_name: str) -> ModuleId:
         if module.name == module_name:
             return module
     raise ValueError(f"module not found under configured source roots: {module_name}")
+
+
+def _path_text(root: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def _mapping(value: object) -> dict[str, object]:

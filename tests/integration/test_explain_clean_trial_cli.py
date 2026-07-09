@@ -46,8 +46,11 @@ def test_clean_command_removes_cache_and_compiled_artifacts(tmp_path: Path) -> N
     artifact.parent.mkdir(parents=True)
     artifact.write_text("", encoding="utf-8")
     cache_dir = tmp_path / ".atoll" / "cache"
+    compile_cache_dir = cache_dir / "compile"
+    mypy_cache_dir = cache_dir / "mypy" / "source-clean"
     build_dir = tmp_path / ".atoll" / "build"
-    cache_dir.mkdir(parents=True)
+    compile_cache_dir.mkdir(parents=True)
+    mypy_cache_dir.mkdir(parents=True)
     build_dir.mkdir(parents=True)
     write_atoll_config(
         tmp_path,
@@ -67,6 +70,8 @@ def test_clean_command_removes_cache_and_compiled_artifacts(tmp_path: Path) -> N
     assert exit_code == 0
     assert not artifact.exists()
     assert not cache_dir.exists()
+    assert not compile_cache_dir.exists()
+    assert not mypy_cache_dir.exists()
     assert not build_dir.exists()
 
 

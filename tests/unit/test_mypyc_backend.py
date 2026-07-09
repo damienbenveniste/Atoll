@@ -96,6 +96,11 @@ def test_build_sidecars_detects_generated_artifact(
     assert result.success is True
     assert FakeBuildExt.artifact_path is not None
     assert result.artifact_paths == (FakeBuildExt.artifact_path,)
+    assert tuple(timing.name for timing in result.phase_timings) == (
+        "mypycify",
+        "build_ext",
+        "artifact_discovery",
+    )
 
 
 def test_build_sidecars_reports_support_artifacts(

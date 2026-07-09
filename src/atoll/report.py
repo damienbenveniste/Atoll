@@ -11,6 +11,7 @@ from atoll.models import (
     Blocker,
     BlockerSeverity,
     CompileAttempt,
+    CompileCacheStatus,
     Confidence,
     ConstantKind,
     DependencyKind,
@@ -172,8 +173,16 @@ class CompilationBuildReport(TypedDict):
     duration_seconds: float
     stdout: str
     stderr: str
+    cache_status: CompileCacheStatus
+    phase_timings: list[CompilationPhaseTimingReport]
     artifacts: list[str]
     support_artifacts: list[str]
+
+
+class CompilationPhaseTimingReport(TypedDict):
+    name: str
+    duration_seconds: float
+    detail: str | None
 
 
 class CompilationCleanupReport(TypedDict):
@@ -394,6 +403,15 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             "duration_seconds": report_input.build.duration_seconds,
             "stdout": report_input.build.stdout,
             "stderr": report_input.build.stderr,
+            "cache_status": report_input.build.cache_status,
+            "phase_timings": [
+                {
+                    "name": timing.name,
+                    "duration_seconds": timing.duration_seconds,
+                    "detail": timing.detail,
+                }
+                for timing in report_input.build.phase_timings
+            ],
             "artifacts": [_path_text(report_input.root, path) for path in artifact_paths],
             "support_artifacts": [
                 _path_text(report_input.root, path) for path in support_artifacts
@@ -489,9 +507,17 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         "",
         f"- Success: {_yes_no(report['build']['success'])}",
         f"- Command: `{' '.join(report['build']['command'])}`",
+        f"- Cache: {report['build']['cache_status']}",
     ]
     if report["build"]["stderr"]:
         lines.append(f"- Error: `{_first_line(report['build']['stderr'])}`")
+    if report["build"]["phase_timings"]:
+        lines.extend(["", "### Phase Timings", ""])
+        lines.extend(
+            f"- {timing['name']}: {timing['duration_seconds']:.3f}s"
+            + (f" ({timing['detail']})" if timing["detail"] else "")
+            for timing in report["build"]["phase_timings"]
+        )
     if report["build"]["artifacts"]:
         lines.extend(["", "### Artifacts", ""])
         lines.extend(f"- `{artifact}`" for artifact in report["build"]["artifacts"])

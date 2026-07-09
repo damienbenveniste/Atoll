@@ -229,6 +229,43 @@ def test_generate_sidecar_erases_local_type_alias_annotations_for_mypyc(
     assert "NodeID" not in generation.source_text
 
 
+def test_generate_sidecar_prunes_annotation_only_imports_for_mypyc(
+    tmp_path: Path,
+) -> None:
+    """Annotation-only imported types are erased so mypyc does not analyze them."""
+    module_path = tmp_path / "sample.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from heavy.typing_graph import DecisionBranchBuilder",
+                "from runtime.boxes import Box",
+                "",
+                "def wrap(value: DecisionBranchBuilder[int]) -> DecisionBranchBuilder[int]:",
+                "    return Box(value).value",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    module = ModuleId(name="sample", path=module_path)
+    scan = enrich_island_analysis(scan_module(module))
+    island = EnabledIslandConfig(
+        source_module=module.name,
+        source_path=module.path,
+        sidecar_module="sample_atoll",
+        sidecar_path=tmp_path / "sample_atoll.py",
+        symbols=("wrap",),
+    )
+
+    generation = generate_sidecar(scan, island)
+
+    assert "from heavy.typing_graph import DecisionBranchBuilder" not in generation.source_text
+    assert "from runtime.boxes import Box" in generation.source_text
+    assert _imports_from_typing(generation.source_text, "Any")
+    assert "def wrap(value: Any) -> Any:" in generation.source_text
+
+
 def test_generate_sidecar_erases_typing_module_typevar_annotations(
     tmp_path: Path,
 ) -> None:

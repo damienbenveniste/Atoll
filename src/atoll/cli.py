@@ -714,8 +714,10 @@ def _source_clean_report_build(result: PackageCommandResult) -> CompileAttempt:
         command=result.build.command,
         stdout=result.build.stdout,
         stderr=result.build.stderr,
-        artifact_paths=(),
+        artifact_paths=result.report_artifact_paths,
         duration_seconds=result.build.duration_seconds,
+        phase_timings=result.build.phase_timings,
+        cache_status=result.build.cache_status,
     )
 
 
