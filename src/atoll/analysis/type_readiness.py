@@ -1,4 +1,10 @@
-"""Attach type-checker diagnostics to scanned modules and symbols."""
+"""Attach type-checker diagnostics to scanned modules and symbols.
+
+Atoll treats mypy errors inside a symbol as extraction blockers because mypyc
+depends on the same type information. Diagnostics outside symbol line ranges
+stay on the module so reports can surface them without falsely blaming a
+candidate.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +18,12 @@ def attach_mypy_diagnostics(
     modules: tuple[ModuleScan, ...],
     diagnostics: tuple[MypyDiagnostic, ...],
 ) -> tuple[ModuleScan, ...]:
-    """Map mypy diagnostics to symbols by source line range."""
+    """Map mypy diagnostics to symbols by source line range.
+
+    The mapping is intentionally line-based and conservative. It does not try to
+    interpret mypy context notes beyond the scanner's symbol spans, so unmapped
+    diagnostics remain module-level evidence.
+    """
     diagnostics_by_path = _group_diagnostics_by_path(diagnostics)
     return tuple(
         _attach_module_diagnostics(module, diagnostics_by_path.get(module.module.path, ()))

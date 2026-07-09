@@ -1,4 +1,9 @@
-"""Implementation of the `atoll enable` command."""
+"""Implementation of the `atoll enable` command.
+
+Enable prepares an Atoll island by generating a sidecar, inserting or replacing
+the managed source shim, and recording the island in configuration. The module
+also supports enabling every current scan candidate in one operation.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +21,7 @@ from atoll.project import DiscoveredProject, discover_project
 
 @dataclass(frozen=True, slots=True)
 class EnableOptions:
-    """User-facing options for enabling an Atoll island."""
+    """User-facing options for enabling one explicit Atoll island."""
 
     root: Path
     module_name: str
@@ -28,7 +33,7 @@ class EnableOptions:
 
 @dataclass(frozen=True, slots=True)
 class EnableAllOptions:
-    """User-facing options for enabling all scan candidates."""
+    """User-facing options for enabling all current scan candidates."""
 
     root: Path
     module_name: str | None = None
@@ -38,7 +43,11 @@ class EnableAllOptions:
 
 @dataclass(frozen=True, slots=True)
 class EnableCommandResult:
-    """Files and generated text from an enable operation."""
+    """Prepared or applied files from enabling one island.
+
+    The result includes both generated sidecar source and the managed shim edit
+    so dry-run callers can show exactly what would change before writing.
+    """
 
     island: EnabledIslandConfig
     sidecar: SidecarGeneration
@@ -49,7 +58,7 @@ class EnableCommandResult:
 
 @dataclass(frozen=True, slots=True)
 class EnableAllCommandResult:
-    """Files and generated text from an all-candidates enable operation."""
+    """Prepared or applied results from enabling all selected candidates."""
 
     enabled: tuple[EnableCommandResult, ...]
     applied: bool
@@ -61,7 +70,11 @@ class EnableAllCommandResult:
 
 
 def execute_enable(options: EnableOptions) -> EnableCommandResult:
-    """Generate a sidecar, insert a managed shim, and update `.atoll.toml`."""
+    """Generate a sidecar, insert a managed shim, and update `.atoll.toml`.
+
+    Dry-run mode performs discovery, scanning, sidecar rendering, and shim diff
+    generation without mutating the source module, sidecar path, or config file.
+    """
     project = discover_project(options.root)
     module = _find_module(project.modules, options.module_name)
     scan = enrich_island_analysis(scan_module(module))
@@ -79,7 +92,11 @@ def execute_enable(options: EnableOptions) -> EnableCommandResult:
 
 
 def execute_enable_all(options: EnableAllOptions) -> EnableAllCommandResult:
-    """Enable every scan candidate, grouped into one sidecar per source module."""
+    """Enable every scan candidate, grouped into one sidecar per source module.
+
+    Existing islands for selected modules are replaced atomically in the written
+    config, while islands for other modules are preserved.
+    """
     project = discover_project(options.root)
     scans = _candidate_scans(project, options.module_name)
     results = tuple(

@@ -1,4 +1,9 @@
-"""Implementation of the `atoll clean` command."""
+"""Implementation of the `atoll clean` command.
+
+Cleaning is limited to Atoll-owned cache, build, and compiled sidecar artifacts.
+The command discovers configured islands before artifact deletion so it does not
+remove unrelated extension modules in the project tree.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +17,7 @@ from atoll.config import load_enabled_islands
 
 @dataclass(frozen=True, slots=True)
 class CleanOptions:
-    """User-facing options for removing Atoll-generated outputs."""
+    """User-facing options for selecting which Atoll outputs to remove."""
 
     root: Path
     cache: bool = False
@@ -22,13 +27,18 @@ class CleanOptions:
 
 @dataclass(frozen=True, slots=True)
 class CleanCommandResult:
-    """Paths removed by a clean operation."""
+    """Paths that no longer exist after a clean operation completes."""
 
     removed: tuple[Path, ...]
 
 
 def execute_clean(options: CleanOptions) -> CleanCommandResult:
-    """Remove Atoll cache/build outputs and compiled sidecar artifacts."""
+    """Remove selected Atoll cache/build outputs and compiled artifacts.
+
+    With no specific flag, the default is to clear cache/build state. Artifact
+    removal is opt-in through `artifacts` or `all_outputs` because compiled files
+    may be useful for later inspection.
+    """
     root = options.root.resolve()
     remove_cache = options.cache or options.all_outputs or not options.artifacts
     remove_artifacts = options.artifacts or options.all_outputs

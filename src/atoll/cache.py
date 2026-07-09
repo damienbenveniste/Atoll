@@ -1,4 +1,10 @@
-"""File-hash cache for Atoll's first-pass AST scans."""
+"""File-hash cache for Atoll's first-pass AST scans.
+
+The cache stores only deterministic scanner facts derived from source files. It
+is invalidated by file hash, Python version, module name, and scanner version so
+later enrichment can safely recompute mypy diagnostics and candidate analysis on
+top of cached AST records.
+"""
 
 from __future__ import annotations
 
@@ -28,11 +34,19 @@ SCANNER_VERSION = "1"
 
 
 class CacheStats(TypedDict):
+    """Hit and miss counts returned with a cached scan run."""
+
     hits: int
     misses: int
 
 
 class BlockerCacheEntry(TypedDict):
+    """JSON-safe representation of a `Blocker`.
+
+    The symbol identity is split into nullable module and qualname fields because
+    module-level blockers do not belong to a concrete symbol.
+    """
+
     severity: BlockerSeverity
     code: str
     message: str
@@ -42,6 +56,8 @@ class BlockerCacheEntry(TypedDict):
 
 
 class ImportCacheEntry(TypedDict):
+    """Cached top-level import record used for dependency and sidecar analysis."""
+
     source_text: str
     imported_names: list[str]
     module: str | None
@@ -51,6 +67,8 @@ class ImportCacheEntry(TypedDict):
 
 
 class ConstantCacheEntry(TypedDict):
+    """Cached top-level assignment record and its literal-safety classification."""
+
     name: str
     kind: ConstantKind
     source_text: str
@@ -59,6 +77,13 @@ class ConstantCacheEntry(TypedDict):
 
 
 class SymbolCacheEntry(TypedDict):
+    """Cached AST facts for a function, class, or simple method.
+
+    The payload intentionally excludes mypy diagnostics and candidate data
+    because those are enrichment outputs that can change without the source file
+    itself changing.
+    """
+
     module: str
     qualname: str
     kind: SymbolKind
@@ -80,6 +105,8 @@ class SymbolCacheEntry(TypedDict):
 
 
 class ModuleScanCacheEntry(TypedDict):
+    """Cached first-pass scan for one module before enrichment."""
+
     module_name: str
     path: str
     imports: list[ImportCacheEntry]
@@ -90,6 +117,8 @@ class ModuleScanCacheEntry(TypedDict):
 
 
 class FileCacheEntry(TypedDict):
+    """One indexed source file and the scanner inputs that validate its cache."""
+
     path: str
     module_name: str
     sha256: str
@@ -99,6 +128,8 @@ class FileCacheEntry(TypedDict):
 
 
 class CacheIndex(TypedDict):
+    """Root cache file mapping relative source paths to scan entries."""
+
     version: Literal[1]
     files: dict[str, FileCacheEntry]
 
@@ -107,7 +138,12 @@ def scan_modules_with_cache(
     config: ProjectConfig,
     modules: tuple[ModuleId, ...],
 ) -> tuple[tuple[ModuleScan, ...], CacheStats]:
-    """Return first-pass scans, reusing cached AST facts when file hashes match."""
+    """Return first-pass scans, reusing cached AST facts when inputs match.
+
+    The function updates the cache index after scanning misses. It does not cache
+    mypy diagnostics, dependency edges, candidate scores, or reports; callers
+    must run those enrichment phases on the returned scans every time.
+    """
     index = _read_index(config.cache_dir / "index.json")
     files = dict(index["files"])
     scans: list[ModuleScan] = []
@@ -131,7 +167,11 @@ def scan_modules_with_cache(
 
 
 def clear_scan_cache(root: Path) -> None:
-    """Remove the file-hash scan cache for `root`."""
+    """Remove the file-hash scan cache for `root` if it exists.
+
+    This is a best-effort cleanup helper used by commands that want a fresh AST
+    scan. Missing cache files are treated as already clean.
+    """
     index = root.resolve() / ".atoll" / "cache" / "index.json"
     if index.exists():
         index.unlink()

@@ -1,4 +1,10 @@
-"""Conservative island clustering and scoring for Atoll scans."""
+"""Conservative island clustering and scoring for enriched Atoll scans.
+
+This module turns raw symbol facts into recommendations, not guarantees. It
+propagates blockers through local calls, scores typed and dependency-light
+function clusters, and records poison-radius explanations so users understand
+why nearby code was rejected.
+"""
 
 from __future__ import annotations
 
@@ -24,7 +30,12 @@ _HIGH_CONFIDENCE_SCORE = 90
 
 
 def enrich_island_analysis(module: ModuleScan) -> ModuleScan:
-    """Attach dependency edges, island candidates, and poison-radius records."""
+    """Attach dependency edges, island candidates, and poison-radius records.
+
+    Enrichment is pure: it returns a replacement `ModuleScan` and does not mutate
+    the input scan. Candidate selection remains conservative so later build,
+    verify, and target-test gates can provide stronger proof.
+    """
     symbols = _attach_dynamic_global_blockers(module)
     module_with_blockers = replace(module, symbols=symbols)
     edges = build_dependency_edges(module_with_blockers)

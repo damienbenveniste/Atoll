@@ -50,8 +50,43 @@ These rules apply to every code, documentation, and configuration change in this
 ## Documentation Rules
 
 - Update `README.md`, docs, examples, and tests when public behavior changes.
-- Add docstrings to public modules, classes, functions, and methods when behavior, invariants, side effects, or error handling are not obvious from names and types.
-- Keep docstrings useful: explain why the code exists, what it guarantees, and what it touches. Do not add boilerplate that restates the signature.
+- Treat docstrings as part of the public contract for the package. When adding or
+  changing behavior, document the operational promise the code makes, the
+  boundaries it relies on, and the failure modes a caller or maintainer must
+  understand.
+- Add or update module docstrings for public modules and for internal modules
+  that own non-obvious behavior. A module docstring should state the module's
+  responsibility, its main collaborators, and what it deliberately does not own.
+- Add or update class docstrings for public classes, dataclasses, and structured
+  state used across modules. Class docstrings should describe invariants,
+  lifecycle expectations, mutability, and whether instances are safe to persist,
+  compare, serialize, or pass across command boundaries.
+- Add or update function and method docstrings when the name and type signature
+  do not fully explain behavior. Cover side effects, filesystem writes, command
+  execution, subprocess assumptions, cache behavior, generated files, external
+  tool requirements, and error handling.
+- Document CLI command handlers and workflow entry points with enough context for
+  a maintainer to understand what files they read or write, which validations
+  they perform, and what user-visible output or exit behavior they produce.
+- For analysis, generation, and runtime verification code, document conservative
+  assumptions, false-positive or false-negative tradeoffs, ordering guarantees,
+  and how partial failure is reported.
+- For return objects, report structures, and stable mappings, document the
+  meaning of fields whose semantics are not obvious from their names. Prefer
+  precise field descriptions over generic "data container" wording.
+- For exceptions and validation failures, document what triggers the failure and
+  whether callers should recover, retry, surface the message directly, or treat
+  it as a programming error.
+- Keep docstrings close to the code they explain and update them in the same
+  change as the behavior. A behavior change with stale docstrings is incomplete.
+- Write docstrings for maintainers, not for linters. Avoid boilerplate that
+  repeats the signature, obvious parameter names, or vague claims such as
+  "handles the operation." State the concrete guarantee instead.
+- Include small examples only when they clarify a public API, CLI behavior, or
+  tricky invariant. Examples must be realistic, deterministic, and runnable from
+  the repository context.
+- Do not use docstrings to describe planned behavior, speculative architecture,
+  implementation roadmaps, or tasks that are not true in the current code.
 - Keep examples small, realistic, and runnable.
 - Do not document future behavior as if it works today.
 

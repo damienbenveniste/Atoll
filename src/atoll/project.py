@@ -1,4 +1,9 @@
-"""Project discovery and module-name resolution for Atoll scans."""
+"""Project discovery and module-name resolution for Atoll scans.
+
+Discovery resolves source roots, filters generated/test directories, and returns
+importable module names without importing target-project code. The resulting
+configuration is shared by scan, generation, build, and verification commands.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +35,11 @@ IGNORED_DIR_NAMES = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class DiscoveredProject:
-    """Resolved project configuration plus importable modules."""
+    """Resolved project configuration plus importable modules.
+
+    `modules` is sorted by import name for deterministic scans and reports. The
+    object is immutable so command handlers can pass it between phases safely.
+    """
 
     config: ProjectConfig
     modules: tuple[ModuleId, ...]
@@ -56,7 +65,11 @@ def discover_project(
     source_roots: Sequence[Path] = (),
     max_files: int | None = None,
 ) -> DiscoveredProject:
-    """Discover Python modules under Atoll source roots."""
+    """Discover Python modules under Atoll source roots.
+
+    Generated caches, build outputs, virtual environments, and tests are skipped.
+    `max_files` provides a deterministic early stop for exploratory scans.
+    """
     config = resolve_project_config(root, source_roots)
     modules = tuple(_iter_modules(config.source_roots, max_files=max_files))
     return DiscoveredProject(config=config, modules=modules)

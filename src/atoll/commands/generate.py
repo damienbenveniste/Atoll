@@ -1,4 +1,9 @@
-"""Implementation of the `atoll generate` command."""
+"""Implementation of the `atoll generate` command.
+
+Generate refreshes sidecar source for configured islands. In check mode it only
+reports missing or stale sidecars, allowing CI to verify generated files without
+changing the working tree.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ from atoll.project import discover_project
 
 @dataclass(frozen=True, slots=True)
 class GenerateOptions:
-    """User-facing options for sidecar generation."""
+    """User-facing options for sidecar generation or stale checks."""
 
     root: Path
     module_name: str | None = None
@@ -23,14 +28,19 @@ class GenerateOptions:
 
 @dataclass(frozen=True, slots=True)
 class GenerateCommandResult:
-    """Generated sidecars and stale files."""
+    """Generated sidecars plus stale or missing paths found in check mode."""
 
     generated: tuple[SidecarGeneration, ...]
     stale_paths: tuple[Path, ...]
 
 
 def execute_generate(options: GenerateOptions) -> GenerateCommandResult:
-    """Generate or check all enabled sidecars."""
+    """Generate or check all enabled sidecars.
+
+    `module_name` narrows work to one configured source module. When `check` is
+    false, generated source is written to disk and `stale_paths` is empty because
+    the command has already reconciled the files.
+    """
     project = discover_project(options.root)
     generations = tuple(
         _generate_for_island(island)

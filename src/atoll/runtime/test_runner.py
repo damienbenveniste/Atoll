@@ -1,4 +1,9 @@
-"""Run target-project pytest gates with Atoll routing controls."""
+"""Run target-project pytest gates with Atoll routing controls.
+
+Trial mode uses this module to execute supported pytest commands in a spawned
+child process. The child receives an adjusted `PYTHONPATH` and optional
+`ATOLL_REQUIRE_COMPILED` flag so tests exercise the overlay routing path.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +24,11 @@ def run_pytest_command(
     source_roots: tuple[Path, ...],
     require_compiled: bool,
 ) -> PytestRunResult:
-    """Run a supported pytest command in the target project environment."""
+    """Run a supported pytest command in a spawned target-project process.
+
+    The parent process receives only the normalized command and exit code; pytest
+    output remains attached to the child process streams.
+    """
     command_parts = parse_pytest_command(command)
     context = get_context("spawn")
     process = context.Process(
@@ -42,7 +51,11 @@ def run_pytest_command(
 
 
 def parse_pytest_command(command: str) -> tuple[str, ...]:
-    """Parse and validate a supported pytest command."""
+    """Parse and validate a supported pytest command string.
+
+    Only `pytest ...` and `python -m pytest ...` forms are accepted so trial mode
+    does not execute arbitrary shell commands.
+    """
     command_parts = tuple(shlex.split(command))
     _pytest_args(command_parts)
     return command_parts

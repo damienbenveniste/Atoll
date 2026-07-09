@@ -1,4 +1,10 @@
-"""Conservative same-module dependency graph construction."""
+"""Conservative same-module dependency graph construction.
+
+Edges model what copied sidecar code may need at runtime. The graph links direct
+same-module calls with high confidence, imported boundaries with medium
+confidence, and unresolved globals with low confidence so candidate scoring can
+prefer explainable, local clusters.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +12,12 @@ from atoll.models import ConstantRecord, DependencyEdge, ImportRecord, ModuleSca
 
 
 def build_dependency_edges(module: ModuleScan) -> tuple[DependencyEdge, ...]:
-    """Build same-module call, import-boundary, and global-use edges."""
+    """Build dependency edges for top-level function symbols in a module.
+
+    The function intentionally ignores classes and methods as edge sources for
+    V1 candidate clustering. It uses scanner-provided name facts rather than AST
+    re-traversal so dependency analysis stays aligned with cached scan output.
+    """
     symbol_by_name = {symbol.id.qualname: symbol.id for symbol in module.symbols}
     imported_names = _imported_name_map(module.imports)
     constants = {constant.name: constant for constant in module.constants}

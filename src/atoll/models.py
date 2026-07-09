@@ -1,4 +1,9 @@
-"""Typed data structures for Atoll's source analysis pipeline."""
+"""Typed contracts shared by Atoll analysis, generation, build, and reporting.
+
+The dataclasses in this module are immutable handoff objects. They keep raw
+source facts, conservative analysis decisions, and runtime/build evidence
+separate so command handlers can enrich data without mutating earlier phases.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +24,13 @@ Visibility = Literal["public", "private"]
 
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
-    """Resolved project settings used by scan commands."""
+    """Resolved project settings for one Atoll invocation.
+
+    Paths are absolute after discovery. `source_roots` controls importable module
+    discovery, while `cache_dir` and `report_dir` are Atoll-owned output
+    locations under the project root unless configuration explicitly overrides
+    them.
+    """
 
     root: Path
     source_roots: tuple[Path, ...]
@@ -31,7 +42,13 @@ class ProjectConfig:
 
 @dataclass(frozen=True, slots=True)
 class EnabledIslandConfig:
-    """A configured Atoll island that can be generated, built, and verified."""
+    """Persistent configuration for one Atoll-managed source module.
+
+    The source module keeps the managed shim, the sidecar module contains copied
+    symbols, and `symbols` names the exported top-level functions that should be
+    rebound at runtime. Disabled islands remain in configuration for auditability
+    but are skipped by generation, build, and verification commands.
+    """
 
     source_module: str
     source_path: Path
@@ -43,7 +60,11 @@ class EnabledIslandConfig:
 
 @dataclass(frozen=True, slots=True)
 class ModuleId:
-    """Stable identifier for a Python module in a source root."""
+    """Stable import name and filesystem path for a discovered Python module.
+
+    The `name` is the importable dotted module name relative to a configured
+    source root. The `path` points at the source file scanned for AST facts.
+    """
 
     name: str
     path: Path
@@ -51,20 +72,31 @@ class ModuleId:
 
 @dataclass(frozen=True, slots=True)
 class SymbolId:
-    """Stable identifier for a top-level symbol or simple method."""
+    """Stable symbol identity within a scanned module.
+
+    `qualname` is limited to top-level functions/classes and simple
+    `Class.method` names because Atoll V1 does not extract nested symbols. The
+    `stable_id` property is the report-facing identifier used across JSON and
+    Markdown output.
+    """
 
     module: str
     qualname: str
 
     @property
     def stable_id(self) -> str:
-        """Return the report-facing `module::qualname` identifier."""
+        """Return the stable report-facing `module::qualname` identifier text used in reports."""
         return f"{self.module}::{self.qualname}"
 
 
 @dataclass(frozen=True, slots=True)
 class Blocker:
-    """A reason a symbol or module is risky for native sidecar extraction."""
+    """Conservative reason a module or symbol should not be compiled blindly.
+
+    Hard blockers prevent candidate extraction, while soft and info blockers
+    explain risk that may still be useful in reports. `symbol` is absent only for
+    module-level conditions that cannot be tied to a specific symbol.
+    """
 
     severity: BlockerSeverity
     code: str
@@ -75,7 +107,12 @@ class Blocker:
 
 @dataclass(frozen=True, slots=True)
 class MypyDiagnostic:
-    """One parsed mypy diagnostic, optionally mapped back to a symbol."""
+    """One parsed mypy diagnostic, optionally mapped back to a scanned symbol.
+
+    Paths are resolved before storage so diagnostics can be grouped without
+    depending on the current working directory. A mapped error also becomes a
+    hard blocker on the owning symbol during type-readiness enrichment.
+    """
 
     path: Path
     line: int
@@ -88,7 +125,12 @@ class MypyDiagnostic:
 
 @dataclass(frozen=True, slots=True)
 class ImportRecord:
-    """Top-level import statement and the names it binds in the module."""
+    """Top-level import statement captured exactly enough for sidecar copying.
+
+    `source_text` preserves the original statement for generated sidecars, while
+    `imported_names` records the names made available in the module namespace for
+    dependency analysis.
+    """
 
     source_text: str
     imported_names: tuple[str, ...]
@@ -100,7 +142,12 @@ class ImportRecord:
 
 @dataclass(frozen=True, slots=True)
 class ConstantRecord:
-    """Top-level assignment classification used by later island extraction."""
+    """Top-level assignment classified for safe reuse in generated sidecars.
+
+    Literal constants can be copied into sidecars. Dynamic or unknown constants
+    remain visible to analysis so users can see why a global dependency blocked
+    or raised the risk of extraction.
+    """
 
     name: str
     kind: ConstantKind
@@ -111,7 +158,13 @@ class ConstantRecord:
 
 @dataclass(frozen=True, slots=True)
 class SymbolRecord:
-    """AST-derived facts for one function, class, or simple method."""
+    """AST-derived facts for one function, class, or simple method.
+
+    The scanner records source locations, type-readiness signals, referenced
+    names, and local blockers without executing project code. Later phases attach
+    mypy diagnostics, dependency edges, and candidate decisions by replacing this
+    immutable record.
+    """
 
     id: SymbolId
     kind: SymbolKind
@@ -135,7 +188,12 @@ class SymbolRecord:
 
 @dataclass(frozen=True, slots=True)
 class DependencyEdge:
-    """A conservative dependency edge from one symbol to another boundary."""
+    """Conservative dependency edge from one symbol to another boundary.
+
+    Destinations are either another `SymbolId` in the same module or a string for
+    imports, constants, and unresolved globals. `confidence` documents whether
+    the edge is a direct AST fact or a lower-confidence boundary inference.
+    """
 
     src: SymbolId
     dst: SymbolId | str
@@ -146,7 +204,12 @@ class DependencyEdge:
 
 @dataclass(frozen=True, slots=True)
 class IslandCandidate:
-    """A connected cluster that appears safe and useful to compile together."""
+    """Connected function cluster that appears useful to compile together.
+
+    Candidates are heuristic recommendations, not proof of native compatibility.
+    Build, verification, and target tests are still required before treating a
+    candidate as deployable.
+    """
 
     source_module: ModuleId
     symbols: tuple[SymbolId, ...]
@@ -161,7 +224,11 @@ class IslandCandidate:
 
 @dataclass(frozen=True, slots=True)
 class PoisonRadius:
-    """Report which clean candidates are affected by a rejected symbol."""
+    """Explain how a rejected symbol contaminates otherwise clean candidates.
+
+    The radius is report-only evidence: it helps users understand why a nearby
+    candidate is risky, but it does not mutate the original blockers or scores.
+    """
 
     poison: SymbolId
     impacted: tuple[SymbolId, ...]
@@ -170,7 +237,12 @@ class PoisonRadius:
 
 @dataclass(frozen=True, slots=True)
 class SidecarGeneration:
-    """Generated sidecar source and metadata for one enabled island."""
+    """Generated sidecar source and metadata for one enabled island.
+
+    The source text is deterministic for the current generator version and input
+    scan. `source_hash` is embedded into the generated file so stale sidecars can
+    be detected without importing project code.
+    """
 
     config: EnabledIslandConfig
     included_symbols: tuple[str, ...]
@@ -180,7 +252,13 @@ class SidecarGeneration:
 
 @dataclass(frozen=True, slots=True)
 class CompileAttempt:
-    """Result from compiling one or more generated sidecar modules."""
+    """Evidence from one mypyc build attempt.
+
+    Commands capture the invoked build shape, stdout/stderr preserve diagnostics,
+    and `artifact_paths` lists extension outputs that were newly produced or
+    modified. A failed attempt keeps enough detail for report rendering and CLI
+    error messages without raising through command handlers.
+    """
 
     success: bool
     command: tuple[str, ...]
@@ -192,7 +270,13 @@ class CompileAttempt:
 
 @dataclass(frozen=True, slots=True)
 class VerifyResult:
-    """Runtime routing verification for an enabled Atoll island."""
+    """Runtime routing verification for an enabled Atoll island.
+
+    Verification imports the source module, inspects the managed shim status, and
+    records whether exported symbols were rebound to the sidecar. `error` is
+    populated when the island is inactive, not compiled when required, or
+    otherwise fails the routing contract.
+    """
 
     source_module: str
     sidecar_module: str
@@ -205,7 +289,12 @@ class VerifyResult:
 
 @dataclass(frozen=True, slots=True)
 class PytestRunResult:
-    """Result from a target-project pytest gate."""
+    """Result from a target-project pytest gate.
+
+    The command is normalized before execution and the success flag is derived
+    only from the child process exit code. Captured test output remains owned by
+    pytest and is not stored in this lightweight result.
+    """
 
     command: tuple[str, ...]
     exit_code: int
@@ -214,7 +303,12 @@ class PytestRunResult:
 
 @dataclass(frozen=True, slots=True)
 class ModuleScan:
-    """Complete first-pass scan result for one Python module."""
+    """Complete analysis state for one Python module.
+
+    Initial scans contain AST facts and module blockers. Later enrichment adds
+    type diagnostics, dependency edges, candidates, and poison-radius records
+    while preserving the same immutable shape for reports and commands.
+    """
 
     module: ModuleId
     imports: tuple[ImportRecord, ...]
@@ -230,7 +324,12 @@ class ModuleScan:
 
 @dataclass(frozen=True, slots=True)
 class ScanResult:
-    """Project-wide result produced by `atoll scan`."""
+    """Project-wide result produced by `atoll scan`.
+
+    The result binds the resolved configuration to the enriched module scans used
+    for JSON and Markdown reports. It intentionally excludes generated sidecar or
+    build artifacts, which are owned by separate command results.
+    """
 
     config: ProjectConfig
     modules: tuple[ModuleScan, ...]
