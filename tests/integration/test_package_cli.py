@@ -25,8 +25,8 @@ from atoll.runtime.verify import verify_islands
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXIT_USAGE = 2
-RANKING_SYMBOL_COUNT = 3
-TYPEVAR_FIXTURE_SYMBOL_COUNT = 2
+RANKING_SYMBOL_COUNT = 1
+REJECTED_SYMBOL_COUNT = 2
 
 
 def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
@@ -58,6 +58,14 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     assert report["wheel_path"] == f".atoll/dist/{wheel_path.name}"
     assert report["summary"]["islands"] == 1
     assert report["summary"]["symbols"] == RANKING_SYMBOL_COUNT
+    assert report["summary"]["native_ready_symbols"] == 1
+    assert report["summary"]["native_rejected_symbols"] == REJECTED_SYMBOL_COUNT
+    readiness_by_symbol = {
+        readiness["symbol"]: readiness for readiness in report["native_readiness"]
+    }
+    assert readiness_by_symbol["normalize_features"]["eligible"] is True
+    assert readiness_by_symbol["score_user"]["eligible"] is False
+    assert readiness_by_symbol["rank_candidates"]["eligible"] is False
     assert report["build"]["cache_status"] == "miss"
     assert any(timing["name"] == "mypycify" for timing in report["build"]["phase_timings"])
     assert any(timing["name"] == "build_ext" for timing in report["build"]["phase_timings"])
@@ -166,7 +174,7 @@ def test_compile_can_keep_install_tree_for_debugging(
                     source_path=install_source,
                     sidecar_module="app._atoll_app_ranking",
                     sidecar_path=install_root / ".atoll" / "sidecars" / "_atoll_app_ranking.py",
-                    symbols=("normalize_features", "score_user", "rank_candidates"),
+                    symbols=("normalize_features",),
                 ),
             ),
         ),
@@ -176,16 +184,16 @@ def test_compile_can_keep_install_tree_for_debugging(
     assert result.error is None
     assert result.compiled is True
     ranking = importlib.import_module("app.ranking")
-    score_user = ranking.score_user
-    native_target = score_user.__atoll_compiled_target__
-    assert inspect.isfunction(score_user)
-    wrapped_score_user = inspect.unwrap(score_user)
-    assert inspect.signature(score_user) == inspect.signature(wrapped_score_user)
-    assert score_user.__name__ == "score_user"
-    assert score_user.__qualname__ == "score_user"
-    assert score_user.__module__ == "app.ranking"
-    assert score_user.__doc__ == "Score one user from activity and event count."
-    assert score_user.__annotations__ == wrapped_score_user.__annotations__
+    normalize_features = ranking.normalize_features
+    native_target = normalize_features.__atoll_compiled_target__
+    assert inspect.isfunction(normalize_features)
+    wrapped_normalize_features = inspect.unwrap(normalize_features)
+    assert inspect.signature(normalize_features) == inspect.signature(wrapped_normalize_features)
+    assert normalize_features.__name__ == "normalize_features"
+    assert normalize_features.__qualname__ == "normalize_features"
+    assert normalize_features.__module__ == "app.ranking"
+    assert normalize_features.__doc__ == "Normalize feature values by their total."
+    assert normalize_features.__annotations__ == wrapped_normalize_features.__annotations__
     assert native_target.__module__ == "app._atoll_app_ranking"
     assert not hasattr(ranking, "_atoll_bind_compiled")
     assert not hasattr(ranking, "_atoll_functools")
@@ -293,13 +301,20 @@ def test_compile_reports_preflight_skipped_modules(
     assert report["preflight_blockers"][0]["module"] == "pkg.blocked"
 
 
-def test_compile_attempts_clean_function_in_typevar_blocked_module(
+def test_compile_rejects_typevar_erased_functions_before_mypyc(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Module-level TypeVar blockers do not prevent compiling unrelated clean functions."""
+    """TypeVar-erased generated functions are not reported as native compilation."""
     (tmp_path / "src" / "pkg").mkdir(parents=True)
     (tmp_path / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        "\n".join(["[project]", 'name = "pkg"', 'version = "0.1.0"', ""]),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / ".atoll" / "dist"
+    output_dir.mkdir(parents=True)
+    (output_dir / "pkg-0.1.0-cp311-cp311-macosx_11_0_arm64.whl").write_bytes(b"stale")
     (tmp_path / "src" / "pkg" / "mod.py").write_text(
         "\n".join(
             [
@@ -324,12 +339,15 @@ def test_compile_attempts_clean_function_in_typevar_blocked_module(
 
     captured = capsys.readouterr()
     report = json.loads((tmp_path / ".atoll" / "compile-report.json").read_text())
-    assert exit_code == 0
-    assert "Atoll source-clean compile built 1 module(s) and 2 symbol(s)." in captured.out
-    assert "mypy/mypyc rejects typing constructs" not in captured.out
-    assert report["success"] is True
+    assert exit_code == 1
+    assert "Rejected 2 scan candidate symbol(s)" in captured.out
+    assert "mypyc was not invoked" in captured.out
+    assert report["success"] is False
     assert report["summary"]["preflight_blockers"] == 0
-    assert report["summary"]["symbols"] == TYPEVAR_FIXTURE_SYMBOL_COUNT
+    assert report["summary"]["symbols"] == 0
+    assert report["summary"]["native_rejected_symbols"] == REJECTED_SYMBOL_COUNT
+    assert report["build"]["command"] == []
+    assert not tuple(output_dir.glob("*.whl"))
 
 
 def test_compile_in_place_rejects_output(

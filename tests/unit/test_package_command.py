@@ -20,6 +20,7 @@ from atoll.project import DiscoveredProject, discover_project
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXPECTED_REBUILDS = 2
 EXPECTED_PARTIAL_CACHE_BACKEND_CALLS = 3
+EXPECTED_READINESS_COUNT = 2
 
 
 class _Metadata(Protocol):
@@ -733,11 +734,11 @@ def test_package_whole_project_reports_zero_successful_retries_concisely(
     )
 
 
-def test_package_attempts_typevar_blocked_selected_module(
+def test_package_rejects_trivial_selected_module_before_backend(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Module-level TypeVar blockers do not prevent trying clean candidate sidecars."""
+    """Generated candidates without repeated native work never reach mypyc."""
     project_root = tmp_path / "project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -788,19 +789,22 @@ def test_package_attempts_typevar_blocked_selected_module(
     )
 
     assert result.success is False
-    assert build_calls
-    assert result.error == "MYPYC_TYPE_ERROR: generated sidecar failed"
+    assert build_calls == []
+    assert result.error is not None
+    assert "No performance-worthy native islands" in result.error
     assert result.preflight_skipped == ()
-    assert (output_dir / "build").exists()
-    assert result.cleanup_removed == (output_dir / "install",)
-    assert result.cleanup_kept == (output_dir / "build",)
+    assert not (output_dir / "build").exists()
+    assert result.cleanup_removed == (output_dir / "build", output_dir / "install")
+    assert result.cleanup_kept == ()
+    assert len(result.native_readiness) == EXPECTED_READINESS_COUNT
+    assert all(not readiness.eligible for readiness in result.native_readiness)
 
 
-def test_package_whole_project_attempts_typevar_blocked_modules(
+def test_package_whole_project_skips_non_native_ready_modules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Whole-project package mode tries clean candidates in modules with TypeVar blockers."""
+    """Whole-project mode builds ready kernels and omits rejected modules."""
     project_root = tmp_path / "project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -859,17 +863,22 @@ def test_package_whole_project_attempts_typevar_blocked_modules(
     assert result.install_tree_kept is True
     assert result.cleanup_removed == (output_dir / "build",)
     assert result.cleanup_kept == (output_dir / "install",)
-    assert {island.source_module for island in result.islands} == {
-        "app.blocked",
-        "app.ranking",
-    }
+    assert {island.source_module for island in result.islands} == {"app.ranking"}
+    assert result.islands[0].symbols == ("normalize_features",)
     assert result.preflight_skipped == ()
     assert "# BEGIN ATOLL MANAGED: app.ranking" in (
         output_dir / "install" / "app" / "ranking.py"
     ).read_text(encoding="utf-8")
-    assert "# BEGIN ATOLL MANAGED: app.blocked" in (
+    assert "# BEGIN ATOLL MANAGED: app.blocked" not in (
         output_dir / "install" / "app" / "blocked.py"
     ).read_text(encoding="utf-8")
+    blocked_readiness = tuple(
+        readiness
+        for readiness in result.native_readiness
+        if readiness.source_module == "app.blocked"
+    )
+    assert blocked_readiness
+    assert all(not readiness.eligible for readiness in blocked_readiness)
     assert clean_source.read_text(encoding="utf-8") == original_clean_source
 
 

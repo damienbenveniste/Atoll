@@ -566,6 +566,7 @@ def _run_source_clean_artifact_build(
         )
     )
     report_paths = _write_source_clean_compile_report(result, module_name=module_name)
+    _print_native_readiness_rejections(result)
     if not result.success:
         _print_compile_report_paths(report_paths)
         print(result.error or result.build.stderr)
@@ -592,6 +593,17 @@ def _run_source_clean_artifact_build(
     print(f"Wheel: {result.wheel_path}")
     _print_compile_report_paths(report_paths)
     return 0
+
+
+def _print_native_readiness_rejections(result: PackageCommandResult) -> None:
+    """Explain scan candidates rejected after generated-code analysis."""
+    rejected = tuple(readiness for readiness in result.native_readiness if not readiness.eligible)
+    if not rejected:
+        return
+    print(f"Rejected {len(rejected)} scan candidate symbol(s) after native-readiness analysis.")
+    for readiness in rejected[:10]:
+        reason = "; ".join(readiness.reasons) or "not native-ready"
+        print(f"- {readiness.source_module}.{readiness.symbol}: {reason}")
 
 
 def _source_clean_progress_reporter() -> Callable[[str], None]:
@@ -712,6 +724,7 @@ def _write_source_clean_compile_report(
             cleanup_kept=result.cleanup_kept,
             skipped_modules=_package_skipped_module_inputs(result.skipped),
             preflight_blockers=_package_preflight_blocker_inputs(result.preflight_skipped),
+            native_readiness=result.native_readiness,
         )
     )
     json_path = result.project_root / ".atoll" / "compile-report.json"

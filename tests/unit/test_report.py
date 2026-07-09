@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from atoll.analysis.native_readiness import NativeReadiness
 from atoll.models import (
     CompileAttempt,
     CompilePhaseTiming,
@@ -245,6 +246,37 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
                     message="TypeVar keyword(s) default are rejected by mypyc",
                 ),
             ),
+            native_readiness=(
+                NativeReadiness(
+                    source_module="app.ranking",
+                    symbol="normalize_features",
+                    eligible=True,
+                    score=100,
+                    function_count=1,
+                    any_typed_functions=(),
+                    boxed_typed_functions=(),
+                    dynamic_dependencies=(),
+                    loop_count=1,
+                    native_operation_count=2,
+                    reasons=(),
+                ),
+                NativeReadiness(
+                    source_module="app.ranking",
+                    symbol="score_user",
+                    eligible=False,
+                    score=30,
+                    function_count=1,
+                    any_typed_functions=("score_user",),
+                    boxed_typed_functions=(),
+                    dynamic_dependencies=("Score",),
+                    loop_count=0,
+                    native_operation_count=2,
+                    reasons=(
+                        "Any annotations: score_user",
+                        "dynamic getattr dependencies: Score",
+                    ),
+                ),
+            ),
         )
     )
 
@@ -256,7 +288,13 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
     assert report["cleanup"]["kept"] == [".atoll/dist/install"]
     assert report["summary"]["skipped_modules"] == 1
     assert report["summary"]["preflight_blockers"] == 1
+    assert report["summary"]["native_ready_symbols"] == 1
+    assert report["summary"]["native_rejected_symbols"] == 1
+    assert report["native_readiness"][1]["symbol"] == "score_user"
+    assert report["native_readiness"][1]["eligible"] is False
     assert "Source-clean compile builds a wheel" in markdown
+    assert "Scan scores estimate extraction safety" in markdown
+    assert "`app.ranking.score_user`: rejected (30/100)" in markdown
     assert "- Wheel: `.atoll/dist/app-0+atoll-cp312.whl`" in markdown
     assert "## Skipped Modules" in markdown
     assert "`app.blocked` (src/app/blocked.py:4)" in markdown

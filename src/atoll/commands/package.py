@@ -24,6 +24,7 @@ from packaging import tags
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
+from atoll.analysis.native_readiness import NativeReadiness, analyze_native_readiness
 from atoll.backends.mypyc import build_sidecars
 from atoll.generation.shim import insert_or_replace_shim, remove_shim
 from atoll.generation.sidecar import (
@@ -91,6 +92,7 @@ class PackageCommandResult:
     error: str | None = None
     skipped: tuple[PackageBuildFailure, ...] = ()
     preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
+    native_readiness: tuple[NativeReadiness, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +123,14 @@ class _ProjectMetadata:
 class _SelectedModule:
     scan: ModuleScan
     symbols: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedModule:
+    """Generated module after performance-worthiness filtering."""
+
+    island: EnabledIslandConfig | None
+    native_readiness: tuple[NativeReadiness, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,8 +195,11 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     staged_source_roots = _copy_source_roots(project, build_root)
     _progress(options.progress, f"copied source roots in {_duration(copy_started)}")
     sidecar_started = time.perf_counter()
-    _progress(options.progress, f"generating {len(selected)} sidecar module(s)")
-    islands = tuple(
+    _progress(
+        options.progress,
+        f"analyzing {selected_symbols} generated candidate symbol(s) for native readiness",
+    )
+    prepared_modules = tuple(
         _prepare_staged_island(
             project=project,
             staged_source_roots=staged_source_roots,
@@ -194,7 +207,32 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         )
         for selected_module in selected
     )
-    _progress(options.progress, f"generated sidecars in {_duration(sidecar_started)}")
+    native_readiness = tuple(
+        readiness
+        for prepared_module in prepared_modules
+        for readiness in prepared_module.native_readiness
+    )
+    islands = tuple(
+        prepared_module.island
+        for prepared_module in prepared_modules
+        if prepared_module.island is not None
+    )
+    native_ready_symbols = sum(readiness.eligible for readiness in native_readiness)
+    _progress(
+        options.progress,
+        (
+            f"native readiness accepted {native_ready_symbols}/{len(native_readiness)} "
+            f"symbol(s) across {len(islands)} module(s) in {_duration(sidecar_started)}"
+        ),
+    )
+    if not islands:
+        return _no_native_ready_result(
+            project=project,
+            build_root=build_root,
+            install_root=install_root,
+            native_readiness=native_readiness,
+            preflight_skipped=preflight_skipped,
+        )
     outcome = _build_package_islands(
         islands,
         _PackageBuildContext(
@@ -208,6 +246,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     )
     if not outcome.build.success:
         _progress(options.progress, "build failed; keeping build tree for diagnostics")
+        _remove_failed_wheels(project, output_dir)
         cleanup_removed = _remove_tree(install_root)
         return PackageCommandResult(
             success=False,
@@ -222,6 +261,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             cleanup_kept=(build_root,),
             skipped=outcome.skipped,
             preflight_skipped=preflight_skipped,
+            native_readiness=native_readiness,
         )
 
     payload_started = time.perf_counter()
@@ -269,6 +309,46 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         report_artifact_paths=report_artifact_paths,
         skipped=outcome.skipped,
         preflight_skipped=preflight_skipped,
+        native_readiness=native_readiness,
+    )
+
+
+def _no_native_ready_result(
+    *,
+    project: DiscoveredProject,
+    build_root: Path,
+    install_root: Path,
+    native_readiness: tuple[NativeReadiness, ...],
+    preflight_skipped: tuple[PackagePreflightFailure, ...],
+) -> PackageCommandResult:
+    """Return a clean failure without invoking mypyc or retaining a stale wheel."""
+    output_dir = build_root.parent
+    _remove_failed_wheels(project, output_dir)
+    cleanup_removed = (*_remove_tree(build_root), *_remove_tree(install_root))
+    error = (
+        "No performance-worthy native islands remain after generated-code analysis. "
+        f"Rejected {len(native_readiness)} scan candidate symbol(s); mypyc was not invoked. "
+        "See the compile report for native-readiness reasons."
+    )
+    return PackageCommandResult(
+        success=False,
+        project_root=project.config.root,
+        output_dir=output_dir,
+        install_root=install_root,
+        wheel_path=None,
+        islands=(),
+        build=CompileAttempt(
+            success=False,
+            command=(),
+            stdout="",
+            stderr=error,
+            artifact_paths=(),
+            duration_seconds=0.0,
+        ),
+        cleanup_removed=cleanup_removed,
+        error=error,
+        preflight_skipped=preflight_skipped,
+        native_readiness=native_readiness,
     )
 
 
@@ -881,7 +961,7 @@ def _prepare_staged_island(
     project: DiscoveredProject,
     staged_source_roots: tuple[Path, ...],
     selected_module: _SelectedModule,
-) -> EnabledIslandConfig:
+) -> _PreparedModule:
     staged_module = _staged_module(selected_module.scan.module, project, staged_source_roots)
     staged_source_root = _staged_source_root(
         selected_module.scan.module,
@@ -890,12 +970,35 @@ def _prepare_staged_island(
     )
     staged_scan = enrich_island_analysis(scan_module(staged_module))
     sidecar_module = default_sidecar_module(staged_module.name)
+    sidecar_path = expected_sidecar_path(staged_source_root, sidecar_module)
+    native_readiness: list[NativeReadiness] = []
+    for symbol in selected_module.symbols:
+        probe = EnabledIslandConfig(
+            source_module=staged_module.name,
+            source_path=staged_module.path,
+            sidecar_module=sidecar_module,
+            sidecar_path=sidecar_path,
+            symbols=(symbol,),
+        )
+        generation = generate_sidecar(staged_scan, probe)
+        native_readiness.append(
+            analyze_native_readiness(
+                source_module=staged_module.name,
+                exported_symbol=symbol,
+                generated_source=generation.source_text,
+            )
+        )
+    eligible_symbols = tuple(
+        readiness.symbol for readiness in native_readiness if readiness.eligible
+    )
+    if not eligible_symbols:
+        return _PreparedModule(island=None, native_readiness=tuple(native_readiness))
     island = EnabledIslandConfig(
         source_module=staged_module.name,
         source_path=staged_module.path,
         sidecar_module=sidecar_module,
-        sidecar_path=expected_sidecar_path(staged_source_root, sidecar_module),
-        symbols=selected_module.symbols,
+        sidecar_path=sidecar_path,
+        symbols=eligible_symbols,
     )
     sidecar = generate_sidecar(staged_scan, island)
     island.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
@@ -905,7 +1008,7 @@ def _prepare_staged_island(
         insert_or_replace_shim(source_text, island).new_text,
         encoding="utf-8",
     )
-    return island
+    return _PreparedModule(island=island, native_readiness=tuple(native_readiness))
 
 
 def _copy_source_roots(
@@ -1017,7 +1120,7 @@ def _write_wheel(
     distribution = _wheel_safe_name(metadata.name)
     version = _wheel_safe_version(metadata.version)
     dist_info = f"{distribution}-{version}.dist-info"
-    wheel_path = output_dir / f"{distribution}-{version}-{wheel_tag}.whl"
+    wheel_path = _wheel_output_path(output_dir, metadata)
     if wheel_path.exists():
         wheel_path.unlink()
     payload = _wheel_payload(install_root)
@@ -1039,6 +1142,25 @@ def _write_wheel(
         records.append((record_path, "", ""))
         wheel.writestr(record_path, _record_text(records))
     return wheel_path
+
+
+def _wheel_output_path(output_dir: Path, metadata: _ProjectMetadata) -> Path:
+    distribution = _wheel_safe_name(metadata.name)
+    version = _wheel_safe_version(metadata.version)
+    return output_dir / f"{distribution}-{version}-{_wheel_tag()}.whl"
+
+
+def _remove_failed_wheels(project: DiscoveredProject, output_dir: Path) -> None:
+    """Remove wheel artifacts that could be mistaken for the failed attempt."""
+    metadata = _project_metadata(project.config.root)
+    default_output = project.config.root / ".atoll" / "dist"
+    if output_dir.resolve() != default_output.resolve():
+        _wheel_output_path(output_dir, metadata).unlink(missing_ok=True)
+        return
+    distribution = _wheel_safe_name(metadata.name)
+    version = _wheel_safe_version(metadata.version)
+    for wheel_path in output_dir.glob(f"{distribution}-{version}-*.whl"):
+        wheel_path.unlink()
 
 
 def _wheel_payload(install_root: Path) -> tuple[tuple[str, Path], ...]:

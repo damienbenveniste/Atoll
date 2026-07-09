@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict
 
+from atoll.analysis.native_readiness import NativeReadiness
 from atoll.models import (
     Blocker,
     BlockerSeverity,
@@ -181,11 +182,29 @@ CompilationOperation = Literal["build", "compile"]
 CompilationMode = Literal["in-place", "source-clean"]
 
 
+class CompilationNativeReadinessReport(TypedDict):
+    """Post-generation evidence that a selected symbol can benefit from mypyc."""
+
+    source_module: str
+    symbol: str
+    eligible: bool
+    score: int
+    function_count: int
+    any_typed_functions: list[str]
+    boxed_typed_functions: list[str]
+    dynamic_dependencies: list[str]
+    loop_count: int
+    native_operation_count: int
+    reasons: list[str]
+
+
 class CompilationSummaryReport(TypedDict):
     """Aggregate build, verification, test, and cleanup counts for compilation."""
 
     islands: int
     symbols: int
+    native_ready_symbols: int
+    native_rejected_symbols: int
     artifacts: int
     support_artifacts: int
     skipped_modules: int
@@ -294,6 +313,7 @@ class CompilationReport(TypedDict):
     cleanup: CompilationCleanupReport
     skipped_modules: list[CompilationSkippedModuleReport]
     preflight_blockers: list[CompilationPreflightBlockerReport]
+    native_readiness: list[CompilationNativeReadinessReport]
     islands: list[CompilationIslandReport]
 
 
@@ -346,6 +366,7 @@ class CompilationReportInput:
     cleanup_kept: tuple[Path, ...] = ()
     skipped_modules: tuple[CompilationSkippedModuleInput, ...] = ()
     preflight_blockers: tuple[CompilationPreflightBlockerInput, ...] = ()
+    native_readiness: tuple[NativeReadiness, ...] = ()
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -452,6 +473,12 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         "summary": {
             "islands": len(report_input.islands),
             "symbols": sum(len(island.symbols) for island in report_input.islands),
+            "native_ready_symbols": sum(
+                readiness.eligible for readiness in report_input.native_readiness
+            ),
+            "native_rejected_symbols": sum(
+                not readiness.eligible for readiness in report_input.native_readiness
+            ),
             "artifacts": len(artifact_paths),
             "support_artifacts": len(support_artifacts),
             "skipped_modules": len(report_input.skipped_modules),
@@ -508,6 +535,22 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             }
             for blocker in report_input.preflight_blockers
         ],
+        "native_readiness": [
+            {
+                "source_module": readiness.source_module,
+                "symbol": readiness.symbol,
+                "eligible": readiness.eligible,
+                "score": readiness.score,
+                "function_count": readiness.function_count,
+                "any_typed_functions": list(readiness.any_typed_functions),
+                "boxed_typed_functions": list(readiness.boxed_typed_functions),
+                "dynamic_dependencies": list(readiness.dynamic_dependencies),
+                "loop_count": readiness.loop_count,
+                "native_operation_count": readiness.native_operation_count,
+                "reasons": list(readiness.reasons),
+            }
+            for readiness in report_input.native_readiness
+        ],
         "islands": [
             {
                 "source_module": island.source_module,
@@ -555,6 +598,8 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         f"- Wheel: {_optional_path(report['wheel_path'])}",
         f"- Islands: {report['summary']['islands']}",
         f"- Symbols: {report['summary']['symbols']}",
+        f"- Native-ready scan candidates: {report['summary']['native_ready_symbols']}",
+        f"- Rejected scan candidates: {report['summary']['native_rejected_symbols']}",
         f"- Artifacts: {report['summary']['artifacts']}",
         f"- Support artifacts: {report['summary']['support_artifacts']}",
         f"- Skipped modules: {report['summary']['skipped_modules']}",
@@ -568,12 +613,36 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         "",
         _verification_scope_text(report["mode"]),
         "",
-        "## Build",
+        "## Native Readiness",
         "",
-        f"- Success: {_yes_no(report['build']['success'])}",
-        f"- Command: `{' '.join(report['build']['command'])}`",
-        f"- Cache: {report['build']['cache_status']}",
+        (
+            "Scan scores estimate extraction safety. Source-clean compile separately checks the "
+            "generated code for concrete native types and repeated primitive work before mypyc."
+        ),
+        "",
     ]
+    if report["native_readiness"]:
+        lines.extend(
+            (
+                f"- `{readiness['source_module']}.{readiness['symbol']}`: "
+                f"{'ready' if readiness['eligible'] else 'rejected'} "
+                f"({readiness['score']}/100)"
+                + (f"; {'; '.join(readiness['reasons'])}" if readiness["reasons"] else "")
+            )
+            for readiness in report["native_readiness"]
+        )
+    else:
+        lines.append("- Not evaluated for this compilation mode.")
+    lines.extend(
+        [
+            "",
+            "## Build",
+            "",
+            f"- Success: {_yes_no(report['build']['success'])}",
+            f"- Command: `{' '.join(report['build']['command'])}`",
+            f"- Cache: {report['build']['cache_status']}",
+        ]
+    )
     if report["build"]["stderr"]:
         lines.append(f"- Error: `{_first_line(report['build']['stderr'])}`")
     if report["build"]["phase_timings"]:

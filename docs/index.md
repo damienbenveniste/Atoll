@@ -11,10 +11,11 @@ uv run atoll scan .
 ```
 
 The scan command writes `.atoll/report.json` and `.atoll/report.md`.
-Candidate scores are 0-100 scan-only heuristics for how promising an island looks, while
-candidate risk describes extraction risk. Frame-introspection code such as
-`inspect.currentframe()`, `sys._getframe()`, and direct frame attributes such as `f_locals`
-are hard blockers because mypyc changes Python frame semantics.
+Candidate scores are 0-100 scan-only heuristics for extraction safety, not predicted speed, while
+candidate risk also describes extraction risk. Source-clean compile applies a separate
+native-readiness gate to generated code before invoking mypyc. Frame-introspection code such as
+`inspect.currentframe()`, `sys._getframe()`, and direct frame attributes such as `f_locals` are
+hard blockers because mypyc changes Python frame semantics.
 
 ## Compile
 
@@ -32,6 +33,15 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
+
+Before mypyc runs, Atoll regenerates each scan candidate independently and retains only leaf
+kernels whose complete generated function set has concrete builtin annotations and repeated
+primitive work. Generated functions containing `Any`, erased or boxed project types, runtime
+`getattr` dependencies, or only trivial delegation are rejected. The compilation report records
+every accepted and rejected candidate with its native-readiness evidence. If no performance-worthy
+kernel remains, compile fails before mypyc and removes any stale wheel for the same package and
+platform tag.
+
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
 staging, cache lookup or restore, mypyc batch or retry builds, wheel writing, and cleanup. Compile
 reports include cache status plus subphase timings such as `mypycify` and `build_ext`. Duplicate
@@ -43,7 +53,15 @@ When compiling a whole project, Atoll retries modules individually if the batch 
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
-scan and compile reports, but Atoll still tries clean candidate functions from those modules.
+scan and compile reports. A function from such a module is compiled only when its generated kernel
+still preserves concrete native types.
+
+Atoll v1 source-clean compile targets top-level typed leaf kernels. It does not compile whole
+classes, class methods, async-generator execution loops, or object-rich orchestration as one native
+unit. Large gains are therefore expected only when meaningful application time is spent inside the
+accepted CPU-bound kernels; benchmark the installed wheel against the original workload rather
+than treating successful compilation as a speedup claim.
+
 Compiled exports retain the source function's name, documentation, annotations, signature, and
 sync, coroutine, or generator shape. The managed export delegates to the native mypyc callable,
 which remains available to Atoll's routing verification without changing public metadata.
