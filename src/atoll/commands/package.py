@@ -20,7 +20,7 @@ from typing import cast
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.backends.mypyc import build_sidecars
-from atoll.generation.shim import insert_or_replace_shim
+from atoll.generation.shim import insert_or_replace_shim, remove_shim
 from atoll.generation.sidecar import default_sidecar_module, generate_sidecar
 from atoll.models import CompileAttempt, EnabledIslandConfig, ModuleId, ModuleScan
 from atoll.project import DiscoveredProject, discover_project
@@ -60,6 +60,15 @@ class PackageCommandResult:
     islands: tuple[EnabledIslandConfig, ...]
     build: CompileAttempt
     error: str | None = None
+    skipped: tuple[PackageBuildFailure, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PackageBuildFailure:
+    """A selected island that could not be compiled into the artifact package."""
+
+    island: EnabledIslandConfig
+    build: CompileAttempt
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +83,13 @@ class _ProjectMetadata:
 class _SelectedModule:
     scan: ModuleScan
     symbols: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PackageBuildOutcome:
+    successful: tuple[EnabledIslandConfig, ...]
+    build: CompileAttempt
+    skipped: tuple[PackageBuildFailure, ...]
 
 
 def execute_package(options: PackageOptions) -> PackageCommandResult:
@@ -100,25 +116,26 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         )
         for selected_module in selected
     )
-    build = build_sidecars(
-        tuple(island.sidecar_path for island in islands),
+    outcome = _build_package_islands(
+        islands,
         project_root=build_root,
-        build_dir=build_root / ".atoll" / "build",
         source_roots=staged_source_roots,
+        allow_partial=options.module_name is None,
     )
-    if not build.success:
+    if not outcome.build.success:
         return PackageCommandResult(
             success=False,
             output_dir=output_dir,
             install_root=install_root,
             wheel_path=None,
-            islands=islands,
-            build=build,
-            error=build.stderr,
+            islands=outcome.successful,
+            build=outcome.build,
+            error=outcome.build.stderr,
+            skipped=outcome.skipped,
         )
 
-    _place_compiled_artifacts(islands, build.artifact_paths)
-    _remove_generated_sidecar_sources(islands)
+    _place_compiled_artifacts(outcome.successful, outcome.build.artifact_paths)
+    _remove_generated_sidecar_sources(outcome.successful)
     _copy_install_payload(staged_source_roots, install_root)
     metadata = _project_metadata(project.config.root)
     wheel_path = _write_wheel(
@@ -132,8 +149,9 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         output_dir=output_dir,
         install_root=install_root,
         wheel_path=wheel_path,
-        islands=islands,
-        build=build,
+        islands=outcome.successful,
+        build=outcome.build,
+        skipped=outcome.skipped,
     )
 
 
@@ -158,6 +176,115 @@ def _failed_result(
             duration_seconds=0.0,
         ),
         error=error,
+    )
+
+
+def _build_package_islands(
+    islands: tuple[EnabledIslandConfig, ...],
+    *,
+    project_root: Path,
+    source_roots: tuple[Path, ...],
+    allow_partial: bool,
+) -> _PackageBuildOutcome:
+    batch = build_sidecars(
+        tuple(island.sidecar_path for island in islands),
+        project_root=project_root,
+        build_dir=project_root / ".atoll" / "build",
+        source_roots=source_roots,
+    )
+    if batch.success:
+        return _PackageBuildOutcome(successful=islands, build=batch, skipped=())
+    if not allow_partial or len(islands) <= 1:
+        return _PackageBuildOutcome(successful=(), build=batch, skipped=())
+    return _build_package_islands_individually(
+        islands,
+        project_root=project_root,
+        source_roots=source_roots,
+        batch_failure=batch,
+    )
+
+
+def _build_package_islands_individually(
+    islands: tuple[EnabledIslandConfig, ...],
+    *,
+    project_root: Path,
+    source_roots: tuple[Path, ...],
+    batch_failure: CompileAttempt,
+) -> _PackageBuildOutcome:
+    successful: list[EnabledIslandConfig] = []
+    skipped: list[PackageBuildFailure] = []
+    attempts: list[CompileAttempt] = []
+    for island in islands:
+        attempt = build_sidecars(
+            (island.sidecar_path,),
+            project_root=project_root,
+            build_dir=project_root / ".atoll" / "retry-builds" / island.sidecar_path.stem,
+            source_roots=source_roots,
+        )
+        attempts.append(attempt)
+        if attempt.success:
+            successful.append(island)
+            continue
+        skipped.append(PackageBuildFailure(island=island, build=attempt))
+        _remove_staged_island(island)
+    combined = _combine_package_attempts(
+        batch_failure=batch_failure,
+        attempts=tuple(attempts),
+        successful_count=len(successful),
+        skipped_count=len(skipped),
+    )
+    return _PackageBuildOutcome(
+        successful=tuple(successful),
+        build=combined,
+        skipped=tuple(skipped),
+    )
+
+
+def _combine_package_attempts(
+    *,
+    batch_failure: CompileAttempt,
+    attempts: tuple[CompileAttempt, ...],
+    successful_count: int,
+    skipped_count: int,
+) -> CompileAttempt:
+    artifact_paths = tuple(path for attempt in attempts for path in attempt.artifact_paths)
+    stdout_parts = [
+        (
+            "Initial batch build failed; retried islands individually. "
+            f"Compiled {successful_count}, skipped {skipped_count}."
+        )
+    ]
+    failed_attempts = tuple(attempt for attempt in attempts if not attempt.success)
+    stderr_parts = (
+        [_no_successful_retry_error(failed_attempts, batch_failure)]
+        if successful_count == 0
+        else [batch_failure.stderr, *(attempt.stderr for attempt in failed_attempts)]
+    )
+    return CompileAttempt(
+        success=successful_count > 0,
+        command=("mypyc", "partial-package-build"),
+        stdout="\n".join(part for part in stdout_parts if part),
+        stderr="\n\n".join(part for part in stderr_parts if part),
+        artifact_paths=artifact_paths,
+        duration_seconds=batch_failure.duration_seconds
+        + sum(attempt.duration_seconds for attempt in attempts),
+    )
+
+
+def _no_successful_retry_error(
+    attempts: tuple[CompileAttempt, ...],
+    batch_failure: CompileAttempt,
+) -> str:
+    first_failure = next((attempt.stderr for attempt in attempts if attempt.stderr), "")
+    if not first_failure:
+        first_failure = batch_failure.stderr
+    return "\n".join(
+        part
+        for part in (
+            "No selected islands compiled after retrying them individually.",
+            first_failure,
+        )
+        if part
     )
 
 
@@ -252,6 +379,12 @@ def _place_compiled_artifacts(
 def _remove_generated_sidecar_sources(islands: tuple[EnabledIslandConfig, ...]) -> None:
     for island in islands:
         island.sidecar_path.unlink(missing_ok=True)
+
+
+def _remove_staged_island(island: EnabledIslandConfig) -> None:
+    source_text = island.source_path.read_text(encoding="utf-8")
+    island.source_path.write_text(remove_shim(source_text, island).new_text, encoding="utf-8")
+    island.sidecar_path.unlink(missing_ok=True)
 
 
 def _copy_install_payload(source_roots: tuple[Path, ...], install_root: Path) -> None:

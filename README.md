@@ -48,6 +48,9 @@ uv run atoll compile
 
 The install tree is written to `.atoll/dist/install` by default, and the wheel is written to
 `.atoll/dist/*.whl`. Use `--output` to place those generated artifacts somewhere else.
+When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
+and skips islands that cannot be compiled; if none compile, the command fails with a representative
+mypyc diagnostic.
 
 ```bash
 uv pip install --force-reinstall .atoll/dist/*.whl

@@ -532,6 +532,11 @@ def _run_source_clean_artifact_build(
         f"Atoll {label} built {len(result.islands)} module(s) "
         f"and {sum(len(island.symbols) for island in result.islands)} symbol(s)."
     )
+    if result.skipped:
+        print(f"Skipped {len(result.skipped)} module(s) that mypyc could not build.")
+        for failure in result.skipped[:10]:
+            first_line = failure.build.stderr.splitlines()[0] if failure.build.stderr else "failed"
+            print(f"- {failure.island.source_module}: {first_line}")
     print(f"Install tree: {result.install_root}")
     print(f"Wheel: {result.wheel_path}")
     return 0

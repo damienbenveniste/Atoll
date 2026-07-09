@@ -135,6 +135,128 @@ def test_package_reports_build_failure_without_source_edits(
     assert (output_dir / "build").exists()
 
 
+def test_package_whole_project_retries_and_skips_failed_islands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whole-project package mode keeps buildable islands when one island fails."""
+    project_root = tmp_path / "project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    package_dir = project_root / "src" / "app"
+    ranking_source = package_dir / "ranking.py"
+    (package_dir / "good.py").write_text(ranking_source.read_text(encoding="utf-8"))
+    (package_dir / "bad.py").write_text(ranking_source.read_text(encoding="utf-8"))
+    ranking_source.unlink()
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+
+    def mixed_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        assert kwargs
+        assert args
+        paths = cast(tuple[Path, ...], args[0])
+        assert paths
+        if len(paths) > 1:
+            return CompileAttempt(
+                success=False,
+                command=("mypyc", "batch"),
+                stdout="",
+                stderr="MYPYC_TYPE_ERROR: batch failed",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            )
+        path = next(iter(paths))
+        if path.stem.endswith("_good"):
+            artifact = tmp_path / f"{path.stem}{suffix}"
+            artifact.write_text("binary", encoding="utf-8")
+            return CompileAttempt(
+                success=True,
+                command=("mypyc", str(path)),
+                stdout="",
+                stderr="",
+                artifact_paths=(artifact,),
+                duration_seconds=0.1,
+            )
+        return CompileAttempt(
+            success=False,
+            command=("mypyc", str(path)),
+            stdout="",
+            stderr="MYPYC_TYPE_ERROR: bad failed",
+            artifact_paths=(),
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", mixed_build_sidecars)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+    )
+
+    good_text = (output_dir / "install" / "app" / "good.py").read_text(encoding="utf-8")
+    bad_text = (output_dir / "install" / "app" / "bad.py").read_text(encoding="utf-8")
+    assert result.success is True
+    assert tuple(island.source_module for island in result.islands) == ("app.good",)
+    assert tuple(failure.island.source_module for failure in result.skipped) == ("app.bad",)
+    assert "Initial batch build failed; retried islands individually" in result.build.stdout
+    assert "# BEGIN ATOLL MANAGED: app.good" in good_text
+    assert "# BEGIN ATOLL MANAGED" not in bad_text
+    assert (output_dir / "install" / "app" / f"_atoll_app_good{suffix}").exists()
+    assert result.wheel_path is not None
+
+
+def test_package_whole_project_reports_zero_successful_retries_concisely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whole-project package mode reports one representative error when all retries fail."""
+    project_root = tmp_path / "project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    package_dir = project_root / "src" / "app"
+    ranking_source = package_dir / "ranking.py"
+    (package_dir / "first.py").write_text(ranking_source.read_text(encoding="utf-8"))
+    (package_dir / "second.py").write_text(ranking_source.read_text(encoding="utf-8"))
+    ranking_source.unlink()
+
+    def failing_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        assert kwargs
+        assert args
+        paths = cast(tuple[Path, ...], args[0])
+        assert paths
+        if len(paths) > 1:
+            return CompileAttempt(
+                success=False,
+                command=("mypyc", "batch"),
+                stdout="",
+                stderr="MYPYC_TYPE_ERROR: batch failed",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            )
+        path = next(iter(paths))
+        return CompileAttempt(
+            success=False,
+            command=("mypyc", str(path)),
+            stdout="",
+            stderr=f"MYPYC_TYPE_ERROR: {path.stem} failed",
+            artifact_paths=(),
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", failing_build_sidecars)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.startswith("No selected islands compiled")
+    assert result.error.count("MYPYC_TYPE_ERROR") == 1
+    assert tuple(failure.island.source_module for failure in result.skipped) == (
+        "app.first",
+        "app.second",
+    )
+
+
 def test_package_helpers_handle_flat_source_roots(tmp_path: Path) -> None:
     """Flat source roots copy their contents into the build root."""
     (tmp_path / "pkg").mkdir()

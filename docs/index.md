@@ -29,6 +29,9 @@ name to limit the operation to one source module. The original source files are 
 
 The install tree is written to `.atoll/dist/install` by default, and the wheel is written to
 `.atoll/dist/*.whl`. Use `--output` to place those generated artifacts somewhere else.
+When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
+and skips islands that cannot be compiled; if none compile, the command fails with a representative
+mypyc diagnostic.
 Build failures keep terminal output short and write full mypyc diagnostics to
 `.atoll/build/mypyc.log`.
 Run build commands inside the target project's Python environment because mypyc uses the active
