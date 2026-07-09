@@ -10,7 +10,15 @@ from pathlib import Path
 import pytest
 
 from atoll.cli import main
-from atoll.models import EnabledIslandConfig, ProjectConfig
+from atoll.commands.package import PackageCommandResult, PackagePreflightFailure
+from atoll.models import (
+    Blocker,
+    CompileAttempt,
+    EnabledIslandConfig,
+    ModuleId,
+    ModuleScan,
+    ProjectConfig,
+)
 from atoll.runtime.verify import verify_islands
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
@@ -44,7 +52,8 @@ def test_compile_builds_install_tree_and_wheel_without_source_edits(
     assert "# BEGIN ATOLL MANAGED" not in original_source
     assert "# BEGIN ATOLL MANAGED: app.ranking" in install_source.read_text(encoding="utf-8")
     assert not (output_dir / "build").exists()
-    assert _extension_artifacts(install_root / "app", "_atoll_app_ranking")
+    assert not (install_root / "app" / "_atoll_app_ranking.py").exists()
+    assert _extension_artifacts(install_root / ".atoll" / "artifacts", "_atoll_app_ranking")
 
     result = verify_islands(
         ProjectConfig(
@@ -58,7 +67,7 @@ def test_compile_builds_install_tree_and_wheel_without_source_edits(
                     source_module="app.ranking",
                     source_path=install_source,
                     sidecar_module="app._atoll_app_ranking",
-                    sidecar_path=install_root / "app" / "_atoll_app_ranking.py",
+                    sidecar_path=install_root / ".atoll" / "sidecars" / "_atoll_app_ranking.py",
                     symbols=("normalize_features", "score_user", "rank_candidates"),
                 ),
             ),
@@ -72,7 +81,10 @@ def test_compile_builds_install_tree_and_wheel_without_source_edits(
         names = set(wheel.namelist())
     assert "app/ranking.py" in names
     assert "app/types.py" in names
-    assert any(name.startswith("app/_atoll_app_ranking") and name.endswith(".so") for name in names)
+    assert any(
+        name.startswith(".atoll/artifacts/_atoll_app_ranking") and name.endswith(".so")
+        for name in names
+    )
     assert any(name.endswith(".dist-info/METADATA") for name in names)
     assert any(name.endswith(".dist-info/WHEEL") for name in names)
     assert any(name.endswith(".dist-info/RECORD") for name in names)
@@ -106,6 +118,59 @@ def test_compile_reports_no_candidates_from_source_clean_default(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "scan found no candidate islands" in captured.out
+
+
+def test_compile_reports_preflight_skipped_modules(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source-clean compile reports modules skipped before mypyc runs."""
+    module_path = tmp_path / "src" / "pkg" / "blocked.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("", encoding="utf-8")
+    blocker = Blocker(
+        severity="hard",
+        code="MYPYC_UNSUPPORTED_TYPEVAR",
+        message="TypeVar keyword(s) default are rejected by mypyc",
+        lineno=4,
+        symbol=None,
+    )
+    scan = ModuleScan(
+        module=ModuleId(name="pkg.blocked", path=module_path),
+        imports=(),
+        constants=(),
+        symbols=(),
+        blockers=(blocker,),
+        top_level_statement_lines=(),
+    )
+
+    def fake_execute_package(*_args: object, **_kwargs: object) -> PackageCommandResult:
+        return PackageCommandResult(
+            success=True,
+            output_dir=tmp_path / "out",
+            install_root=tmp_path / "out" / "install",
+            wheel_path=tmp_path / "out" / "pkg-0-atoll.whl",
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("mypyc",),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.0,
+            ),
+            preflight_skipped=(PackagePreflightFailure(scan=scan, blockers=(blocker,)),),
+        )
+
+    monkeypatch.setattr("atoll.cli.execute_package", fake_execute_package)
+
+    exit_code = main(["compile", "--root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Skipped 1 module(s) with known mypyc typing blockers." in captured.out
+    assert "- pkg.blocked: line 4: TypeVar keyword(s) default are rejected by mypyc" in captured.out
 
 
 def test_compile_reports_mypyc_preflight_blockers(

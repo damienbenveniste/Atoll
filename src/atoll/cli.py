@@ -537,6 +537,14 @@ def _run_source_clean_artifact_build(
         for failure in result.skipped[:10]:
             first_line = failure.build.stderr.splitlines()[0] if failure.build.stderr else "failed"
             print(f"- {failure.island.source_module}: {first_line}")
+    if result.preflight_skipped:
+        print(
+            f"Skipped {len(result.preflight_skipped)} module(s) with known mypyc typing blockers."
+        )
+        for preflight_failure in result.preflight_skipped[:10]:
+            first = preflight_failure.blockers[0]
+            location = f"line {first.lineno}" if first.lineno is not None else "module"
+            print(f"- {preflight_failure.scan.module.name}: {location}: {first.message}")
     print(f"Install tree: {result.install_root}")
     print(f"Wheel: {result.wheel_path}")
     return 0

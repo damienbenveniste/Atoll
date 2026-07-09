@@ -21,7 +21,7 @@ from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.backends.mypyc import build_sidecars
 from atoll.generation.shim import insert_or_replace_shim, remove_shim
-from atoll.generation.sidecar import default_sidecar_module, generate_sidecar
+from atoll.generation.sidecar import default_sidecar_module, expected_sidecar_path, generate_sidecar
 from atoll.models import Blocker, CompileAttempt, EnabledIslandConfig, ModuleId, ModuleScan
 from atoll.project import DiscoveredProject, discover_project
 
@@ -63,6 +63,7 @@ class PackageCommandResult:
     build: CompileAttempt
     error: str | None = None
     skipped: tuple[PackageBuildFailure, ...] = ()
+    preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,14 @@ class PackageBuildFailure:
 
     island: EnabledIslandConfig
     build: CompileAttempt
+
+
+@dataclass(frozen=True, slots=True)
+class PackagePreflightFailure:
+    """A selected module skipped before build because mypyc rejects module-level code."""
+
+    scan: ModuleScan
+    blockers: tuple[Blocker, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,10 +113,24 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     """Build an install tree and wheel containing Atoll compiled islands."""
     project = discover_project(options.root)
     scans = _selected_scans(project, options.module_name)
-    if preflight_error := _mypyc_preflight_error(scans):
-        return _failed_result(project.config.root, options.output_dir, preflight_error)
-    selected = _selected_modules(scans)
+    preflight_skipped = _mypyc_preflight_failures(scans)
+    buildable_scans = _buildable_scans(scans, preflight_skipped)
+    if options.module_name is not None and preflight_skipped:
+        return _failed_result(
+            project.config.root,
+            options.output_dir,
+            _format_mypyc_preflight_error(_module_blockers(preflight_skipped)),
+            preflight_skipped=preflight_skipped,
+        )
+    selected = _selected_modules(buildable_scans)
     if not selected:
+        if preflight_skipped:
+            return _failed_result(
+                project.config.root,
+                options.output_dir,
+                _format_mypyc_preflight_error(_module_blockers(preflight_skipped)),
+                preflight_skipped=preflight_skipped,
+            )
         return _failed_result(
             project.config.root, options.output_dir, "scan found no candidate islands"
         )
@@ -143,11 +166,13 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             build=outcome.build,
             error=outcome.build.stderr,
             skipped=outcome.skipped,
+            preflight_skipped=preflight_skipped,
         )
 
     _place_compiled_artifacts(outcome.successful, outcome.build.artifact_paths)
     _remove_generated_sidecar_sources(outcome.successful)
     _copy_install_payload(staged_source_roots, install_root)
+    _copy_atoll_artifacts(staged_source_roots, install_root)
     metadata = _project_metadata(project.config.root)
     wheel_path = _write_wheel(
         install_root=install_root,
@@ -163,6 +188,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         islands=outcome.successful,
         build=outcome.build,
         skipped=outcome.skipped,
+        preflight_skipped=preflight_skipped,
     )
 
 
@@ -170,6 +196,8 @@ def _failed_result(
     root: Path,
     output_dir: Path | None,
     error: str,
+    *,
+    preflight_skipped: tuple[PackagePreflightFailure, ...] = (),
 ) -> PackageCommandResult:
     resolved_output_dir = _resolve_output_dir(root, output_dir)
     return PackageCommandResult(
@@ -187,6 +215,7 @@ def _failed_result(
             duration_seconds=0.0,
         ),
         error=error,
+        preflight_skipped=preflight_skipped,
     )
 
 
@@ -318,16 +347,34 @@ def _selected_modules(
     return tuple(selected)
 
 
-def _mypyc_preflight_error(scans: tuple[ModuleScan, ...]) -> str | None:
-    blockers = tuple(
-        _ModuleBlocker(scan=scan, blocker=blocker)
+def _mypyc_preflight_failures(scans: tuple[ModuleScan, ...]) -> tuple[PackagePreflightFailure, ...]:
+    return tuple(
+        PackagePreflightFailure(scan=scan, blockers=blockers)
         for scan in scans
-        for blocker in scan.blockers
-        if blocker.severity == "hard" and blocker.code in _MYPYC_PREFLIGHT_BLOCKERS
+        if (
+            blockers := tuple(
+                blocker
+                for blocker in scan.blockers
+                if blocker.severity == "hard" and blocker.code in _MYPYC_PREFLIGHT_BLOCKERS
+            )
+        )
     )
-    if not blockers:
-        return None
-    return _format_mypyc_preflight_error(blockers)
+
+
+def _buildable_scans(
+    scans: tuple[ModuleScan, ...],
+    skipped: tuple[PackagePreflightFailure, ...],
+) -> tuple[ModuleScan, ...]:
+    skipped_modules = {failure.scan.module.name for failure in skipped}
+    return tuple(scan for scan in scans if scan.module.name not in skipped_modules)
+
+
+def _module_blockers(skipped: tuple[PackagePreflightFailure, ...]) -> tuple[_ModuleBlocker, ...]:
+    return tuple(
+        _ModuleBlocker(scan=failure.scan, blocker=blocker)
+        for failure in skipped
+        for blocker in failure.blockers
+    )
 
 
 def _format_mypyc_preflight_error(blockers: tuple[_ModuleBlocker, ...]) -> str:
@@ -370,17 +417,22 @@ def _prepare_staged_island(
     selected_module: _SelectedModule,
 ) -> EnabledIslandConfig:
     staged_module = _staged_module(selected_module.scan.module, project, staged_source_roots)
+    staged_source_root = _staged_source_root(
+        selected_module.scan.module,
+        project,
+        staged_source_roots,
+    )
     staged_scan = enrich_island_analysis(scan_module(staged_module))
     sidecar_module = default_sidecar_module(staged_module.name)
-    sidecar_name = sidecar_module.rsplit(".", maxsplit=1)[-1]
     island = EnabledIslandConfig(
         source_module=staged_module.name,
         source_path=staged_module.path,
         sidecar_module=sidecar_module,
-        sidecar_path=staged_module.path.parent / f"{sidecar_name}.py",
+        sidecar_path=expected_sidecar_path(staged_source_root, sidecar_module),
         symbols=selected_module.symbols,
     )
     sidecar = generate_sidecar(staged_scan, island)
+    island.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
     island.sidecar_path.write_text(sidecar.source_text, encoding="utf-8")
     source_text = island.source_path.read_text(encoding="utf-8")
     island.source_path.write_text(
@@ -418,14 +470,29 @@ def _place_compiled_artifacts(
     support_artifacts = tuple(
         artifact for artifact in artifact_paths if artifact not in island_artifacts
     )
-    package_dirs = tuple(sorted({island.source_path.parent for island in islands}))
+    target_dirs = tuple(sorted({_artifact_dir(island) for island in islands}))
     for island in islands:
+        target_dir = _artifact_dir(island)
+        target_dir.mkdir(parents=True, exist_ok=True)
         for artifact in artifact_paths:
             if artifact.name.startswith(f"{island.sidecar_path.stem}."):
-                shutil.copy2(artifact, island.source_path.parent / artifact.name)
-    for package_dir in package_dirs:
+                _copy_if_different(artifact, target_dir / artifact.name)
+    for target_dir in target_dirs:
+        target_dir.mkdir(parents=True, exist_ok=True)
         for artifact in support_artifacts:
-            shutil.copy2(artifact, package_dir / artifact.name)
+            _copy_if_different(artifact, target_dir / artifact.name)
+
+
+def _artifact_dir(island: EnabledIslandConfig) -> Path:
+    if island.sidecar_path.parent.name == "sidecars":
+        return island.sidecar_path.parent.parent / "artifacts"
+    return island.sidecar_path.parent
+
+
+def _copy_if_different(source: Path, destination: Path) -> None:
+    if source.resolve() == destination.resolve():
+        return
+    shutil.copy2(source, destination)
 
 
 def _remove_generated_sidecar_sources(islands: tuple[EnabledIslandConfig, ...]) -> None:
@@ -445,6 +512,20 @@ def _copy_install_payload(source_roots: tuple[Path, ...], install_root: Path) ->
             if not path.is_file() or _is_ignored_payload(path, source_root):
                 continue
             if not _is_package_payload(path, source_root):
+                continue
+            relative = path.relative_to(source_root)
+            destination = install_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+
+
+def _copy_atoll_artifacts(source_roots: tuple[Path, ...], install_root: Path) -> None:
+    for source_root in source_roots:
+        artifact_root = source_root / ".atoll" / "artifacts"
+        if not artifact_root.exists():
+            continue
+        for path in sorted(artifact_root.rglob("*")):
+            if not path.is_file():
                 continue
             relative = path.relative_to(source_root)
             destination = install_root / relative
@@ -633,12 +714,27 @@ def _staged_module(
     project: DiscoveredProject,
     staged_source_roots: tuple[Path, ...],
 ) -> ModuleId:
-    for index, source_root in enumerate(project.config.source_roots):
+    staged_source_root = _staged_source_root(module, project, staged_source_roots)
+    for source_root in project.config.source_roots:
         try:
             relative = module.path.relative_to(source_root)
         except ValueError:
             continue
-        return ModuleId(name=module.name, path=staged_source_roots[index] / relative)
+        return ModuleId(name=module.name, path=staged_source_root / relative)
+    raise ValueError(f"module is outside configured source roots: {module.name}")
+
+
+def _staged_source_root(
+    module: ModuleId,
+    project: DiscoveredProject,
+    staged_source_roots: tuple[Path, ...],
+) -> Path:
+    for index, source_root in enumerate(project.config.source_roots):
+        try:
+            module.path.relative_to(source_root)
+        except ValueError:
+            continue
+        return staged_source_roots[index]
     raise ValueError(f"module is outside configured source roots: {module.name}")
 
 

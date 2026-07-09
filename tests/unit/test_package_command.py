@@ -12,7 +12,7 @@ from typing import Protocol, cast
 import pytest
 
 from atoll.commands import package as package_command
-from atoll.models import CompileAttempt, ModuleId
+from atoll.models import CompileAttempt, EnabledIslandConfig, ModuleId
 from atoll.project import DiscoveredProject, discover_project
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
@@ -58,9 +58,21 @@ _copy_install_payload = cast(
     Callable[[tuple[Path, ...], Path], None],
     _package_attr("_copy_install_payload"),
 )
+_copy_atoll_artifacts = cast(
+    Callable[[tuple[Path, ...], Path], None],
+    _package_attr("_copy_atoll_artifacts"),
+)
+_copy_if_different = cast(
+    Callable[[Path, Path], None],
+    _package_attr("_copy_if_different"),
+)
 _copy_source_roots = cast(
     Callable[[DiscoveredProject, Path], tuple[Path, ...]],
     _package_attr("_copy_source_roots"),
+)
+_artifact_dir = cast(
+    Callable[[EnabledIslandConfig], Path],
+    _package_attr("_artifact_dir"),
 )
 _find_module = cast(
     Callable[[tuple[ModuleId, ...], str], ModuleId],
@@ -199,7 +211,7 @@ def test_package_whole_project_retries_and_skips_failed_islands(
     assert "Initial batch build failed; retried islands individually" in result.build.stdout
     assert "# BEGIN ATOLL MANAGED: app.good" in good_text
     assert "# BEGIN ATOLL MANAGED" not in bad_text
-    assert (output_dir / "install" / "app" / f"_atoll_app_good{suffix}").exists()
+    assert (output_dir / "install" / ".atoll" / "artifacts" / f"_atoll_app_good{suffix}").exists()
     assert result.wheel_path is not None
 
 
@@ -257,11 +269,11 @@ def test_package_whole_project_reports_zero_successful_retries_concisely(
     )
 
 
-def test_package_preflight_reports_mypyc_unsupported_typevar(
+def test_package_preflight_reports_mypyc_unsupported_typevar_for_selected_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Source-clean package mode reports known mypyc typing blockers before building."""
+    """Module-specific package mode reports known mypyc typing blockers before building."""
     project_root = tmp_path / "project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -288,7 +300,11 @@ def test_package_preflight_reports_mypyc_unsupported_typevar(
     monkeypatch.setattr(package_command, "build_sidecars", unexpected_build_sidecars)
 
     result = package_command.execute_package(
-        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.typing_features",
+            output_dir=output_dir,
+        )
     )
 
     assert result.success is False
@@ -297,6 +313,71 @@ def test_package_preflight_reports_mypyc_unsupported_typevar(
     assert "typing_features.py:4" in result.error
     assert "infer_variance" in result.error
     assert not (output_dir / "build").exists()
+
+
+def test_package_whole_project_skips_mypyc_unsupported_typevar_modules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whole-project package mode skips known preflight blockers and keeps clean islands."""
+    project_root = tmp_path / "project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    package_dir = project_root / "src" / "app"
+    clean_source = package_dir / "ranking.py"
+    original_clean_source = clean_source.read_text(encoding="utf-8")
+    (package_dir / "blocked.py").write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from typing_extensions import TypeVar",
+                "",
+                "T = TypeVar('T', default=str)",
+                "",
+                "def candidate(value: int) -> int:",
+                "    return value + 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+
+    def successful_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        assert kwargs
+        paths = cast(tuple[Path, ...], args[0])
+        artifacts: list[Path] = []
+        for path in paths:
+            artifact = tmp_path / f"{path.stem}{suffix}"
+            artifact.write_text("binary", encoding="utf-8")
+            artifacts.append(artifact)
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=tuple(artifacts),
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+    )
+
+    assert result.success is True
+    assert tuple(island.source_module for island in result.islands) == ("app.ranking",)
+    assert tuple(failure.scan.module.name for failure in result.preflight_skipped) == (
+        "app.blocked",
+    )
+    assert "# BEGIN ATOLL MANAGED: app.ranking" in (
+        output_dir / "install" / "app" / "ranking.py"
+    ).read_text(encoding="utf-8")
+    assert "# BEGIN ATOLL MANAGED" not in (output_dir / "install" / "app" / "blocked.py").read_text(
+        encoding="utf-8"
+    )
+    assert clean_source.read_text(encoding="utf-8") == original_clean_source
 
 
 def test_package_helpers_handle_flat_source_roots(tmp_path: Path) -> None:
@@ -342,6 +423,39 @@ def test_copy_install_payload_filters_package_files(tmp_path: Path) -> None:
     assert not (install_root / "pkg" / "data.txt").exists()
     assert not (install_root / "README.md").exists()
     assert not (install_root / "tests" / "test_mod.py").exists()
+
+
+def test_atoll_artifact_helpers_copy_artifacts_and_skip_same_file(tmp_path: Path) -> None:
+    """Source-clean artifact helpers place compiled extensions under install `.atoll`."""
+    source_root = tmp_path / "source"
+    artifact_dir = source_root / ".atoll" / "artifacts"
+    install_root = tmp_path / "install"
+    artifact_dir.mkdir(parents=True)
+    native = artifact_dir / f"_sidecar{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    native.write_text("binary", encoding="utf-8")
+
+    _copy_atoll_artifacts((tmp_path / "missing", source_root), install_root)
+    copied = install_root / ".atoll" / "artifacts" / native.name
+    _copy_if_different(copied, copied)
+
+    package_sidecar = EnabledIslandConfig(
+        source_module="pkg.mod",
+        source_path=source_root / "pkg" / "mod.py",
+        sidecar_module="pkg._sidecar",
+        sidecar_path=source_root / "pkg" / "_sidecar.py",
+        symbols=("func",),
+    )
+    external_sidecar = EnabledIslandConfig(
+        source_module="pkg.mod",
+        source_path=source_root / "pkg" / "mod.py",
+        sidecar_module="pkg._sidecar",
+        sidecar_path=source_root / ".atoll" / "sidecars" / "_sidecar.py",
+        symbols=("func",),
+    )
+
+    assert copied.read_text(encoding="utf-8") == "binary"
+    assert _artifact_dir(package_sidecar) == source_root / "pkg"
+    assert _artifact_dir(external_sidecar) == source_root / ".atoll" / "artifacts"
 
 
 def test_wheel_writer_replaces_existing_wheel_and_records_metadata(tmp_path: Path) -> None:

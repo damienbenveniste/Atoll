@@ -27,8 +27,9 @@ uv run atoll compile
 compiles the copied sidecars, and writes both an install tree and a platform wheel. Pass a module
 name to limit the operation to one source module. The original source files are left untouched.
 
-The install tree is written to `.atoll/dist/install` by default, and the wheel is written to
-`.atoll/dist/*.whl`. Use `--output` to place those generated artifacts somewhere else.
+The install tree is written to `.atoll/dist/install` by default, with compiled runtime artifacts
+under `.atoll/dist/install/.atoll/artifacts`; the wheel is written to `.atoll/dist/*.whl`.
+Use `--output` to place those generated artifacts somewhere else.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic.

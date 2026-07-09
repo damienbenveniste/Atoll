@@ -46,8 +46,9 @@ uv run atoll compile app.ranking
 uv run atoll compile
 ```
 
-The install tree is written to `.atoll/dist/install` by default, and the wheel is written to
-`.atoll/dist/*.whl`. Use `--output` to place those generated artifacts somewhere else.
+The install tree is written to `.atoll/dist/install` by default, with compiled runtime artifacts
+under `.atoll/dist/install/.atoll/artifacts`; the wheel is written to `.atoll/dist/*.whl`.
+Use `--output` to place those generated artifacts somewhere else.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic. Known project-level mypyc blockers, such as unsupported `TypeVar` keyword
