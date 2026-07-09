@@ -8,24 +8,377 @@ outside Python's normal `sys.stderr` object.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import io
+import json
 import os
 import sys
+import sysconfig
 import tempfile
 import time
 from collections.abc import Generator
 from contextlib import chdir, contextmanager, redirect_stderr, redirect_stdout
-from pathlib import Path
+from importlib import metadata as importlib_metadata
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
 from mypyc.build import mypycify
+from packaging import tags
 from setuptools import Distribution
 from setuptools.command.build_ext import build_ext
 
-from atoll.models import CompileAttempt, CompilePhaseTiming
+from atoll.backends.base import UnsupportedBackendRegionError
+from atoll.models import (
+    ArtifactRecord,
+    Backend,
+    BackendAssessment,
+    BackendAssessmentStatus,
+    BackendCapability,
+    BackendCompileContext,
+    BackendCompileResult,
+    BackendDiagnostic,
+    BackendDiagnosticCode,
+    BackendLoweringRequest,
+    CompilationUnit,
+    CompileAttempt,
+    CompilePhaseTiming,
+    LoweringDecision,
+    RegionMember,
+    SymbolId,
+    TypedRegion,
+)
 
 _MAX_DIAGNOSTIC_LINES = 20
+_MYPYC_ADAPTER_VERSION = "1"
+_SHARED_REGION_ID = "__shared__"
+
+
+class MypycBackend:
+    """CompilerBackend adapter around mypyc's in-process setuptools build.
+
+    Capability assessment is member-specific so unsupported async generators or
+    unresolved generic members remain available to another backend. Compilation
+    delegates to the proven legacy build implementation and adds structured
+    artifact metadata without changing command-facing `CompileAttempt` output.
+    """
+
+    @property
+    def name(self) -> Backend:
+        """Return the stable backend name used by reports and cache keys."""
+        return "mypyc"
+
+    def assess(self, region: TypedRegion) -> BackendAssessment:
+        """Assess typed functions, methods, classes, generators, and coroutines."""
+        decisions = {decision.target: decision for decision in region.decisions}
+        supported: list[SymbolId] = []
+        unsupported: list[SymbolId] = []
+        reasons: list[str] = []
+        for member in region.members:
+            reason = _unsupported_member_reason(member, decisions.get(member.id.stable_id))
+            if reason is None:
+                supported.append(member.id)
+            else:
+                unsupported.append(member.id)
+                reasons.append(f"{member.id.stable_id}: {reason}")
+
+        class_member = next((member for member in region.members if member.kind == "class"), None)
+        if region.atomic_class and class_member is not None and unsupported:
+            if class_member.id in supported:
+                supported.remove(class_member.id)
+                unsupported.append(class_member.id)
+            reasons.append(
+                f"{class_member.id.stable_id}: native class requires every class member to pass"
+            )
+
+        status = _assessment_status(supported, unsupported)
+        return BackendAssessment(
+            region_id=region.id,
+            backend="mypyc",
+            status=status,
+            supported_members=tuple(supported),
+            unsupported_members=tuple(unsupported),
+            capabilities=_member_capabilities(region, tuple(supported)),
+            reasons=tuple(reasons),
+        )
+
+    def lower(self, request: BackendLoweringRequest) -> CompilationUnit:
+        """Validate prepared source and register supported members as one unit.
+
+        The adapter deliberately does not generate source. The typed-region
+        lowerer supplies a preserved source file, and this method records the
+        exact member selection and content hash consumed by mypyc.
+        """
+        assessment = self.assess(request.region)
+        selected = request.members or assessment.supported_members
+        unsupported = set(selected) - set(assessment.supported_members)
+        if not selected or unsupported:
+            names = (
+                ", ".join(
+                    symbol.stable_id
+                    for symbol in sorted(unsupported, key=lambda item: item.stable_id)
+                )
+                or "none"
+            )
+            raise UnsupportedBackendRegionError(
+                f"mypyc cannot lower requested members for {request.region.id}: {names}"
+            )
+        return CompilationUnit(
+            region_id=request.region.id,
+            backend="mypyc",
+            logical_module=request.logical_module,
+            source_paths=(request.source_path,),
+            source_hash=_file_digest(request.source_path),
+            members=selected,
+            install_relative_dir=request.install_relative_dir,
+        )
+
+    def compile(
+        self,
+        units: tuple[CompilationUnit, ...],
+        context: BackendCompileContext,
+    ) -> BackendCompileResult:
+        """Compile prepared units and attach install-facing artifact records."""
+        _validate_units(units, expected_backend="mypyc")
+        paths = tuple(path for unit in units for path in unit.source_paths)
+        attempt = _build_paths(paths, context=context, backend=self)
+        artifact_dir = context.build_dir.parent / "artifacts"
+        artifacts = (
+            _artifact_records(units, attempt.artifact_paths, artifact_dir)
+            if context.record_artifacts
+            else ()
+        )
+        return BackendCompileResult(attempt=attempt, artifacts=artifacts)
+
+    def fingerprint(
+        self,
+        unit: CompilationUnit,
+        context: BackendCompileContext,
+    ) -> str:
+        """Hash unit content together with the active mypyc toolchain and ABI."""
+        _validate_units((unit,), expected_backend="mypyc")
+        payload = {
+            "adapter_version": _MYPYC_ADAPTER_VERSION,
+            "backend": self.name,
+            "mypy_version": importlib_metadata.version("mypy"),
+            "setuptools_version": importlib_metadata.version("setuptools"),
+            "python_cache_tag": sys.implementation.cache_tag,
+            "platform": sysconfig.get_platform(),
+            "soabi": sysconfig.get_config_var("SOABI"),
+            "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
+            "compiler": sysconfig.get_config_var("CC"),
+            "compiler_flags": sysconfig.get_config_var("CFLAGS"),
+            "extension_suffixes": importlib.machinery.EXTENSION_SUFFIXES,
+            "region_id": unit.region_id,
+            "logical_module": unit.logical_module,
+            "install_relative_dir": unit.install_relative_dir,
+            "source_hash": unit.source_hash,
+            "source_digests": [_file_digest(path) for path in unit.source_paths],
+            "members": [member.stable_id for member in unit.members],
+            "project_root": str(context.project_root.resolve()),
+            "source_roots": [str(path.resolve()) for path in context.source_roots],
+            "package_root": _package_root(context.project_root, context.source_roots),
+            "backend_options": [list(option) for option in context.backend_options],
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def normalize_diagnostic(
+        self,
+        error: BaseException,
+        *,
+        diagnostics: str,
+        log_path: Path | None,
+    ) -> BackendDiagnostic:
+        """Normalize mypyc, import-path, and native toolchain failures."""
+        message = repr(error)
+        lowered = f"{message}\n{diagnostics}".lower()
+        code = _diagnostic_code(lowered)
+        detail = _diagnostic_summary(diagnostics, log_path)
+        return BackendDiagnostic(
+            code=code,
+            message=message,
+            details=tuple(line for line in detail.splitlines() if line),
+            log_path=log_path,
+            transient=code != "MYPYC_TYPE_ERROR",
+        )
+
+
+MYPYC_BACKEND = MypycBackend()
+
+
+def _unsupported_member_reason(
+    member: RegionMember,
+    decision: LoweringDecision | None,
+) -> str | None:
+    if member.execution_kind == "async_generator":
+        return "mypyc does not preserve async-generator execution semantics"
+    if decision is None or decision.action in {"preserve", "specialize"}:
+        return None
+    if decision.action == "box":
+        return "mypyc preference requires concrete typing; source uses Any"
+    if decision.action == "fallback":
+        return "member requires interpreted fallback before specialization"
+    return "member was rejected by typed-region analysis"
+
+
+def _assessment_status(
+    supported: list[SymbolId],
+    unsupported: list[SymbolId],
+) -> BackendAssessmentStatus:
+    if supported and unsupported:
+        return "partial"
+    if supported:
+        return "supported"
+    return "unsupported"
+
+
+def _member_capabilities(
+    region: TypedRegion,
+    supported: tuple[SymbolId, ...],
+) -> tuple[BackendCapability, ...]:
+    supported_ids = set(supported)
+    capabilities: list[BackendCapability] = []
+    for member in region.members:
+        if member.id not in supported_ids:
+            continue
+        if member.kind == "class":
+            capabilities.append("native_class")
+        elif member.kind == "function":
+            capabilities.append("typed_function")
+        elif member.binding_kind == "instance_method":
+            capabilities.append("instance_method")
+        elif member.binding_kind == "staticmethod":
+            capabilities.append("staticmethod")
+        elif member.binding_kind == "classmethod":
+            capabilities.append("classmethod")
+        if member.execution_kind == "generator":
+            capabilities.append("generator")
+        elif member.execution_kind == "coroutine":
+            capabilities.append("coroutine")
+    return tuple(dict.fromkeys(capabilities))
+
+
+def _legacy_unit(path: Path) -> CompilationUnit:
+    digest = _path_digest(path)
+    return CompilationUnit(
+        region_id=f"legacy:{path.stem}:{digest[:12]}",
+        backend="mypyc",
+        logical_module=path.stem,
+        source_paths=(path,),
+        source_hash=digest,
+        members=(),
+        install_relative_dir=".atoll/artifacts",
+    )
+
+
+def _validate_units(
+    units: tuple[CompilationUnit, ...],
+    *,
+    expected_backend: Backend,
+) -> None:
+    mismatched = tuple(unit for unit in units if unit.backend != expected_backend)
+    if mismatched:
+        names = ", ".join(unit.region_id for unit in mismatched)
+        raise ValueError(f"{expected_backend} backend received incompatible unit(s): {names}")
+    empty = tuple(unit.region_id for unit in units if not unit.source_paths)
+    if empty:
+        raise ValueError(
+            f"{expected_backend} backend received source-less unit(s): {', '.join(empty)}"
+        )
+
+
+def _artifact_records(
+    units: tuple[CompilationUnit, ...],
+    artifact_paths: tuple[Path, ...],
+    artifact_dir: Path,
+) -> tuple[ArtifactRecord, ...]:
+    if not artifact_paths:
+        return ()
+    system_tag = next(tags.sys_tags())
+    records: list[ArtifactRecord] = []
+    for artifact in artifact_paths:
+        unit = _artifact_unit(artifact, units, artifact_dir)
+        install_dirs: tuple[str, ...]
+        if unit is not None:
+            install_dirs = (unit.install_relative_dir,)
+        else:
+            install_dirs = tuple(
+                dict.fromkeys(candidate.install_relative_dir for candidate in units)
+            ) or ("",)
+        records.extend(
+            ArtifactRecord(
+                region_id=unit.region_id if unit is not None else _SHARED_REGION_ID,
+                backend="mypyc",
+                logical_module=(
+                    unit.logical_module if unit is not None else _extension_module_stem(artifact)
+                ),
+                role="primary" if unit is not None else "support",
+                install_relative_path=_install_relative_path(
+                    artifact,
+                    artifact_dir,
+                    install_relative_dir,
+                ),
+                digest=_file_digest(artifact),
+                abi=system_tag.abi,
+                platform_tag=system_tag.platform,
+            )
+            for install_relative_dir in install_dirs
+        )
+    return tuple(records)
+
+
+def _artifact_unit(
+    artifact: Path,
+    units: tuple[CompilationUnit, ...],
+    artifact_dir: Path,
+) -> CompilationUnit | None:
+    module_stem = _extension_module_stem(artifact)
+    try:
+        relative = artifact.resolve().relative_to(artifact_dir.resolve())
+    except ValueError:
+        return None
+    artifact_module = ".".join((*relative.parent.parts, module_stem))
+    logical_matches = tuple(unit for unit in units if unit.logical_module == artifact_module)
+    if len(logical_matches) == 1:
+        return logical_matches[0]
+    stem_matches = tuple(
+        unit for unit in units if any(module_stem == path.stem for path in unit.source_paths)
+    )
+    return stem_matches[0] if len(stem_matches) == 1 else None
+
+
+def _extension_module_stem(artifact: Path) -> str:
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        if artifact.name.endswith(suffix):
+            return artifact.name[: -len(suffix)]
+    return artifact.stem
+
+
+def _install_relative_path(
+    artifact: Path,
+    artifact_dir: Path,
+    install_relative_dir: str,
+) -> str:
+    try:
+        relative_output = artifact.resolve().relative_to(artifact_dir.resolve())
+    except ValueError as error:
+        raise ValueError(f"artifact is outside backend output root: {artifact}") from error
+    return (PurePosixPath(install_relative_dir) / relative_output.as_posix()).as_posix()
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _path_digest(path: Path) -> str:
+    if path.is_file():
+        return _file_digest(path)
+    return hashlib.sha256(f"missing:{path.resolve()}".encode()).hexdigest()
 
 
 def build_sidecars(
@@ -42,6 +395,30 @@ def build_sidecars(
     `CompileAttempt` values with classified diagnostics instead of escaping as
     exceptions through CLI command handlers.
     """
+    units = tuple(_legacy_unit(path) for path in paths)
+    return MYPYC_BACKEND.compile(
+        units,
+        BackendCompileContext(
+            project_root=project_root,
+            build_dir=build_dir,
+            source_roots=source_roots,
+            cache_dir=cache_dir,
+            record_artifacts=False,
+        ),
+    ).attempt
+
+
+def _build_paths(
+    paths: tuple[Path, ...],
+    *,
+    context: BackendCompileContext,
+    backend: MypycBackend,
+) -> CompileAttempt:
+    """Run the legacy mypyc build and preserve its CompileAttempt contract."""
+    project_root = context.project_root
+    build_dir = context.build_dir
+    source_roots = context.source_roots
+    cache_dir = context.cache_dir
     start = time.perf_counter()
     if not paths:
         return CompileAttempt(
@@ -103,7 +480,13 @@ def build_sidecars(
             success=False,
             command=command,
             stdout="",
-            stderr=_classify_build_error(error, diagnostics=diagnostics, log_path=log_path),
+            stderr=_diagnostic_text(
+                backend.normalize_diagnostic(
+                    error,
+                    diagnostics=diagnostics,
+                    log_path=log_path,
+                )
+            ),
             artifact_paths=(),
             duration_seconds=time.perf_counter() - start,
             phase_timings=tuple(phase_timings),
@@ -117,7 +500,13 @@ def build_sidecars(
             success=False,
             command=command,
             stdout="",
-            stderr=_classify_build_error(error, diagnostics=diagnostics, log_path=log_path),
+            stderr=_diagnostic_text(
+                backend.normalize_diagnostic(
+                    error,
+                    diagnostics=diagnostics,
+                    log_path=log_path,
+                )
+            ),
             artifact_paths=(),
             duration_seconds=time.perf_counter() - start,
             phase_timings=tuple(phase_timings),
@@ -303,22 +692,18 @@ def _write_build_log(
     return log_path
 
 
-def _classify_build_error(
-    error: BaseException,
-    *,
-    diagnostics: str,
-    log_path: Path | None,
-) -> str:
-    message = repr(error)
-    lowered = f"{message}\n{diagnostics}".lower()
-    detail = _diagnostic_summary(diagnostics, log_path)
+def _diagnostic_code(lowered: str) -> BackendDiagnosticCode:
     if "no such file" in lowered or "compiler" in lowered or "clang" in lowered or "gcc" in lowered:
-        return f"NATIVE_BUILD_ENV_ERROR: {message}{detail}"
+        return "NATIVE_BUILD_ENV_ERROR"
     if "mypy" in lowered or "type" in lowered or ": error:" in lowered:
-        return f"MYPYC_TYPE_ERROR: {message}{detail}"
+        return "MYPYC_TYPE_ERROR"
     if "import" in lowered or "module" in lowered:
-        return f"IMPORT_PATH_ERROR: {message}{detail}"
-    return f"UNKNOWN_BUILD_ERROR: {message}{detail}"
+        return "IMPORT_PATH_ERROR"
+    return "UNKNOWN_BUILD_ERROR"
+
+
+def _diagnostic_text(diagnostic: BackendDiagnostic) -> str:
+    return "\n".join((f"{diagnostic.code}: {diagnostic.message}", *diagnostic.details))
 
 
 def _diagnostic_summary(diagnostics: str, log_path: Path | None) -> str:

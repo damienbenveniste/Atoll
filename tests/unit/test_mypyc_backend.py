@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from atoll.backends import mypyc as mypyc_backend
+from atoll.models import ArtifactRecord, BackendCompileContext, CompilationUnit
 
 
 class FakeBuildExt:
@@ -53,6 +55,18 @@ class FakeBuildExtWithNativeWarnings(FakeBuildExt):
         super().run()
 
 
+class FakeBuildExtDuplicateStems(FakeBuildExt):
+    """Build stand-in that writes same-named extensions under two packages."""
+
+    artifact_paths: tuple[Path, ...] = ()
+
+    def run(self) -> None:
+        """Write every configured nested extension artifact."""
+        for artifact in self.artifact_paths:
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_bytes(artifact.parent.name.encode())
+
+
 def test_build_sidecars_succeeds_for_empty_input(tmp_path: Path) -> None:
     """Building with no enabled sidecars is a no-op success."""
     result = mypyc_backend.build_sidecars(
@@ -83,8 +97,21 @@ def test_build_sidecars_detects_generated_artifact(
         assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
         return []
 
+    def fail_artifact_records(
+        units: tuple[CompilationUnit, ...],
+        artifact_paths: tuple[Path, ...],
+        artifact_dir: Path,
+    ) -> tuple[ArtifactRecord, ...]:
+        _ = (units, artifact_paths, artifact_dir)
+        pytest.fail("legacy facade must not materialize structured records")
+
     monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
     monkeypatch.setattr(mypyc_backend, "build_ext", FakeBuildExt)
+    monkeypatch.setattr(
+        mypyc_backend,
+        "_artifact_records",
+        fail_artifact_records,
+    )
 
     result = mypyc_backend.build_sidecars(
         (sidecar,),
@@ -116,7 +143,7 @@ def test_build_sidecars_reports_support_artifacts(
         f"{sidecar.stem}{importlib.machinery.EXTENSION_SUFFIXES[0]}"
     )
     FakeBuildExtWithSupport.support_path = artifact_dir.joinpath(
-        f"fixture__mypyc{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+        f"{sidecar.stem}__mypyc{importlib.machinery.EXTENSION_SUFFIXES[0]}"
     )
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
@@ -139,6 +166,124 @@ def test_build_sidecars_reports_support_artifacts(
         FakeBuildExtWithSupport.artifact_path,
         FakeBuildExtWithSupport.support_path,
     )
+
+
+def test_mypyc_adapter_returns_structured_primary_and_support_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adapter compilation records ownership, install paths, digests, and ABI tags."""
+    sidecar = tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
+    artifact_dir = tmp_path / ".atoll" / "artifacts"
+    FakeBuildExtWithSupport.artifact_path = artifact_dir.joinpath(
+        f"{sidecar.stem}{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    )
+    FakeBuildExtWithSupport.support_path = artifact_dir.joinpath(
+        f"{sidecar.stem}__mypyc{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    )
+
+    def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
+        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        return []
+
+    monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
+    monkeypatch.setattr(mypyc_backend, "build_ext", FakeBuildExtWithSupport)
+    unit = CompilationUnit(
+        region_id="app.ranking::score_user:fixture",
+        backend="mypyc",
+        logical_module="app._atoll_app_ranking",
+        source_paths=(sidecar,),
+        source_hash="fixture",
+        members=(),
+        install_relative_dir=".atoll/artifacts",
+    )
+
+    result = mypyc_backend.MypycBackend().compile(
+        (unit,),
+        BackendCompileContext(
+            project_root=tmp_path,
+            build_dir=tmp_path / ".atoll" / "build",
+            source_roots=(tmp_path,),
+        ),
+    )
+
+    assert result.attempt.success is True
+    assert [record.role for record in result.artifacts] == ["primary", "support"]
+    primary, support = result.artifacts
+    assert primary.region_id == unit.region_id
+    assert primary.logical_module == unit.logical_module
+    assert primary.install_relative_path == (
+        f".atoll/artifacts/{FakeBuildExtWithSupport.artifact_path.name}"
+    )
+    assert support.region_id == "__shared__"
+    assert support.logical_module == f"{sidecar.stem}__mypyc"
+    assert support.install_relative_path == (
+        f".atoll/artifacts/{FakeBuildExtWithSupport.support_path.name}"
+    )
+    empty_digest = hashlib.sha256(b"").hexdigest()
+    assert all(record.digest == empty_digest for record in result.artifacts)
+    assert all(record.abi for record in result.artifacts)
+    assert all(record.platform_tag for record in result.artifacts)
+
+
+def test_artifact_ownership_uses_logical_module_for_duplicate_stems(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Artifacts from same-named modules retain the correct region and install path."""
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    artifact_dir = tmp_path / ".atoll" / "artifacts"
+    first_artifact = artifact_dir / "first" / f"shared{suffix}"
+    second_artifact = artifact_dir / "second" / f"shared{suffix}"
+    first_source = tmp_path / "first" / "shared.py"
+    second_source = tmp_path / "second" / "shared.py"
+    first_source.parent.mkdir(parents=True)
+    second_source.parent.mkdir(parents=True)
+    first_source.write_text("def first() -> int:\n    return 1\n", encoding="utf-8")
+    second_source.write_text("def second() -> int:\n    return 2\n", encoding="utf-8")
+    FakeBuildExtDuplicateStems.artifact_paths = (first_artifact, second_artifact)
+
+    def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
+        assert paths == ["first/shared.py", "second/shared.py"]
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        return []
+
+    monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
+    monkeypatch.setattr(mypyc_backend, "build_ext", FakeBuildExtDuplicateStems)
+    units = (
+        CompilationUnit(
+            region_id="first-region",
+            backend="mypyc",
+            logical_module="first.shared",
+            source_paths=(first_source,),
+            source_hash="first",
+            members=(),
+        ),
+        CompilationUnit(
+            region_id="second-region",
+            backend="mypyc",
+            logical_module="second.shared",
+            source_paths=(second_source,),
+            source_hash="second",
+            members=(),
+        ),
+    )
+
+    result = mypyc_backend.MypycBackend().compile(
+        units,
+        BackendCompileContext(
+            project_root=tmp_path,
+            build_dir=tmp_path / ".atoll" / "build",
+            source_roots=(tmp_path,),
+        ),
+    )
+    assert [(record.region_id, record.install_relative_path) for record in result.artifacts] == [
+        ("first-region", f"first/shared{suffix}"),
+        ("second-region", f"second/shared{suffix}"),
+    ]
 
 
 def test_build_sidecars_captures_and_filters_native_stderr(
@@ -272,6 +417,10 @@ def test_build_sidecars_captures_mypyc_system_exit(
     assert captured.out == ""
     assert result.success is False
     assert result.stderr.startswith("MYPYC_TYPE_ERROR")
+    assert result.stderr.splitlines()[:2] == [
+        "MYPYC_TYPE_ERROR: SystemExit(1)",
+        "Captured 2 mypyc error line(s).",
+    ]
     assert "Captured 2 mypyc error line(s)." in result.stderr
     assert str(log_path) in result.stderr
     assert "target project's environment" in result.stderr

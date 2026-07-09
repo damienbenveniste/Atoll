@@ -33,6 +33,12 @@ descriptor and execution kinds, class fields, and connected typed regions. These
 source typing for later backend assessment; the current compile path continues to use the legacy
 island pipeline, so typed regions are analysis output only.
 
+Atoll's compiler boundary is backend-neutral. `CompilerBackend` separates per-member capability
+assessment, registration of prepared compilation units, native compilation, strict fingerprinting,
+and diagnostic normalization. The mypyc adapter reports partial support when one member is
+unsupported, records native artifacts with region ownership and ABI/platform metadata, and retains
+the existing `build_sidecars` facade for legacy compile, build, and trial workflows.
+
 Use `--no-mypy` to skip mypy diagnostics during a scan.
 
 Candidate scores are 0-100 scan-only heuristics for extraction safety, not predicted speed.

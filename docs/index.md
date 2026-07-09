@@ -14,6 +14,10 @@ The scan command writes `.atoll/report.json` and `.atoll/report.md`.
 Report schema v2 preserves callable annotations, type parameters, class ownership, descriptor and
 execution kinds, class fields, and connected typed regions for later backend assessment. Source-clean
 compile currently uses the legacy island path, so typed regions are analysis output only.
+The public `CompilerBackend` contract separates per-member capability assessment, prepared
+compilation units, native compilation, strict fingerprints, and normalized diagnostics. The mypyc
+adapter emits region-owned artifact metadata while the existing `build_sidecars` facade preserves
+legacy compile, build, and trial behavior.
 Candidate scores are 0-100 scan-only heuristics for extraction safety, not predicted speed, while
 candidate risk also describes extraction risk. Source-clean compile applies a separate
 native-readiness gate to generated code before invoking mypyc. Frame-introspection code such as

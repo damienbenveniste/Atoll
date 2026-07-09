@@ -8,10 +8,29 @@ separate so command handlers can enrich data without mutating earlier phases.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
-Backend = Literal["mypyc"]
+ArtifactRole = Literal["primary", "support"]
+Backend = Literal["mypyc", "cython"]
+BackendAssessmentStatus = Literal["supported", "partial", "unsupported"]
+BackendCapability = Literal[
+    "typed_function",
+    "instance_method",
+    "staticmethod",
+    "classmethod",
+    "native_class",
+    "generator",
+    "coroutine",
+    "async_generator",
+]
+BackendDiagnosticCode = Literal[
+    "MYPYC_TYPE_ERROR",
+    "CYTHON_COMPILE_ERROR",
+    "NATIVE_BUILD_ENV_ERROR",
+    "IMPORT_PATH_ERROR",
+    "UNKNOWN_BUILD_ERROR",
+]
 BindingKind = Literal["module", "class", "instance_method", "staticmethod", "classmethod"]
 BlockerSeverity = Literal["hard", "soft", "info"]
 CompileCacheStatus = Literal["disabled", "hit", "miss", "partial"]
@@ -50,6 +69,9 @@ TypeBindingSource = Literal[
     "import",
 ]
 Visibility = Literal["public", "private"]
+
+_SHA256_HEX_LENGTH = 64
+_LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +380,123 @@ class TypedRegion:
 
 
 @dataclass(frozen=True, slots=True)
+class BackendAssessment:
+    """Deterministic capability decision for one backend and typed region.
+
+    Partial assessments keep supported and unsupported members separate so one
+    unsupported execution shape cannot poison independent members. Support
+    means the backend can compile a correctly prepared member unit; it does not
+    promise that runtime binding for that member has been implemented. Reasons
+    are stable diagnostic text suitable for reports and backend selection.
+    """
+
+    region_id: str
+    backend: Backend
+    status: BackendAssessmentStatus
+    supported_members: tuple[SymbolId, ...]
+    unsupported_members: tuple[SymbolId, ...]
+    capabilities: tuple[BackendCapability, ...]
+    reasons: tuple[str, ...]
+    deterministic: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class BackendLoweringRequest:
+    """A prepared source file and member selection offered to one backend.
+
+    Source generation remains separate from backend registration. An empty
+    `members` tuple asks the backend to include every member it assessed as
+    supported; explicit members must be a subset of that assessment.
+    """
+
+    region: TypedRegion
+    source_path: Path
+    logical_module: str
+    install_relative_dir: str = ""
+    members: tuple[SymbolId, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CompilationUnit:
+    """Backend-specific, content-addressable source unit ready to compile."""
+
+    region_id: str
+    backend: Backend
+    logical_module: str
+    source_paths: tuple[Path, ...]
+    source_hash: str
+    members: tuple[SymbolId, ...]
+    install_relative_dir: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class BackendCompileContext:
+    """Filesystem and import-path boundaries for a native backend invocation.
+
+    `record_artifacts=False` is reserved for the legacy `build_sidecars` facade,
+    whose callers consume only `CompileAttempt`. Typed-region compilation keeps
+    the default strict artifact recording and validation. `backend_options` is
+    normalized key/value evidence included in backend fingerprints.
+    """
+
+    project_root: Path
+    build_dir: Path
+    source_roots: tuple[Path, ...] = ()
+    cache_dir: Path | None = None
+    record_artifacts: bool = True
+    backend_options: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRecord:
+    """Install-facing identity and integrity metadata for a native artifact.
+
+    `install_relative_path` is always POSIX-style and relative to the staged
+    payload root. Support artifacts shared by multiple regions use the reserved
+    region ID `__shared__` instead of being assigned to an arbitrary member.
+    """
+
+    region_id: str
+    backend: Backend
+    logical_module: str
+    role: ArtifactRole
+    install_relative_path: str
+    digest: str
+    abi: str
+    platform_tag: str
+
+    def __post_init__(self) -> None:
+        """Reject absolute, parent-traversing, or non-POSIX install paths."""
+        path = PurePosixPath(self.install_relative_path)
+        if (
+            not self.install_relative_path
+            or "\\" in self.install_relative_path
+            or path.is_absolute()
+            or ".." in path.parts
+        ):
+            raise ValueError("artifact install_relative_path must be a relative POSIX path")
+        if len(self.digest) != _SHA256_HEX_LENGTH or any(
+            character not in _LOWERCASE_HEX_DIGITS for character in self.digest
+        ):
+            raise ValueError("artifact digest must be a lowercase SHA-256 hex digest")
+        if not self.region_id.strip() or not self.logical_module.strip():
+            raise ValueError("artifact region_id and logical_module must be non-empty")
+        if not self.abi.strip() or not self.platform_tag.strip():
+            raise ValueError("artifact ABI and platform tag must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class BackendDiagnostic:
+    """Normalized compiler failure independent of backend exception types."""
+
+    code: BackendDiagnosticCode
+    message: str
+    details: tuple[str, ...]
+    log_path: Path | None
+    transient: bool
+
+
+@dataclass(frozen=True, slots=True)
 class DependencyEdge:
     """Conservative dependency edge from one symbol to another boundary.
 
@@ -432,7 +571,7 @@ class CompilePhaseTiming:
 
 @dataclass(frozen=True, slots=True)
 class CompileAttempt:
-    """Evidence from one mypyc build attempt.
+    """Compatibility evidence from one native backend build attempt.
 
     Commands capture the invoked build shape, stdout/stderr preserve diagnostics,
     and `artifact_paths` lists extension outputs that were newly produced or
@@ -448,6 +587,14 @@ class CompileAttempt:
     duration_seconds: float
     phase_timings: tuple[CompilePhaseTiming, ...] = ()
     cache_status: CompileCacheStatus = "disabled"
+
+
+@dataclass(frozen=True, slots=True)
+class BackendCompileResult:
+    """Structured backend output plus the legacy attempt compatibility view."""
+
+    attempt: CompileAttempt
+    artifacts: tuple[ArtifactRecord, ...]
 
 
 @dataclass(frozen=True, slots=True)
