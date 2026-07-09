@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
@@ -539,12 +541,14 @@ def _run_source_clean_artifact_build(
     keep_install_tree: bool,
     label: str,
 ) -> int:
+    progress = _source_clean_progress_reporter()
     result = execute_package(
         PackageOptions(
             root=root,
             module_name=module_name,
             output_dir=output_dir,
             keep_install_tree=keep_install_tree,
+            progress=progress,
         )
     )
     report_paths = _write_source_clean_compile_report(result, module_name=module_name)
@@ -574,6 +578,16 @@ def _run_source_clean_artifact_build(
     print(f"Wheel: {result.wheel_path}")
     _print_compile_report_paths(report_paths)
     return 0
+
+
+def _source_clean_progress_reporter() -> Callable[[str], None]:
+    started = time.perf_counter()
+
+    def progress(message: str) -> None:
+        elapsed = time.perf_counter() - started
+        print(f"Atoll compile [{elapsed:6.2f}s] {message}", file=sys.stderr)
+
+    return progress
 
 
 def _build_exit_code(result: CompileAttempt) -> int:

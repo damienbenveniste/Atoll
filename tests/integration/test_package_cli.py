@@ -62,6 +62,10 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     assert "Source-clean compile builds a wheel" in report_markdown_path.read_text(encoding="utf-8")
     assert "Install tree:" not in captured.out
     assert "Compile reports:" in captured.out
+    assert "Atoll compile [" in captured.err
+    assert "discovering project" in captured.err
+    assert "running mypyc batch" in captured.err
+    assert "cleaned temporary outputs" in captured.err
     with zipfile.ZipFile(wheel_path) as wheel:
         names = set(wheel.namelist())
     assert "app/ranking.py" in names

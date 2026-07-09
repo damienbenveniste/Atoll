@@ -11,8 +11,10 @@ import re
 import shutil
 import sys
 import sysconfig
+import time
 import tomllib
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -24,6 +26,8 @@ from atoll.generation.shim import insert_or_replace_shim, remove_shim
 from atoll.generation.sidecar import default_sidecar_module, expected_sidecar_path, generate_sidecar
 from atoll.models import Blocker, CompileAttempt, EnabledIslandConfig, ModuleId, ModuleScan
 from atoll.project import DiscoveredProject, discover_project
+
+PackageProgress = Callable[[str], None]
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -48,6 +52,7 @@ class PackageOptions:
     module_name: str | None = None
     output_dir: Path | None = None
     keep_install_tree: bool = False
+    progress: PackageProgress | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,10 +113,22 @@ class _PackageBuildOutcome:
 
 def execute_package(options: PackageOptions) -> PackageCommandResult:
     """Build an install tree and wheel containing Atoll compiled islands."""
+    _progress(options.progress, f"discovering project at {options.root.resolve()}")
     project = discover_project(options.root)
+    _progress(
+        options.progress,
+        f"discovered {len(project.modules)} module(s); scan scope: {options.module_name or 'all'}",
+    )
+    scan_started = time.perf_counter()
     scans = _selected_scans(project, options.module_name)
+    _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
     preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
     selected = _selected_modules(scans)
+    selected_symbols = sum(len(selected_module.symbols) for selected_module in selected)
+    _progress(
+        options.progress,
+        f"selected {len(selected)} candidate module(s), {selected_symbols} symbol(s)",
+    )
     if not selected:
         return _failed_result(
             project.config.root, options.output_dir, "scan found no candidate islands"
@@ -120,10 +137,16 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
     build_root = output_dir / "build"
     install_root = output_dir / "install"
+    _progress(options.progress, f"resetting temporary build roots in {output_dir}")
     _reset_dir(build_root)
     _reset_dir(install_root)
 
+    copy_started = time.perf_counter()
+    _progress(options.progress, "copying source roots into temporary build tree")
     staged_source_roots = _copy_source_roots(project, build_root)
+    _progress(options.progress, f"copied source roots in {_duration(copy_started)}")
+    sidecar_started = time.perf_counter()
+    _progress(options.progress, f"generating {len(selected)} sidecar module(s)")
     islands = tuple(
         _prepare_staged_island(
             project=project,
@@ -132,13 +155,16 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         )
         for selected_module in selected
     )
+    _progress(options.progress, f"generated sidecars in {_duration(sidecar_started)}")
     outcome = _build_package_islands(
         islands,
         project_root=build_root,
         source_roots=staged_source_roots,
         allow_partial=options.module_name is None,
+        progress=options.progress,
     )
     if not outcome.build.success:
+        _progress(options.progress, "build failed; keeping build tree for diagnostics")
         cleanup_removed = _remove_tree(install_root)
         return PackageCommandResult(
             success=False,
@@ -155,16 +181,24 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             preflight_skipped=preflight_skipped,
         )
 
+    payload_started = time.perf_counter()
+    _progress(options.progress, "placing compiled artifacts into install payload")
     _place_compiled_artifacts(outcome.successful, outcome.build.artifact_paths)
     _remove_generated_sidecar_sources(outcome.successful)
     _copy_install_payload(staged_source_roots, install_root)
     _copy_atoll_artifacts(staged_source_roots, install_root)
+    _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
     metadata = _project_metadata(project.config.root)
+    wheel_started = time.perf_counter()
+    _progress(options.progress, f"writing wheel to {output_dir}")
     wheel_path = _write_wheel(
         install_root=install_root,
         output_dir=output_dir,
         metadata=metadata,
     )
+    _progress(options.progress, f"wrote wheel in {_duration(wheel_started)}")
+    cleanup_started = time.perf_counter()
+    _progress(options.progress, "cleaning temporary build outputs")
     cleanup_removed_paths = [build_root]
     shutil.rmtree(build_root)
     cleanup_kept: tuple[Path, ...] = ()
@@ -173,6 +207,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         shutil.rmtree(install_root)
     else:
         cleanup_kept = (install_root,)
+    _progress(options.progress, f"cleaned temporary outputs in {_duration(cleanup_started)}")
     return PackageCommandResult(
         success=True,
         project_root=project.config.root,
@@ -224,13 +259,25 @@ def _remove_tree(path: Path) -> tuple[Path, ...]:
     return (path,)
 
 
+def _progress(progress: PackageProgress | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
+def _duration(started: float) -> str:
+    return f"{time.perf_counter() - started:.2f}s"
+
+
 def _build_package_islands(
     islands: tuple[EnabledIslandConfig, ...],
     *,
     project_root: Path,
     source_roots: tuple[Path, ...],
     allow_partial: bool,
+    progress: PackageProgress | None,
 ) -> _PackageBuildOutcome:
+    batch_started = time.perf_counter()
+    _progress(progress, f"running mypyc batch for {len(islands)} island(s)")
     batch = build_sidecars(
         tuple(island.sidecar_path for island in islands),
         project_root=project_root,
@@ -238,14 +285,21 @@ def _build_package_islands(
         source_roots=source_roots,
     )
     if batch.success:
+        _progress(progress, f"mypyc batch succeeded in {_duration(batch_started)}")
         return _PackageBuildOutcome(successful=islands, build=batch, skipped=())
     if not allow_partial or len(islands) <= 1:
+        _progress(progress, f"mypyc batch failed in {_duration(batch_started)}")
         return _PackageBuildOutcome(successful=(), build=batch, skipped=())
+    _progress(
+        progress,
+        f"mypyc batch failed in {_duration(batch_started)}; retrying islands individually",
+    )
     return _build_package_islands_individually(
         islands,
         project_root=project_root,
         source_roots=source_roots,
         batch_failure=batch,
+        progress=progress,
     )
 
 
@@ -255,11 +309,14 @@ def _build_package_islands_individually(
     project_root: Path,
     source_roots: tuple[Path, ...],
     batch_failure: CompileAttempt,
+    progress: PackageProgress | None,
 ) -> _PackageBuildOutcome:
     successful: list[EnabledIslandConfig] = []
     skipped: list[PackageBuildFailure] = []
     attempts: list[CompileAttempt] = []
-    for island in islands:
+    for index, island in enumerate(islands, start=1):
+        retry_started = time.perf_counter()
+        _progress(progress, f"retrying {island.source_module} ({index}/{len(islands)})")
         attempt = build_sidecars(
             (island.sidecar_path,),
             project_root=project_root,
@@ -269,9 +326,11 @@ def _build_package_islands_individually(
         attempts.append(attempt)
         if attempt.success:
             successful.append(island)
+            _progress(progress, f"compiled {island.source_module} in {_duration(retry_started)}")
             continue
         skipped.append(PackageBuildFailure(island=island, build=attempt))
         _remove_staged_island(island)
+        _progress(progress, f"skipped {island.source_module} in {_duration(retry_started)}")
     combined = _combine_package_attempts(
         batch_failure=batch_failure,
         attempts=tuple(attempts),

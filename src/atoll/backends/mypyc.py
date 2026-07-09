@@ -5,10 +5,13 @@ from __future__ import annotations
 import importlib.machinery
 import io
 import os
+import sys
+import tempfile
 import time
 from collections.abc import Generator
 from contextlib import chdir, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import BinaryIO
 
 from mypyc.build import mypycify
 from setuptools import Distribution
@@ -46,12 +49,14 @@ def build_sidecars(
     command = ("mypyc", *tuple(str(path) for path in paths), "build_ext")
     stdout = io.StringIO()
     stderr = io.StringIO()
+    native_stderr = _NativeStderrCapture()
     try:
         with (
             chdir(project_root),
             _mypy_environment(source_roots, build_dir / "mypy_cache"),
             redirect_stdout(stdout),
             redirect_stderr(stderr),
+            native_stderr,
         ):
             ext_modules = mypycify(
                 [_source_arg(path, project_root) for path in paths],
@@ -71,7 +76,7 @@ def build_sidecars(
             command_obj.ensure_finalized()
             command_obj.run()
     except SystemExit as error:
-        diagnostics = _captured_output(stdout, stderr)
+        diagnostics = _captured_output(stdout, stderr, native_stderr.output())
         log_path = _write_build_log(build_dir, diagnostics, error)
         return CompileAttempt(
             success=False,
@@ -82,7 +87,7 @@ def build_sidecars(
             duration_seconds=time.perf_counter() - start,
         )
     except Exception as error:
-        diagnostics = _captured_output(stdout, stderr)
+        diagnostics = _captured_output(stdout, stderr, native_stderr.output())
         log_path = _write_build_log(build_dir, diagnostics, error)
         return CompileAttempt(
             success=False,
@@ -93,7 +98,7 @@ def build_sidecars(
             duration_seconds=time.perf_counter() - start,
         )
     artifacts = _artifact_paths(paths, artifact_dir, previous_artifacts)
-    diagnostics = _captured_output(stdout, stderr)
+    diagnostics = _captured_output(stdout, stderr, native_stderr.output())
     if diagnostics:
         _write_build_log(build_dir, diagnostics, None)
     return CompileAttempt(
@@ -104,6 +109,42 @@ def build_sidecars(
         artifact_paths=artifacts,
         duration_seconds=time.perf_counter() - start,
     )
+
+
+class _NativeStderrCapture:
+    def __init__(self) -> None:
+        self._saved_fd: int | None = None
+        self._file: BinaryIO | None = None
+        self._captured = ""
+
+    def __enter__(self) -> _NativeStderrCapture:
+        sys.stderr.flush()
+        self._file = tempfile.TemporaryFile(mode="w+b")
+        self._saved_fd = os.dup(2)
+        os.dup2(self._file.fileno(), 2)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc: object,
+        traceback: object,
+    ) -> None:
+        _ = (exc_type, exc, traceback)
+        sys.stderr.flush()
+        if self._saved_fd is not None:
+            os.dup2(self._saved_fd, 2)
+            os.close(self._saved_fd)
+            self._saved_fd = None
+        if self._file is not None:
+            self._file.flush()
+            self._file.seek(0)
+            self._captured = self._file.read().decode("utf-8", errors="replace")
+            self._file.close()
+            self._file = None
+
+    def output(self) -> str:
+        return self._captured
 
 
 def _artifact_paths(
@@ -186,10 +227,24 @@ def _mypy_environment(
             os.environ["MYPY_CACHE_DIR"] = original_cache_dir
 
 
-def _captured_output(stdout: io.StringIO, stderr: io.StringIO) -> str:
+def _captured_output(stdout: io.StringIO, stderr: io.StringIO, native_stderr: str = "") -> str:
     return "\n".join(
-        part.rstrip() for part in (stdout.getvalue(), stderr.getvalue()) if part.rstrip()
+        line
+        for value in (stdout.getvalue(), stderr.getvalue(), native_stderr)
+        for line in _diagnostic_lines(value)
     )
+
+
+def _diagnostic_lines(value: str) -> tuple[str, ...]:
+    return tuple(
+        line.rstrip()
+        for line in value.splitlines()
+        if line.strip() and not _is_ignored_diagnostic(line.strip())
+    )
+
+
+def _is_ignored_diagnostic(line: str) -> bool:
+    return line.startswith("ld: warning: duplicate -rpath ") and line.endswith(" ignored")
 
 
 def _write_build_log(

@@ -43,6 +43,16 @@ class FakeBuildExtWithSupport(FakeBuildExt):
             self.support_path.write_text("", encoding="utf-8")
 
 
+class FakeBuildExtWithNativeWarnings(FakeBuildExt):
+    """Build stand-in that writes native compiler warnings to fd stderr."""
+
+    def run(self) -> None:
+        """Emit one ignored linker warning and one useful warning."""
+        os.write(2, b"ld: warning: duplicate -rpath '/opt/anaconda3/lib' ignored\n")
+        os.write(2, b"compiler: warning: useful diagnostic\n")
+        super().run()
+
+
 def test_build_sidecars_succeeds_for_empty_input(tmp_path: Path) -> None:
     """Building with no enabled sidecars is a no-op success."""
     result = mypyc_backend.build_sidecars(
@@ -124,6 +134,41 @@ def test_build_sidecars_reports_support_artifacts(
         FakeBuildExtWithSupport.artifact_path,
         FakeBuildExtWithSupport.support_path,
     )
+
+
+def test_build_sidecars_captures_and_filters_native_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Native compiler stderr is captured, with noisy duplicate rpath warnings filtered."""
+    sidecar = tmp_path / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
+    FakeBuildExtWithNativeWarnings.artifact_path = (tmp_path / ".atoll" / "artifacts").joinpath(
+        f"{sidecar.stem}{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    )
+
+    def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
+        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        return []
+
+    monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
+    monkeypatch.setattr(mypyc_backend, "build_ext", FakeBuildExtWithNativeWarnings)
+
+    result = mypyc_backend.build_sidecars(
+        (sidecar,),
+        project_root=tmp_path,
+        build_dir=tmp_path / ".atoll" / "build",
+        source_roots=(tmp_path,),
+    )
+
+    captured = capsys.readouterr()
+    assert result.success is True
+    assert captured.err == ""
+    assert "duplicate -rpath" not in result.stdout
+    assert "useful diagnostic" in result.stdout
 
 
 def test_build_sidecars_adds_source_roots_to_mypy_path(

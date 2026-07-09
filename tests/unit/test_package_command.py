@@ -225,6 +225,52 @@ def test_package_whole_project_retries_and_skips_failed_islands(
     assert result.wheel_path is not None
 
 
+def test_package_reports_progress_for_expensive_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source-clean package builds expose phase progress to the CLI."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    messages: list[str] = []
+
+    def successful_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        assert kwargs
+        paths = cast(tuple[Path, ...], args[0])
+        artifacts: list[Path] = []
+        for path in paths:
+            artifact = tmp_path / f"{path.stem}{suffix}"
+            artifact.write_text("binary", encoding="utf-8")
+            artifacts.append(artifact)
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=tuple(artifacts),
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+            progress=messages.append,
+        )
+    )
+
+    assert result.success is True
+    assert any(message.startswith("discovered ") for message in messages)
+    assert any(message.startswith("scanned ") for message in messages)
+    assert any(message.startswith("running mypyc batch") for message in messages)
+    assert any(message.startswith("writing wheel") for message in messages)
+
+
 def test_package_whole_project_reports_zero_successful_retries_concisely(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
