@@ -85,6 +85,45 @@ def test_verify_reports_bad_compiled_origin(tmp_path: Path) -> None:
     assert result.error == "sidecar origin does not use a compiled extension suffix"
 
 
+def test_verify_accepts_metadata_wrapper_around_sidecar_callable(tmp_path: Path) -> None:
+    """Verification follows a managed wrapper to its native sidecar target."""
+    config = _config(
+        tmp_path,
+        "def _compiled() -> int:\n"
+        "    return 1\n"
+        "_compiled.__module__ = 'app._atoll_app_ranking'\n"
+        "def score_user() -> int:\n"
+        "    return _compiled()\n"
+        "score_user.__atoll_compiled_target__ = _compiled\n"
+        "__atoll_status__ = {'active': True, 'compiled': True, 'origin': 'x.so'}\n",
+        ("score_user",),
+    )
+
+    result = verify_islands(config)[0]
+
+    assert result.error is None
+    assert result.symbols == (("score_user", True),)
+
+
+def test_verify_rejects_native_target_marker_without_compiled_status(tmp_path: Path) -> None:
+    """A source function cannot spoof compiled routing with only the marker."""
+    config = _config(
+        tmp_path,
+        "def _compiled() -> int:\n"
+        "    return 1\n"
+        "_compiled.__module__ = 'app._atoll_app_ranking'\n"
+        "def score_user() -> int:\n"
+        "    return _compiled()\n"
+        "score_user.__atoll_compiled_target__ = _compiled\n"
+        "__atoll_status__ = {'active': True, 'compiled': False, 'origin': 'x.py'}\n",
+        ("score_user",),
+    )
+
+    result = verify_islands(config)[0]
+
+    assert result.error == "one or more symbols are not rebound to the sidecar module"
+
+
 def test_verify_reports_import_exception(tmp_path: Path) -> None:
     """Import failures become verification errors rather than uncaught exceptions."""
     config = _config(tmp_path, "raise RuntimeError('boom')\n", ("score_user",))

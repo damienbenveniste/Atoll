@@ -55,7 +55,11 @@ def _verify_island(island: EnabledIslandConfig, *, require_compiled: bool) -> Ve
         symbols = tuple(
             (
                 symbol,
-                getattr(getattr(module, symbol, None), "__module__", None) == island.sidecar_module,
+                _is_sidecar_binding(
+                    getattr(module, symbol, None),
+                    island.sidecar_module,
+                    compiled=compiled,
+                ),
             )
             for symbol in island.symbols
         )
@@ -102,6 +106,18 @@ def _failed(island: EnabledIslandConfig, error: str) -> VerifyResult:
         symbols=tuple((symbol, False) for symbol in island.symbols),
         error=error,
     )
+
+
+def _is_sidecar_binding(value: object, sidecar_module: str, *, compiled: bool) -> bool:
+    """Return whether an export delegates to the configured sidecar module.
+
+    Compiled mypyc functions cannot retain writable metadata. Managed shims wrap
+    them with the original source function and expose the native callable through
+    `__atoll_compiled_target__`; pure-Python fallback bindings remain direct. The
+    marker is trusted only when the managed shim reports compiled routing.
+    """
+    target = getattr(value, "__atoll_compiled_target__", value) if compiled else value
+    return getattr(target, "__module__", None) == sidecar_module
 
 
 def _clear_modules(source_module: str, sidecar_module: str) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.machinery
+import inspect
 import json
 import shutil
 import zipfile
@@ -174,6 +175,21 @@ def test_compile_can_keep_install_tree_for_debugging(
 
     assert result.error is None
     assert result.compiled is True
+    ranking = importlib.import_module("app.ranking")
+    score_user = ranking.score_user
+    native_target = score_user.__atoll_compiled_target__
+    assert inspect.isfunction(score_user)
+    wrapped_score_user = inspect.unwrap(score_user)
+    assert inspect.signature(score_user) == inspect.signature(wrapped_score_user)
+    assert score_user.__name__ == "score_user"
+    assert score_user.__qualname__ == "score_user"
+    assert score_user.__module__ == "app.ranking"
+    assert score_user.__doc__ == "Score one user from activity and event count."
+    assert score_user.__annotations__ == wrapped_score_user.__annotations__
+    assert native_target.__module__ == "app._atoll_app_ranking"
+    assert not hasattr(ranking, "_atoll_bind_compiled")
+    assert not hasattr(ranking, "_atoll_functools")
+    assert not hasattr(ranking, "_atoll_inspect")
     with zipfile.ZipFile(wheel_path) as wheel:
         names = set(wheel.namelist())
     assert "app/ranking.py" in names

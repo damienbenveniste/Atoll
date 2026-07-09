@@ -63,6 +63,10 @@ mypyc diagnostic. Module-level typing diagnostics, such as unsupported `TypeVar`
 arguments, remain visible in scan and compile reports, but Atoll still tries clean candidate
 functions from those modules.
 
+Compiled exports retain the source function's name, documentation, annotations, signature, and
+sync, coroutine, or generator shape. The managed export delegates to the native mypyc callable,
+which remains available to Atoll's routing verification without changing public metadata.
+
 ```bash
 uv pip install --force-reinstall .atoll/dist/*.whl
 ```

@@ -44,6 +44,9 @@ and skips islands that cannot be compiled; if none compile, the command fails wi
 mypyc diagnostic.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
 scan and compile reports, but Atoll still tries clean candidate functions from those modules.
+Compiled exports retain the source function's name, documentation, annotations, signature, and
+sync, coroutine, or generator shape. The managed export delegates to the native mypyc callable,
+which remains available to Atoll's routing verification without changing public metadata.
 Source-clean build failures keep terminal output short, write `.atoll/compile-report.*`, and list
 any retained diagnostic scratch path in the report. Run compile commands inside the target
 project's Python environment because mypyc uses the active interpreter and installed dependencies.

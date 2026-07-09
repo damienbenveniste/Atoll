@@ -56,12 +56,21 @@ def render_shim(config: EnabledIslandConfig) -> str:
 
     The shim prefers compiled artifacts when present, falls back to the generated
     Python sidecar otherwise, and honors `ATOLL_DISABLE`, `ATOLL_STRICT`, and
-    `ATOLL_REQUIRE_COMPILED`. It keeps transient helper names out of the module
-    namespace after import.
+    `ATOLL_REQUIRE_COMPILED`. Compiled exports are wrapped with their original
+    Python metadata so reflection APIs retain source signatures and callable
+    kinds. Transient helper names are removed from the module namespace after
+    import.
     """
     status_symbols = tuple(config.symbols)
     assignments = "\n".join(
-        f"            {symbol} = _atoll_mod.{symbol}" for symbol in config.symbols
+        line
+        for symbol in config.symbols
+        for line in (
+            "            if _atoll_compiled:",
+            f"                {symbol} = _atoll_bind_compiled({symbol}, _atoll_mod.{symbol})",
+            "            else:",
+            f"                {symbol} = _atoll_mod.{symbol}",
+        )
     )
     sidecar_relative = _relative_path_text(config.source_path.parent, config.sidecar_path)
     artifact_relative = _relative_path_text(config.source_path.parent, _artifact_dir(config))
@@ -70,11 +79,38 @@ def render_shim(config: EnabledIslandConfig) -> str:
             _begin_marker(config.source_module),
             "# This block is managed by Atoll. Do not edit manually.",
             "try:",
+            "    import functools as _atoll_functools",
             "    import importlib.machinery as _atoll_machinery",
             "    import importlib.util as _atoll_util",
+            "    import inspect as _atoll_inspect",
             "    import os as _atoll_os",
             "    import pathlib as _atoll_pathlib",
             "    import sys as _atoll_sys",
+            "",
+            "    def _atoll_bind_compiled(_atoll_source, _atoll_target):",
+            "        if _atoll_inspect.isasyncgenfunction(_atoll_source):",
+            "            @_atoll_functools.wraps(_atoll_source)",
+            "            async def _atoll_wrapped(*args, **kwargs):",
+            "                async for _atoll_item in _atoll_target(*args, **kwargs):",
+            "                    yield _atoll_item",
+            "        elif _atoll_inspect.iscoroutinefunction(_atoll_source):",
+            "            @_atoll_functools.wraps(_atoll_source)",
+            "            async def _atoll_wrapped(*args, **kwargs):",
+            "                return await _atoll_target(*args, **kwargs)",
+            "        elif _atoll_inspect.isgeneratorfunction(_atoll_source):",
+            "            @_atoll_functools.wraps(_atoll_source)",
+            "            def _atoll_wrapped(*args, **kwargs):",
+            "                return (yield from _atoll_target(*args, **kwargs))",
+            "        else:",
+            "            @_atoll_functools.wraps(_atoll_source)",
+            "            def _atoll_wrapped(*args, **kwargs):",
+            "                return _atoll_target(*args, **kwargs)",
+            "        try:",
+            "            _atoll_wrapped.__signature__ = _atoll_inspect.signature(_atoll_source)",
+            "        except (TypeError, ValueError):",
+            "            pass",
+            "        _atoll_wrapped.__atoll_compiled_target__ = _atoll_target",
+            "        return _atoll_wrapped",
             "",
             "    __atoll_status__ = {",
             f'        "source_module": "{config.source_module}",',
@@ -163,10 +199,13 @@ def render_shim(config: EnabledIslandConfig) -> str:
             '        "_atoll_added_artifact_path",',
             '        "_atoll_artifact_dir",',
             '        "_atoll_artifact_dir_text",',
+            '        "_atoll_bind_compiled",',
             '        "_atoll_candidate",',
             '        "_atoll_compiled",',
             '        "_atoll_compiled_paths",',
             '        "_atoll_error",',
+            '        "_atoll_functools",',
+            '        "_atoll_inspect",',
             '        "_atoll_machinery",',
             '        "_atoll_mod",',
             '        "_atoll_os",',
