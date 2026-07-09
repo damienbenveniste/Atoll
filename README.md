@@ -50,7 +50,8 @@ The install tree is written to `.atoll/dist/install` by default, and the wheel i
 `.atoll/dist/*.whl`. Use `--output` to place those generated artifacts somewhere else.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
-mypyc diagnostic.
+mypyc diagnostic. Known project-level mypyc blockers, such as unsupported `TypeVar` keyword
+arguments, are reported before the compiler runs.
 
 ```bash
 uv pip install --force-reinstall .atoll/dist/*.whl

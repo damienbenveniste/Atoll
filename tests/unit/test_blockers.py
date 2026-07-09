@@ -151,3 +151,29 @@ def test_blocked_local_call_dependency_is_rejected(tmp_path: Path) -> None:
     assert blockers_by_symbol["unsafe"] == {"FRAME_INTROSPECTION"}
     assert blockers_by_symbol["wrapper"] == {"LOCAL_BLOCKED_DEP"}
     assert scan.island_candidates == ()
+
+
+def test_mypyc_unsupported_typevar_keywords_block_module_candidates(tmp_path: Path) -> None:
+    """TypeVar features rejected by mypyc block generated island builds up front."""
+    module_path = tmp_path / "typing_features.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from typing_extensions import TypeVar as TV",
+                "",
+                "T = TV('T', infer_variance=True, default=str)",
+                "",
+                "def candidate(value: int) -> int:",
+                "    return value + 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = enrich_island_analysis(scan_module(ModuleId(name="typing_features", path=module_path)))
+
+    assert [blocker.code for blocker in scan.blockers] == ["MYPYC_UNSUPPORTED_TYPEVAR"]
+    assert "default, infer_variance" in scan.blockers[0].message
+    assert scan.island_candidates == ()

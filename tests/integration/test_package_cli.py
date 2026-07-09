@@ -108,6 +108,38 @@ def test_compile_reports_no_candidates_from_source_clean_default(
     assert "scan found no candidate islands" in captured.out
 
 
+def test_compile_reports_mypyc_preflight_blockers(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Source-clean compile surfaces known mypyc blockers without retry noise."""
+    (tmp_path / "src" / "pkg").mkdir(parents=True)
+    (tmp_path / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "pkg" / "mod.py").write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from typing_extensions import TypeVar",
+                "",
+                "T = TypeVar('T', default=str)",
+                "",
+                "def candidate(value: int) -> int:",
+                "    return value + 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["compile", "--root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "mypy/mypyc rejects typing constructs" in captured.out
+    assert "mod.py:4" in captured.out
+    assert "default" in captured.out
+
+
 def test_compile_in_place_rejects_output(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

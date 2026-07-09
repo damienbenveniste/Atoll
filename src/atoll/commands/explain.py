@@ -59,6 +59,11 @@ def _module_explanation(module: ModuleScan) -> str:
             lines.append(f"- {score_summary(candidate.score)}; {risk_summary(candidate.risk)}")
             lines.append(f"  symbols: {symbols}")
             lines.append(f"  reasons: {', '.join(candidate.reasons)}")
+    if module.blockers:
+        lines.extend(["", "Module blockers:"])
+        for blocker in module.blockers:
+            location = f"line {blocker.lineno}" if blocker.lineno is not None else "module"
+            lines.append(f"- {blocker.code} ({blocker.severity}, {location}): {blocker.message}")
     if module.poison_radii:
         lines.extend(["", "Poison residue:"])
         for radius in module.poison_radii:

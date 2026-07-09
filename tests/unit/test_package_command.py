@@ -257,6 +257,48 @@ def test_package_whole_project_reports_zero_successful_retries_concisely(
     )
 
 
+def test_package_preflight_reports_mypyc_unsupported_typevar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source-clean package mode reports known mypyc typing blockers before building."""
+    project_root = tmp_path / "project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    bad_module = project_root / "src" / "app" / "typing_features.py"
+    bad_module.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from typing_extensions import TypeVar",
+                "",
+                "T = TypeVar('T', infer_variance=True)",
+                "",
+                "def candidate(value: int) -> int:",
+                "    return value + 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def unexpected_build_sidecars(*_args: object, **_kwargs: object) -> CompileAttempt:
+        raise AssertionError("mypy build should not run after preflight blockers")
+
+    monkeypatch.setattr(package_command, "build_sidecars", unexpected_build_sidecars)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert "mypy/mypyc rejects typing constructs" in result.error
+    assert "typing_features.py:4" in result.error
+    assert "infer_variance" in result.error
+    assert not (output_dir / "build").exists()
+
+
 def test_package_helpers_handle_flat_source_roots(tmp_path: Path) -> None:
     """Flat source roots copy their contents into the build root."""
     (tmp_path / "pkg").mkdir()

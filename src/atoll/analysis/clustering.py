@@ -21,6 +21,7 @@ _MIN_SYMBOL_SCORE = 60
 _MIN_CLUSTER_SCORE = 70
 _MIN_CLUSTER_LINES = 3
 _HIGH_CONFIDENCE_SCORE = 90
+_MODULE_COMPILE_BLOCKERS = frozenset({"MYPYC_UNSUPPORTED_TYPEVAR"})
 
 
 def enrich_island_analysis(module: ModuleScan) -> ModuleScan:
@@ -127,6 +128,8 @@ def _cluster_candidates(
     module: ModuleScan,
     edges: tuple[DependencyEdge, ...],
 ) -> tuple[IslandCandidate, ...]:
+    if _module_blocks_compilation(module):
+        return ()
     symbols = {symbol.id: symbol for symbol in module.symbols}
     clean_function_ids = {
         symbol.id
@@ -257,6 +260,13 @@ def _candidate_reasons(symbols: tuple[SymbolRecord, ...], score: int) -> tuple[s
     if score >= _HIGH_CONFIDENCE_SCORE:
         reasons.append("high confidence candidate")
     return tuple(reasons)
+
+
+def _module_blocks_compilation(module: ModuleScan) -> bool:
+    return any(
+        blocker.severity == "hard" and blocker.code in _MODULE_COMPILE_BLOCKERS
+        for blocker in module.blockers
+    )
 
 
 def _required_imports(

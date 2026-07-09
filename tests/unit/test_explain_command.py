@@ -36,6 +36,35 @@ def test_explain_module_describes_candidate_score_and_risk() -> None:
     assert "rank_candidates" in output
 
 
+def test_explain_module_lists_module_blockers(tmp_path: Path) -> None:
+    """Module-level blockers are visible when they suppress candidate islands."""
+    package = tmp_path / "src" / "pkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "mod.py").write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "from typing_extensions import TypeVar",
+                "",
+                "T = TypeVar('T', infer_variance=True)",
+                "",
+                "def candidate(value: int) -> int:",
+                "    return value + 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    output = execute_explain(ExplainOptions(root=tmp_path, target="pkg.mod", mypy_enabled=False))
+
+    assert "Candidate islands: 0" in output
+    assert "Module blockers:" in output
+    assert "MYPYC_UNSUPPORTED_TYPEVAR" in output
+    assert "infer_variance" in output
+
+
 def test_explain_missing_module_and_symbol_fail() -> None:
     """Invalid explain targets fail with useful errors."""
     with pytest.raises(ValueError, match="module not found"):

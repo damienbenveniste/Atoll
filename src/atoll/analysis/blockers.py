@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from atoll.models import Blocker, BlockerSeverity, SymbolId
 
@@ -43,6 +44,8 @@ _FRAME_ATTRIBUTE_BLOCKERS = frozenset(
     }
 )
 _GETATTR_MIN_ARGS = 2
+_TYPING_MODULES = frozenset({"typing", "typing_extensions"})
+_MYPYC_UNSUPPORTED_TYPEVAR_KEYWORDS = frozenset({"default", "infer_variance"})
 
 
 def detect_function_blockers(
@@ -80,7 +83,8 @@ def detect_class_blockers(node: ast.ClassDef, symbol: SymbolId) -> tuple[Blocker
 
 def module_level_blockers(nodes: Iterable[ast.stmt], module: str) -> tuple[Blocker, ...]:
     """Detect obvious top-level monkey-patching statements."""
-    return tuple(
+    node_tuple = tuple(nodes)
+    monkey_patch_blockers = tuple(
         Blocker(
             severity="hard",
             code="DYN_MODULE_MONKEYPATCH",
@@ -92,6 +96,7 @@ def module_level_blockers(nodes: Iterable[ast.stmt], module: str) -> tuple[Block
         if isinstance(node, ast.Assign)
         and any(isinstance(target, ast.Attribute) for target in node.targets)
     )
+    return (*monkey_patch_blockers, *_module_typevar_blockers(node_tuple, module))
 
 
 def _metaclass_blockers(node: ast.ClassDef, symbol: SymbolId) -> tuple[Blocker, ...]:
@@ -255,6 +260,92 @@ def _decorator_blockers(decorators: Iterable[ast.expr], symbol: SymbolId) -> tup
                 )
             )
     return tuple(blockers)
+
+
+def _module_typevar_blockers(nodes: Iterable[ast.stmt], module: str) -> tuple[Blocker, ...]:
+    aliases = _typing_aliases(nodes)
+    if not aliases.typevar_names and not aliases.typing_module_names:
+        return ()
+    visitor = _ModuleTypeVarVisitor(module, aliases)
+    for node in nodes:
+        visitor.visit(node)
+    return tuple(visitor.blockers)
+
+
+@dataclass(frozen=True, slots=True)
+class _TypingAliases:
+    typevar_names: frozenset[str]
+    typing_module_names: frozenset[str]
+
+
+def _typing_aliases(nodes: Iterable[ast.stmt]) -> _TypingAliases:
+    typevar_names: set[str] = set()
+    typing_module_names: set[str] = set()
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _TYPING_MODULES:
+                    typing_module_names.add(alias.asname or alias.name)
+        elif (
+            isinstance(node, ast.ImportFrom) and node.module in _TYPING_MODULES and node.level == 0
+        ):
+            for alias in node.names:
+                if alias.name == "TypeVar":
+                    typevar_names.add(alias.asname or alias.name)
+    return _TypingAliases(
+        typevar_names=frozenset(typevar_names),
+        typing_module_names=frozenset(typing_module_names),
+    )
+
+
+class _ModuleTypeVarVisitor(ast.NodeVisitor):
+    def __init__(self, module: str, aliases: _TypingAliases) -> None:
+        self.module = module
+        self.aliases = aliases
+        self.blockers: list[Blocker] = []
+
+    def visit_Call(self, node: ast.Call) -> None:
+        unsupported = _unsupported_typevar_keywords(node, self.aliases)
+        if unsupported:
+            keywords = ", ".join(unsupported)
+            self.blockers.append(
+                Blocker(
+                    severity="hard",
+                    code="MYPYC_UNSUPPORTED_TYPEVAR",
+                    message=f"TypeVar keyword(s) {keywords} are rejected by mypyc",
+                    lineno=node.lineno,
+                    symbol=SymbolId(module=self.module, qualname="<module>"),
+                )
+            )
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        _ = node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        _ = node
+
+
+def _unsupported_typevar_keywords(node: ast.Call, aliases: _TypingAliases) -> tuple[str, ...]:
+    if not _is_typevar_call(node.func, aliases):
+        return ()
+    unsupported = [
+        keyword.arg
+        for keyword in node.keywords
+        if keyword.arg is not None and keyword.arg in _MYPYC_UNSUPPORTED_TYPEVAR_KEYWORDS
+    ]
+    return tuple(sorted(unsupported))
+
+
+def _is_typevar_call(node: ast.AST, aliases: _TypingAliases) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in aliases.typevar_names
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "TypeVar"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in aliases.typing_module_names
+    )
 
 
 def _annotation_args(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.arg, ...]:

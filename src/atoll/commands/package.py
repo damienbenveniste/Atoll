@@ -22,7 +22,7 @@ from atoll.analysis.clustering import enrich_island_analysis
 from atoll.backends.mypyc import build_sidecars
 from atoll.generation.shim import insert_or_replace_shim, remove_shim
 from atoll.generation.sidecar import default_sidecar_module, generate_sidecar
-from atoll.models import CompileAttempt, EnabledIslandConfig, ModuleId, ModuleScan
+from atoll.models import Blocker, CompileAttempt, EnabledIslandConfig, ModuleId, ModuleScan
 from atoll.project import DiscoveredProject, discover_project
 
 _GENERATED_DIR_NAMES = frozenset(
@@ -38,6 +38,8 @@ _GENERATED_DIR_NAMES = frozenset(
         "site-packages",
     }
 )
+_MYPYC_PREFLIGHT_BLOCKERS = frozenset({"MYPYC_UNSUPPORTED_TYPEVAR"})
+_MAX_PREFLIGHT_BLOCKERS = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +88,12 @@ class _SelectedModule:
 
 
 @dataclass(frozen=True, slots=True)
+class _ModuleBlocker:
+    scan: ModuleScan
+    blocker: Blocker
+
+
+@dataclass(frozen=True, slots=True)
 class _PackageBuildOutcome:
     successful: tuple[EnabledIslandConfig, ...]
     build: CompileAttempt
@@ -95,7 +103,10 @@ class _PackageBuildOutcome:
 def execute_package(options: PackageOptions) -> PackageCommandResult:
     """Build an install tree and wheel containing Atoll compiled islands."""
     project = discover_project(options.root)
-    selected = _selected_modules(project, options.module_name)
+    scans = _selected_scans(project, options.module_name)
+    if preflight_error := _mypyc_preflight_error(scans):
+        return _failed_result(project.config.root, options.output_dir, preflight_error)
+    selected = _selected_modules(scans)
     if not selected:
         return _failed_result(
             project.config.root, options.output_dir, "scan found no candidate islands"
@@ -288,18 +299,59 @@ def _no_successful_retry_error(
     )
 
 
-def _selected_modules(
+def _selected_scans(
     project: DiscoveredProject,
     module_name: str | None,
-) -> tuple[_SelectedModule, ...]:
+) -> tuple[ModuleScan, ...]:
     modules = (_find_module(project.modules, module_name),) if module_name else project.modules
+    return tuple(enrich_island_analysis(scan_module(module)) for module in modules)
+
+
+def _selected_modules(
+    scans: tuple[ModuleScan, ...],
+) -> tuple[_SelectedModule, ...]:
     selected: list[_SelectedModule] = []
-    for module in modules:
-        scan = enrich_island_analysis(scan_module(module))
+    for scan in scans:
         symbols = _candidate_symbols(scan)
         if symbols:
             selected.append(_SelectedModule(scan=scan, symbols=symbols))
     return tuple(selected)
+
+
+def _mypyc_preflight_error(scans: tuple[ModuleScan, ...]) -> str | None:
+    blockers = tuple(
+        _ModuleBlocker(scan=scan, blocker=blocker)
+        for scan in scans
+        for blocker in scan.blockers
+        if blocker.severity == "hard" and blocker.code in _MYPYC_PREFLIGHT_BLOCKERS
+    )
+    if not blockers:
+        return None
+    return _format_mypyc_preflight_error(blockers)
+
+
+def _format_mypyc_preflight_error(blockers: tuple[_ModuleBlocker, ...]) -> str:
+    shown = blockers[:_MAX_PREFLIGHT_BLOCKERS]
+    lines = [
+        "Atoll cannot compile the selected project because mypy/mypyc rejects typing constructs "
+        "used before generated islands can be built.",
+        "Unsupported typing blockers:",
+    ]
+    lines.extend(_format_mypyc_preflight_blocker(item) for item in shown)
+    remaining = len(blockers) - len(shown)
+    if remaining > 0:
+        lines.append(f"... {remaining} more blocker(s)")
+    lines.append(
+        "This is a target-project typing compatibility issue, not an Atoll source-edit issue."
+    )
+    return "\n".join(lines)
+
+
+def _format_mypyc_preflight_blocker(item: _ModuleBlocker) -> str:
+    location = str(item.scan.module.path)
+    if item.blocker.lineno is not None:
+        location = f"{location}:{item.blocker.lineno}"
+    return f"- {location}: {item.blocker.message}"
 
 
 def _candidate_symbols(scan: ModuleScan) -> tuple[str, ...]:

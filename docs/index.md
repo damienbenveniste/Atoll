@@ -32,6 +32,8 @@ The install tree is written to `.atoll/dist/install` by default, and the wheel i
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic.
+Known project-level mypyc blockers, such as unsupported `TypeVar` keyword arguments, are reported
+before the compiler runs.
 Build failures keep terminal output short and write full mypyc diagnostics to
 `.atoll/build/mypyc.log`.
 Run build commands inside the target project's Python environment because mypyc uses the active
