@@ -94,22 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     enable.add_argument("--build", action="store_true", help="compile the enabled sidecar")
     enable.add_argument("--dry-run", action="store_true", help="show changes without writing files")
     enable.add_argument("--yes", action="store_true", help="suppress managed shim diff output")
-    compile_cmd = subparsers.add_parser(
-        "compile",
-        help="enable, build, and verify discovered candidates",
-    )
-    compile_cmd.add_argument(
-        "module",
-        nargs="?",
-        default=None,
-        help="optional source module to compile",
-    )
-    compile_cmd.add_argument("--root", type=Path, default=Path(), help="project root")
-    compile_cmd.add_argument(
-        "--test",
-        default=None,
-        help='pytest command to run after compiled routing, for example "pytest tests"',
-    )
+    _add_compile_parser(subparsers)
     disable = subparsers.add_parser("disable", help="disable an Atoll island")
     disable.add_argument("module", help="source module to disable")
     disable.add_argument("--root", type=Path, default=Path(), help="project root")
@@ -167,6 +152,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="do not require compiled extension routing after build",
     )
     return parser
+
+
+def _add_compile_parser(subparsers: _Subparsers) -> None:
+    compile_cmd = subparsers.add_parser(
+        "compile",
+        help="enable, build, and verify discovered candidates",
+    )
+    compile_cmd.add_argument(
+        "module",
+        nargs="?",
+        default=None,
+        help="optional source module to compile",
+    )
+    compile_cmd.add_argument("--root", type=Path, default=Path(), help="project root")
+    compile_cmd.add_argument(
+        "--test",
+        default=None,
+        help='pytest command to run after compiled routing, for example "pytest tests"',
+    )
+    compile_cmd.add_argument(
+        "--no-source-edit",
+        action="store_true",
+        help="compile a copied install tree and wheel without modifying source files",
+    )
+    compile_cmd.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="output directory for --no-source-edit install tree and wheel",
+    )
 
 
 def _add_package_parser(subparsers: _Subparsers) -> None:
@@ -319,8 +334,21 @@ def _print_enable_result(result: EnableCommandResult, *, yes: bool) -> None:
 
 
 def _run_compile(args: argparse.Namespace) -> int:
-    if not _validate_compile_test_command(args.test):
+    option_error = _compile_option_error(args)
+    if option_error is not None:
+        print(option_error)
         return 2
+    if args.no_source_edit:
+        return _run_source_clean_artifact_build(
+            root=args.root,
+            module_name=args.module,
+            output_dir=args.output,
+            label="source-clean compile",
+        )
+    return _run_inplace_compile(args)
+
+
+def _run_inplace_compile(args: argparse.Namespace) -> int:
     try:
         enable_result = execute_enable_all(
             EnableAllOptions(root=args.root, module_name=args.module, yes=True)
@@ -393,15 +421,18 @@ def _run_compile(args: argparse.Namespace) -> int:
     return 0
 
 
-def _validate_compile_test_command(command: str | None) -> bool:
-    if command is None:
-        return True
+def _compile_option_error(args: argparse.Namespace) -> str | None:
+    if args.no_source_edit and args.test is not None:
+        return "--test cannot be used with --no-source-edit"
+    if not args.no_source_edit and args.output is not None:
+        return "--output requires --no-source-edit"
+    if args.test is None:
+        return None
     try:
-        parse_pytest_command(command)
+        parse_pytest_command(args.test)
     except ValueError as error:
-        print(error)
-        return False
-    return True
+        return str(error)
+    return None
 
 
 def _run_compile_test_gate(
@@ -470,14 +501,29 @@ def _run_build(args: argparse.Namespace) -> int:
 
 
 def _run_package(args: argparse.Namespace) -> int:
+    return _run_source_clean_artifact_build(
+        root=args.root,
+        module_name=args.module,
+        output_dir=args.output,
+        label="package",
+    )
+
+
+def _run_source_clean_artifact_build(
+    *,
+    root: Path,
+    module_name: str | None,
+    output_dir: Path | None,
+    label: str,
+) -> int:
     result = execute_package(
-        PackageOptions(root=args.root, module_name=args.module, output_dir=args.output)
+        PackageOptions(root=root, module_name=module_name, output_dir=output_dir)
     )
     if not result.success:
         print(result.error or result.build.stderr)
         return 1
     print(
-        f"Atoll package built {len(result.islands)} module(s) "
+        f"Atoll {label} built {len(result.islands)} module(s) "
         f"and {sum(len(island.symbols) for island in result.islands)} symbol(s)."
     )
     print(f"Install tree: {result.install_root}")

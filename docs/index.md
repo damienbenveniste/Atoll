@@ -44,17 +44,18 @@ interpreter and installed dependencies.
 
 ## Installable Artifacts
 
-Use `package` when you want compiled islands without modifying the source checkout. It copies the
-target package into an Atoll build area, inserts shims only in that copy, compiles the copied
-sidecars, and writes both an install tree and a platform wheel.
+Use `compile --no-source-edit` when you want compiled islands without modifying the source
+checkout. It copies the target package into an Atoll build area, inserts shims only in that copy,
+compiles the copied sidecars, and writes both an install tree and a platform wheel.
 
 ```bash
-uv run atoll package app.ranking --output .atoll/dist
+uv run atoll compile app.ranking --no-source-edit --output .atoll/dist
 uv pip install --force-reinstall .atoll/dist/*.whl
 ```
 
 The original source files are left untouched. The install tree is written to `.atoll/dist/install`
-by default, and the wheel contains the shimmed modules plus the compiled native artifacts.
+by default, and the wheel contains the shimmed modules plus the compiled native artifacts. The
+older `atoll package` command remains available as a compatibility alias.
 
 Lower-level commands remain available for debugging:
 

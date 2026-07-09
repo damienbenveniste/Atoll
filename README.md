@@ -59,17 +59,18 @@ the generated build inputs in place for debugging and marks the report failed.
 
 ## Build installable artifacts
 
-Use `package` when you want compiled islands without modifying the source checkout. It copies the
-target package into an Atoll build area, inserts shims only in that copy, compiles the copied
-sidecars, and writes both an install tree and a platform wheel.
+Use `compile --no-source-edit` when you want compiled islands without modifying the source
+checkout. It copies the target package into an Atoll build area, inserts shims only in that copy,
+compiles the copied sidecars, and writes both an install tree and a platform wheel.
 
 ```bash
-uv run atoll package app.ranking --output .atoll/dist
+uv run atoll compile app.ranking --no-source-edit --output .atoll/dist
 uv pip install --force-reinstall .atoll/dist/*.whl
 ```
 
 The original source files are left untouched. The install tree is written to `.atoll/dist/install`
-by default, and the wheel contains the shimmed modules plus the compiled native artifacts.
+by default, and the wheel contains the shimmed modules plus the compiled native artifacts. The
+older `atoll package` command remains available as a compatibility alias.
 
 Build failures print a concise summary and write full mypyc diagnostics to `.atoll/build/mypyc.log`.
 Run `atoll build` inside the target project's Python environment, since mypyc imports and
