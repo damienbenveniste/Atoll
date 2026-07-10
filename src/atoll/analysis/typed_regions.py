@@ -107,20 +107,26 @@ def build_typed_regions(
     declared method is eligible; otherwise its eligible methods remain
     independent callable members on the original source class.
     """
+    source = module.module.path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(module.module.path), type_comments=True)
     eligible = {symbol.id: symbol for symbol in module.symbols if _eligible(symbol)}
     if not eligible:
         return ()
     adjacency = _adjacency(eligible, edges)
-    downgraded_classes = _connect_atomic_classes(module.symbols, eligible, adjacency)
+    downgraded_classes = _connect_atomic_classes(
+        module.symbols,
+        eligible,
+        adjacency,
+        tree,
+    )
     components = _components(eligible, adjacency)
-    source = module.module.path.read_text(encoding="utf-8")
     source_lines = source.splitlines()
     context = _RegionBuildContext(
         module=module,
         eligible=eligible,
         edges=edges,
         source_lines=source_lines,
-        tree=ast.parse(source, filename=str(module.module.path), type_comments=True),
+        tree=tree,
         downgraded_classes=downgraded_classes,
         forbidden_type_paths=_semantic_any_paths(module),
     )
@@ -168,6 +174,7 @@ def _connect_atomic_classes(
     symbols: tuple[SymbolRecord, ...],
     eligible: dict[SymbolId, SymbolRecord],
     adjacency: dict[SymbolId, set[SymbolId]],
+    tree: ast.Module,
 ) -> dict[str, LoweringDecision]:
     methods_by_owner: dict[str, list[SymbolRecord]] = defaultdict(list)
     classes = {symbol.id.qualname: symbol for symbol in symbols if symbol.kind == "class"}
@@ -179,7 +186,19 @@ def _connect_atomic_classes(
         class_symbol = classes.get(owner)
         if class_symbol is None:
             continue
+        unsafe_reason = _atomic_class_unsafe_reason(class_symbol, tree)
+        if unsafe_reason is not None:
+            eligible.pop(class_symbol.id, None)
+            adjacency.pop(class_symbol.id, None)
+            _connect_interpreted_owner_methods(methods, eligible, adjacency)
+            downgraded[owner] = LoweringDecision(
+                target=class_symbol.id.stable_id,
+                action="fallback",
+                reason=unsafe_reason,
+            )
+            continue
         if class_symbol.id not in eligible:
+            _connect_interpreted_owner_methods(methods, eligible, adjacency)
             downgraded[owner] = LoweringDecision(
                 target=class_symbol.id.stable_id,
                 action="fallback",
@@ -189,6 +208,7 @@ def _connect_atomic_classes(
         if any(method.id not in eligible for method in methods):
             eligible.pop(class_symbol.id, None)
             adjacency.pop(class_symbol.id, None)
+            _connect_interpreted_owner_methods(methods, eligible, adjacency)
             downgraded[owner] = LoweringDecision(
                 target=class_symbol.id.stable_id,
                 action="fallback",
@@ -199,6 +219,304 @@ def _connect_atomic_classes(
             adjacency[class_symbol.id].add(method.id)
             adjacency[method.id].add(class_symbol.id)
     return downgraded
+
+
+def _connect_interpreted_owner_methods(
+    methods: list[SymbolRecord],
+    eligible: dict[SymbolId, SymbolRecord],
+    adjacency: dict[SymbolId, set[SymbolId]],
+) -> None:
+    """Keep one owner-level method region after whole-class replacement is rejected."""
+    method_ids = tuple(method.id for method in methods if method.id in eligible)
+    if not method_ids:
+        return
+    anchor = method_ids[0]
+    for method_id in method_ids[1:]:
+        adjacency[anchor].add(method_id)
+        adjacency[method_id].add(anchor)
+
+
+def _atomic_class_unsafe_reason(class_symbol: SymbolRecord, tree: ast.Module) -> str | None:
+    """Explain why replacing a source class after module execution is unsafe.
+
+    Class replacement is allowed only when no object created while the module is
+    loading can retain the original class identity. Class decorators may register
+    or replace the class, duplicate module bindings obscure the public identity,
+    and any later module-level reference may create an instance, subclass, default,
+    annotation, or registry entry before the staged shim runs.
+    """
+    declaration_issue = _atomic_class_declaration_issue(class_symbol, tree)
+    if declaration_issue is not None:
+        return f"class remains interpreted because {declaration_issue}"
+    identity_issue = _atomic_class_identity_issue(class_symbol, tree)
+    return f"class remains interpreted because {identity_issue}" if identity_issue else None
+
+
+def _atomic_class_declaration_issue(
+    class_symbol: SymbolRecord,
+    tree: ast.Module,
+) -> str | None:
+    if class_symbol.decorators:
+        return "decorators may register or replace it"
+    class_node = next(
+        (
+            statement
+            for statement in tree.body
+            if isinstance(statement, ast.ClassDef)
+            and statement.name == class_symbol.id.qualname
+            and statement.lineno == class_symbol.lineno
+        ),
+        None,
+    )
+    if class_node is None:
+        return "its declaration cannot be resolved"
+    return _atomic_class_definition_issue(class_node)
+
+
+def _atomic_class_identity_issue(
+    class_symbol: SymbolRecord,
+    tree: ast.Module,
+) -> str | None:
+    class_name = class_symbol.id.qualname
+    if class_name in _ambiguous_module_bindings(tree):
+        return "its module binding is reassigned"
+    if _has_later_module_reference(tree, class_symbol):
+        return "module-time code retains its original identity"
+    if _has_later_import(tree, class_symbol):
+        return "a later import can expose its source identity"
+    if _has_later_call(tree, class_symbol):
+        return "a later call can expose its source identity"
+    return None
+
+
+def _atomic_class_definition_issue(node: ast.ClassDef) -> str | None:
+    """Return a reason when evaluating a copied class could change behavior."""
+    if node.bases or node.keywords:
+        return "source inheritance is outside the closed atomic-class subset"
+    for statement in node.body:
+        issue = _atomic_class_statement_issue(statement)
+        if issue is not None:
+            return issue
+    return None
+
+
+def _atomic_class_statement_issue(statement: ast.stmt) -> str | None:
+    if isinstance(statement, ast.Pass | ast.AsyncFunctionDef):
+        return None
+    if (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Constant)
+        and isinstance(statement.value.value, str)
+    ):
+        return None
+    if (
+        isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+        and statement.value is None
+    ):
+        return None
+    if isinstance(statement, ast.FunctionDef):
+        return _atomic_method_definition_issue(statement)
+    return "its class body contains executable statements"
+
+
+def _atomic_method_definition_issue(statement: ast.FunctionDef) -> str | None:
+    if (
+        statement.name.startswith("__")
+        and statement.name.endswith("__")
+        and statement.name != "__init__"
+    ):
+        return f"special method {statement.name} requires interpreted class semantics"
+    if any(
+        _atomic_decorator_name(decorator) not in {"staticmethod", "classmethod"}
+        for decorator in statement.decorator_list
+    ):
+        return f"method {statement.name} has a runtime decorator"
+    defaults = (*statement.args.defaults, *statement.args.kw_defaults)
+    if any(default is not None and not _atomic_default_is_literal(default) for default in defaults):
+        return f"method {statement.name} has a nonliteral default"
+    return None
+
+
+def _atomic_decorator_name(decorator: ast.expr) -> str | None:
+    if isinstance(decorator, ast.Name):
+        return decorator.id
+    return None
+
+
+def _atomic_default_is_literal(expression: ast.expr) -> bool:
+    if isinstance(expression, ast.Constant):
+        return True
+    return (
+        isinstance(expression, ast.UnaryOp)
+        and isinstance(expression.op, ast.UAdd | ast.USub)
+        and isinstance(expression.operand, ast.Constant)
+        and isinstance(expression.operand.value, int | float | complex)
+    )
+
+
+def _has_later_import(tree: ast.Module, class_symbol: SymbolRecord) -> bool:
+    class_statement_seen = False
+    for statement in tree.body:
+        if (
+            isinstance(statement, ast.ClassDef)
+            and statement.name == class_symbol.id.qualname
+            and statement.lineno == class_symbol.lineno
+        ):
+            class_statement_seen = True
+            continue
+        if class_statement_seen:
+            visitor = _ModuleTimeImportVisitor()
+            visitor.visit(statement)
+            if visitor.found:
+                return True
+    return False
+
+
+class _ModuleTimeImportVisitor(ast.NodeVisitor):
+    """Find imports executed after a class while skipping deferred function bodies."""
+
+    def __init__(self) -> None:
+        self.found = False
+
+    def visit_Import(self, node: ast.Import) -> None:
+        _ = node
+        self.found = True
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        _ = node
+        self.found = True
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        _ = node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        _ = node
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        _ = node
+
+
+def _has_later_call(tree: ast.Module, class_symbol: SymbolRecord) -> bool:
+    class_statement_seen = False
+    for statement in tree.body:
+        if (
+            isinstance(statement, ast.ClassDef)
+            and statement.name == class_symbol.id.qualname
+            and statement.lineno == class_symbol.lineno
+        ):
+            class_statement_seen = True
+            continue
+        if class_statement_seen:
+            visitor = _ModuleTimeCallVisitor()
+            visitor.visit(statement)
+            if visitor.found:
+                return True
+    return False
+
+
+class _ModuleTimeCallVisitor(ast.NodeVisitor):
+    """Find arbitrary calls that can re-enter a partially initialized module."""
+
+    def __init__(self) -> None:
+        self.found = False
+
+    def visit_Call(self, node: ast.Call) -> None:
+        _ = node
+        self.found = True
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function_header(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function_header(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_arguments(node.args)
+
+    def _visit_function_header(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self._visit_arguments(node.args)
+        if node.returns is not None:
+            self.visit(node.returns)
+
+    def _visit_arguments(self, arguments: ast.arguments) -> None:
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+            *((arguments.vararg,) if arguments.vararg is not None else ()),
+            *((arguments.kwarg,) if arguments.kwarg is not None else ()),
+        ):
+            if argument.annotation is not None:
+                self.visit(argument.annotation)
+        for default in (*arguments.defaults, *arguments.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+
+def _has_later_module_reference(tree: ast.Module, class_symbol: SymbolRecord) -> bool:
+    class_statement_seen = False
+    for statement in tree.body:
+        if (
+            isinstance(statement, ast.ClassDef)
+            and statement.name == class_symbol.id.qualname
+            and statement.lineno == class_symbol.lineno
+        ):
+            class_statement_seen = True
+            continue
+        if not class_statement_seen:
+            continue
+        visitor = _ModuleTimeClassReferenceVisitor(class_symbol.id.qualname)
+        visitor.visit(statement)
+        if visitor.found:
+            return True
+    return False
+
+
+class _ModuleTimeClassReferenceVisitor(ast.NodeVisitor):
+    """Find class-name use in expressions evaluated while a module is loading."""
+
+    def __init__(self, class_name: str) -> None:
+        self.class_name = class_name
+        self.found = False
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id == self.class_name:
+            self.found = True
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function_header(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function_header(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_arguments(node.args)
+
+    def _visit_function_header(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self._visit_arguments(node.args)
+        if node.returns is not None:
+            self.visit(node.returns)
+        for type_parameter in getattr(node, "type_params", ()):
+            self.visit(type_parameter)
+
+    def _visit_arguments(self, arguments: ast.arguments) -> None:
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+            *((arguments.vararg,) if arguments.vararg is not None else ()),
+            *((arguments.kwarg,) if arguments.kwarg is not None else ()),
+        ):
+            if argument.annotation is not None:
+                self.visit(argument.annotation)
+        for default in (*arguments.defaults, *arguments.kw_defaults):
+            if default is not None:
+                self.visit(default)
 
 
 def _components(
@@ -439,6 +757,10 @@ def _binding_targets(
     for symbol in symbols:
         if atomic_class and symbol.kind == "method":
             continue
+        if symbol.kind == "method" and symbol.id.qualname.rsplit(".", maxsplit=1)[-1].startswith(
+            "__"
+        ):
+            continue
         targets.append(
             BindingTarget(
                 source=symbol.id,
@@ -516,7 +838,7 @@ def _subclass_specializations(
     specializations: list[RegionSpecialization | None] = []
     for subclass in inputs.by_class.values():
         if (
-            subclass.id not in inputs.context.eligible
+            not _class_supports_member_binding(subclass, inputs.context)
             or subclass.has_any_annotation
             or subclass.type_parameters
             or subclass.scope_type_parameter_records
@@ -658,7 +980,7 @@ def _concrete_base_targets(
 
 def _generic_base_is_safe(base: SymbolRecord, context: _RegionBuildContext) -> bool:
     """Allow a legacy generic base blocked only by its own TypeVar assignment."""
-    if base.id in context.eligible:
+    if _class_supports_member_binding(base, context):
         return True
     hard_blockers = tuple(blocker for blocker in base.blockers if blocker.severity == "hard")
     type_parameters = set(base.scope_type_parameters)
@@ -767,7 +1089,32 @@ def _owner_class_is_eligible(symbol: SymbolRecord, context: _RegionBuildContext)
     if symbol.owner_class is None:
         return False
     owner_id = SymbolId(module=symbol.id.module, qualname=symbol.owner_class)
-    return owner_id in context.eligible
+    owner = next(
+        (candidate for candidate in context.module.symbols if candidate.id == owner_id),
+        None,
+    )
+    return owner is not None and _class_supports_member_binding(owner, context)
+
+
+def _class_supports_member_binding(
+    class_symbol: SymbolRecord,
+    context: _RegionBuildContext,
+) -> bool:
+    """Keep method evidence when only whole-class replacement was downgraded."""
+    if class_symbol.id in context.eligible:
+        return True
+    decision = context.downgraded_classes.get(class_symbol.id.qualname)
+    if decision is None or class_symbol.blockers:
+        return False
+    return any(
+        reason in decision.reason
+        for reason in (
+            "source inheritance is outside",
+            "module-time code retains",
+            "later import can expose",
+            "later call can expose",
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)

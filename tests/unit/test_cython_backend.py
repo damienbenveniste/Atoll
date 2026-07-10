@@ -60,7 +60,7 @@ def test_cython_backend_structurally_conforms_to_compiler_backend() -> None:
 
 
 def test_cython_assesses_typed_functions_methods_and_async_generators(tmp_path: Path) -> None:
-    """Cython accepts typed callable members but leaves class-atomic lowering out."""
+    """Cython accepts typed callable members and closed atomic classes."""
     regions = _regions(
         tmp_path,
         "cython_shapes",
@@ -111,20 +111,18 @@ def test_cython_assesses_typed_functions_methods_and_async_generators(tmp_path: 
     worker_region = _region_containing(regions, "Worker", "Worker.scale", "Worker.parse")
     worker_assessment = backend.assess(worker_region)
 
-    assert worker_assessment.status == "partial"
-    assert _member(worker_region, "Worker") in worker_assessment.unsupported_members
+    assert worker_assessment.status == "supported"
+    assert _member(worker_region, "Worker") in worker_assessment.supported_members
     assert _member(worker_region, "Worker.scale") in worker_assessment.supported_members
     assert _member(worker_region, "Worker.parse") in worker_assessment.supported_members
     assert _member(worker_region, "Worker.build") in worker_assessment.supported_members
-    assert "native_class" not in worker_assessment.capabilities
+    assert "native_class" in worker_assessment.capabilities
     assert set(worker_assessment.capabilities) >= {
         "instance_method",
         "staticmethod",
         "classmethod",
     }
-    assert any(
-        "class-atomic lowering is not implemented" in reason for reason in worker_assessment.reasons
-    )
+    assert worker_assessment.reasons == ()
 
 
 def test_cython_rejects_any_generic_fallback_and_reject_decisions(tmp_path: Path) -> None:
@@ -195,13 +193,13 @@ def test_cython_lower_validates_requested_members_and_variant_id(tmp_path: Path)
     assert unit.install_relative_dir == "compiled"
     assert len(unit.source_hash) == SHA256_HEX_LENGTH
 
-    with pytest.raises(UnsupportedBackendRegionError, match=r"cython_lowering::Worker"):
+    with pytest.raises(UnsupportedBackendRegionError, match=r"cython_lowering::Worker.missing"):
         backend.lower(
             BackendLoweringRequest(
                 region=region,
                 source_path=source_path,
                 logical_module="cython_lowering",
-                members=(_member(region, "Worker"),),
+                members=(SymbolId("cython_lowering", "Worker.missing"),),
             )
         )
 

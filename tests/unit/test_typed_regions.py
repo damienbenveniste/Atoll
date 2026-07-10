@@ -113,6 +113,287 @@ def test_dynamic_class_downgrades_to_method_regions(tmp_path: Path) -> None:
     )
 
 
+def test_module_time_instance_downgrades_class_but_keeps_safe_methods(
+    tmp_path: Path,
+) -> None:
+    """A pre-shim instance keeps the source class identity and permits method binding."""
+    scan = _scan_source(
+        tmp_path,
+        "module_instance",
+        [
+            "class Worker:",
+            "    value: int",
+            "",
+            "    def __init__(self, value: int) -> None:",
+            "        self.value = value",
+            "",
+            "    def double(self) -> int:",
+            "        return self.value * 2",
+            "",
+            "WORKER = Worker(3)",
+            "",
+        ],
+    )
+
+    assert not any(region.atomic_class for region in scan.typed_regions)
+    method_region = next(
+        region
+        for region in scan.typed_regions
+        if any(member.id.qualname == "Worker.double" for member in region.members)
+    )
+    assert tuple(binding.source.qualname for binding in method_region.bindings) == (
+        "Worker.double",
+    )
+    assert any(
+        decision.target == "module_instance::Worker"
+        and decision.action == "fallback"
+        and "module-time code retains" in decision.reason
+        for decision in method_region.decisions
+    )
+
+
+def test_registration_decorator_keeps_original_class_for_method_binding(tmp_path: Path) -> None:
+    """A class decorator prevents replacement without poisoning an eligible method."""
+    scan = _scan_source(
+        tmp_path,
+        "registered_class",
+        [
+            "REGISTRY: list[type[object]] = []",
+            "",
+            "def register(cls: type[object]) -> type[object]:",
+            "    REGISTRY.append(cls)",
+            "    return cls",
+            "",
+            "@register",
+            "class Worker:",
+            "    def double(self, value: int) -> int:",
+            "        return value * 2",
+            "",
+        ],
+    )
+
+    method_region = next(
+        region
+        for region in scan.typed_regions
+        if any(member.id.qualname == "Worker.double" for member in region.members)
+    )
+    assert method_region.atomic_class is False
+    assert method_region.bindings[0].kind == "instance_method"
+    assert any(
+        decision.target == "registered_class::Worker"
+        and decision.action == "fallback"
+        and "decorators may register" in decision.reason
+        for decision in method_region.decisions
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "owner", "lines", "reason"),
+    [
+        (
+            "source_inheritance",
+            "Child",
+            [
+                "class Base:",
+                "    def value(self) -> int:",
+                "        return 1",
+                "",
+                "class Child(Base):",
+                "    def double(self, value: int) -> int:",
+                "        return value * 2",
+                "",
+            ],
+            "source inheritance is outside",
+        ),
+        (
+            "class_body_effect",
+            "Worker",
+            [
+                "def create() -> int:",
+                "    return 1",
+                "",
+                "class Worker:",
+                "    value: int = create()",
+                "",
+                "    def double(self, value: int) -> int:",
+                "        return value * 2",
+                "",
+            ],
+            "class body contains executable statements",
+        ),
+        (
+            "method_default_effect",
+            "Worker",
+            [
+                "def create() -> int:",
+                "    return 1",
+                "",
+                "class Worker:",
+                "    def double(self, value: int = create()) -> int:",
+                "        return value * 2",
+                "",
+            ],
+            "nonliteral default",
+        ),
+        (
+            "post_class_import",
+            "Worker",
+            [
+                "class Worker:",
+                "    def double(self, value: int) -> int:",
+                "        return value * 2",
+                "",
+                "import math",
+                "",
+            ],
+            "later import can expose",
+        ),
+        (
+            "post_class_import_from",
+            "Worker",
+            [
+                "class Worker:",
+                "    def double(self, value: int) -> int:",
+                "        return value * 2",
+                "",
+                "from math import sqrt",
+                "",
+            ],
+            "later import can expose",
+        ),
+        (
+            "post_class_call",
+            "Worker",
+            [
+                "class Factory:",
+                "    pass",
+                "",
+                "class Worker:",
+                "    def double(self, value: int) -> int:",
+                "        return value * 2",
+                "",
+                "FACTORY = Factory()",
+                "",
+            ],
+            "later call can expose",
+        ),
+        (
+            "method_runtime_decorator",
+            "Worker",
+            [
+                "class Decorators:",
+                "    @staticmethod",
+                "    def cache(value: object) -> object:",
+                "        return value",
+                "",
+                "class Worker:",
+                "    def increment(self, value: int) -> int:",
+                "        return value + 1",
+                "",
+                "    @Decorators.cache",
+                "    def double(self, value: int) -> int:",
+                "        return value * 2",
+                "",
+            ],
+            "runtime decorator",
+        ),
+    ],
+)
+def test_atomic_class_safety_rejects_identity_and_definition_hazards(
+    tmp_path: Path,
+    name: str,
+    owner: str,
+    lines: list[str],
+    reason: str,
+) -> None:
+    """Class replacement is rejected before copied declarations can execute twice."""
+    scan = _scan_source(tmp_path, name, lines)
+
+    assert not any(
+        region.atomic_class and any(member.id.qualname == owner for member in region.members)
+        for region in scan.typed_regions
+    )
+    assert any(
+        any(member.owner_class == owner for member in region.members)
+        and decision.action == "fallback"
+        and reason in decision.reason
+        for region in scan.typed_regions
+        for decision in region.decisions
+    )
+
+
+def test_function_body_only_class_reference_does_not_escape_during_import(tmp_path: Path) -> None:
+    """A global class lookup inside a later function observes the post-shim binding."""
+    scan = _scan_source(
+        tmp_path,
+        "deferred_class_reference",
+        [
+            "class Worker:",
+            "    def double(self, value: int) -> int:",
+            "        return value * 2",
+            "",
+            "def deferred(value: int) -> int:",
+            "    worker_type = Worker",
+            "    return worker_type().double(value)",
+            "",
+        ],
+    )
+
+    assert any(
+        region.atomic_class and any(member.id.qualname == "Worker" for member in region.members)
+        for region in scan.typed_regions
+    )
+
+
+def test_deferred_import_after_class_does_not_escape_during_module_load(tmp_path: Path) -> None:
+    """Imports inside later function bodies run only after the class shim is installed."""
+    scan = _scan_source(
+        tmp_path,
+        "deferred_import",
+        [
+            "class Worker:",
+            "    def double(self, value: int) -> int:",
+            "        return value * 2",
+            "",
+            "async def deferred(value: int) -> int:",
+            "    import math",
+            "    return int(math.sqrt(value))",
+            "",
+        ],
+    )
+
+    assert any(
+        region.atomic_class and any(member.id.qualname == "Worker" for member in region.members)
+        for region in scan.typed_regions
+    )
+
+
+def test_dynamic_method_global_prevents_atomic_class_region(tmp_path: Path) -> None:
+    """Atomic classes cannot depend on state omitted from their generated module."""
+    scan = _scan_source(
+        tmp_path,
+        "dynamic_class_global",
+        [
+            "def load_factor() -> int:",
+            "    return 2",
+            "",
+            "FACTOR = load_factor()",
+            "",
+            "class Worker:",
+            "    def apply(self, value: int) -> int:",
+            "        return value * FACTOR",
+            "",
+        ],
+    )
+
+    worker = next(symbol for symbol in scan.symbols if symbol.id.qualname == "Worker.apply")
+    assert {blocker.code for blocker in worker.blockers} == {"DYNAMIC_GLOBAL_DEP"}
+    assert not any(
+        region.atomic_class and any(member.id.qualname == "Worker" for member in region.members)
+        for region in scan.typed_regions
+    )
+
+
 def test_unannotated_staticmethod_prevents_atomic_class_region(tmp_path: Path) -> None:
     """A static method's first argument must be annotated because it is not bound."""
     module_path = tmp_path / "static_method.py"

@@ -6,10 +6,11 @@ import asyncio
 import importlib
 import inspect
 import json
+import pickle
 import shutil
 import sys
 import zipfile
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Protocol, TypedDict, cast
@@ -19,8 +20,8 @@ import pytest
 from atoll.cli import main
 
 FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
-COMPILED_METHOD_COUNT = 8
-COMPILED_REGION_COUNT = 4
+COMPILED_SYMBOL_COUNT = 10
+COMPILED_REGION_COUNT = 6
 SCALE_RESULT = 23
 PARSED_RESULT = 7
 ADJUSTED_RESULT = 6
@@ -28,6 +29,12 @@ DYNAMIC_RESULT = 11
 ASYNC_FIRST_RESULT = 4
 ASYNC_SENT_RESULT = 8
 ASYNC_THROWN_RESULT = 2
+MODEL_RESULT = 18
+MODEL_DEFAULT_FACTOR = 2
+MODEL_CHILD_RESULT = 20
+UNSAFE_SQUARE_RESULT = 16
+_PICKLE_LOADS_NAME = "loads"
+_APPLY_METHOD_NAME = "apply"
 
 
 class _ExchangeWorker(Protocol):
@@ -38,6 +45,14 @@ class _ExchangeWorker(Protocol):
     def exchange(self, start: int) -> AsyncGenerator[int, int | None]:
         """Return the fixture async generator."""
         ...
+
+
+class _ScaleModelInstance(Protocol):
+    """Typed view of a dynamically declared interpreted subclass instance."""
+
+    def apply(self, value: int) -> int: ...
+
+    def describe(self) -> str: ...
 
 
 class _GuardReport(TypedDict):
@@ -55,6 +70,14 @@ class _BindingReport(TypedDict):
     target_owner_class: str | None
     execution_kind: str
     guards: list[_GuardReport]
+
+
+class _TypedRegionMemberReport(TypedDict):
+    id: str
+    kind: str
+    owner_class: str | None
+    binding_kind: str
+    execution_kind: str
 
 
 class _CompiledRegionReport(TypedDict):
@@ -76,6 +99,8 @@ class _SpecializationReport(TypedDict):
 
 
 class _TypedRegionReport(TypedDict):
+    atomic_class: bool
+    members: list[_TypedRegionMemberReport]
     specializations: list[_SpecializationReport]
 
 
@@ -118,6 +143,7 @@ def test_compile_builds_and_routes_typed_methods_without_source_edits(
     _assert_worker_compile_report(report)
     assert "-> IntPairer (instance_method, 1 guard(s))" in markdown_report
     assert "-> PayloadPairer (instance_method, 1 guard(s))" in markdown_report
+    assert "typed_region_project.worker::ScaleModel (class)" in markdown_report
     assert not (output_dir / "build").exists()
     assert not tuple(install_root.rglob("_atoll_region_*.py"))
     assert tuple((install_root / ".atoll" / "artifacts").glob("*.so"))
@@ -129,6 +155,7 @@ def test_compile_builds_and_routes_typed_methods_without_source_edits(
 
     monkeypatch.setattr(sys, "path", [str(install_root), *sys.path])
     monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "1")
+    monkeypatch.setitem(sys.modules, "mypy_extensions", None)
     _clear_fixture_modules()
     worker_module = importlib.import_module("typed_region_project.worker")
     _assert_compiled_worker_module(worker_module)
@@ -137,9 +164,13 @@ def test_compile_builds_and_routes_typed_methods_without_source_edits(
     _clear_fixture_modules()
     disabled_module = importlib.import_module("typed_region_project.worker")
     assert disabled_module.Worker(3).scale(5) == SCALE_RESULT
+    assert disabled_module.ScaleModel("fixture", 3).apply(6) == MODEL_RESULT
     assert disabled_module.__atoll_status__["compiled"] is False
     assert not hasattr(disabled_module.Worker.scale, "__atoll_compiled_target__")
     assert not hasattr(disabled_module.Worker.exchange, "__atoll_compiled_target__")
+    assert not hasattr(disabled_module.ScaleModel, "__atoll_compiled_target__")
+    assert disabled_module.UNSAFE_IDENTITY_CLASS is disabled_module.UnsafeIdentityWorker
+    assert type(disabled_module.UNSAFE_IDENTITY_INSTANCE) is disabled_module.UnsafeIdentityWorker
     assert "pair" not in vars(disabled_module.IntPairer)
     assert "maybe_pair" not in vars(disabled_module.PayloadPairer)
     assert not hasattr(disabled_module.Pairer.pair, "__atoll_compiled_target__")
@@ -217,15 +248,24 @@ def test_compile_routes_closed_generic_function_with_guarded_fallback(
 
 def _assert_worker_compile_report(report: _CompileReport) -> None:
     summary = report["summary"]
-    assert summary["symbols"] == COMPILED_METHOD_COUNT
+    assert summary["symbols"] == COMPILED_SYMBOL_COUNT
     assert summary["islands"] == 0
     assert summary["compiled_regions"] == COMPILED_REGION_COUNT
     assert summary["native_rejected_symbols"] == 1
     assert report["build"]["command"] == ["atoll", "typed-region-build"]
     compiled_regions = report["compiled_regions"]
-    worker_mypyc = next(
+    worker_mypyc_regions = tuple(
         region
         for region in compiled_regions
+        if region["backend"] == "mypyc"
+        and any(
+            binding["source"].startswith("typed_region_project.worker::Worker.")
+            for binding in region["bindings"]
+        )
+    )
+    worker_scale_region = next(
+        region
+        for region in worker_mypyc_regions
         if any(
             binding["source"] == "typed_region_project.worker::Worker.scale"
             for binding in region["bindings"]
@@ -241,30 +281,86 @@ def _assert_worker_compile_report(report: _CompileReport) -> None:
         for region in compiled_regions
         if any(binding["target_owner_class"] == "PayloadPairer" for binding in region["bindings"])
     )
-    cython_region = next(region for region in compiled_regions if region["backend"] == "cython")
-    assert worker_mypyc["backend"] == "mypyc"
+    exchange_cython_region = next(
+        region
+        for region in compiled_regions
+        if any(
+            binding["source"] == "typed_region_project.worker::Worker.exchange"
+            for binding in region["bindings"]
+        )
+    )
+    class_region = next(
+        region
+        for region in compiled_regions
+        if any(
+            binding["source"] == "typed_region_project.worker::ScaleModel"
+            for binding in region["bindings"]
+        )
+    )
+    class_typed_region = next(
+        region
+        for region in report["typed_regions"]
+        if any(
+            member["id"] == "typed_region_project.worker::ScaleModel"
+            for member in region["members"]
+        )
+    )
+    unsafe_method_region = next(
+        region
+        for region in compiled_regions
+        if any(
+            binding["source"] == "typed_region_project.worker::UnsafeIdentityWorker.square"
+            for binding in region["bindings"]
+        )
+    )
+    assert worker_mypyc_regions
     assert pairer_mypyc["backend"] == "mypyc"
     assert payload_mypyc["backend"] == "mypyc"
-    assert {binding["source"] for binding in worker_mypyc["bindings"]} == {
+    assert class_region["backend"] == "cython"
+    assert unsafe_method_region["backend"] == "mypyc"
+    assert class_typed_region["atomic_class"] is True
+    assert {member["id"] for member in class_typed_region["members"]} == {
+        "typed_region_project.worker::ScaleModel",
+        "typed_region_project.worker::ScaleModel.__init__",
+        "typed_region_project.worker::ScaleModel.apply",
+        "typed_region_project.worker::ScaleModel.describe",
+    }
+    class_binding = class_region["bindings"][0]
+    assert class_binding["source"] == "typed_region_project.worker::ScaleModel"
+    assert class_binding["kind"] == "class"
+    assert class_binding["owner_class"] is None
+    assert class_binding["target_owner_class"] is None
+    assert class_binding["execution_kind"] == "class"
+    assert class_binding["guards"] == []
+    assert {
+        binding["source"] for region in worker_mypyc_regions for binding in region["bindings"]
+    } == {
         "typed_region_project.worker::Worker.adjust",
         "typed_region_project.worker::Worker.parse",
         "typed_region_project.worker::Worker.scale",
         "typed_region_project.worker::Worker.score",
         "typed_region_project.worker::Worker.values",
     }
-    assert {binding["kind"] for binding in worker_mypyc["bindings"]} == {
+    assert {
+        binding["kind"] for region in worker_mypyc_regions for binding in region["bindings"]
+    } == {
         "instance_method",
         "staticmethod",
         "classmethod",
     }
-    assert [binding["source"] for binding in cython_region["bindings"]] == [
+    assert [binding["source"] for binding in exchange_cython_region["bindings"]] == [
         "typed_region_project.worker::Worker.exchange"
     ]
     assert (
-        cython_region["bindings"][0]["execution_kind"],
-        worker_mypyc["variant_id"].endswith("@mypyc"),
-        cython_region["variant_id"].endswith("@cython"),
+        exchange_cython_region["bindings"][0]["execution_kind"],
+        worker_scale_region["variant_id"].endswith("@mypyc"),
+        exchange_cython_region["variant_id"].endswith("@cython"),
     ) == ("async_generator", True, True)
+    unsafe_binding = unsafe_method_region["bindings"][0]
+    assert unsafe_binding["source"] == "typed_region_project.worker::UnsafeIdentityWorker.square"
+    assert unsafe_binding["kind"] == "instance_method"
+    assert unsafe_binding["owner_class"] == "UnsafeIdentityWorker"
+    assert unsafe_binding["target_owner_class"] is None
     pairer_binding = pairer_mypyc["bindings"][0]
     assert pairer_binding["source"] == "typed_region_project.worker::Pairer.pair"
     assert pairer_binding["owner_class"] == "Pairer"
@@ -320,15 +416,88 @@ def _assert_compiled_worker_module(worker_module: ModuleType) -> None:
     assert worker_module.Worker.scale.__qualname__ == "Worker.scale"
     assert worker_module.Worker.scale.__module__ == "typed_region_project.worker"
     assert worker_module.__atoll_status__["compiled"] is True
+    _assert_compiled_scale_model(worker_module)
     assert hasattr(worker_module.Worker.scale, "__atoll_compiled_target__")
     assert hasattr(worker_module.Worker.exchange, "__atoll_compiled_target__")
     assert hasattr(worker_module.IntPairer.pair, "__atoll_compiled_target__")
     assert not hasattr(worker_module.Pairer.pair, "__atoll_compiled_target__")
+    assert issubclass(worker_module.IntPairer, worker_module.Pairer)
+    assert isinstance(worker_module.IntPairer(), worker_module.Pairer)
     assert hasattr(worker_module.PayloadPairer.maybe_pair, "__atoll_compiled_target__")
     assert not hasattr(worker_module.OptionalPairer.maybe_pair, "__atoll_compiled_target__")
     assert worker_module.IntPairer.pair.__atoll_runtime_guards__[0]["types"] == (int,)
     assert not hasattr(worker_module.DynamicWorker.calculate, "__atoll_compiled_target__")
     assert worker_module.DynamicWorker().calculate(4) == DYNAMIC_RESULT
+    assert worker_module.UNSAFE_IDENTITY_CLASS is worker_module.UnsafeIdentityWorker
+    assert type(worker_module.UNSAFE_IDENTITY_INSTANCE) is worker_module.UnsafeIdentityWorker
+    assert hasattr(worker_module.UnsafeIdentityWorker.square, "__atoll_compiled_target__")
+    assert worker_module.UnsafeIdentityWorker(5).square(4) == UNSAFE_SQUARE_RESULT
+
+
+def _assert_compiled_scale_model(worker_module: ModuleType) -> None:
+    scale_model = worker_module.ScaleModel
+    signature = inspect.signature(scale_model)
+    model = scale_model("fixture", 3)
+
+    assert scale_model.__module__ == "typed_region_project.worker"
+    assert scale_model.__qualname__ == "ScaleModel"
+    assert scale_model.__doc__ == "Safe non-generic class used to verify atomic class compilation."
+    assert scale_model.__annotations__ == {"name": "str", "factor": "int"}
+    assert signature.parameters["name"].annotation == "str"
+    assert signature.parameters["factor"].annotation == "int"
+    assert signature.parameters["factor"].default == MODEL_DEFAULT_FACTOR
+    assert signature.return_annotation == "None"
+    assert model.apply(6) == MODEL_RESULT
+    assert model.describe() == "fixture:3"
+    assert type(model) is scale_model
+    assert isinstance(model, scale_model)
+    assert issubclass(type(model), scale_model)
+    assert _pickle_round_trip(scale_model) is scale_model
+    assert hasattr(scale_model, "__atoll_compiled_target__")
+    assert hasattr(scale_model.apply, "__atoll_compiled_target__")
+    assert scale_model.__init__.__module__ == "typed_region_project.worker"
+    assert scale_model.__init__.__qualname__ == "ScaleModel.__init__"
+    assert scale_model.__init__.__doc__ == "Store a named integer scale factor."
+    assert scale_model.__init__.__annotations__ == {
+        "name": "str",
+        "factor": "int",
+        "return": "None",
+    }
+    assert str(inspect.signature(scale_model.__init__)) == (
+        "(self, name: 'str', factor: 'int' = 2) -> 'None'"
+    )
+    assert scale_model.apply.__module__ == "typed_region_project.worker"
+    assert scale_model.apply.__qualname__ == "ScaleModel.apply"
+    assert scale_model.apply.__doc__ == "Scale one integer value."
+    assert scale_model.apply.__annotations__ == {"value": "int", "return": "int"}
+    assert str(inspect.signature(scale_model.apply)) == "(self, value: 'int') -> 'int'"
+    assert scale_model.describe.__module__ == "typed_region_project.worker"
+    assert scale_model.describe.__qualname__ == "ScaleModel.describe"
+    assert scale_model.describe.__doc__ == "Return a compact source-visible description."
+    assert scale_model.describe.__annotations__ == {"return": "str"}
+    assert str(inspect.signature(scale_model.describe)) == "(self) -> 'str'"
+
+    interpreted_scale_model: type[object]
+
+    def interpreted_apply(self: object, value: int) -> int:
+        parent = super(interpreted_scale_model, self)
+        parent_apply = cast(Callable[[int], int], getattr(parent, _APPLY_METHOD_NAME))
+        return parent_apply(value) + 1
+
+    interpreted_scale_model = type(
+        "InterpretedScaleModel",
+        (scale_model,),
+        {"apply": interpreted_apply},
+    )
+    interpreted_factory = cast(Callable[[str, int], object], interpreted_scale_model)
+    interpreted = cast(_ScaleModelInstance, interpreted_factory("child", 4))
+    assert isinstance(interpreted, scale_model)
+    assert issubclass(interpreted_scale_model, scale_model)
+    assert interpreted_scale_model.__mro__[:2] == (interpreted_scale_model, scale_model)
+    assert interpreted.apply(5) == MODEL_CHILD_RESULT + 1
+    restored = _pickle_round_trip(model)
+    assert type(restored) is scale_model
+    assert restored.describe() == "fixture:3"
 
 
 def _source_contents(root: Path) -> dict[Path, str]:
@@ -364,3 +533,8 @@ async def _assert_async_generator_protocol(worker: _ExchangeWorker) -> None:
     await failing_generator.aclose()
     with pytest.raises(StopAsyncIteration):
         await anext(failing_generator)
+
+
+def _pickle_round_trip[T](value: T) -> T:
+    loads = cast(Callable[[bytes], object], getattr(pickle, _PICKLE_LOADS_NAME))
+    return cast(T, loads(pickle.dumps(value)))

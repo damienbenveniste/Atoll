@@ -139,6 +139,66 @@ def test_generation_is_deterministic(tmp_path: Path) -> None:
     assert first.source_hash == second.source_hash
 
 
+def test_atomic_class_generation_preserves_declaration_and_mypyc_contract(
+    tmp_path: Path,
+) -> None:
+    """A safe complete class becomes one native class binding without method extraction."""
+    source_path = tmp_path / "counter.py"
+    source_path.write_text(
+        """class Counter:
+    \"\"\"Store and increment one integer.\"\"\"
+
+    value: int
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def increment(self, amount: int) -> int:
+        self.value += amount
+        return self.value
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="counter", path=source_path)))
+    region = next(region for region in scan.typed_regions if region.atomic_class)
+    owner = next(member.id for member in region.members if member.kind == "class")
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (owner,),
+        output_path=tmp_path / "generated_counter.py",
+    )
+    cython_generation = generate_typed_method_region(
+        scan,
+        region,
+        (owner,),
+        output_path=tmp_path / "generated_counter_cython.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    tree = ast.parse(generation.source_text)
+    generated_class = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+    assert generated_class.name == "Counter"
+    assert ast.unparse(generated_class.decorator_list[0]) == (
+        "mypyc_attr(allow_interpreted_subclasses=True, serializable=True)"
+    )
+    assert "if TYPE_CHECKING:\n    from mypy_extensions import mypyc_attr" in (
+        generation.source_text
+    )
+    assert {node.name for node in generated_class.body if isinstance(node, ast.FunctionDef)} == {
+        "__init__",
+        "increment",
+    }
+    assert "Protocol" not in generation.source_text
+    assert generation.bindings == region.bindings
+    assert generation.bindings[0].kind == "class"
+    assert generation.bindings[0].compiled_name == "Counter"
+    assert cython_generation.backend == "cython"
+    assert "mypyc_attr" not in cython_generation.source_text
+    assert cython_generation.bindings == generation.bindings
+
+
 def test_generation_rejects_async_generators(tmp_path: Path) -> None:
     """Async generators remain reserved for the Cython backend milestone."""
     scan = _scan(tmp_path)

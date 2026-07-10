@@ -54,7 +54,7 @@ mypyc changes Python frame semantics.
 ## Compile candidates
 
 Use `compile` for the normal workflow. It copies the target package into a temporary Atoll build
-area, inserts shims only in that copy, compiles generated function islands or typed callable
+area, inserts shims only in that copy, compiles generated function islands or typed regions
 regions, writes a platform wheel, and removes the temporary install tree. The original source files
 are left untouched.
 
@@ -67,10 +67,10 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
-For typed callables, the report's `compiled_regions` section names each backend variant, every
-descriptor-aware binding, its runtime guards and concrete target owner, and the artifact paths
-associated with that variant. Typed-region entries retain the original generic declaration plus
-the specialization origin, substitutions, and concrete type bindings.
+For typed regions, the report's `compiled_regions` section names each backend variant, every class
+or descriptor-aware binding, its runtime guards and concrete target owner, and the artifact paths
+associated with that variant. Typed-region entries retain the original generic declaration plus the
+specialization origin, substitutions, and concrete type bindings.
 
 Before mypyc runs, Atoll regenerates each scan candidate independently and retains only leaf
 kernels whose complete generated function set has concrete builtin annotations and repeated
@@ -81,12 +81,17 @@ kernel remains, compile fails before mypyc and removes any stale wheel for the s
 platform tag.
 
 When a selected module has no accepted top-level function island, source-clean compile can lower
-concretely typed instance methods, static methods, class methods, generators, coroutines, and async
-generators from a safe owner class. Backend selection is automatic per member: mypyc is preferred,
-while Cython handles execution shapes mypyc rejects and deterministic mypyc type failures. Cython
-annotation typing and C-type inference are disabled so Python integer and container semantics are
-not silently narrowed. Dynamic owner classes, dunder methods, unresolved generics, and explicit
-`Any` remain interpreted.
+safe complete classes plus concretely typed instance methods, static methods, class methods,
+generators, coroutines, and async generators. A class is replaced atomically only when every method
+is supported and module loading cannot retain the original class through a decorator, reassignment,
+instance, subclass, annotation, default, registry use, source-defined base, asynchronous method, or
+class-body side effect. Otherwise Atoll preserves the source class and compiles eligible methods
+independently. Cython owns atomic classes because its Python-compatible class objects can preserve
+method reflection; mypyc remains preferred for callable members, while Cython also handles member
+execution shapes mypyc rejects and deterministic mypyc type failures. Cython annotation typing and
+C-type inference are disabled so Python integer and container semantics are not silently narrowed.
+Special methods other than a closed class constructor, unresolved generics, and explicit `Any`
+remain interpreted.
 
 Generic definitions remain the authoritative Python fallback. Atoll may compile a separate
 specialization when every TypeVar closes from a same-module concrete subclass or an unambiguous
@@ -110,17 +115,19 @@ mypyc diagnostic. Module-level typing diagnostics, such as unsupported `TypeVar`
 arguments, remain visible in scan and compile reports. A function from such a module is compiled
 only when its generated kernel still preserves concrete native types.
 
-Atoll v1 source-clean compile targets top-level typed leaf kernels, safe typed methods, and narrowly
-guarded concrete generic specializations. It does not yet replace whole classes or treat
-object-rich orchestration as one native unit. Large gains are therefore expected only when
-meaningful application time is spent inside accepted CPU-bound code; successful compilation is not
-a speedup claim.
+Atoll v1 source-clean compile targets top-level typed leaf kernels, safe atomic classes, typed
+methods, and narrowly guarded concrete generic specializations. It still leaves dynamic or
+identity-sensitive classes in Python and does not treat object-rich orchestration as one native
+unit. Large gains are therefore expected only when meaningful application time is spent inside
+accepted CPU-bound code; successful compilation is not a speedup claim.
 
-Compiled exports retain the source function or method's name, qualified name, documentation,
+Compiled functions and methods retain their source name, qualified name, documentation,
 annotations, signature, and sync, coroutine, generator, or async-generator shape. Async-generator
 wrappers forward `asend`, `athrow`, and `aclose`; method routing preserves normal, static, and class
-descriptors on the original source class. `ATOLL_DISABLE=1` retains interpreted routing, and
-`ATOLL_REQUIRE_COMPILED=1` checks only bindings promised by the staged wheel.
+descriptors on the original source class. Atomic classes preserve their public module, qualified
+name, documentation, annotations, constructor signature, bases, subclass behavior, and pickle
+identity. `ATOLL_DISABLE=1` retains interpreted routing, and `ATOLL_REQUIRE_COMPILED=1` checks only
+bindings promised by the staged wheel.
 
 ```bash
 uv pip install --force-reinstall .atoll/dist/*.whl

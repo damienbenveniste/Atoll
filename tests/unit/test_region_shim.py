@@ -88,6 +88,36 @@ def test_region_shim_renders_descriptor_and_status_contract(tmp_path: Path) -> N
     assert "_atoll_name_to_remove.startswith" in rendered
 
 
+def test_region_shim_renders_atomic_class_identity_checks(tmp_path: Path) -> None:
+    """A class promise validates public identity before replacing the module binding."""
+    source_path = tmp_path / "pkg" / "worker.py"
+    binding = BindingTarget(
+        source=SymbolId(module="pkg.worker", qualname="Worker"),
+        compiled_name="Worker",
+        kind="class",
+        owner_class=None,
+        execution_kind="class",
+    )
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=source_path,
+        region_id="pkg.worker::Worker:atomic",
+        backend="mypyc",
+        compiled_module="_atoll_pkg_worker_atomic",
+        artifact_dir=tmp_path / "artifacts",
+        bindings=(binding,),
+    )
+
+    rendered = render_region_shim((config,))
+
+    compile(rendered, "worker.py", "exec")
+    assert "def _atoll_prepare_class" in rendered
+    assert "compiled class changed source inheritance" in rendered
+    assert "compiled class changed its constructor signature" in rendered
+    assert "globals()[_atoll_name] = _atoll_target" in rendered
+    assert "'kind': 'class'" in rendered
+
+
 def test_region_shim_renders_subclass_target_and_constant_time_guard(tmp_path: Path) -> None:
     """Specialized methods read the base descriptor but bind only the target subclass."""
     source_path = tmp_path / "worker.py"
@@ -215,11 +245,11 @@ def test_region_shim_config_rejects_invalid_promises(tmp_path: Path) -> None:
             config,
             bindings=(replace(binding, source=SymbolId("other", "Worker.scale")),),
         )
-    with pytest.raises(ValueError, match="unsupported region shim binding"):
+    with pytest.raises(ValueError, match="module or class region shim binding"):
         replace(config, bindings=(replace(binding, kind="class"),))
     with pytest.raises(ValueError, match="owner class"):
         replace(config, bindings=(replace(binding, owner_class=None),))
-    with pytest.raises(ValueError, match="module region shim binding"):
+    with pytest.raises(ValueError, match="module or class region shim binding"):
         replace(
             config,
             bindings=(

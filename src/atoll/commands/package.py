@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import csv
 import hashlib
@@ -11,6 +12,7 @@ import json
 import re
 import shutil
 import sys
+import textwrap
 import time
 import tomllib
 import zipfile
@@ -171,7 +173,7 @@ class _SelectedModule:
 
 @dataclass(frozen=True, slots=True)
 class _SelectedTypedRegion:
-    """One typed region and callable subset selected for a backend variant."""
+    """One typed region and member subset selected for a backend variant."""
 
     scan: ModuleScan
     region: TypedRegion
@@ -180,6 +182,7 @@ class _SelectedTypedRegion:
     assessment: BackendAssessment
     members: tuple[SymbolId, ...]
     specialization: RegionSpecialization | None = None
+    conditional_on_failure_of: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +194,7 @@ class _PreparedTypedRegion:
     unit: CompilationUnit
     shim: RegionShimConfig
     fallback: _PreparedTypedRegion | None = None
+    conditional_on_failure_of: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,7 +457,7 @@ def _handle_no_native_islands(
     if context.selected:
         _progress(
             options.progress,
-            "no function islands passed native readiness; trying typed callable regions",
+            "no function islands passed native readiness; trying typed regions",
         )
         return _execute_typed_region_package(
             options=options,
@@ -475,7 +479,7 @@ def _execute_typed_region_package(
     project: DiscoveredProject,
     context: _TypedRegionPackageContext,
 ) -> PackageCommandResult:
-    """Build the first source-clean method-region vertical slice.
+    """Build source-clean class and callable region variants.
 
     Generation and shims live only in copied build roots. Regions compile
     independently so one backend rejection leaves successful regions available
@@ -579,7 +583,7 @@ def _execute_typed_region_package(
         )
 
     payload_started = time.perf_counter()
-    _progress(options.progress, "binding compiled callables in staged source modules")
+    _progress(options.progress, "binding compiled classes and callables in staged modules")
     successful_shims = tuple(item.shim for item in outcome.successful)
     _insert_region_shims(successful_shims)
     _place_region_artifacts(successful_shims, outcome.build.artifact_paths)
@@ -774,6 +778,7 @@ def _prepare_backend_variant(
             artifact_dir=staged.staged_source_root / ".atoll" / "artifacts",
             bindings=generation.bindings,
         ),
+        conditional_on_failure_of=selection.conditional_on_failure_of,
     )
 
 
@@ -801,6 +806,7 @@ def _build_typed_regions(
     skipped = list(initial_failures)
     attempts: list[CompileAttempt] = [failure.build for failure in initial_failures]
     artifacts: list[ArtifactRecord] = []
+    successful_promises: set[str] = set()
     backend_context = BackendCompileContext(
         project_root=context.build_root,
         build_dir=context.build_root / ".atoll" / "build",
@@ -808,6 +814,15 @@ def _build_typed_regions(
         cache_dir=context.cache_dir,
     )
     for index, item in enumerate(prepared, start=1):
+        if (
+            item.conditional_on_failure_of is not None
+            and item.conditional_on_failure_of in successful_promises
+        ):
+            _progress(
+                context.progress,
+                f"class variant succeeded; skipped method fallback {item.unit.region_id}",
+            )
+            continue
         _progress(
             context.progress,
             (
@@ -821,6 +836,7 @@ def _build_typed_regions(
             attempts.append(tagged_attempt)
             successful.append(item)
             artifacts.extend(result.artifacts)
+            successful_promises.add(item.unit.region_id)
             _progress(context.progress, f"compiled typed region variant {item.unit.region_id}")
             continue
         failure_item = item
@@ -845,6 +861,7 @@ def _build_typed_regions(
                 )
                 successful.append(fallback)
                 artifacts.extend(fallback_result.artifacts)
+                successful_promises.add(item.unit.region_id)
                 _progress(
                     context.progress,
                     f"compiled Cython fallback variant {fallback.unit.region_id}",
@@ -1090,14 +1107,14 @@ def _progress_compile_selection(
     selected_regions: tuple[_SelectedTypedRegion, ...],
 ) -> None:
     function_count = sum(len(module.symbols) for module in selected_modules)
-    callable_count = sum(len(region.members) for region in selected_regions)
+    member_count = sum(len(region.members) for region in selected_regions)
     specialization_count = sum(region.specialization is not None for region in selected_regions)
     _progress(
         progress,
         (
             f"selected {len(selected_modules)} candidate module(s), {function_count} "
-            f"function(s), and {len(selected_regions)} typed callable backend variant(s), "
-            f"{callable_count} callable(s), {specialization_count} specialization(s)"
+            f"function(s), and {len(selected_regions)} typed region backend variant(s), "
+            f"{member_count} member(s), {specialization_count} specialization(s)"
         ),
     )
 
@@ -1664,8 +1681,23 @@ def _selected_typed_method_regions(
     for scan in scans:
         for region in scan.typed_regions:
             decisions = {decision.target: decision for decision in region.decisions}
-            eligible = _eligible_typed_methods(region, decisions)
             mypyc_assessment = MYPYC_BACKEND.assess(region)
+            cython_assessment = CYTHON_BACKEND.assess(region)
+            atomic_class_member = _eligible_atomic_class(region, cython_assessment)
+            atomic_variant_id: str | None = None
+            if atomic_class_member is not None:
+                atomic_variant_id = f"{region.id}@cython-class"
+                selected.append(
+                    _SelectedTypedRegion(
+                        scan=scan,
+                        region=region,
+                        variant_id=atomic_variant_id,
+                        backend="cython",
+                        assessment=cython_assessment,
+                        members=(atomic_class_member,),
+                    )
+                )
+            eligible = _eligible_typed_methods(region, decisions)
             mypyc_supported = set(mypyc_assessment.supported_members)
             mypyc_members = tuple(member for member in eligible if member in mypyc_supported)
             if mypyc_members:
@@ -1677,9 +1709,9 @@ def _selected_typed_method_regions(
                         backend="mypyc",
                         assessment=mypyc_assessment,
                         members=mypyc_members,
+                        conditional_on_failure_of=atomic_variant_id,
                     )
                 )
-            cython_assessment = CYTHON_BACKEND.assess(region)
             cython_supported = set(cython_assessment.supported_members)
             cython_members = tuple(
                 member
@@ -1695,6 +1727,7 @@ def _selected_typed_method_regions(
                         backend="cython",
                         assessment=cython_assessment,
                         members=cython_members,
+                        conditional_on_failure_of=atomic_variant_id,
                     )
                 )
             for specialization in region.specializations:
@@ -1727,6 +1760,29 @@ def _selected_typed_method_regions(
                         )
                     )
     return tuple(selected)
+
+
+def _eligible_atomic_class(
+    region: TypedRegion,
+    assessment: BackendAssessment,
+) -> SymbolId | None:
+    """Return the class binding only when mypyc supports its complete region."""
+    if not region.atomic_class or assessment.status != "supported":
+        return None
+    class_members = tuple(member for member in region.members if member.kind == "class")
+    method_members = tuple(member for member in region.members if member.kind == "method")
+    if len(class_members) != 1 or any(
+        member.kind not in {"class", "method"} for member in region.members
+    ):
+        return None
+    if not method_members:
+        return None
+    if any(member.execution_kind != "sync" for member in method_members):
+        return None
+    supported = set(assessment.supported_members)
+    if any(member.id not in supported for member in region.members):
+        return None
+    return class_members[0].id
 
 
 def _specialized_region(
@@ -1776,15 +1832,16 @@ def _eligible_typed_methods(
         and member.binding_kind in {"instance_method", "staticmethod", "classmethod"}
         and not member.id.qualname.rsplit(".", 1)[-1].startswith("__")
         and decisions[member.id.stable_id].action == "preserve"
-        and not _owner_requires_fallback(
+        and not _owner_disallows_method_binding(
             member.owner_class,
             region.source_module.name,
             decisions,
         )
+        and not _member_requires_source_class(member.source_text)
     )
 
 
-def _owner_requires_fallback(
+def _owner_disallows_method_binding(
     owner_class: str | None,
     module_name: str,
     decisions: dict[str, LoweringDecision],
@@ -1792,7 +1849,38 @@ def _owner_requires_fallback(
     if owner_class is None:
         return True
     decision = decisions.get(f"{module_name}::{owner_class}")
-    return decision is not None and decision.action in {"fallback", "reject"}
+    if decision is None:
+        return False
+    return any(
+        reason in decision.reason
+        for reason in (
+            "decorators may register or replace",
+            "dynamic behavior is blocked",
+            "module binding is reassigned",
+            "special method",
+        )
+    )
+
+
+def _member_requires_source_class(source_text: str) -> bool:
+    """Reject method extraction when Python's class compilation supplies semantics."""
+    tree = ast.parse(textwrap.dedent(source_text))
+    return any(
+        (isinstance(node, ast.Name) and node.id == "__class__")
+        or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "super"
+            and not node.args
+            and not node.keywords
+        )
+        or (
+            isinstance(node, ast.Attribute)
+            and node.attr.startswith("__")
+            and not node.attr.endswith("__")
+        )
+        for node in ast.walk(tree)
+    )
 
 
 def _candidate_symbols(scan: ModuleScan) -> tuple[str, ...]:

@@ -51,11 +51,13 @@ from atoll.models import (
     TypedRegion,
 )
 
-_CYTHON_ADAPTER_VERSION = "1"
+_CYTHON_ADAPTER_VERSION = "2"
 _DIRECTIVES: dict[str, object] = {
     "language_level": 3,
     "annotation_typing": False,
     "infer_types": False,
+    "binding": True,
+    "embedsignature": True,
 }
 _MAX_DIAGNOSTIC_LINES = 20
 _SHARED_REGION_ID = "__shared__"
@@ -95,9 +97,9 @@ class CythonBackend:
     """CompilerBackend adapter around Cython's in-process setuptools build.
 
     Cython is selected for typed functions and methods, including async
-    generators, but not for class-atomic compilation. The adapter rejects
-    analysis decisions that would require unresolved generics, explicit ``Any``
-    boxing, or previously rejected source members.
+    generators, and for closed atomic classes whose method reflection must stay
+    Python-compatible. The adapter rejects analysis decisions that require
+    unresolved generics, explicit ``Any`` boxing, or rejected source members.
     """
 
     @property
@@ -106,7 +108,7 @@ class CythonBackend:
         return "cython"
 
     def assess(self, region: TypedRegion) -> BackendAssessment:
-        """Assess typed functions and methods, including async generators."""
+        """Assess typed functions, methods, async generators, and closed classes."""
         decisions = {decision.target: decision for decision in region.decisions}
         supported: list[SymbolId] = []
         unsupported: list[SymbolId] = []
@@ -118,6 +120,15 @@ class CythonBackend:
             else:
                 unsupported.append(member.id)
                 reasons.append(f"{member.id.stable_id}: {reason}")
+
+        class_member = next((member for member in region.members if member.kind == "class"), None)
+        if region.atomic_class and class_member is not None and unsupported:
+            if class_member.id in supported:
+                supported.remove(class_member.id)
+                unsupported.append(class_member.id)
+            reasons.append(
+                f"{class_member.id.stable_id}: atomic class requires every class member to pass"
+            )
 
         return BackendAssessment(
             region_id=region.id,
@@ -236,8 +247,7 @@ def _unsupported_member_reason(
     member: RegionMember,
     decision: LoweringDecision | None,
 ) -> str | None:
-    if member.kind == "class":
-        return "cython class-atomic lowering is not implemented"
+    _ = member
     if decision is None or decision.action in {"preserve", "specialize"}:
         return None
     if decision.action == "box":
@@ -267,21 +277,37 @@ def _member_capabilities(
     for member in region.members:
         if member.id not in supported_ids:
             continue
-        if member.kind == "function":
-            capabilities.append("typed_function")
-        elif member.binding_kind == "instance_method":
-            capabilities.append("instance_method")
-        elif member.binding_kind == "staticmethod":
-            capabilities.append("staticmethod")
-        elif member.binding_kind == "classmethod":
-            capabilities.append("classmethod")
-        if member.execution_kind == "generator":
-            capabilities.append("generator")
-        elif member.execution_kind == "coroutine":
-            capabilities.append("coroutine")
-        elif member.execution_kind == "async_generator":
-            capabilities.append("async_generator")
+        binding_capability = _binding_capability(member)
+        execution_capability = _execution_capability(member)
+        if binding_capability is not None:
+            capabilities.append(binding_capability)
+        if execution_capability is not None:
+            capabilities.append(execution_capability)
     return tuple(dict.fromkeys(capabilities))
+
+
+def _binding_capability(member: RegionMember) -> BackendCapability | None:
+    if member.kind == "class":
+        return "native_class"
+    if member.kind == "function":
+        return "typed_function"
+    if member.binding_kind == "instance_method":
+        return "instance_method"
+    if member.binding_kind == "staticmethod":
+        return "staticmethod"
+    if member.binding_kind == "classmethod":
+        return "classmethod"
+    return None
+
+
+def _execution_capability(member: RegionMember) -> BackendCapability | None:
+    if member.execution_kind == "generator":
+        return "generator"
+    if member.execution_kind == "coroutine":
+        return "coroutine"
+    if member.execution_kind == "async_generator":
+        return "async_generator"
+    return None
 
 
 def _validate_units(

@@ -1,4 +1,4 @@
-"""Lower typed callables into backend-ready source-clean compilation units.
+"""Lower typed callables and safe atomic classes into backend-ready units.
 
 The lowerer operates only on scanner evidence and never imports the target
 project. It preserves explicit annotations and executable bodies, supplies a
@@ -26,7 +26,7 @@ from atoll.models import (
     TypedRegion,
 )
 
-TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-method-v2"
+TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-region-v3"
 _SUPPORTED_BINDINGS = frozenset({"instance_method", "staticmethod", "classmethod"})
 _SUPPORTED_EXECUTION_KINDS = frozenset({"sync", "generator", "coroutine"})
 
@@ -70,9 +70,12 @@ def generate_typed_method_region(
     output_path: Path,
     options: TypedRegionGenerationOptions = _DEFAULT_GENERATION_OPTIONS,
 ) -> TypedRegionGeneration:
-    """Write one preserved or concretely specialized callable module.
+    """Write one preserved class, callable set, or concrete specialization.
 
-    Ordinary selections retain their source annotations exactly. A generic
+    Atomic class selections retain the complete class declaration and are
+    decorated only with backend directives needed to preserve Python subclass
+    and pickle behavior. Ordinary callable selections retain their source
+    annotations exactly. A generic
     selection must provide analysis-produced specialization evidence; this
     function never infers substitutions or erases unresolved types. Unsafe
     decorators and unresolved member identifiers fail before a file is written.
@@ -114,15 +117,18 @@ def _selected_region_members(
     specialization: RegionSpecialization | None,
 ) -> tuple[RegionMember, ...]:
     if not selected_members:
-        raise ValueError("typed callable generation requires at least one selected member")
+        raise ValueError("typed region generation requires at least one selected member")
     if len(set(selected_members)) != len(selected_members):
-        raise ValueError("typed callable generation received duplicate selected members")
+        raise ValueError("typed region generation received duplicate selected members")
     by_id = {member.id: member for member in region.members}
     unknown = tuple(symbol for symbol in selected_members if symbol not in by_id)
     if unknown:
         names = ", ".join(symbol.stable_id for symbol in unknown)
         raise ValueError(f"selected members are outside typed region {region.id}: {names}")
     members = tuple(by_id[symbol] for symbol in selected_members)
+    if _is_atomic_class_selection(region, members, specialization):
+        _validate_atomic_class_selection(region, members[0])
+        return members
     if specialization is not None and (
         len(members) != 1 or members[0].id != specialization.source_member
     ):
@@ -131,34 +137,65 @@ def _selected_region_members(
             f"{specialization.source_member.stable_id}"
         )
     for member in members:
-        method_binding = member.kind == "method" and member.binding_kind in _SUPPORTED_BINDINGS
-        specialized_function = (
-            specialization is not None
-            and member.kind == "function"
-            and member.binding_kind == "module"
-        )
-        if not method_binding and not specialized_function:
-            raise ValueError(f"unsupported typed-region binding: {member.id.stable_id}")
-        execution_supported = member.execution_kind in _SUPPORTED_EXECUTION_KINDS or (
-            backend == "cython" and member.execution_kind == "async_generator"
-        )
-        if not execution_supported:
-            raise ValueError(
-                f"unsupported typed-region execution kind {member.execution_kind}: "
-                f"{member.id.stable_id}"
-            )
-        decorators = _callable_node(member).decorator_list
-        unknown_decorators = tuple(
-            ast.unparse(decorator)
-            for decorator in decorators
-            if _decorator_name(decorator) not in {"staticmethod", "classmethod"}
-        )
-        if unknown_decorators:
-            raise ValueError(
-                f"unsupported method decorator(s) for {member.id.stable_id}: "
-                f"{', '.join(unknown_decorators)}"
-            )
+        _validate_callable_selection(member, backend, specialization)
     return members
+
+
+def _is_atomic_class_selection(
+    region: TypedRegion,
+    members: tuple[RegionMember, ...],
+    specialization: RegionSpecialization | None,
+) -> bool:
+    return (
+        region.atomic_class
+        and specialization is None
+        and len(members) == 1
+        and members[0].kind == "class"
+    )
+
+
+def _validate_atomic_class_selection(region: TypedRegion, class_member: RegionMember) -> None:
+    decisions = {decision.target: decision for decision in region.decisions}
+    if any(
+        member.kind not in {"class", "method"}
+        or (member.kind == "method" and member.execution_kind not in _SUPPORTED_EXECUTION_KINDS)
+        or decisions[member.id.stable_id].action != "preserve"
+        for member in region.members
+    ):
+        raise ValueError(
+            f"unsupported typed-region binding: atomic class {class_member.id.stable_id}"
+        )
+
+
+def _validate_callable_selection(
+    member: RegionMember,
+    backend: Backend,
+    specialization: RegionSpecialization | None,
+) -> None:
+    method_binding = member.kind == "method" and member.binding_kind in _SUPPORTED_BINDINGS
+    specialized_function = (
+        specialization is not None and member.kind == "function" and member.binding_kind == "module"
+    )
+    if not method_binding and not specialized_function:
+        raise ValueError(f"unsupported typed-region binding: {member.id.stable_id}")
+    execution_supported = member.execution_kind in _SUPPORTED_EXECUTION_KINDS or (
+        backend == "cython" and member.execution_kind == "async_generator"
+    )
+    if not execution_supported:
+        raise ValueError(
+            f"unsupported typed-region execution kind {member.execution_kind}: "
+            f"{member.id.stable_id}"
+        )
+    unknown_decorators = tuple(
+        ast.unparse(decorator)
+        for decorator in _callable_node(member).decorator_list
+        if _decorator_name(decorator) not in {"staticmethod", "classmethod"}
+    )
+    if unknown_decorators:
+        raise ValueError(
+            f"unsupported method decorator(s) for {member.id.stable_id}: "
+            f"{', '.join(unknown_decorators)}"
+        )
 
 
 def _generated_source(
@@ -174,6 +211,41 @@ def _generated_source(
         if owner is not None:
             owner_names.add(owner)
     owners = tuple(sorted(owner_names))
+    atomic_class = len(members) == 1 and members[0].kind == "class"
+    sections = _generated_sections(
+        scan,
+        owners,
+        backend,
+        specialization,
+        atomic_class=atomic_class,
+    )
+    if atomic_class:
+        sections.extend(("", _lowered_atomic_class(members[0], backend)))
+    else:
+        binding_by_source = {binding.source: binding for binding in bindings}
+        for member in members:
+            sections.extend(
+                (
+                    "",
+                    _lowered_callable(
+                        member,
+                        binding_by_source[member.id],
+                        backend,
+                        specialization,
+                    ),
+                )
+            )
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def _generated_sections(
+    scan: ModuleScan,
+    owners: tuple[str, ...],
+    backend: Backend,
+    specialization: RegionSpecialization | None,
+    *,
+    atomic_class: bool,
+) -> list[str]:
     imports = tuple(
         _preserved_import(scan, record)
         for record in scan.imports
@@ -183,6 +255,16 @@ def _generated_source(
         record.source_text for record in scan.constants if record.kind == "literal_constant"
     )
     sections: list[str] = ["from __future__ import annotations"]
+    if atomic_class and backend == "mypyc":
+        sections.extend(
+            (
+                "",
+                "from typing import TYPE_CHECKING",
+                "",
+                "if TYPE_CHECKING:",
+                "    from mypy_extensions import mypyc_attr",
+            )
+        )
     if backend == "mypyc" and owners:
         sections.extend(("", "from typing import Protocol"))
     if imports:
@@ -209,20 +291,25 @@ def _generated_source(
                     ),
                 )
             )
-    binding_by_source = {binding.source: binding for binding in bindings}
-    for member in members:
-        sections.extend(
-            (
-                "",
-                _lowered_callable(
-                    member,
-                    binding_by_source[member.id],
-                    backend,
-                    specialization,
-                ),
-            )
+    return sections
+
+
+def _lowered_atomic_class(member: RegionMember, backend: Backend) -> str:
+    """Preserve one class declaration and add semantics-preserving backend flags."""
+    node = _class_node(member)
+    if backend == "mypyc":
+        node.decorator_list.insert(
+            0,
+            ast.Call(
+                func=ast.Name(id="mypyc_attr", ctx=ast.Load()),
+                args=[],
+                keywords=[
+                    ast.keyword(arg="allow_interpreted_subclasses", value=ast.Constant(True)),
+                    ast.keyword(arg="serializable", value=ast.Constant(True)),
+                ],
+            ),
         )
-    return "\n".join(sections).rstrip() + "\n"
+    return ast.unparse(ast.fix_missing_locations(node))
 
 
 def _preserved_import(scan: ModuleScan, record: ImportRecord) -> str:
@@ -381,6 +468,14 @@ def _callable_node(member: RegionMember) -> ast.FunctionDef | ast.AsyncFunctionD
     )
     if node is None:
         raise ValueError(f"member source is not a method declaration: {member.id.stable_id}")
+    return node
+
+
+def _class_node(member: RegionMember) -> ast.ClassDef:
+    tree = ast.parse(textwrap.dedent(member.source_text))
+    node = next((statement for statement in tree.body if isinstance(statement, ast.ClassDef)), None)
+    if node is None:
+        raise ValueError(f"member source is not a class declaration: {member.id.stable_id}")
     return node
 
 

@@ -100,3 +100,41 @@ class DynamicWorker:
     def calculate(self, value: int) -> int:
         """Expose an otherwise typed method on an unsafe owner class."""
         return value + self.missing
+
+
+class UnsafeIdentityWorker:
+    """Eagerly retained owner downgraded so source identity survives."""
+
+    value: int
+
+    def __init__(self, value: int) -> None:
+        """Store one value for module-time identity checks."""
+        self.value = value
+
+    def square(self, value: int) -> int:
+        """Expose a safe method on an unsafe class owner."""
+        return value * value
+
+
+UNSAFE_IDENTITY_CLASS = UnsafeIdentityWorker
+UNSAFE_IDENTITY_INSTANCE = UnsafeIdentityWorker(5)
+
+
+class ScaleModel:
+    """Safe non-generic class used to verify atomic class compilation."""
+
+    name: str
+    factor: int
+
+    def __init__(self, name: str, factor: int = 2) -> None:
+        """Store a named integer scale factor."""
+        self.name = name
+        self.factor = factor
+
+    def apply(self, value: int) -> int:
+        """Scale one integer value."""
+        return value * self.factor
+
+    def describe(self) -> str:
+        """Return a compact source-visible description."""
+        return f"{self.name}:{self.factor}"

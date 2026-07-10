@@ -1,9 +1,10 @@
-"""Generate staged-wheel shims for descriptor-aware typed-region bindings.
+"""Generate staged-wheel shims for class and descriptor typed-region bindings.
 
 Unlike the legacy in-place shim, this block is inserted only into a copied
-package payload. It loads region artifacts by file location, binds compiled
-callables onto the original source classes, and records status per promised
-binding so intentionally interpreted members do not become strict failures.
+package payload. It loads region artifacts by file location, installs verified
+atomic classes or binds compiled callables onto original source classes, and
+records status per promised binding so interpreted members do not become strict
+failures.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ class RegionShimConfig:
     bindings: tuple[BindingTarget, ...]
 
     def __post_init__(self) -> None:
-        """Reject configs the current descriptor binder cannot preserve."""
+        """Reject configs the current runtime binder cannot preserve."""
         if not self.source_module or not self.region_id or not self.compiled_module:
             raise ValueError("region shim identifiers must be non-empty")
         if not self.bindings:
@@ -41,17 +42,20 @@ class RegionShimConfig:
                 raise ValueError("region shim binding belongs to another source module")
             if binding.kind not in {
                 "module",
+                "class",
                 "instance_method",
                 "staticmethod",
                 "classmethod",
             }:
                 raise ValueError(f"unsupported region shim binding: {binding.kind}")
-            if binding.kind != "module" and binding.owner_class is None:
+            if binding.kind in {"instance_method", "staticmethod", "classmethod"} and (
+                binding.owner_class is None
+            ):
                 raise ValueError("method region shim binding requires an owner class")
-            if binding.kind == "module" and (
+            if binding.kind in {"module", "class"} and (
                 binding.owner_class is not None or binding.target_owner_class is not None
             ):
-                raise ValueError("module region shim binding cannot name an owner class")
+                raise ValueError("module or class region shim binding cannot name an owner class")
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +225,95 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "        _atoll_wrapped.__atoll_runtime_guards__ = _atoll_guards",
             "        return _atoll_wrapped",
             "",
+            "    def _atoll_callable_descriptor(_atoll_descriptor):",
+            "        if isinstance(_atoll_descriptor, (staticmethod, classmethod)):",
+            "            return _atoll_descriptor.__func__",
+            '        if callable(_atoll_descriptor) and hasattr(_atoll_descriptor, "__name__"):',
+            "            return _atoll_descriptor",
+            "        return None",
+            "",
+            "    def _atoll_prepare_class(_atoll_source, _atoll_target):",
+            (
+                "        if not isinstance(_atoll_source, type) or not "
+                "isinstance(_atoll_target, type):"
+            ),
+            '            raise TypeError("Atoll class binding requires two class objects")',
+            "        if type(_atoll_source) is not type(_atoll_target):",
+            '            raise TypeError("compiled class changed the source metaclass")',
+            "        if _atoll_source.__bases__ != _atoll_target.__bases__:",
+            '            raise TypeError("compiled class changed source inheritance")',
+            "        _atoll_signature = _atoll_inspect.signature(_atoll_source)",
+            '        for _atoll_attribute in ("__module__", "__qualname__", "__doc__"):',
+            "            _atoll_expected = getattr(_atoll_source, _atoll_attribute)",
+            "            if getattr(_atoll_target, _atoll_attribute) != _atoll_expected:",
+            "                setattr(_atoll_target, _atoll_attribute, _atoll_expected)",
+            "        _atoll_source_annotations = dict(",
+            '            getattr(_atoll_source, "__annotations__", {})',
+            "        )",
+            "        _atoll_target_annotations = getattr(",
+            '            _atoll_target, "__annotations__", None',
+            "        )",
+            "        if isinstance(_atoll_target_annotations, dict):",
+            "            _atoll_target_annotations.clear()",
+            "            _atoll_target_annotations.update(_atoll_source_annotations)",
+            "        elif _atoll_source_annotations:",
+            '            setattr(_atoll_target, "__annotations__", _atoll_source_annotations)',
+            "        _atoll_target_namespace = vars(_atoll_target)",
+            "        for _atoll_method_name, _atoll_source_descriptor in vars(",
+            "            _atoll_source",
+            "        ).items():",
+            "            _atoll_source_callable = _atoll_callable_descriptor(",
+            "                _atoll_source_descriptor",
+            "            )",
+            "            if _atoll_source_callable is None:",
+            "                continue",
+            "            _atoll_target_callable = _atoll_callable_descriptor(",
+            "                _atoll_target_namespace.get(_atoll_method_name)",
+            "            )",
+            "            if _atoll_target_callable is None:",
+            "                raise TypeError(",
+            '                    f"compiled class lost method {_atoll_method_name}"',
+            "                )",
+            "            try:",
+            "                _atoll_functools.update_wrapper(",
+            "                    _atoll_target_callable, _atoll_source_callable",
+            "                )",
+            "                _atoll_target_callable.__signature__ = (",
+            "                    _atoll_inspect.signature(_atoll_source_callable)",
+            "                )",
+            "                _atoll_target_callable.__atoll_compiled_target__ = (",
+            "                    _atoll_target_callable",
+            "                )",
+            "                _atoll_target_callable.__atoll_python_fallback__ = (",
+            "                    _atoll_source_callable",
+            "                )",
+            "            except (AttributeError, TypeError, ValueError) as _atoll_metadata_error:",
+            "                raise TypeError(",
+            '                    f"compiled class cannot preserve {_atoll_method_name} metadata"',
+            "                ) from _atoll_metadata_error",
+            "            if _atoll_inspect.signature(_atoll_target_callable) != (",
+            "                _atoll_inspect.signature(_atoll_source_callable)",
+            "            ):",
+            "                raise TypeError(",
+            '                    f"compiled class changed {_atoll_method_name} signature"',
+            "                )",
+            "        try:",
+            "            _atoll_target.__signature__ = _atoll_signature",
+            "        except (AttributeError, TypeError):",
+            "            if _atoll_inspect.signature(_atoll_target) != _atoll_signature:",
+            '                raise TypeError("compiled class changed its constructor signature")',
+            "        if _atoll_target.__module__ != _atoll_source.__module__:",
+            '            raise TypeError("compiled class changed its public module")',
+            "        if _atoll_target.__qualname__ != _atoll_source.__qualname__:",
+            '            raise TypeError("compiled class changed its public qualname")',
+            '        if dict(getattr(_atoll_target, "__annotations__", {})) != (',
+            "            _atoll_source_annotations",
+            "        ):",
+            '            raise TypeError("compiled class changed its annotations")',
+            "        _atoll_target.__atoll_compiled_target__ = _atoll_target",
+            "        _atoll_target.__atoll_python_fallback__ = _atoll_source",
+            "        return _atoll_target",
+            "",
             f"    _atoll_regions = {regions!r}",
             "    __atoll_region_status__ = {}",
             "    __atoll_status__ = {",
@@ -304,7 +397,7 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             '                            _atoll_binding["source_qualname"]',
             "                        )",
             '                        _atoll_name = _atoll_source_qualname.rsplit(".", 1)[-1]',
-            '                        if _atoll_binding["kind"] == "module":',
+            '                        if _atoll_binding["kind"] in {"module", "class"}:',
             "                            _atoll_source = globals()[_atoll_name]",
             "                            _atoll_target_owner = None",
             "                        else:",
@@ -326,30 +419,36 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "                        _atoll_target = getattr(",
             '                            _atoll_mod, _atoll_binding["compiled_name"]',
             "                        )",
-            "                        _atoll_guards = _atoll_resolve_guards(",
-            '                            _atoll_binding["guards"]',
-            "                        )",
-            "                        _atoll_wrapped = _atoll_bind(",
-            "                            _atoll_source, _atoll_target, _atoll_guards",
-            "                        )",
-            '                        if _atoll_binding["kind"] == "module":',
-            "                            globals()[_atoll_name] = _atoll_wrapped",
-            '                        elif _atoll_binding["kind"] == "staticmethod":',
-            "                            setattr(",
-            "                                _atoll_target_owner,",
-            "                                _atoll_name,",
-            "                                staticmethod(_atoll_wrapped),",
+            '                        if _atoll_binding["kind"] == "class":',
+            "                            _atoll_target = _atoll_prepare_class(",
+            "                                _atoll_source, _atoll_target",
             "                            )",
-            '                        elif _atoll_binding["kind"] == "classmethod":',
-            "                            setattr(",
-            "                                _atoll_target_owner,",
-            "                                _atoll_name,",
-            "                                classmethod(_atoll_wrapped),",
-            "                            )",
+            "                            globals()[_atoll_name] = _atoll_target",
             "                        else:",
-            "                            setattr(",
-            "                                _atoll_target_owner, _atoll_name, _atoll_wrapped",
+            "                            _atoll_guards = _atoll_resolve_guards(",
+            '                                _atoll_binding["guards"]',
             "                            )",
+            "                            _atoll_wrapped = _atoll_bind(",
+            "                                _atoll_source, _atoll_target, _atoll_guards",
+            "                            )",
+            '                            if _atoll_binding["kind"] == "module":',
+            "                                globals()[_atoll_name] = _atoll_wrapped",
+            '                            elif _atoll_binding["kind"] == "staticmethod":',
+            "                                setattr(",
+            "                                    _atoll_target_owner,",
+            "                                    _atoll_name,",
+            "                                    staticmethod(_atoll_wrapped),",
+            "                                )",
+            '                            elif _atoll_binding["kind"] == "classmethod":',
+            "                                setattr(",
+            "                                    _atoll_target_owner,",
+            "                                    _atoll_name,",
+            "                                    classmethod(_atoll_wrapped),",
+            "                                )",
+            "                            else:",
+            "                                setattr(",
+            "                                    _atoll_target_owner, _atoll_name, _atoll_wrapped",
+            "                                )",
             '                        _atoll_binding_status["active"] = True',
             '                        _atoll_binding_status["compiled"] = True',
             "                    except Exception as _atoll_binding_error:",

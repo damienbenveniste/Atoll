@@ -26,9 +26,11 @@ from atoll.models import (
     CompiledRegionVariant,
     CompilePhaseTiming,
     EnabledIslandConfig,
+    LoweringDecision,
     ModuleId,
     ModuleScan,
     RegionSpecialization,
+    SymbolId,
     TypedRegion,
 )
 from atoll.project import DiscoveredProject, discover_project
@@ -39,6 +41,7 @@ TYPED_FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
 EXPECTED_REBUILDS = 2
 EXPECTED_PARTIAL_CACHE_BACKEND_CALLS = 3
 EXPECTED_READINESS_COUNT = 2
+EXPECTED_ATOMIC_SELECTION_COUNT = 2
 
 
 class _Metadata(Protocol):
@@ -75,7 +78,10 @@ class _CacheLookup(Protocol):
 
 class _TypedSelection(Protocol):
     backend: Backend
+    variant_id: str
+    members: tuple[SymbolId, ...]
     specialization: RegionSpecialization | None
+    conditional_on_failure_of: str | None
 
 
 class _TypedGeneration(Protocol):
@@ -89,13 +95,18 @@ class _PreparedTypedRegion(Protocol):
     assessment: BackendAssessment
     unit: CompilationUnit
     fallback: _PreparedTypedRegion | None
+    conditional_on_failure_of: str | None
 
 
 class _TypedRegionOutcome(Protocol):
     successful: tuple[_PreparedTypedRegion, ...]
     build: CompileAttempt
     artifacts: tuple[ArtifactRecord, ...]
-    skipped: tuple[object, ...]
+    skipped: tuple[_TypedRegionFailure, ...]
+
+
+class _TypedRegionFailure(Protocol):
+    variant_id: str
 
 
 class _FakeCompileBackend:
@@ -207,6 +218,14 @@ _build_typed_regions = cast(
 )
 _TypedRegionBuildContext = cast(Callable[..., object], _package_attr("_TypedRegionBuildContext"))
 _compiler_backends = cast(dict[Backend, object], _package_attr("_COMPILER_BACKENDS"))
+_member_requires_source_class = cast(
+    Callable[[str], bool],
+    _package_attr("_member_requires_source_class"),
+)
+_owner_disallows_method_binding = cast(
+    Callable[[str | None, str, dict[str, LoweringDecision]], bool],
+    _package_attr("_owner_disallows_method_binding"),
+)
 
 
 def test_typed_region_selection_prefers_mypyc_for_safe_specializations(
@@ -245,6 +264,100 @@ def test_typed_region_selection_prefers_mypyc_for_safe_specializations(
     assert function_selections[0].backend == "mypyc"
     assert function_selections[0].specialization is not None
     assert function_selections[0].specialization.origin == "closed_call"
+
+
+def test_atomic_class_selection_is_exclusive_and_partial_classes_split(
+    tmp_path: Path,
+) -> None:
+    """A closed class has one class variant while mixed shapes remain per-member."""
+    project_root = tmp_path / "typed_region_project"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+
+    selections = _selected_typed_method_regions(
+        _selected_scans(project, "typed_region_project.worker")
+    )
+    scale_selections = tuple(
+        selection
+        for selection in selections
+        if any(member.qualname.startswith("ScaleModel") for member in selection.members)
+    )
+    worker_selections = tuple(
+        selection
+        for selection in selections
+        if any(member.qualname.startswith("Worker") for member in selection.members)
+    )
+
+    class_selection = next(
+        selection
+        for selection in scale_selections
+        if selection.variant_id.endswith("@cython-class")
+    )
+    method_fallback = next(
+        selection for selection in scale_selections if selection is not class_selection
+    )
+    assert len(scale_selections) == EXPECTED_ATOMIC_SELECTION_COUNT
+    assert class_selection.backend == "cython"
+    assert tuple(member.qualname for member in class_selection.members) == ("ScaleModel",)
+    assert method_fallback.backend == "mypyc"
+    assert {member.qualname for member in method_fallback.members} == {
+        "ScaleModel.apply",
+        "ScaleModel.describe",
+    }
+    assert method_fallback.conditional_on_failure_of == class_selection.variant_id
+    assert {member.qualname for selection in worker_selections for member in selection.members} == {
+        "Worker.adjust",
+        "Worker.exchange",
+        "Worker.parse",
+        "Worker.scale",
+        "Worker.score",
+        "Worker.values",
+    }
+    assert {
+        selection.backend
+        for selection in worker_selections
+        if any(member.qualname == "Worker.exchange" for member in selection.members)
+    } == {"cython"}
+    assert all(
+        member.qualname not in {"Worker", "Worker.__init__"}
+        for selection in worker_selections
+        for member in selection.members
+    )
+
+
+def test_method_selection_rejects_class_cell_and_private_name_semantics() -> None:
+    """Top-level extraction never guesses class-cell or name-mangling behavior."""
+    assert _member_requires_source_class("def value(self) -> int:\n    return super().value()\n")
+    assert _member_requires_source_class("def owner(self) -> type[object]:\n    return __class__\n")
+    assert _member_requires_source_class("def secret(self) -> int:\n    return self.__secret\n")
+    assert not _member_requires_source_class(
+        "def regular(self) -> int:\n    return len(self.__dict__)\n"
+    )
+
+
+def test_method_selection_preserves_registered_and_dynamic_owner_classes() -> None:
+    """Method mutation is rejected when an owner may be replaced or intercept writes."""
+    registered = LoweringDecision(
+        target="module::Registered",
+        action="fallback",
+        reason="class remains interpreted because decorators may register or replace it",
+    )
+    eager = LoweringDecision(
+        target="module::Eager",
+        action="fallback",
+        reason="class remains interpreted because module-time code retains its original identity",
+    )
+
+    assert _owner_disallows_method_binding(
+        "Registered",
+        "module",
+        {registered.target: registered},
+    )
+    assert not _owner_disallows_method_binding(
+        "Eager",
+        "module",
+        {eager.target: eager},
+    )
 
 
 def test_package_reports_build_failure_without_source_edits(
@@ -424,6 +537,91 @@ def test_typed_region_build_does_not_compile_speculative_cython_after_mypyc_succ
     assert outcome.skipped == ()
     assert len(mypyc.calls) == 1
     assert cython.calls == []
+
+
+@pytest.mark.parametrize("class_succeeds", [True, False])
+def test_atomic_class_build_conditionally_uses_method_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    class_succeeds: bool,
+) -> None:
+    """Method variants stay dormant unless the selected atomic class fails."""
+    project_root = tmp_path / "typed_region_project"
+    build_root = tmp_path / "build"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    selections = _selected_typed_method_regions(
+        _selected_scans(project, "typed_region_project.worker")
+    )
+    class_selection = next(
+        selection for selection in selections if selection.variant_id.endswith("@cython-class")
+    )
+    method_selection = next(
+        selection
+        for selection in selections
+        if selection.conditional_on_failure_of == class_selection.variant_id
+    )
+    staged_source_roots = _copy_source_roots(project, build_root)
+    prepared = tuple(
+        _prepare_typed_region(
+            project=project,
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            selection=selection,
+        )
+        for selection in (class_selection, method_selection)
+    )
+    cython = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=class_succeeds,
+                command=("cython",),
+                stdout="",
+                stderr="" if class_succeeds else "CYTHON_COMPILE_ERROR: fixture",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    mypyc = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=True,
+                command=("mypyc",),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    monkeypatch.setitem(_compiler_backends, "cython", cython)
+    monkeypatch.setitem(_compiler_backends, "mypyc", mypyc)
+
+    outcome = _build_typed_regions(
+        prepared=prepared,
+        context=_TypedRegionBuildContext(
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            cache_dir=tmp_path / "cache",
+            progress=None,
+        ),
+        initial_failures=(),
+    )
+
+    assert outcome.build.success is True
+    if class_succeeds:
+        assert [item.unit.region_id for item in outcome.successful] == [class_selection.variant_id]
+        assert outcome.skipped == ()
+        assert mypyc.calls == []
+    else:
+        assert [item.unit.region_id for item in outcome.successful] == [method_selection.variant_id]
+        assert [failure.variant_id for failure in outcome.skipped] == [class_selection.variant_id]
+        assert len(mypyc.calls) == 1
+    assert len(cython.calls) == 1
 
 
 def test_typed_region_build_records_real_cython_artifacts_after_mypyc_retry(
