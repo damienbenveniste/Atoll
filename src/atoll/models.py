@@ -76,6 +76,44 @@ _LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
 
 
 @dataclass(frozen=True, slots=True)
+class CompileConfig:
+    """Validated source-clean compiler, test, and benchmark configuration.
+
+    Commands remain argv tuples and are never interpreted by a shell. A
+    benchmark requires a semantic test command because Atoll must prove both
+    baseline and compiled behavior before measuring profitability.
+    """
+
+    backends: tuple[Backend, ...] = ("mypyc", "cython")
+    test_command: tuple[str, ...] | None = None
+    benchmark_command: tuple[str, ...] | None = None
+    benchmark_warmups: int = 1
+    benchmark_samples: int = 7
+    minimum_speedup: float = 1.10
+
+    def __post_init__(self) -> None:
+        """Reject incomplete or ambiguous compile policy at discovery time."""
+        if not self.backends or len(set(self.backends)) != len(self.backends):
+            raise ValueError("tool.atoll.compile.backends must be a non-empty unique list")
+        if any(backend not in {"mypyc", "cython"} for backend in self.backends):
+            raise ValueError("tool.atoll.compile.backends supports only mypyc and cython")
+        for field_name, command in (
+            ("test_command", self.test_command),
+            ("benchmark_command", self.benchmark_command),
+        ):
+            if command is not None and (not command or any(not part.strip() for part in command)):
+                raise ValueError(f"tool.atoll.compile.{field_name} must be a non-empty argv list")
+        if self.benchmark_command is not None and self.test_command is None:
+            raise ValueError("tool.atoll.compile.benchmark_command requires test_command")
+        if self.benchmark_warmups < 0:
+            raise ValueError("tool.atoll.compile.benchmark_warmups must be at least 0")
+        if self.benchmark_samples < 1:
+            raise ValueError("tool.atoll.compile.benchmark_samples must be at least 1")
+        if self.minimum_speedup <= 0:
+            raise ValueError("tool.atoll.compile.minimum_speedup must be greater than 0")
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectConfig:
     """Resolved project settings for one Atoll invocation.
 
@@ -91,6 +129,7 @@ class ProjectConfig:
     cache_dir: Path
     report_dir: Path
     islands: tuple[EnabledIslandConfig, ...] = ()
+    compile: CompileConfig = field(default_factory=CompileConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,6 +624,7 @@ class CompiledRegionVariant:
     region: TypedRegion
     backend: Backend
     bindings: tuple[BindingTarget, ...]
+    cache_status: CompileCacheStatus = "disabled"
 
     def __post_init__(self) -> None:
         """Require a non-empty variant ID and bindings owned by the region."""

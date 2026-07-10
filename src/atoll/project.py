@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from atoll.config import load_enabled_islands
+from atoll.config import load_compile_config, load_enabled_islands
 from atoll.models import ModuleId, ProjectConfig
 
 IGNORED_DIR_NAMES = frozenset(
@@ -56,6 +56,7 @@ def resolve_project_config(root: Path, source_roots: Sequence[Path] = ()) -> Pro
         cache_dir=project_root / ".atoll" / "cache",
         report_dir=project_root / ".atoll",
         islands=load_enabled_islands(project_root),
+        compile=load_compile_config(project_root),
     )
 
 

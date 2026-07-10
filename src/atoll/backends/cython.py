@@ -372,7 +372,11 @@ def _build_units(
             native_stderr,
         ):
             active_phase = ("cythonize", time.perf_counter())
-            extensions = _cythonize_extensions(units, build_dir)
+            extensions = _cythonize_extensions(
+                units,
+                build_dir,
+                project_root=context.project_root,
+            )
             phase_timings.append(_phase_timing(active_phase))
             active_phase = ("build_ext", time.perf_counter())
             distribution = Distribution(
@@ -382,6 +386,10 @@ def _build_units(
             command_obj.inplace = False
             command_obj.build_lib = str(artifact_dir)
             command_obj.build_temp = str(build_dir / "temp")
+            _prepare_build_temp_source_dir(
+                Path(command_obj.build_temp),
+                _project_path(build_dir / "cythonized", context.project_root),
+            )
             command_obj.ensure_finalized()
             command_obj.run()
             phase_timings.append(_phase_timing(active_phase))
@@ -457,16 +465,37 @@ def _failed_attempt(
 def _cythonize_extensions(
     units: tuple[CompilationUnit, ...],
     build_dir: Path,
+    *,
+    project_root: Path,
 ) -> list[Extension]:
     cython_build = importlib.import_module("Cython.Build")
     cythonize = cast(_CythonizeFunction, cython_build.cythonize)
-    extensions = [Extension(unit.logical_module, [str(unit.source_paths[0])]) for unit in units]
+    cythonized_dir = build_dir / "cythonized"
+    cythonized_dir.mkdir(parents=True, exist_ok=True)
+    extensions = [
+        Extension(unit.logical_module, [_project_path(unit.source_paths[0], project_root)])
+        for unit in units
+    ]
     return cythonize(
         extensions,
         compiler_directives=_DIRECTIVES,
         quiet=True,
-        build_dir=str(build_dir / "cythonized"),
+        build_dir=_project_path(cythonized_dir, project_root),
     )
+
+
+def _project_path(path: Path, project_root: Path) -> str:
+    try:
+        return path.resolve().relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _prepare_build_temp_source_dir(build_temp: Path, source_dir: str) -> None:
+    """Create the object-file parent mirrored by setuptools for generated C sources."""
+    source_path = Path(source_dir)
+    relative_parts = source_path.parts[1:] if source_path.anchor else source_path.parts
+    build_temp.joinpath(*relative_parts).mkdir(parents=True, exist_ok=True)
 
 
 def _phase_timing(active_phase: tuple[str, float]) -> CompilePhaseTiming:

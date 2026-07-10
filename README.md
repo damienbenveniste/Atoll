@@ -54,8 +54,8 @@ mypyc changes Python frame semantics.
 ## Compile candidates
 
 Use `compile` for the normal workflow. It copies the target package into a temporary Atoll build
-area, inserts shims only in that copy, compiles generated function islands or typed regions
-regions, writes a platform wheel, and removes the temporary install tree. The original source files
+area, inserts shims only in that copy, compiles generated function islands or typed regions,
+writes a platform wheel, and removes the temporary install tree. The original source files
 are left untouched.
 
 ```bash
@@ -67,6 +67,11 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
+Atoll first builds the target project's normal PEP 517 wheel from a temporary source-clean copy,
+then overlays only staged routing code and region-owned native artifacts. Package data, entry
+points, and distribution metadata therefore come from the project's build backend. Atoll rewrites
+the platform tag and `RECORD`, verifies both the staged payload and final wheel in fresh
+interpreters, and removes the copied project and install payload after a successful default run.
 For typed regions, the report's `compiled_regions` section names each backend variant, every class
 or descriptor-aware binding, its runtime guards and concrete target owner, and the artifact paths
 associated with that variant. Typed-region entries retain the original generic declaration plus the
@@ -107,8 +112,10 @@ staging, cache lookup or restore, mypyc batch or retry builds, wheel writing, an
 reports include cache status plus subphase timings such as `mypycify` and `build_ext`. Duplicate
 macOS linker `-rpath` warnings are filtered from terminal output; other native compiler diagnostics
 are still captured in Atoll's build diagnostics. Atoll keeps strict reusable compile and mypy cache
-state under `.atoll/cache/`; unchanged legacy function-island builds restore successful artifacts
-and cached skips without invoking mypyc again. `atoll clean --cache` removes that state.
+state under `.atoll/cache/`. Typed artifacts are cached independently by backend and region under
+`.atoll/cache/compile/regions/`; unchanged variants restore their native files without invoking
+mypyc or Cython again. Legacy function-island builds also restore successful artifacts and cached
+skips. `atoll clean --cache` removes all of this reusable state.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic. Module-level typing diagnostics, such as unsupported `TypeVar` keyword
@@ -120,6 +127,32 @@ methods, and narrowly guarded concrete generic specializations. It still leaves 
 identity-sensitive classes in Python and does not treat object-rich orchestration as one native
 unit. Large gains are therefore expected only when meaningful application time is spent inside
 accepted CPU-bound code; successful compilation is not a speedup claim.
+
+### Semantic and performance gates
+
+Source-clean compile is valid without a benchmark, but its report then records performance as
+`unbenchmarked`; Atoll does not claim an acceleration. Projects that want wheel promotion to depend
+on behavior and measured profitability can configure argv commands in `pyproject.toml`:
+
+```toml
+[tool.atoll.compile]
+backends = ["mypyc", "cython"]
+test_command = ["pytest", "-q"]
+benchmark_command = ["python", "benchmarks/atoll_workload.py"]
+benchmark_warmups = 1
+benchmark_samples = 7
+minimum_speedup = 1.10
+```
+
+Commands run directly with `shell=False`. When a benchmark is configured, Atoll tests both the
+baseline wheel payload and compiled payload, runs alternating baseline/compiled benchmark pairs,
+and compares median durations. A median below 0.25 seconds is rejected as too noisy. Failed tests,
+invalid measurements, or speedup below `minimum_speedup` remove the candidate wheel and are recorded
+in `.atoll/compile-report.*`; only a passing gate promotes the wheel. Commands run from a temporary
+copy that retains project tests and benchmark files but removes importable checkout modules, so a
+flat-layout checkout cannot shadow the baseline or compiled payload. On verification or gate
+failure, Atoll keeps `.atoll/dist/install` and moves the rejected wheel under
+`.atoll/dist/build/diagnostics/` for inspection; no candidate remains in `.atoll/dist/*.whl`.
 
 Compiled functions and methods retain their source name, qualified name, documentation,
 annotations, signature, and sync, coroutine, generator, or async-generator shape. Async-generator

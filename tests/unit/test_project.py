@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from atoll.models import CompileConfig
 from atoll.project import discover_project, module_name_for_path
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
@@ -33,6 +34,7 @@ def test_discover_project_defaults_to_src_root() -> None:
         "app.types",
     ]
     assert discovered.config.report_dir == FIXTURE_ROOT.resolve() / ".atoll"
+    assert discovered.config.compile == CompileConfig()
 
 
 def test_discover_project_honors_max_files() -> None:

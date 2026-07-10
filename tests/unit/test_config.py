@@ -2,8 +2,15 @@
 
 from pathlib import Path
 
-from atoll.config import disable_island, load_enabled_islands, write_atoll_config
-from atoll.models import EnabledIslandConfig
+import pytest
+
+from atoll.config import (
+    disable_island,
+    load_compile_config,
+    load_enabled_islands,
+    write_atoll_config,
+)
+from atoll.models import CompileConfig, EnabledIslandConfig
 
 
 def test_write_and_load_atoll_config(tmp_path: Path) -> None:
@@ -64,3 +71,69 @@ def test_write_atoll_config_handles_absolute_paths_outside_root(tmp_path: Path) 
     path = write_atoll_config(tmp_path, (island,))
 
     assert outside.as_posix() in path.read_text(encoding="utf-8")
+
+
+def test_load_compile_config_reads_argv_and_performance_policy(tmp_path: Path) -> None:
+    """Compile policy preserves argv arrays and validates numeric gates."""
+    (tmp_path / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[tool.atoll.compile]",
+                'backends = ["cython", "mypyc"]',
+                'test_command = ["pytest", "-q"]',
+                'benchmark_command = ["python", "benchmarks/workload.py"]',
+                "benchmark_warmups = 2",
+                "benchmark_samples = 9",
+                "minimum_speedup = 1.25",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_compile_config(tmp_path)
+
+    assert config == CompileConfig(
+        backends=("cython", "mypyc"),
+        test_command=("pytest", "-q"),
+        benchmark_command=("python", "benchmarks/workload.py"),
+        benchmark_warmups=2,
+        benchmark_samples=9,
+        minimum_speedup=1.25,
+    )
+
+
+def test_load_compile_config_defaults_when_section_is_absent(tmp_path: Path) -> None:
+    """Projects need no Atoll configuration for source-clean compilation."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+
+    assert load_compile_config(tmp_path) == CompileConfig()
+
+
+@pytest.mark.parametrize(
+    ("compile_lines", "message"),
+    [
+        (["backends = []"], "backends"),
+        (["test_command = 'pytest'"], "test_command"),
+        (
+            ['benchmark_command = ["python", "bench.py"]'],
+            "requires test_command",
+        ),
+        (["benchmark_warmups = -1"], "benchmark_warmups"),
+        (["benchmark_samples = 0"], "benchmark_samples"),
+        (["minimum_speedup = 0"], "minimum_speedup"),
+    ],
+)
+def test_load_compile_config_rejects_invalid_policy(
+    tmp_path: Path,
+    compile_lines: list[str],
+    message: str,
+) -> None:
+    """Invalid compile settings fail discovery instead of weakening a gate."""
+    (tmp_path / "pyproject.toml").write_text(
+        "\n".join(["[tool.atoll.compile]", *compile_lines, ""]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        load_compile_config(tmp_path)

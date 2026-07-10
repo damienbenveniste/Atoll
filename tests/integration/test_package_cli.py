@@ -6,6 +6,7 @@ import importlib.machinery
 import inspect
 import json
 import shutil
+import sys
 import zipfile
 from pathlib import Path
 
@@ -27,6 +28,7 @@ FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXIT_USAGE = 2
 RANKING_SYMBOL_COUNT = 1
 REJECTED_SYMBOL_COUNT = 2
+GATE_FAILURE_CODE = 7
 
 
 def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
@@ -67,11 +69,15 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     assert readiness_by_symbol["score_user"]["eligible"] is False
     assert readiness_by_symbol["rank_candidates"]["eligible"] is False
     assert report["build"]["cache_status"] == "miss"
+    assert report["performance"]["status"] == "unbenchmarked"
+    assert report["performance"]["speedup"] is None
     assert any(timing["name"] == "mypycify" for timing in report["build"]["phase_timings"])
     assert any(timing["name"] == "build_ext" for timing in report["build"]["phase_timings"])
     assert report["cleanup"]["removed"] == [".atoll/dist/build", ".atoll/dist/install"]
     assert report["cleanup"]["kept"] == []
-    assert "Source-clean compile builds a wheel" in report_markdown_path.read_text(encoding="utf-8")
+    markdown_report = report_markdown_path.read_text(encoding="utf-8")
+    assert "normal PEP 517 wheel" in markdown_report
+    assert "unbenchmarked" in markdown_report
     assert "Install tree:" not in captured.out
     assert "Compile reports:" in captured.out
     assert "Atoll compile [" in captured.err
@@ -80,7 +86,13 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     assert "cleaned temporary outputs" in captured.err
     with zipfile.ZipFile(wheel_path) as wheel:
         names = set(wheel.namelist())
+        metadata_path = next(name for name in names if name.endswith(".dist-info/METADATA"))
+        metadata = wheel.read(metadata_path).decode("utf-8")
     assert "app/ranking.py" in names
+    assert "app/data/schema.json" in names
+    assert "app/py.typed" in names
+    assert any(name.endswith(".dist-info/entry_points.txt") for name in names)
+    assert "Summary: Fixture metadata preserved by Atoll wheel overlays." in metadata
     assert any(
         name.startswith(".atoll/artifacts/_atoll_app_ranking") and name.endswith(".so")
         for name in names
@@ -115,7 +127,11 @@ def test_compile_uses_cache_on_unchanged_second_run(
     assert second_report["build"]["cache_status"] == "hit"
     assert "compile cache miss" in first_capture.err
     assert "compile cache hit" in second_capture.err
-    assert [timing["name"] for timing in second_report["build"]["phase_timings"]] == [
+    assert [
+        timing["name"]
+        for timing in second_report["build"]["phase_timings"]
+        if timing["name"].startswith("cache_")
+    ] == [
         "cache_lookup",
         "cache_restore",
     ]
@@ -125,6 +141,128 @@ def test_compile_uses_cache_on_unchanged_second_run(
         assert any(
             name.startswith(".atoll/artifacts/_atoll_app_ranking") for name in wheel.namelist()
         )
+
+
+def test_compile_runs_semantic_gate_without_flat_checkout_shadowing(
+    tmp_path: Path,
+) -> None:
+    """Configured commands import the staged payload from a source-stripped project mirror."""
+    project_root = tmp_path / "flat_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    shutil.move(project_root / "src" / "app", project_root / "app")
+    (project_root / "src").rmdir()
+    pyproject = project_root / "pyproject.toml"
+    config = pyproject.read_text(encoding="utf-8").replace('where = ["src"]', 'where = ["."]')
+    probe = (
+        "import app.ranking as module; "
+        "assert '/.atoll/dist/install/' in module.__file__.replace('\\\\', '/')"
+    )
+    pyproject.write_text(
+        config
+        + "\n".join(
+            (
+                "",
+                "[tool.atoll.compile]",
+                f'test_command = [{json.dumps(sys.executable)}, "-c", {json.dumps(probe)}]',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
+
+    report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    assert exit_code == 0
+    assert report["test_results"][0]["mode"] == "compiled"
+    assert report["test_results"][0]["returncode"] == 0
+    assert report["performance"]["status"] == "unbenchmarked"
+
+
+def test_compile_rejects_wheel_after_real_semantic_gate_failure(tmp_path: Path) -> None:
+    """A nonzero configured command retains diagnostics but exposes no candidate wheel."""
+    project_root = tmp_path / "failed_gate_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    command = "raise SystemExit(7)"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + "\n".join(
+            (
+                "",
+                "[tool.atoll.compile]",
+                f'test_command = [{json.dumps(sys.executable)}, "-c", {json.dumps(command)}]',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
+
+    output_dir = project_root / ".atoll" / "dist"
+    report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    assert exit_code == 1
+    assert report["success"] is False
+    assert report["test_results"][0]["returncode"] == GATE_FAILURE_CODE
+    assert report["performance"]["status"] == "invalid"
+    assert report["cleanup"]["kept"] == [".atoll/dist/build", ".atoll/dist/install"]
+    assert not tuple(output_dir.glob("*.whl"))
+    assert tuple((output_dir / "build" / "diagnostics").glob("*.whl"))
+    assert (output_dir / "install").exists()
+
+
+def test_compile_reports_backend_wheel_omission_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A backend wheel that omits the selected module becomes a diagnostic failure."""
+    project_root = tmp_path / "omitted_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'where = ["src"]',
+            'where = ["wheel_src"]',
+        ),
+        encoding="utf-8",
+    )
+    (project_root / "wheel_src").mkdir()
+
+    exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
+
+    captured = capsys.readouterr()
+    report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    assert exit_code == 1
+    assert report["success"] is False
+    assert "target PEP 517 wheel omitted" in report["build"]["stderr"]
+    assert "Traceback" not in captured.err
+    assert not tuple((project_root / ".atoll" / "dist").glob("*.whl"))
+    assert (project_root / ".atoll" / "dist" / "build").exists()
+    assert (project_root / ".atoll" / "dist" / "install").exists()
+
+
+def test_compile_rejects_invalid_compile_config_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Configuration validation errors use a stable CLI exit instead of escaping."""
+    project_root = tmp_path / "invalid_config_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + '\n[tool.atoll.compile]\nbenchmark_command = ["python", "bench.py"]\n',
+        encoding="utf-8",
+    )
+
+    exit_code = main(["compile", "--root", str(project_root)])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE
+    assert "Atoll compile configuration error" in captured.err
+    assert "requires test_command" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_compile_can_keep_install_tree_for_debugging(

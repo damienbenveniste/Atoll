@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import ast
-import base64
-import csv
 import hashlib
 import importlib.machinery
-import io
 import json
 import re
 import shutil
@@ -19,7 +16,7 @@ import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from importlib import metadata as importlib_metadata
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 from packaging import tags
@@ -39,6 +36,7 @@ from atoll.generation.sidecar import (
     generate_sidecar,
 )
 from atoll.generation.typed_region import (
+    TYPED_METHOD_GENERATOR_VERSION,
     TypedRegionGeneration,
     TypedRegionGenerationOptions,
     generate_typed_method_region,
@@ -54,6 +52,7 @@ from atoll.models import (
     Blocker,
     CompilationUnit,
     CompileAttempt,
+    CompileCacheStatus,
     CompiledRegionVariant,
     CompilePhaseTiming,
     EnabledIslandConfig,
@@ -65,6 +64,29 @@ from atoll.models import (
     TypedRegion,
 )
 from atoll.project import DiscoveredProject, discover_project
+from atoll.region_cache import compile_with_region_cache
+from atoll.runtime.package_verify import (
+    PackageVerificationPlan,
+    PackageVerificationResult,
+    VerificationArtifact,
+    VerificationStage,
+    verify_package_subprocess,
+)
+from atoll.runtime.performance import (
+    BenchmarkGateConfig,
+    BenchmarkGateResult,
+    BenchmarkProgress,
+    CommandRunEvidence,
+    run_benchmark_gate,
+    run_performance_command,
+)
+from atoll.wheel_overlay import (
+    WheelBuildEvidence,
+    WheelOverlayError,
+    build_baseline_wheel,
+    repack_overlaid_wheel,
+    unpack_wheel_payload,
+)
 
 PackageProgress = Callable[[str], None]
 
@@ -89,6 +111,20 @@ _GENERATED_DIR_NAMES = frozenset(
 _COMPILE_CACHE_VERSION = 2
 _CACHE_INPUT_SUFFIXES = frozenset({".py", ".pyi", ".toml"})
 _CACHE_INPUT_NAMES = frozenset({"py.typed"})
+_PEP517_IGNORED_NAMES = frozenset(
+    {
+        ".atoll",
+        ".git",
+        ".mypy_cache",
+        ".nox",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "venv",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +164,9 @@ class PackageCommandResult:
     backend_assessments: tuple[BackendAssessment, ...] = ()
     artifact_records: tuple[ArtifactRecord, ...] = ()
     region_skipped: tuple[PackageRegionBuildFailure, ...] = ()
+    verification_steps: tuple[PackageVerificationResult, ...] = ()
+    test_results: tuple[CommandRunEvidence, ...] = ()
+    performance: BenchmarkGateResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +244,7 @@ class _TypedRegionBuildOutcome:
     build: CompileAttempt
     artifacts: tuple[ArtifactRecord, ...]
     skipped: tuple[PackageRegionBuildFailure, ...]
+    cache_statuses: tuple[tuple[str, CompileCacheStatus], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +253,8 @@ class _TypedRegionBuildContext:
 
     build_root: Path
     staged_source_roots: tuple[Path, ...]
-    cache_dir: Path
+    mypy_cache_dir: Path
+    compile_cache_dir: Path
     progress: PackageProgress | None
 
 
@@ -273,6 +314,66 @@ class _CompileCacheLookup:
     phase_timings: tuple[CompilePhaseTiming, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _BaselineWheelPayload:
+    """Normal target wheel unpacked as the immutable source-clean base layer."""
+
+    wheel_path: Path | None
+    build: CompileAttempt
+    baseline_install_root: Path | None = None
+    quality_project_root: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _QualityGateOutcome:
+    """Configured semantic-test and benchmark evidence before wheel promotion."""
+
+    success: bool
+    tests: tuple[CommandRunEvidence, ...]
+    performance: BenchmarkGateResult
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceCleanPromotionContext:
+    """Shared inputs for verifying, gating, and promoting one staged payload."""
+
+    options: PackageOptions
+    project: DiscoveredProject
+    output_dir: Path
+    build_root: Path
+    install_root: Path
+    baseline: _BaselineWheelPayload
+    verification_plan: PackageVerificationPlan
+    build: CompileAttempt
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceCleanPromotionResult:
+    """Final wheel, gate evidence, and cleanup state for a staged payload."""
+
+    success: bool
+    wheel_path: Path | None
+    build: CompileAttempt
+    verification_steps: tuple[PackageVerificationResult, ...]
+    test_results: tuple[CommandRunEvidence, ...] = ()
+    performance: BenchmarkGateResult | None = None
+    cleanup_removed: tuple[Path, ...] = ()
+    cleanup_kept: tuple[Path, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceCleanPromotionFailure:
+    """Evidence needed to reject a staged source-clean wheel candidate."""
+
+    build: CompileAttempt
+    verification_steps: tuple[PackageVerificationResult, ...]
+    error: str | None
+    wheel_path: Path | None = None
+    quality_gate: _QualityGateOutcome | None = None
+
+
 def execute_package(options: PackageOptions) -> PackageCommandResult:
     """Build an install tree and wheel containing Atoll compiled islands."""
     _progress(options.progress, f"discovering project at {options.root.resolve()}")
@@ -286,7 +387,10 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     typed_regions = tuple(region for scan in scans for region in scan.typed_regions)
     _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
     selected = _selected_modules(scans)
-    selected_typed_regions = _selected_typed_method_regions(scans)
+    selected_typed_regions = _selected_typed_method_regions(
+        scans,
+        project.config.compile.backends,
+    )
     _progress_compile_selection(options.progress, selected, selected_typed_regions)
     if not selected and not selected_typed_regions:
         return _failed_result(
@@ -364,6 +468,30 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
                 native_readiness=native_readiness,
             ),
         )
+    baseline = _prepare_baseline_wheel_payload(
+        project=project,
+        build_root=build_root,
+        install_root=install_root,
+        progress=options.progress,
+    )
+    if baseline.wheel_path is None:
+        _remove_failed_wheels(project, output_dir)
+        cleanup_removed = _remove_tree(install_root)
+        return PackageCommandResult(
+            success=False,
+            project_root=project.config.root,
+            output_dir=output_dir,
+            install_root=install_root,
+            wheel_path=None,
+            islands=(),
+            build=baseline.build,
+            error=baseline.build.stderr,
+            cleanup_removed=cleanup_removed,
+            cleanup_kept=(build_root,),
+            preflight_skipped=(),
+            native_readiness=native_readiness,
+            typed_regions=typed_regions,
+        )
     outcome = _build_package_islands(
         islands,
         _PackageBuildContext(
@@ -375,6 +503,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             progress=options.progress,
         ),
     )
+    outcome = replace(outcome, build=_combine_baseline_and_native(baseline.build, outcome.build))
     if not outcome.build.success:
         _progress(options.progress, "build failed; keeping build tree for diagnostics")
         _remove_failed_wheels(project, output_dir)
@@ -404,45 +533,56 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         outcome.build.artifact_paths,
     )
     _remove_generated_sidecar_sources(outcome.successful)
-    _copy_install_payload(staged_source_roots, install_root)
-    _copy_atoll_artifacts(staged_source_roots, install_root)
-    _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
-    metadata = _project_metadata(project.config.root)
-    wheel_started = time.perf_counter()
-    _progress(options.progress, f"writing wheel to {output_dir}")
-    wheel_path = _write_wheel(
-        install_root=install_root,
-        output_dir=output_dir,
-        metadata=metadata,
+    overlay_error = _overlay_install_payload(
+        staged_source_roots,
+        install_root,
+        tuple(island.source_path for island in outcome.successful),
     )
-    _progress(options.progress, f"wrote wheel in {_duration(wheel_started)}")
-    cleanup_started = time.perf_counter()
-    _progress(options.progress, "cleaning temporary build outputs")
-    cleanup_removed_paths = [build_root]
-    shutil.rmtree(build_root)
-    cleanup_kept: tuple[Path, ...] = ()
-    if not options.keep_install_tree:
-        cleanup_removed_paths.append(install_root)
-        shutil.rmtree(install_root)
+    verification_plan = _legacy_verification_plan(
+        outcome.successful,
+        outcome.build.artifact_paths,
+    )
+    promotion_context = _SourceCleanPromotionContext(
+        options=options,
+        project=project,
+        output_dir=output_dir,
+        build_root=build_root,
+        install_root=install_root,
+        baseline=baseline,
+        verification_plan=verification_plan,
+        build=outcome.build,
+    )
+    if overlay_error is None:
+        _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
+        promotion = _promote_source_clean_payload(promotion_context)
     else:
-        cleanup_kept = (install_root,)
-    _progress(options.progress, f"cleaned temporary outputs in {_duration(cleanup_started)}")
+        promotion = _failed_promotion(
+            promotion_context,
+            _SourceCleanPromotionFailure(
+                build=replace(outcome.build, success=False, stderr=overlay_error),
+                verification_steps=(),
+                error=overlay_error,
+            ),
+        )
     return PackageCommandResult(
-        success=True,
+        success=promotion.success,
         project_root=project.config.root,
         output_dir=output_dir,
         install_root=install_root,
-        wheel_path=wheel_path,
+        wheel_path=promotion.wheel_path,
         islands=outcome.successful,
-        build=outcome.build,
-        install_tree_kept=options.keep_install_tree,
-        cleanup_removed=tuple(cleanup_removed_paths),
-        cleanup_kept=cleanup_kept,
+        build=promotion.build,
+        install_tree_kept=options.keep_install_tree and promotion.success,
+        cleanup_removed=promotion.cleanup_removed,
+        cleanup_kept=promotion.cleanup_kept,
         report_artifact_paths=report_artifact_paths,
+        error=promotion.error,
         skipped=outcome.skipped,
-        preflight_skipped=(),
         native_readiness=native_readiness,
         typed_regions=typed_regions,
+        verification_steps=promotion.verification_steps,
+        test_results=promotion.test_results,
+        performance=promotion.performance,
     )
 
 
@@ -491,6 +631,32 @@ def _execute_typed_region_package(
     _progress(options.progress, f"resetting temporary build roots in {output_dir}")
     _reset_dir(build_root)
     _reset_dir(install_root)
+
+    baseline = _prepare_baseline_wheel_payload(
+        project=project,
+        build_root=build_root,
+        install_root=install_root,
+        progress=options.progress,
+    )
+    if baseline.wheel_path is None:
+        _remove_failed_wheels(project, output_dir)
+        cleanup_removed = _remove_tree(install_root)
+        return PackageCommandResult(
+            success=False,
+            project_root=project.config.root,
+            output_dir=output_dir,
+            install_root=install_root,
+            wheel_path=None,
+            islands=(),
+            build=baseline.build,
+            cleanup_removed=cleanup_removed,
+            cleanup_kept=(build_root,),
+            error=baseline.build.stderr,
+            preflight_skipped=context.preflight_skipped,
+            native_readiness=context.native_readiness,
+            typed_regions=context.typed_regions,
+            backend_assessments=tuple(selection.assessment for selection in context.selected),
+        )
 
     copy_started = time.perf_counter()
     _progress(options.progress, "copying source roots into temporary build tree")
@@ -554,11 +720,13 @@ def _execute_typed_region_package(
         context=_TypedRegionBuildContext(
             build_root=build_root,
             staged_source_roots=staged_source_roots,
-            cache_dir=project.config.cache_dir / "mypy" / "source-clean",
+            mypy_cache_dir=project.config.cache_dir / "mypy" / "source-clean",
+            compile_cache_dir=project.config.cache_dir / "compile" / "regions",
             progress=options.progress,
         ),
         initial_failures=tuple(preparation_failures),
     )
+    outcome = replace(outcome, build=_combine_baseline_and_native(baseline.build, outcome.build))
     if not outcome.successful:
         _progress(options.progress, "all typed-region builds failed; keeping diagnostics")
         _remove_failed_wheels(project, output_dir)
@@ -586,39 +754,46 @@ def _execute_typed_region_package(
     _progress(options.progress, "binding compiled classes and callables in staged modules")
     successful_shims = tuple(item.shim for item in outcome.successful)
     _insert_region_shims(successful_shims)
-    _place_region_artifacts(successful_shims, outcome.build.artifact_paths)
-    report_artifact_paths = _source_clean_report_artifact_paths(
-        project.config.root,
+    _place_region_artifacts(
+        successful_shims,
         outcome.build.artifact_paths,
+        outcome.artifacts,
+    )
+    report_artifact_paths = _source_clean_region_report_artifact_paths(
+        project.config.root,
+        outcome.artifacts,
     )
     for path in _prepared_source_paths(tuple(prepared)):
         path.unlink(missing_ok=True)
-    _copy_install_payload(staged_source_roots, install_root)
-    _copy_atoll_artifacts(staged_source_roots, install_root)
-    _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
-
-    metadata = _project_metadata(project.config.root)
-    wheel_started = time.perf_counter()
-    _progress(options.progress, f"writing wheel to {output_dir}")
-    wheel_path = _write_wheel(
-        install_root=install_root,
-        output_dir=output_dir,
-        metadata=metadata,
+    overlay_error = _overlay_install_payload(
+        staged_source_roots,
+        install_root,
+        tuple(config.source_path for config in successful_shims),
     )
-    _progress(options.progress, f"wrote wheel in {_duration(wheel_started)}")
-
-    cleanup_started = time.perf_counter()
-    _progress(options.progress, "cleaning temporary build outputs")
-    cleanup_removed_paths = [build_root]
-    shutil.rmtree(build_root)
-    cleanup_kept: tuple[Path, ...] = ()
-    if not options.keep_install_tree:
-        cleanup_removed_paths.append(install_root)
-        shutil.rmtree(install_root)
+    verification_plan = _typed_verification_plan(successful_shims, outcome.artifacts)
+    promotion_context = _SourceCleanPromotionContext(
+        options=options,
+        project=project,
+        output_dir=output_dir,
+        build_root=build_root,
+        install_root=install_root,
+        baseline=baseline,
+        verification_plan=verification_plan,
+        build=outcome.build,
+    )
+    if overlay_error is None:
+        _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
+        promotion = _promote_source_clean_payload(promotion_context)
     else:
-        cleanup_kept = (install_root,)
-    _progress(options.progress, f"cleaned temporary outputs in {_duration(cleanup_started)}")
-
+        promotion = _failed_promotion(
+            promotion_context,
+            _SourceCleanPromotionFailure(
+                build=replace(outcome.build, success=False, stderr=overlay_error),
+                verification_steps=(),
+                error=overlay_error,
+            ),
+        )
+    cache_statuses = dict(outcome.cache_statuses)
     successful_regions = tuple(
         {item.generation.region.id: item.generation.region for item in outcome.successful}.values()
     )
@@ -631,21 +806,23 @@ def _execute_typed_region_package(
             region=item.generation.region,
             backend=item.generation.backend,
             bindings=item.generation.bindings,
+            cache_status=cache_statuses.get(item.unit.region_id, "disabled"),
         )
         for item in outcome.successful
     )
     return PackageCommandResult(
-        success=True,
+        success=promotion.success,
         project_root=project.config.root,
         output_dir=output_dir,
         install_root=install_root,
-        wheel_path=wheel_path,
+        wheel_path=promotion.wheel_path,
         islands=(),
-        build=outcome.build,
-        install_tree_kept=options.keep_install_tree,
-        cleanup_removed=tuple(cleanup_removed_paths),
-        cleanup_kept=cleanup_kept,
+        build=promotion.build,
+        install_tree_kept=options.keep_install_tree and promotion.success,
+        cleanup_removed=promotion.cleanup_removed,
+        cleanup_kept=promotion.cleanup_kept,
         report_artifact_paths=report_artifact_paths,
+        error=promotion.error,
         preflight_skipped=context.preflight_skipped,
         native_readiness=context.native_readiness,
         typed_regions=context.typed_regions,
@@ -655,6 +832,9 @@ def _execute_typed_region_package(
         backend_assessments=tuple(selection.assessment for selection in context.selected),
         artifact_records=outcome.artifacts,
         region_skipped=outcome.skipped,
+        verification_steps=promotion.verification_steps,
+        test_results=promotion.test_results,
+        performance=promotion.performance,
     )
 
 
@@ -760,7 +940,7 @@ def _prepare_backend_variant(
             region=staged.region,
             source_path=generated_path,
             logical_module=logical_module,
-            install_relative_dir=".atoll/artifacts",
+            install_relative_dir=_region_artifact_relative_dir(selection.variant_id),
             members=selection.members,
             variant_id=selection.variant_id,
         )
@@ -775,7 +955,7 @@ def _prepare_backend_variant(
             region_id=selection.variant_id,
             backend=selection.backend,
             compiled_module=logical_module,
-            artifact_dir=staged.staged_source_root / ".atoll" / "artifacts",
+            artifact_dir=staged.staged_source_root / unit.install_relative_dir,
             bindings=generation.bindings,
         ),
         conditional_on_failure_of=selection.conditional_on_failure_of,
@@ -806,12 +986,14 @@ def _build_typed_regions(
     skipped = list(initial_failures)
     attempts: list[CompileAttempt] = [failure.build for failure in initial_failures]
     artifacts: list[ArtifactRecord] = []
+    cache_statuses: list[tuple[str, CompileCacheStatus]] = []
     successful_promises: set[str] = set()
     backend_context = BackendCompileContext(
         project_root=context.build_root,
         build_dir=context.build_root / ".atoll" / "build",
         source_roots=context.staged_source_roots,
-        cache_dir=context.cache_dir,
+        cache_dir=context.mypy_cache_dir,
+        backend_options=(("typed_region_generator", TYPED_METHOD_GENERATOR_VERSION),),
     )
     for index, item in enumerate(prepared, start=1):
         if (
@@ -830,12 +1012,17 @@ def _build_typed_regions(
                 f"{item.generation.backend}: {item.unit.region_id}"
             ),
         )
-        result = _compile_typed_variant(item, backend_context)
+        result = _compile_typed_variant(
+            item,
+            backend_context,
+            cache_root=context.compile_cache_dir,
+        )
         tagged_attempt = _tag_region_timings(result.attempt, item.unit.region_id)
         if result.attempt.success:
             attempts.append(tagged_attempt)
             successful.append(item)
             artifacts.extend(result.artifacts)
+            cache_statuses.append((item.unit.region_id, result.attempt.cache_status))
             successful_promises.add(item.unit.region_id)
             _progress(context.progress, f"compiled typed region variant {item.unit.region_id}")
             continue
@@ -847,7 +1034,11 @@ def _build_typed_regions(
                 context.progress,
                 f"retrying deterministic mypyc failure with Cython: {fallback.unit.region_id}",
             )
-            fallback_result = _compile_typed_variant(fallback, backend_context)
+            fallback_result = _compile_typed_variant(
+                fallback,
+                backend_context,
+                cache_root=context.compile_cache_dir,
+            )
             fallback_attempt = _tag_region_timings(
                 fallback_result.attempt,
                 fallback.unit.region_id,
@@ -861,6 +1052,9 @@ def _build_typed_regions(
                 )
                 successful.append(fallback)
                 artifacts.extend(fallback_result.artifacts)
+                cache_statuses.append(
+                    (fallback.unit.region_id, fallback_result.attempt.cache_status)
+                )
                 successful_promises.add(item.unit.region_id)
                 _progress(
                     context.progress,
@@ -890,15 +1084,24 @@ def _build_typed_regions(
         build=_aggregate_region_attempts(tuple(attempts), bool(successful)),
         artifacts=tuple(artifacts),
         skipped=tuple(skipped),
+        cache_statuses=tuple(cache_statuses),
     )
 
 
 def _compile_typed_variant(
     item: _PreparedTypedRegion,
     context: BackendCompileContext,
+    *,
+    cache_root: Path,
 ) -> BackendCompileResult:
-    """Invoke the adapter selected for one prepared backend variant."""
-    return _compiler_backend(item.generation.backend).compile((item.unit,), context)
+    """Restore or invoke the adapter selected for one prepared backend variant."""
+    backend = _compiler_backend(item.generation.backend)
+    return compile_with_region_cache(
+        backend,
+        item.unit,
+        context,
+        cache_root=cache_root,
+    )
 
 
 def _should_retry_with_cython(
@@ -967,7 +1170,19 @@ def _aggregate_region_attempts(
         ),
         duration_seconds=sum(attempt.duration_seconds for attempt in attempts),
         phase_timings=tuple(timing for attempt in attempts for timing in attempt.phase_timings),
+        cache_status=_aggregate_cache_status(attempts),
     )
+
+
+def _aggregate_cache_status(attempts: tuple[CompileAttempt, ...]) -> CompileCacheStatus:
+    statuses = {attempt.cache_status for attempt in attempts if attempt.cache_status != "disabled"}
+    if not statuses:
+        return "disabled"
+    if statuses == {"hit"}:
+        return "hit"
+    if statuses == {"miss"}:
+        return "miss"
+    return "partial"
 
 
 def _failed_region_attempt(error: str) -> CompileAttempt:
@@ -996,11 +1211,43 @@ def _insert_region_shims(configs: tuple[RegionShimConfig, ...]) -> None:
 def _place_region_artifacts(
     configs: tuple[RegionShimConfig, ...],
     artifact_paths: tuple[Path, ...],
+    artifact_records: tuple[ArtifactRecord, ...],
 ) -> None:
-    for artifact_dir in sorted({config.artifact_dir for config in configs}):
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        for artifact in artifact_paths:
-            _copy_if_different(artifact, artifact_dir / artifact.name)
+    source_by_digest = {_file_digest(path): path for path in artifact_paths}
+    for config in configs:
+        records = tuple(
+            record
+            for record in artifact_records
+            if record.region_id == config.region_id
+            or (
+                record.region_id == "__shared__"
+                and PurePosixPath(record.install_relative_path).parent.name
+                == config.artifact_dir.name
+            )
+        )
+        if not records:
+            raise ValueError(f"compiled region has no artifact records: {config.region_id}")
+        config.artifact_dir.mkdir(parents=True, exist_ok=True)
+        for record in records:
+            source = source_by_digest.get(record.digest)
+            if source is None:
+                raise ValueError(
+                    "compiled region artifact digest is unavailable: "
+                    f"{record.install_relative_path}"
+                )
+            destination = config.artifact_dir / PurePosixPath(record.install_relative_path).name
+            _copy_if_different(source, destination)
+
+
+def _source_clean_region_report_artifact_paths(
+    root: Path,
+    artifact_records: tuple[ArtifactRecord, ...],
+) -> tuple[Path, ...]:
+    """Map region-owned install paths to stable report paths under the target root."""
+    return tuple(
+        root / PurePosixPath(path)
+        for path in dict.fromkeys(record.install_relative_path for record in artifact_records)
+    )
 
 
 def _typed_region_module_name(
@@ -1011,6 +1258,14 @@ def _typed_region_module_name(
     module = re.sub(r"[^A-Za-z0-9_]", "_", region.source_module.name)
     variant_hash = hashlib.sha256(variant_id.encode()).hexdigest()[:8]
     return f"_atoll_region_{module}_{backend}_{region.source_hash[:12]}_{variant_hash}"
+
+
+def _region_artifact_relative_dir(variant_id: str) -> str:
+    """Return a stable collision-resistant install directory for one variant."""
+    readable = re.sub(r"[^A-Za-z0-9_.-]", "_", variant_id).strip("_.-")[:48]
+    digest = hashlib.sha256(variant_id.encode()).hexdigest()[:12]
+    label = readable or "region"
+    return f".atoll/artifacts/{label}-{digest}"
 
 
 def _compiler_backend(backend: Backend) -> CompilerBackend:
@@ -1121,6 +1376,571 @@ def _progress_compile_selection(
 
 def _duration(started: float) -> str:
     return f"{time.perf_counter() - started:.2f}s"
+
+
+def _prepare_baseline_wheel_payload(
+    *,
+    project: DiscoveredProject,
+    build_root: Path,
+    install_root: Path,
+    progress: PackageProgress | None,
+) -> _BaselineWheelPayload:
+    """Build and unpack the target project's normal wheel from a clean copy."""
+    copied_project = build_root / "pep517-project"
+    baseline_output = build_root / "pep517-dist"
+    _progress(progress, "building target PEP 517 baseline wheel")
+    copy_started = time.perf_counter()
+    _copy_pep517_project(
+        project.config.root,
+        copied_project,
+        excluded_output=build_root.parent,
+    )
+    copy_timing = CompilePhaseTiming(
+        name="pep517_project_copy",
+        duration_seconds=time.perf_counter() - copy_started,
+        detail="source-clean project copy",
+    )
+    evidence = build_baseline_wheel(copied_project, baseline_output)
+    build_timing = CompilePhaseTiming(
+        name="pep517_wheel",
+        duration_seconds=evidence.duration_seconds,
+        detail=f"exit {evidence.returncode}",
+    )
+    if not evidence.succeeded or len(evidence.wheel_paths) != 1:
+        error = _baseline_build_error(evidence)
+        _progress(progress, f"PEP 517 baseline wheel failed in {evidence.duration_seconds:.2f}s")
+        return _BaselineWheelPayload(
+            wheel_path=None,
+            build=CompileAttempt(
+                success=False,
+                command=evidence.command,
+                stdout=evidence.stdout,
+                stderr=error,
+                artifact_paths=(),
+                duration_seconds=copy_timing.duration_seconds + evidence.duration_seconds,
+                phase_timings=(copy_timing, build_timing),
+            ),
+        )
+    wheel_path = evidence.wheel_paths[0]
+    unpack_started = time.perf_counter()
+    try:
+        unpack_wheel_payload(wheel_path, install_root)
+    except (OSError, WheelOverlayError, zipfile.BadZipFile) as error:
+        unpack_timing = CompilePhaseTiming(
+            name="wheel_unpack",
+            duration_seconds=time.perf_counter() - unpack_started,
+            detail="failed",
+        )
+        return _BaselineWheelPayload(
+            wheel_path=None,
+            build=CompileAttempt(
+                success=False,
+                command=evidence.command,
+                stdout=evidence.stdout,
+                stderr=f"PEP 517 wheel unpack failed: {error}",
+                artifact_paths=(),
+                duration_seconds=(
+                    copy_timing.duration_seconds
+                    + evidence.duration_seconds
+                    + unpack_timing.duration_seconds
+                ),
+                phase_timings=(copy_timing, build_timing, unpack_timing),
+            ),
+        )
+    unpack_timing = CompilePhaseTiming(
+        name="wheel_unpack",
+        duration_seconds=time.perf_counter() - unpack_started,
+        detail=wheel_path.name,
+    )
+    baseline_install_root: Path | None = None
+    baseline_copy_timing: tuple[CompilePhaseTiming, ...] = ()
+    if project.config.compile.benchmark_command is not None:
+        baseline_started = time.perf_counter()
+        baseline_install_root = build_root / "baseline-install"
+        shutil.copytree(install_root, baseline_install_root)
+        baseline_copy_timing = (
+            CompilePhaseTiming(
+                name="baseline_payload_copy",
+                duration_seconds=time.perf_counter() - baseline_started,
+                detail="benchmark baseline",
+            ),
+        )
+    quality_project_root: Path | None = None
+    if (
+        project.config.compile.test_command is not None
+        or project.config.compile.benchmark_command is not None
+    ):
+        _remove_quality_gate_sources(project, copied_project)
+        quality_project_root = copied_project
+    _progress(
+        progress,
+        f"built and unpacked PEP 517 baseline wheel in {evidence.duration_seconds:.2f}s",
+    )
+    return _BaselineWheelPayload(
+        wheel_path=wheel_path,
+        build=CompileAttempt(
+            success=True,
+            command=evidence.command,
+            stdout=evidence.stdout,
+            stderr=evidence.stderr,
+            artifact_paths=(),
+            duration_seconds=(
+                copy_timing.duration_seconds
+                + evidence.duration_seconds
+                + unpack_timing.duration_seconds
+                + sum(timing.duration_seconds for timing in baseline_copy_timing)
+            ),
+            phase_timings=(copy_timing, build_timing, unpack_timing, *baseline_copy_timing),
+        ),
+        baseline_install_root=baseline_install_root,
+        quality_project_root=quality_project_root,
+    )
+
+
+def _baseline_build_error(evidence: WheelBuildEvidence) -> str:
+    if not evidence.succeeded:
+        return evidence.stderr or f"PEP 517 wheel build exited {evidence.returncode}"
+    return f"PEP 517 build produced {len(evidence.wheel_paths)} wheel(s); expected exactly one"
+
+
+def _combine_baseline_and_native(
+    baseline: CompileAttempt,
+    native: CompileAttempt,
+) -> CompileAttempt:
+    """Preserve normal-wheel and native-build evidence in one compatibility view."""
+    return CompileAttempt(
+        success=baseline.success and native.success,
+        command=("atoll", "source-clean-build"),
+        stdout="\n".join(
+            part
+            for part in (
+                baseline.stdout,
+                baseline.stderr if baseline.success else "",
+                native.stdout,
+            )
+            if part
+        ),
+        stderr="\n\n".join(
+            part
+            for part in (
+                baseline.stderr if not baseline.success else "",
+                native.stderr,
+            )
+            if part
+        ),
+        artifact_paths=native.artifact_paths,
+        duration_seconds=baseline.duration_seconds + native.duration_seconds,
+        phase_timings=(*baseline.phase_timings, *native.phase_timings),
+        cache_status=native.cache_status,
+    )
+
+
+def _typed_verification_plan(
+    configs: tuple[RegionShimConfig, ...],
+    records: tuple[ArtifactRecord, ...],
+) -> PackageVerificationPlan:
+    regions_by_module: dict[str, list[str]] = {}
+    for config in configs:
+        regions_by_module.setdefault(config.source_module, []).append(config.region_id)
+    artifacts = {
+        record.install_relative_path: VerificationArtifact(
+            path=record.install_relative_path,
+            digest=record.digest,
+        )
+        for record in records
+    }
+    return PackageVerificationPlan(
+        modules=tuple(sorted(regions_by_module)),
+        regions=tuple(
+            (module, tuple(region_ids)) for module, region_ids in sorted(regions_by_module.items())
+        ),
+        artifacts=tuple(artifacts[path] for path in sorted(artifacts)),
+    )
+
+
+def _legacy_verification_plan(
+    islands: tuple[EnabledIslandConfig, ...],
+    artifact_paths: tuple[Path, ...],
+) -> PackageVerificationPlan:
+    return PackageVerificationPlan(
+        modules=tuple(sorted(island.source_module for island in islands)),
+        regions=(),
+        artifacts=tuple(
+            VerificationArtifact(
+                path=f".atoll/artifacts/{artifact.name}",
+                digest=_file_digest(artifact),
+            )
+            for artifact in sorted(artifact_paths)
+        ),
+    )
+
+
+def _verify_package_stage(
+    *,
+    stage: VerificationStage,
+    target: Path,
+    plan: PackageVerificationPlan,
+    project_root: Path,
+    progress: PackageProgress | None,
+) -> PackageVerificationResult:
+    result = verify_package_subprocess(
+        stage=stage,
+        target=target,
+        plan=plan,
+        project_root=project_root,
+    )
+    status = "passed" if result.success else f"failed with exit {result.exit_code}"
+    _progress(progress, f"{stage} verification {status} in {result.duration_seconds:.2f}s")
+    return result
+
+
+def _append_verification_timing(
+    attempt: CompileAttempt,
+    result: PackageVerificationResult,
+) -> CompileAttempt:
+    return replace(
+        attempt,
+        duration_seconds=attempt.duration_seconds + result.duration_seconds,
+        phase_timings=(
+            *attempt.phase_timings,
+            CompilePhaseTiming(
+                name=f"{result.stage}_verification",
+                duration_seconds=result.duration_seconds,
+                detail="passed" if result.success else f"exit {result.exit_code}",
+            ),
+        ),
+    )
+
+
+def _append_phase_timing(
+    attempt: CompileAttempt,
+    *,
+    name: str,
+    duration_seconds: float,
+    detail: str,
+) -> CompileAttempt:
+    return replace(
+        attempt,
+        duration_seconds=attempt.duration_seconds + duration_seconds,
+        phase_timings=(
+            *attempt.phase_timings,
+            CompilePhaseTiming(
+                name=name,
+                duration_seconds=duration_seconds,
+                detail=detail,
+            ),
+        ),
+    )
+
+
+def _promote_source_clean_payload(
+    context: _SourceCleanPromotionContext,
+) -> _SourceCleanPromotionResult:
+    payload_verification = _verify_package_stage(
+        stage="payload",
+        target=context.install_root,
+        plan=context.verification_plan,
+        project_root=context.project.config.root,
+        progress=context.options.progress,
+    )
+    build = _append_verification_timing(context.build, payload_verification)
+    if not payload_verification.success:
+        return _failed_promotion(
+            context,
+            _SourceCleanPromotionFailure(
+                build=build,
+                verification_steps=(payload_verification,),
+                error=payload_verification.stderr,
+            ),
+        )
+
+    baseline_wheel_path = context.baseline.wheel_path
+    if baseline_wheel_path is None:
+        return _failed_promotion(
+            context,
+            _SourceCleanPromotionFailure(
+                build=build,
+                verification_steps=(payload_verification,),
+                error="baseline wheel path is unavailable during final overlay",
+            ),
+        )
+
+    wheel_started = time.perf_counter()
+    _progress(context.options.progress, f"writing wheel to {context.output_dir}")
+    try:
+        wheel_path = repack_overlaid_wheel(
+            baseline_wheel_path=baseline_wheel_path,
+            payload_dir=context.install_root,
+            output_dir=context.output_dir,
+            platform_tag=_wheel_tag(),
+        )
+    except (OSError, WheelOverlayError, zipfile.BadZipFile) as error:
+        return _failed_promotion(
+            context,
+            _SourceCleanPromotionFailure(
+                build=build,
+                verification_steps=(payload_verification,),
+                error=f"final wheel overlay failed: {error}",
+            ),
+        )
+    build = _append_phase_timing(
+        build,
+        name="wheel_repack",
+        duration_seconds=time.perf_counter() - wheel_started,
+        detail=wheel_path.name,
+    )
+    _progress(context.options.progress, f"wrote wheel in {_duration(wheel_started)}")
+
+    wheel_verification = _verify_package_stage(
+        stage="wheel",
+        target=wheel_path,
+        plan=context.verification_plan,
+        project_root=context.project.config.root,
+        progress=context.options.progress,
+    )
+    build = _append_verification_timing(build, wheel_verification)
+    verification_steps = (payload_verification, wheel_verification)
+    if not wheel_verification.success:
+        return _failed_promotion(
+            context,
+            _SourceCleanPromotionFailure(
+                build=build,
+                verification_steps=verification_steps,
+                error=wheel_verification.stderr,
+                wheel_path=wheel_path,
+            ),
+        )
+
+    quality_gate = _run_configured_quality_gate(
+        project=context.project,
+        baseline=context.baseline,
+        compiled_payload_root=context.install_root,
+        progress=context.options.progress,
+    )
+    build = _append_quality_gate_timings(build, quality_gate)
+    if not quality_gate.success:
+        return _failed_promotion(
+            context,
+            _SourceCleanPromotionFailure(
+                build=build,
+                verification_steps=verification_steps,
+                error=quality_gate.error,
+                wheel_path=wheel_path,
+                quality_gate=quality_gate,
+            ),
+        )
+
+    cleanup_started = time.perf_counter()
+    _progress(context.options.progress, "cleaning temporary build outputs")
+    cleanup_removed = [context.build_root]
+    shutil.rmtree(context.build_root)
+    cleanup_kept: tuple[Path, ...] = ()
+    if context.options.keep_install_tree:
+        cleanup_kept = (context.install_root,)
+    else:
+        cleanup_removed.append(context.install_root)
+        shutil.rmtree(context.install_root)
+    _progress(
+        context.options.progress,
+        f"cleaned temporary outputs in {_duration(cleanup_started)}",
+    )
+    return _SourceCleanPromotionResult(
+        success=True,
+        wheel_path=wheel_path,
+        build=build,
+        verification_steps=verification_steps,
+        test_results=quality_gate.tests,
+        performance=quality_gate.performance,
+        cleanup_removed=tuple(cleanup_removed),
+        cleanup_kept=cleanup_kept,
+    )
+
+
+def _failed_promotion(
+    context: _SourceCleanPromotionContext,
+    failure: _SourceCleanPromotionFailure,
+) -> _SourceCleanPromotionResult:
+    verification_steps = failure.verification_steps
+    if failure.wheel_path is not None:
+        retained_wheel = _retain_failed_wheel(context.build_root, failure.wheel_path)
+        if retained_wheel is not None:
+            verification_steps = tuple(
+                replace(step, target=retained_wheel)
+                if step.target.resolve() == failure.wheel_path.resolve()
+                else step
+                for step in verification_steps
+            )
+    else:
+        _remove_failed_wheels(context.project, context.output_dir)
+    return _SourceCleanPromotionResult(
+        success=False,
+        wheel_path=None,
+        build=failure.build,
+        verification_steps=verification_steps,
+        test_results=failure.quality_gate.tests if failure.quality_gate is not None else (),
+        performance=(
+            failure.quality_gate.performance if failure.quality_gate is not None else None
+        ),
+        cleanup_removed=(),
+        cleanup_kept=(context.build_root, context.install_root),
+        error=failure.error,
+    )
+
+
+def _retain_failed_wheel(build_root: Path, wheel_path: Path) -> Path | None:
+    """Move a rejected candidate under diagnostic scratch without exposing a wheel output."""
+    if not wheel_path.exists():
+        return None
+    diagnostic_root = build_root / "diagnostics"
+    diagnostic_root.mkdir(parents=True, exist_ok=True)
+    retained = diagnostic_root / wheel_path.name
+    try:
+        shutil.move(wheel_path, retained)
+    except OSError:
+        wheel_path.unlink(missing_ok=True)
+        return None
+    return retained
+
+
+def _run_configured_quality_gate(
+    *,
+    project: DiscoveredProject,
+    baseline: _BaselineWheelPayload,
+    compiled_payload_root: Path,
+    progress: PackageProgress | None,
+) -> _QualityGateOutcome:
+    config = project.config.compile
+    commands_configured = config.test_command is not None or config.benchmark_command is not None
+    if commands_configured and baseline.quality_project_root is None:
+        return _invalid_quality_gate(config.minimum_speedup, "quality-gate project is missing")
+    command_root = baseline.quality_project_root or project.config.root
+    tests: list[CommandRunEvidence] = []
+    if config.test_command is not None:
+        if config.benchmark_command is not None:
+            if baseline.baseline_install_root is None:
+                return _invalid_quality_gate(config.minimum_speedup, "baseline payload is missing")
+            tests.append(
+                run_performance_command(
+                    config.test_command,
+                    project_root=command_root,
+                    payload_root=baseline.baseline_install_root,
+                    mode="baseline",
+                )
+            )
+        tests.append(
+            run_performance_command(
+                config.test_command,
+                project_root=command_root,
+                payload_root=compiled_payload_root,
+                mode="compiled",
+            )
+        )
+        for result in tests:
+            status = "passed" if result.succeeded else f"failed with exit {result.returncode}"
+            _progress(
+                progress,
+                f"{result.mode} semantic tests {status} in {result.duration_seconds:.2f}s",
+            )
+        failure = next((result for result in tests if not result.succeeded), None)
+        if failure is not None:
+            return _QualityGateOutcome(
+                success=False,
+                tests=tuple(tests),
+                performance=BenchmarkGateResult(
+                    status="invalid",
+                    reason=f"{failure.mode} semantic test command failed",
+                    minimum_speedup=config.minimum_speedup,
+                    baseline_median_seconds=None,
+                    compiled_median_seconds=None,
+                    speedup=None,
+                    warmups=(),
+                    samples=(),
+                ),
+                error=(
+                    failure.stderr
+                    or f"{failure.mode} semantic test command exited {failure.returncode}"
+                ),
+            )
+    if config.benchmark_command is not None and baseline.baseline_install_root is None:
+        return _invalid_quality_gate(config.minimum_speedup, "baseline payload is missing")
+    benchmark = run_benchmark_gate(
+        BenchmarkGateConfig(
+            command=config.benchmark_command,
+            warmups=config.benchmark_warmups,
+            samples=config.benchmark_samples,
+            minimum_speedup=config.minimum_speedup,
+        ),
+        project_root=command_root,
+        baseline_payload_root=baseline.baseline_install_root or compiled_payload_root,
+        compiled_payload_root=compiled_payload_root,
+        progress=lambda event: _benchmark_progress(progress, event),
+    )
+    accepted = benchmark.status in {"passed", "unbenchmarked"}
+    _progress(progress, f"performance status {benchmark.status}: {benchmark.reason}")
+    return _QualityGateOutcome(
+        success=accepted,
+        tests=tuple(tests),
+        performance=benchmark,
+        error=None if accepted else benchmark.reason,
+    )
+
+
+def _invalid_quality_gate(minimum_speedup: float, reason: str) -> _QualityGateOutcome:
+    return _QualityGateOutcome(
+        success=False,
+        tests=(),
+        performance=BenchmarkGateResult(
+            status="invalid",
+            reason=reason,
+            minimum_speedup=minimum_speedup,
+            baseline_median_seconds=None,
+            compiled_median_seconds=None,
+            speedup=None,
+            warmups=(),
+            samples=(),
+        ),
+        error=reason,
+    )
+
+
+def _benchmark_progress(progress: PackageProgress | None, event: BenchmarkProgress) -> None:
+    sample = event.pair_index + 1
+    _progress(
+        progress,
+        (
+            f"benchmark {event.phase} pair {sample} {event.mode} "
+            f"completed in {event.duration_seconds:.2f}s"
+        ),
+    )
+
+
+def _append_quality_gate_timings(
+    attempt: CompileAttempt,
+    outcome: _QualityGateOutcome,
+) -> CompileAttempt:
+    timings = tuple(
+        CompilePhaseTiming(
+            name="semantic_test",
+            duration_seconds=result.duration_seconds,
+            detail=f"{result.mode}; exit {result.returncode}",
+        )
+        for result in outcome.tests
+    )
+    benchmark_runs = (*outcome.performance.warmups, *outcome.performance.samples)
+    timings += tuple(
+        CompilePhaseTiming(
+            name="benchmark",
+            duration_seconds=result.duration_seconds,
+            detail=f"{result.mode}; {outcome.performance.status}",
+        )
+        for result in benchmark_runs
+    )
+    return replace(
+        attempt,
+        duration_seconds=attempt.duration_seconds
+        + sum(timing.duration_seconds for timing in timings),
+        phase_timings=(*attempt.phase_timings, *timings),
+    )
 
 
 def _progress_phase_timings(
@@ -1674,18 +2494,29 @@ def _selected_modules(
     return tuple(selected)
 
 
+def _supported_members(assessment: BackendAssessment | None) -> set[SymbolId]:
+    if assessment is None:
+        return set()
+    return set(assessment.supported_members)
+
+
 def _selected_typed_method_regions(
     scans: tuple[ModuleScan, ...],
+    backends: tuple[Backend, ...] = ("mypyc", "cython"),
 ) -> tuple[_SelectedTypedRegion, ...]:
     selected: list[_SelectedTypedRegion] = []
     for scan in scans:
         for region in scan.typed_regions:
             decisions = {decision.target: decision for decision in region.decisions}
-            mypyc_assessment = MYPYC_BACKEND.assess(region)
-            cython_assessment = CYTHON_BACKEND.assess(region)
-            atomic_class_member = _eligible_atomic_class(region, cython_assessment)
+            mypyc_assessment = MYPYC_BACKEND.assess(region) if "mypyc" in backends else None
+            cython_assessment = CYTHON_BACKEND.assess(region) if "cython" in backends else None
+            atomic_class_member = (
+                _eligible_atomic_class(region, cython_assessment)
+                if cython_assessment is not None
+                else None
+            )
             atomic_variant_id: str | None = None
-            if atomic_class_member is not None:
+            if atomic_class_member is not None and cython_assessment is not None:
                 atomic_variant_id = f"{region.id}@cython-class"
                 selected.append(
                     _SelectedTypedRegion(
@@ -1698,9 +2529,9 @@ def _selected_typed_method_regions(
                     )
                 )
             eligible = _eligible_typed_methods(region, decisions)
-            mypyc_supported = set(mypyc_assessment.supported_members)
+            mypyc_supported = _supported_members(mypyc_assessment)
             mypyc_members = tuple(member for member in eligible if member in mypyc_supported)
-            if mypyc_members:
+            if mypyc_members and mypyc_assessment is not None:
                 selected.append(
                     _SelectedTypedRegion(
                         scan=scan,
@@ -1712,13 +2543,13 @@ def _selected_typed_method_regions(
                         conditional_on_failure_of=atomic_variant_id,
                     )
                 )
-            cython_supported = set(cython_assessment.supported_members)
+            cython_supported = _supported_members(cython_assessment)
             cython_members = tuple(
                 member
                 for member in eligible
                 if member not in mypyc_supported and member in cython_supported
             )
-            if cython_members:
+            if cython_members and cython_assessment is not None:
                 selected.append(
                     _SelectedTypedRegion(
                         scan=scan,
@@ -1732,29 +2563,37 @@ def _selected_typed_method_regions(
                 )
             for specialization in region.specializations:
                 specialized_region = _specialized_region(region, specialization)
-                mypyc_assessment = MYPYC_BACKEND.assess(specialized_region)
-                if specialization.source_member in mypyc_assessment.supported_members:
+                specialized_mypyc = (
+                    MYPYC_BACKEND.assess(specialized_region) if "mypyc" in backends else None
+                )
+                if specialized_mypyc is not None and (
+                    specialization.source_member in specialized_mypyc.supported_members
+                ):
                     selected.append(
                         _SelectedTypedRegion(
                             scan=scan,
                             region=specialized_region,
                             variant_id=f"{specialization.id}@mypyc",
                             backend="mypyc",
-                            assessment=mypyc_assessment,
+                            assessment=specialized_mypyc,
                             members=(specialization.source_member,),
                             specialization=specialization,
                         )
                     )
                     continue
-                cython_assessment = CYTHON_BACKEND.assess(specialized_region)
-                if specialization.source_member in cython_assessment.supported_members:
+                specialized_cython = (
+                    CYTHON_BACKEND.assess(specialized_region) if "cython" in backends else None
+                )
+                if specialized_cython is not None and (
+                    specialization.source_member in specialized_cython.supported_members
+                ):
                     selected.append(
                         _SelectedTypedRegion(
                             scan=scan,
                             region=specialized_region,
                             variant_id=f"{specialization.id}@cython",
                             backend="cython",
-                            assessment=cython_assessment,
+                            assessment=specialized_cython,
                             members=(specialization.source_member,),
                             specialization=specialization,
                         )
@@ -1766,7 +2605,7 @@ def _eligible_atomic_class(
     region: TypedRegion,
     assessment: BackendAssessment,
 ) -> SymbolId | None:
-    """Return the class binding only when mypyc supports its complete region."""
+    """Return the class binding only when Cython supports its complete region."""
     if not region.atomic_class or assessment.status != "supported":
         return None
     class_members = tuple(member for member in region.members if member.kind == "class")
@@ -2018,17 +2857,43 @@ def _remove_staged_island(island: EnabledIslandConfig) -> None:
     island.sidecar_path.unlink(missing_ok=True)
 
 
-def _copy_install_payload(source_roots: tuple[Path, ...], install_root: Path) -> None:
+def _overlay_staged_sources(
+    source_roots: tuple[Path, ...],
+    install_root: Path,
+    source_paths: tuple[Path, ...],
+) -> None:
+    """Overlay only shimmed modules that already exist in the backend wheel."""
+    for source_path in dict.fromkeys(source_paths):
+        relative = _source_relative_path(source_path, source_roots)
+        destination = install_root / relative
+        if not destination.is_file():
+            raise ValueError(
+                f"target PEP 517 wheel omitted a compiled source module: {relative.as_posix()}"
+            )
+        shutil.copy2(source_path, destination)
+
+
+def _overlay_install_payload(
+    source_roots: tuple[Path, ...],
+    install_root: Path,
+    source_paths: tuple[Path, ...],
+) -> str | None:
+    """Overlay source modules and artifacts, normalizing backend omissions as failure text."""
+    try:
+        _overlay_staged_sources(source_roots, install_root, source_paths)
+        _copy_atoll_artifacts(source_roots, install_root)
+    except (OSError, ValueError) as error:
+        return f"install payload overlay failed: {error}"
+    return None
+
+
+def _source_relative_path(path: Path, source_roots: tuple[Path, ...]) -> Path:
     for source_root in source_roots:
-        for path in sorted(source_root.rglob("*")):
-            if not path.is_file() or _is_ignored_payload(path, source_root):
-                continue
-            if not _is_package_payload(path, source_root):
-                continue
-            relative = path.relative_to(source_root)
-            destination = install_root / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
+        try:
+            return path.relative_to(source_root)
+        except ValueError:
+            continue
+    raise ValueError(f"staged source is outside copied source roots: {path}")
 
 
 def _copy_atoll_artifacts(source_roots: tuple[Path, ...], install_root: Path) -> None:
@@ -2043,41 +2908,6 @@ def _copy_atoll_artifacts(source_roots: tuple[Path, ...], install_root: Path) ->
             destination = install_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
-
-
-def _write_wheel(
-    *,
-    install_root: Path,
-    output_dir: Path,
-    metadata: _ProjectMetadata,
-) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    wheel_tag = _wheel_tag()
-    distribution = _wheel_safe_name(metadata.name)
-    version = _wheel_safe_version(metadata.version)
-    dist_info = f"{distribution}-{version}.dist-info"
-    wheel_path = _wheel_output_path(output_dir, metadata)
-    if wheel_path.exists():
-        wheel_path.unlink()
-    payload = _wheel_payload(install_root)
-    metadata_files = {
-        f"{dist_info}/METADATA": _metadata_text(metadata),
-        f"{dist_info}/WHEEL": _wheel_text(wheel_tag),
-    }
-    with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as wheel:
-        records: list[tuple[str, str, str]] = []
-        for relative, path in payload:
-            data = path.read_bytes()
-            wheel.writestr(relative, data)
-            records.append((relative, _record_hash(data), str(len(data))))
-        for relative, text in metadata_files.items():
-            data = text.encode()
-            wheel.writestr(relative, data)
-            records.append((relative, _record_hash(data), str(len(data))))
-        record_path = f"{dist_info}/RECORD"
-        records.append((record_path, "", ""))
-        wheel.writestr(record_path, _record_text(records))
-    return wheel_path
 
 
 def _wheel_output_path(output_dir: Path, metadata: _ProjectMetadata) -> Path:
@@ -2097,52 +2927,6 @@ def _remove_failed_wheels(project: DiscoveredProject, output_dir: Path) -> None:
     version = _wheel_safe_version(metadata.version)
     for wheel_path in output_dir.glob(f"{distribution}-{version}-*.whl"):
         wheel_path.unlink()
-
-
-def _wheel_payload(install_root: Path) -> tuple[tuple[str, Path], ...]:
-    return tuple(
-        (path.relative_to(install_root).as_posix(), path)
-        for path in sorted(install_root.rglob("*"))
-        if path.is_file()
-    )
-
-
-def _metadata_text(metadata: _ProjectMetadata) -> str:
-    lines = [
-        "Metadata-Version: 2.3",
-        f"Name: {metadata.name}",
-        f"Version: {metadata.version}",
-        "Summary: Atoll compiled artifact",
-    ]
-    if metadata.requires_python is not None:
-        lines.append(f"Requires-Python: {metadata.requires_python}")
-    lines.extend(f"Requires-Dist: {dependency}" for dependency in metadata.dependencies)
-    return "\n".join(lines) + "\n"
-
-
-def _wheel_text(wheel_tag: str) -> str:
-    return "\n".join(
-        [
-            "Wheel-Version: 1.0",
-            "Generator: atoll",
-            "Root-Is-Purelib: false",
-            f"Tag: {wheel_tag}",
-            "",
-        ]
-    )
-
-
-def _record_text(records: list[tuple[str, str, str]]) -> str:
-    output = io.StringIO()
-    writer = csv.writer(output, lineterminator="\n")
-    writer.writerows(records)
-    return output.getvalue()
-
-
-def _record_hash(data: bytes) -> str:
-    digest = hashlib.sha256(data).digest()
-    encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return f"sha256={encoded}"
 
 
 def _project_metadata(root: Path) -> _ProjectMetadata:
@@ -2214,32 +2998,66 @@ def _copytree_contents(source: Path, destination: Path) -> None:
             shutil.copy2(item, target)
 
 
+def _copy_pep517_project(
+    source: Path,
+    destination: Path,
+    *,
+    excluded_output: Path,
+) -> None:
+    """Copy complete build inputs while excluding Atoll state and native residue."""
+    source_root = source.resolve()
+    excluded_root = excluded_output.resolve()
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        directory_path = Path(directory).resolve()
+        ignored = {
+            name
+            for name in names
+            if name in _PEP517_IGNORED_NAMES or name.endswith((".so", ".pyd"))
+        }
+        if directory_path == source_root:
+            ignored.update(name for name in names if name in {"build", "dist"})
+        for name in names:
+            if (directory_path / name).resolve() == excluded_root:
+                ignored.add(name)
+        return ignored
+
+    shutil.copytree(source_root, destination, ignore=ignore)
+    _write_gitdir_pointer(source_root, destination)
+
+
+def _remove_quality_gate_sources(project: DiscoveredProject, copied_project: Path) -> None:
+    """Remove importable checkout modules while preserving tests and benchmark files."""
+    for module in project.modules:
+        try:
+            relative = module.path.relative_to(project.config.root)
+        except ValueError:
+            continue
+        (copied_project / relative).unlink(missing_ok=True)
+
+
+def _write_gitdir_pointer(source: Path, destination: Path) -> None:
+    """Expose read-only VCS metadata to dynamic-version PEP 517 backends."""
+    source_git = source / ".git"
+    if source_git.is_dir():
+        git_dir = source_git.resolve()
+    elif source_git.is_file():
+        first_line = source_git.read_text(encoding="utf-8").splitlines()[0]
+        prefix = "gitdir:"
+        if not first_line.startswith(prefix):
+            return
+        value = first_line.removeprefix(prefix).strip()
+        candidate = Path(value)
+        git_dir = candidate.resolve() if candidate.is_absolute() else (source / candidate).resolve()
+    else:
+        return
+    (destination / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+
+
 def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
     return {
         name for name in names if name in _GENERATED_DIR_NAMES or name.endswith((".so", ".pyd"))
     }
-
-
-def _is_ignored_payload(path: Path, source_root: Path) -> bool:
-    relative_parts = path.relative_to(source_root).parts
-    return any(part in _GENERATED_DIR_NAMES or part == "tests" for part in relative_parts)
-
-
-def _is_package_payload(path: Path, source_root: Path) -> bool:
-    if path.name in {"py.typed", "__init__.py"}:
-        return True
-    if any(path.name.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES):
-        return True
-    if path.suffix not in {".py", ".pyi"}:
-        return False
-    relative = path.relative_to(source_root)
-    if len(relative.parts) == 1:
-        return True
-    return any(
-        (parent / "__init__.py").exists()
-        for parent in path.parents
-        if source_root in parent.parents
-    )
 
 
 def _staged_module(

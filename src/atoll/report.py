@@ -49,6 +49,8 @@ from atoll.models import (
     VerifyResult,
     Visibility,
 )
+from atoll.runtime.package_verify import PackageVerificationResult
+from atoll.runtime.performance import BenchmarkGateResult, CommandRunEvidence
 
 _STRONG_SCORE = 90
 _GOOD_SCORE = 80
@@ -369,6 +371,9 @@ class CompilationSummaryReport(TypedDict):
     verify_failures: int
     semantic_tests_run: bool
     semantic_test_failures: int
+    subprocess_verifications: int
+    subprocess_verification_failures: int
+    performance_status: str
     duration_seconds: float
 
 
@@ -472,8 +477,48 @@ class CompilationCompiledRegionReport(TypedDict):
     variant_id: str
     source_module: str
     backend: Backend | None
+    cache_status: CompileCacheStatus
     bindings: list[CompilationCompiledBindingReport]
     artifacts: list[str]
+
+
+class CompilationVerificationStepReport(TypedDict):
+    """Fresh-interpreter verification evidence for a payload or final wheel."""
+
+    stage: str
+    target: str
+    command: list[str]
+    success: bool
+    exit_code: int
+    duration_seconds: float
+    stdout: str
+    stderr: str
+
+
+class CompilationCommandRunReport(TypedDict):
+    """One baseline or compiled semantic-test or benchmark subprocess run."""
+
+    command: list[str]
+    mode: str
+    payload_root: str
+    returncode: int
+    success: bool
+    duration_seconds: float
+    stdout: str
+    stderr: str
+
+
+class CompilationPerformanceReport(TypedDict):
+    """Measured profitability evidence or an explicit unbenchmarked status."""
+
+    status: str
+    reason: str
+    minimum_speedup: float
+    baseline_median_seconds: float | None
+    compiled_median_seconds: float | None
+    speedup: float | None
+    warmups: list[CompilationCommandRunReport]
+    samples: list[CompilationCommandRunReport]
 
 
 class CompilationReport(TypedDict):
@@ -490,6 +535,9 @@ class CompilationReport(TypedDict):
     summary: CompilationSummaryReport
     build: CompilationBuildReport
     tests: CompilationTestReport | None
+    test_results: list[CompilationCommandRunReport]
+    verification_steps: list[CompilationVerificationStepReport]
+    performance: CompilationPerformanceReport
     cleanup: CompilationCleanupReport
     skipped_modules: list[CompilationSkippedModuleReport]
     preflight_blockers: list[CompilationPreflightBlockerReport]
@@ -527,6 +575,14 @@ class CompilationPreflightBlockerInput:
 
 
 @dataclass(frozen=True, slots=True)
+class _CompiledVariantReportInput:
+    variant_id: str
+    region: TypedRegion
+    backend: Backend | None
+    cache_status: CompileCacheStatus
+
+
+@dataclass(frozen=True, slots=True)
 class CompilationReportInput:
     """All command evidence needed to render one compilation report.
 
@@ -555,6 +611,9 @@ class CompilationReportInput:
     compiled_variants: tuple[CompiledRegionVariant, ...] = ()
     backend_assessments: tuple[BackendAssessment, ...] = ()
     artifact_records: tuple[ArtifactRecord, ...] = ()
+    verification_steps: tuple[PackageVerificationResult, ...] = ()
+    test_results: tuple[CommandRunEvidence, ...] = ()
+    performance: BenchmarkGateResult | None = None
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -654,8 +713,23 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     )
     support_artifacts = tuple(path for path in artifact_paths if path not in mapped_artifacts)
     verify_failures = sum(result.error is not None for result in report_input.verification)
-    test_failures = int(report_input.tests is not None and not report_input.tests.success)
-    success = report_input.build.success and verify_failures == 0 and test_failures == 0
+    subprocess_verify_failures = sum(
+        not result.success for result in report_input.verification_steps
+    )
+    test_failures = int(report_input.tests is not None and not report_input.tests.success) + sum(
+        not result.succeeded for result in report_input.test_results
+    )
+    performance = _compilation_performance_report(report_input.root, report_input.performance)
+    performance_failed = performance["status"] not in {"passed", "unbenchmarked"}
+    wheel_missing = report_input.mode == "source-clean" and report_input.wheel_path is None
+    success = (
+        report_input.build.success
+        and verify_failures == 0
+        and subprocess_verify_failures == 0
+        and test_failures == 0
+        and not performance_failed
+        and not wheel_missing
+    )
     return {
         "version": 2,
         "tool": "atoll",
@@ -687,8 +761,11 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             "preflight_blockers": len(report_input.preflight_blockers),
             "verified": len(report_input.verification),
             "verify_failures": verify_failures,
-            "semantic_tests_run": report_input.tests is not None,
+            "semantic_tests_run": bool(report_input.tests or report_input.test_results),
             "semantic_test_failures": test_failures,
+            "subprocess_verifications": len(report_input.verification_steps),
+            "subprocess_verification_failures": subprocess_verify_failures,
+            "performance_status": performance["status"],
             "duration_seconds": report_input.build.duration_seconds,
         },
         "build": {
@@ -712,6 +789,15 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             ],
         },
         "tests": _compilation_test_report(report_input.tests),
+        "test_results": [
+            _compilation_command_run_report(report_input.root, result)
+            for result in report_input.test_results
+        ],
+        "verification_steps": [
+            _compilation_verification_step_report(report_input.root, result)
+            for result in report_input.verification_steps
+        ],
+        "performance": performance,
         "cleanup": {
             "removed": [
                 *_generated_input_cleanup_reports(report_input.root, report_input.cleanup_removed),
@@ -780,9 +866,12 @@ def _compiled_region_reports(
     if report_input.compiled_variants:
         return [
             _compiled_region_variant_report(
-                variant_id=variant.id,
-                region=variant.region,
-                backend=variant.backend,
+                identity=_CompiledVariantReportInput(
+                    variant_id=variant.id,
+                    region=variant.region,
+                    backend=variant.backend,
+                    cache_status=variant.cache_status,
+                ),
                 bindings=variant.bindings,
                 artifact_records=report_input.artifact_records,
             )
@@ -810,9 +899,12 @@ def _compiled_region_reports(
             backend = None
         reports.append(
             _compiled_region_variant_report(
-                variant_id=region.id,
-                region=region,
-                backend=backend,
+                identity=_CompiledVariantReportInput(
+                    variant_id=region.id,
+                    region=region,
+                    backend=backend,
+                    cache_status="disabled",
+                ),
                 bindings=bindings,
                 artifact_records=report_input.artifact_records,
             )
@@ -822,18 +914,19 @@ def _compiled_region_reports(
 
 def _compiled_region_variant_report(
     *,
-    variant_id: str,
-    region: TypedRegion,
-    backend: Backend | None,
+    identity: _CompiledVariantReportInput,
     bindings: tuple[BindingTarget, ...],
     artifact_records: tuple[ArtifactRecord, ...],
 ) -> CompilationCompiledRegionReport:
-    records = tuple(record for record in artifact_records if record.region_id == variant_id)
+    records = tuple(
+        record for record in artifact_records if record.region_id == identity.variant_id
+    )
     return {
-        "id": region.id,
-        "variant_id": variant_id,
-        "source_module": region.source_module.name,
-        "backend": backend,
+        "id": identity.region.id,
+        "variant_id": identity.variant_id,
+        "source_module": identity.region.source_module.name,
+        "backend": identity.backend,
+        "cache_status": identity.cache_status,
         "bindings": [
             {
                 "source": binding.source.stable_id,
@@ -889,7 +982,13 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         f"- Preflight blockers: {report['summary']['preflight_blockers']}",
         f"- Verified islands: {report['summary']['verified']}",
         f"- Verification failures: {report['summary']['verify_failures']}",
+        f"- Subprocess verifications: {report['summary']['subprocess_verifications']}",
+        (
+            "- Subprocess verification failures: "
+            f"{report['summary']['subprocess_verification_failures']}"
+        ),
         f"- Semantic tests: {_semantic_test_summary(report['tests'])}",
+        f"- Performance: {report['summary']['performance_status']}",
         f"- Build duration: {report['summary']['duration_seconds']:.3f}s",
         "",
         "## Verification Scope",
@@ -948,17 +1047,9 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
     if report["build"]["support_artifacts"]:
         lines.extend(["", "### Support Artifacts", ""])
         lines.extend(f"- `{artifact}`" for artifact in report["build"]["support_artifacts"])
-    lines.extend(["", "## Test Gate", ""])
-    if report["tests"] is None:
-        lines.append("- Not run")
-    else:
-        lines.extend(
-            [
-                f"- Command: `{' '.join(report['tests']['command'])}`",
-                f"- Exit code: {report['tests']['exit_code']}",
-                f"- Success: {_yes_no(report['tests']['success'])}",
-            ]
-        )
+    _append_test_gate_markdown(lines, report)
+    _append_package_verification_markdown(lines, report["verification_steps"])
+    _append_performance_markdown(lines, report["performance"])
     _append_cleanup_markdown(lines, report["cleanup"])
     _append_source_clean_skip_markdown(lines, report)
     lines.extend(["", "## Islands", ""])
@@ -969,13 +1060,80 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _append_test_gate_markdown(lines: list[str], report: CompilationReport) -> None:
+    lines.extend(["", "## Test Gate", ""])
+    if report["tests"] is None and not report["test_results"]:
+        lines.append("- Not run")
+    elif report["tests"] is not None:
+        lines.extend(
+            [
+                f"- Command: `{' '.join(report['tests']['command'])}`",
+                f"- Exit code: {report['tests']['exit_code']}",
+                f"- Success: {_yes_no(report['tests']['success'])}",
+            ]
+        )
+    for result in report["test_results"]:
+        lines.extend(
+            [
+                f"- {result['mode']}: `{' '.join(result['command'])}`",
+                (
+                    f"  exit {result['returncode']}, "
+                    f"{result['duration_seconds']:.3f}s, "
+                    f"{'passed' if result['success'] else 'failed'}"
+                ),
+            ]
+        )
+
+
+def _append_package_verification_markdown(
+    lines: list[str],
+    results: list[CompilationVerificationStepReport],
+) -> None:
+    lines.extend(["", "## Package Verification", ""])
+    if not results:
+        lines.append("- Not run")
+        return
+    lines.extend(
+        (
+            f"- {result['stage']}: {'passed' if result['success'] else 'failed'} "
+            f"in {result['duration_seconds']:.3f}s"
+        )
+        for result in results
+    )
+
+
+def _append_performance_markdown(
+    lines: list[str],
+    performance: CompilationPerformanceReport,
+) -> None:
+    lines.extend(
+        [
+            "",
+            "## Performance",
+            "",
+            f"- Status: {performance['status']}",
+            f"- Reason: {performance['reason']}",
+            f"- Minimum speedup: {performance['minimum_speedup']:.3f}x",
+        ]
+    )
+    if performance["speedup"] is None:
+        return
+    lines.extend(
+        [
+            f"- Baseline median: {_optional_seconds(performance['baseline_median_seconds'])}",
+            f"- Compiled median: {_optional_seconds(performance['compiled_median_seconds'])}",
+            f"- Speedup: {performance['speedup']:.3f}x",
+        ]
+    )
+
+
 def _compiled_region_markdown(region: CompilationCompiledRegionReport) -> str:
     backend = region["backend"] or "unknown backend"
     bindings = ", ".join(_compiled_binding_markdown(binding) for binding in region["bindings"])
     artifacts = ", ".join(region["artifacts"]) or "no recorded artifacts"
     return (
         f"- `{region['variant_id']}` [{backend}] for region `{region['id']}`: "
-        f"{bindings}; artifacts: {artifacts}"
+        f"{bindings}; cache: {region['cache_status']}; artifacts: {artifacts}"
     )
 
 
@@ -1405,6 +1563,65 @@ def _compilation_test_report(result: PytestRunResult | None) -> CompilationTestR
     }
 
 
+def _compilation_command_run_report(
+    root: Path,
+    result: CommandRunEvidence,
+) -> CompilationCommandRunReport:
+    return {
+        "command": list(result.command),
+        "mode": result.mode,
+        "payload_root": _path_text(root, result.payload_root),
+        "returncode": result.returncode,
+        "success": result.succeeded,
+        "duration_seconds": result.duration_seconds,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def _compilation_verification_step_report(
+    root: Path,
+    result: PackageVerificationResult,
+) -> CompilationVerificationStepReport:
+    return {
+        "stage": result.stage,
+        "target": _path_text(root, result.target),
+        "command": _build_command_report(root, result.command),
+        "success": result.success,
+        "exit_code": result.exit_code,
+        "duration_seconds": result.duration_seconds,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def _compilation_performance_report(
+    root: Path,
+    result: BenchmarkGateResult | None,
+) -> CompilationPerformanceReport:
+    if result is None:
+        return {
+            "status": "unbenchmarked",
+            "reason": "no benchmark command configured",
+            "minimum_speedup": 1.10,
+            "baseline_median_seconds": None,
+            "compiled_median_seconds": None,
+            "speedup": None,
+            "warmups": [],
+            "samples": [],
+        }
+    return {
+        "status": result.status,
+        "reason": result.reason,
+        "minimum_speedup": result.minimum_speedup,
+        "baseline_median_seconds": result.baseline_median_seconds,
+        "compiled_median_seconds": result.compiled_median_seconds,
+        "speedup": result.speedup,
+        "warmups": [_compilation_command_run_report(root, run) for run in result.warmups],
+        "samples": [_compilation_command_run_report(root, run) for run in result.samples],
+    }
+
+
 def _semantic_test_summary(result: CompilationTestReport | None) -> str:
     if result is None:
         return "not run"
@@ -1416,9 +1633,10 @@ def _semantic_test_summary(result: CompilationTestReport | None) -> str:
 def _verification_scope_text(mode: CompilationMode) -> str:
     if mode == "source-clean":
         return (
-            "Source-clean compile builds a wheel from a temporary copy of the target source. "
-            "It does not edit the checkout or prove semantic equivalence; install the wheel "
-            "and run the target test suite to validate runtime behavior."
+            "Source-clean compile overlays native artifacts and staged shims onto the target "
+            "project's normal PEP 517 wheel. Fresh child interpreters verify both the unpacked "
+            "payload and final wheel. Semantic equivalence and speedup are claimed only when "
+            "the configured test and benchmark gates pass."
         )
     return (
         "Atoll runtime verification proves managed shims import compiled extensions "
@@ -1463,6 +1681,10 @@ def _path_text(root: Path, path: Path) -> str:
 
 def _optional_path(path: str | None) -> str:
     return f"`{path}`" if path is not None else "none"
+
+
+def _optional_seconds(value: float | None) -> str:
+    return f"{value:.3f}s" if value is not None else "unknown"
 
 
 def _line_suffix(line: int | None) -> str:

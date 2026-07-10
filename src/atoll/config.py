@@ -1,8 +1,9 @@
 """Read and write Atoll project configuration.
 
 Atoll accepts island definitions from `.atoll.toml` and `pyproject.toml`, then
-writes its managed minimal configuration back to `.atoll.toml`. Invalid or
-incomplete island entries are ignored rather than failing discovery.
+writes its managed minimal configuration back to `.atoll.toml`. Source-clean
+compile policy is read only from `pyproject.toml` so legacy in-place commands
+cannot rewrite user-owned test or benchmark settings.
 """
 
 from __future__ import annotations
@@ -11,9 +12,55 @@ import tomllib
 from pathlib import Path
 from typing import cast
 
-from atoll.models import EnabledIslandConfig
+from atoll.models import Backend, CompileConfig, EnabledIslandConfig
 
 CONFIG_PATH = ".atoll.toml"
+
+
+class CompileConfigError(ValueError):
+    """Raised when source-clean compile policy cannot be parsed or validated."""
+
+
+def load_compile_config(root: Path) -> CompileConfig:
+    """Load and validate optional `[tool.atoll.compile]` source-clean policy."""
+    try:
+        return _load_compile_config(root)
+    except (tomllib.TOMLDecodeError, TypeError, ValueError) as error:
+        raise CompileConfigError(f"invalid [tool.atoll.compile] configuration: {error}") from error
+
+
+def _load_compile_config(root: Path) -> CompileConfig:
+    """Parse compile policy before the public loader normalizes configuration errors."""
+    pyproject = root / "pyproject.toml"
+    if not pyproject.exists():
+        return CompileConfig()
+    data = cast(dict[str, object], tomllib.loads(pyproject.read_text(encoding="utf-8")))
+    compile_data = _mapping(_mapping(_mapping(data.get("tool")).get("atoll")).get("compile"))
+    if not compile_data:
+        return CompileConfig()
+    backends = _backend_sequence(compile_data.get("backends"))
+    test_command = _optional_command(compile_data, "test_command")
+    benchmark_command = _optional_command(compile_data, "benchmark_command")
+    return CompileConfig(
+        backends=backends if backends is not None else CompileConfig().backends,
+        test_command=test_command,
+        benchmark_command=benchmark_command,
+        benchmark_warmups=_integer(
+            compile_data.get("benchmark_warmups"),
+            field="benchmark_warmups",
+            default=1,
+        ),
+        benchmark_samples=_integer(
+            compile_data.get("benchmark_samples"),
+            field="benchmark_samples",
+            default=7,
+        ),
+        minimum_speedup=_number(
+            compile_data.get("minimum_speedup"),
+            field="minimum_speedup",
+            default=1.10,
+        ),
+    )
 
 
 def load_enabled_islands(root: Path) -> tuple[EnabledIslandConfig, ...]:
@@ -159,6 +206,48 @@ def _sequence(value: object) -> tuple[object, ...]:
 
 def _string(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _backend_sequence(value: object) -> tuple[Backend, ...] | None:
+    if value is None:
+        return None
+    raw = _required_string_sequence(value, field="backends")
+    invalid = tuple(backend for backend in raw if backend not in {"mypyc", "cython"})
+    if invalid:
+        raise ValueError(
+            "tool.atoll.compile.backends supports only mypyc and cython: " + ", ".join(invalid)
+        )
+    return cast(tuple[Backend, ...], raw)
+
+
+def _optional_command(data: dict[str, object], field: str) -> tuple[str, ...] | None:
+    value = data.get(field)
+    if value is None:
+        return None
+    return _required_string_sequence(value, field=field)
+
+
+def _required_string_sequence(value: object, *, field: str) -> tuple[str, ...]:
+    values = _sequence(value)
+    if not values or any(not isinstance(item, str) or not item.strip() for item in values):
+        raise ValueError(f"tool.atoll.compile.{field} must be a non-empty string list")
+    return tuple(cast(str, item) for item in values)
+
+
+def _integer(value: object, *, field: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"tool.atoll.compile.{field} must be an integer")
+    return value
+
+
+def _number(value: object, *, field: str, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"tool.atoll.compile.{field} must be a number")
+    return float(value)
 
 
 def _bool(value: object, *, default: bool) -> bool:

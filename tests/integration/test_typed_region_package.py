@@ -9,6 +9,7 @@ import json
 import pickle
 import shutil
 import sys
+import venv
 import zipfile
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Protocol, TypedDict, cast
 import pytest
 
 from atoll.cli import main
+from atoll.runtime.performance import run_performance_command
 
 FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
 COMPILED_SYMBOL_COUNT = 10
@@ -85,6 +87,7 @@ class _CompiledRegionReport(TypedDict):
     variant_id: str
     bindings: list[_BindingReport]
     artifacts: list[str]
+    cache_status: str
 
 
 class _SpecializedTypeBindingReport(TypedDict):
@@ -120,7 +123,7 @@ def test_compile_builds_and_routes_typed_methods_without_source_edits(
     shutil.copytree(FIXTURE_ROOT, project_root)
     original_hashes = _source_contents(project_root)
 
-    exit_code = main(
+    first_exit = main(
         [
             "compile",
             "typed_region_project.worker",
@@ -132,13 +135,30 @@ def test_compile_builds_and_routes_typed_methods_without_source_edits(
 
     output_dir = project_root / ".atoll" / "dist"
     install_root = output_dir / "install"
+    first_report = cast(
+        _CompileReport,
+        json.loads((project_root / ".atoll" / "compile-report.json").read_text()),
+    )
+    second_exit = main(
+        [
+            "compile",
+            "typed_region_project.worker",
+            "--root",
+            str(project_root),
+            "--keep-install-tree",
+        ]
+    )
     wheel_path = next(output_dir.glob("*.whl"))
     report = cast(
         _CompileReport,
         json.loads((project_root / ".atoll" / "compile-report.json").read_text()),
     )
     markdown_report = (project_root / ".atoll" / "compile-report.md").read_text()
-    assert exit_code == 0
+    assert first_exit == 0
+    assert second_exit == 0
+    assert first_report["build"]["cache_status"] == "miss"
+    assert report["build"]["cache_status"] == "hit"
+    assert all(region["cache_status"] == "hit" for region in report["compiled_regions"])
     assert _source_contents(project_root) == original_hashes
     _assert_worker_compile_report(report)
     assert "-> IntPairer (instance_method, 1 guard(s))" in markdown_report
@@ -146,12 +166,13 @@ def test_compile_builds_and_routes_typed_methods_without_source_edits(
     assert "typed_region_project.worker::ScaleModel (class)" in markdown_report
     assert not (output_dir / "build").exists()
     assert not tuple(install_root.rglob("_atoll_region_*.py"))
-    assert tuple((install_root / ".atoll" / "artifacts").glob("*.so"))
+    assert tuple((install_root / ".atoll" / "artifacts").rglob("*.so"))
     with zipfile.ZipFile(wheel_path) as wheel:
         names = set(wheel.namelist())
     assert "typed_region_project/worker.py" in names
     assert not any(name.endswith(".py") and "_atoll_region_" in name for name in names)
-    assert any(name.startswith(".atoll/artifacts/_atoll_region_") for name in names)
+    assert any(name.startswith(".atoll/artifacts/") and name.endswith(".so") for name in names)
+    _assert_installed_wheel_routes(wheel_path, tmp_path)
 
     monkeypatch.setattr(sys, "path", [str(install_root), *sys.path])
     monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "1")
@@ -174,6 +195,34 @@ def test_compile_builds_and_routes_typed_methods_without_source_edits(
     assert "pair" not in vars(disabled_module.IntPairer)
     assert "maybe_pair" not in vars(disabled_module.PayloadPairer)
     assert not hasattr(disabled_module.Pairer.pair, "__atoll_compiled_target__")
+
+    worker_source = project_root / "src" / "typed_region_project" / "worker.py"
+    invalidated_source = worker_source.read_text(encoding="utf-8").replace(
+        "        total = 0\n",
+        "        total = 1\n",
+    )
+    worker_source.write_text(
+        invalidated_source,
+        encoding="utf-8",
+    )
+    third_exit = main(
+        [
+            "compile",
+            "typed_region_project.worker",
+            "--root",
+            str(project_root),
+        ]
+    )
+    invalidated_report = cast(
+        _CompileReport,
+        json.loads((project_root / ".atoll" / "compile-report.json").read_text()),
+    )
+    assert third_exit == 0
+    assert invalidated_report["build"]["cache_status"] == "partial"
+    assert {region["cache_status"] for region in invalidated_report["compiled_regions"]} == {
+        "hit",
+        "miss",
+    }
 
 
 def test_compile_routes_closed_generic_function_with_guarded_fallback(
@@ -252,7 +301,7 @@ def _assert_worker_compile_report(report: _CompileReport) -> None:
     assert summary["islands"] == 0
     assert summary["compiled_regions"] == COMPILED_REGION_COUNT
     assert summary["native_rejected_symbols"] == 1
-    assert report["build"]["command"] == ["atoll", "typed-region-build"]
+    assert report["build"]["command"] == ["atoll", "source-clean-build"]
     compiled_regions = report["compiled_regions"]
     worker_mypyc_regions = tuple(
         region
@@ -505,6 +554,47 @@ def _source_contents(root: Path) -> dict[Path, str]:
         path.relative_to(root): path.read_text(encoding="utf-8")
         for path in sorted((root / "src").rglob("*.py"))
     }
+
+
+def _assert_installed_wheel_routes(wheel_path: Path, tmp_path: Path) -> None:
+    """Install the candidate wheel into a fresh environment and require native routing."""
+    environment_root = tmp_path / "installed-wheel-environment"
+    venv.EnvBuilder(with_pip=True, clear=True).create(environment_root)
+    python = (
+        environment_root / "Scripts" / "python.exe"
+        if sys.platform == "win32"
+        else environment_root / "bin" / "python"
+    )
+    empty_pythonpath = tmp_path / "empty-pythonpath"
+    empty_pythonpath.mkdir()
+    install = run_performance_command(
+        (str(python), "-I", "-m", "pip", "install", "--no-deps", str(wheel_path)),
+        project_root=tmp_path,
+        payload_root=empty_pythonpath,
+        mode="baseline",
+    )
+    assert install.succeeded, install.stderr
+
+    smoke = run_performance_command(
+        (
+            str(python),
+            "-I",
+            "-c",
+            "\n".join(
+                (
+                    "import typed_region_project.worker as worker",
+                    "assert worker.Worker(3).scale(5) == 23",
+                    "assert worker.__atoll_status__['compiled'] is True",
+                    "assert hasattr(worker.Worker.scale, '__atoll_compiled_target__')",
+                    "assert hasattr(worker.Worker.exchange, '__atoll_compiled_target__')",
+                )
+            ),
+        ),
+        project_root=tmp_path,
+        payload_root=empty_pythonpath,
+        mode="compiled",
+    )
+    assert smoke.succeeded, smoke.stderr
 
 
 def _clear_fixture_modules() -> None:

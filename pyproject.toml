@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
+    "build>=1.2",
     "Cython>=3.1",
     "mypy>=1.17.0",
     "packaging>=24",
@@ -86,6 +87,9 @@ max-statements = 60
 
 
 [tool.ruff.lint.per-file-ignores]
+"src/atoll/runtime/package_verify.py" = ["S603"]
+"src/atoll/runtime/performance.py" = ["S603"]
+"src/atoll/wheel_overlay.py" = ["S603"]
 "tests/**/*.py" = ["S101"]
 
 

@@ -40,6 +40,10 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
+Atoll builds the target project's normal PEP 517 wheel from a temporary source-clean copy before
+overlaying staged routing code and region-owned native artifacts. This preserves package data,
+entry points, and backend-generated metadata. The final platform tag and `RECORD` are regenerated,
+then staged and wheel routing are verified in fresh interpreters before temporary trees are removed.
 For typed regions, `compiled_regions` records each backend variant, class and descriptor-aware
 bindings, runtime guards, concrete target owners, and native artifact paths. Typed-region entries
 preserve the original generic declaration and list specialization origins, substitutions, and
@@ -78,8 +82,10 @@ staging, cache lookup or restore, mypyc batch or retry builds, wheel writing, an
 reports include cache status plus subphase timings such as `mypycify` and `build_ext`. Duplicate
 macOS linker `-rpath` warnings are filtered from terminal output; other native compiler diagnostics
 are still captured in Atoll's build diagnostics. Atoll keeps strict reusable compile and mypy cache
-state under `.atoll/cache/`; unchanged legacy function-island builds restore successful artifacts
-and cached skips without invoking mypyc again. `atoll clean --cache` removes that state.
+state under `.atoll/cache/`. Typed variants are cached independently by backend and region under
+`.atoll/cache/compile/regions/`; an unchanged variant restores native files without invoking mypyc
+or Cython. Legacy function-island builds also restore successful artifacts and cached skips.
+`atoll clean --cache` removes all reusable compiler state.
 When compiling a whole project, Atoll retries modules individually if the batch mypyc build fails
 and skips islands that cannot be compiled; if none compile, the command fails with a representative
 mypyc diagnostic.
@@ -92,6 +98,32 @@ methods, and narrowly guarded concrete generic specializations. Dynamic and iden
 classes remain Python, and Atoll does not treat object-rich orchestration as one native unit. Large
 gains are expected only when meaningful application time is spent inside accepted CPU-bound code;
 successful compilation is not a speedup claim.
+
+### Semantic and performance gates
+
+Without a configured benchmark, compile can emit a wheel but records performance as
+`unbenchmarked`. Configure argv commands in `pyproject.toml` when wheel promotion must require
+semantic equivalence and a measured minimum speedup:
+
+```toml
+[tool.atoll.compile]
+backends = ["mypyc", "cython"]
+test_command = ["pytest", "-q"]
+benchmark_command = ["python", "benchmarks/atoll_workload.py"]
+benchmark_warmups = 1
+benchmark_samples = 7
+minimum_speedup = 1.10
+```
+
+Atoll runs these arrays with `shell=False`. A configured benchmark first requires the test command
+to pass against both baseline and compiled payloads, then runs alternating subprocess pairs and
+compares median durations. Medians below 0.25 seconds are too noisy. Test failure, invalid timing,
+or speedup below the threshold removes the candidate wheel; the JSON and Markdown reports retain
+the command evidence and decision. Commands run from a temporary project copy that retains tests
+and benchmark files but removes importable checkout modules, preventing flat-layout source from
+shadowing either payload. Verification and gate failures keep `.atoll/dist/install` and move the
+rejected wheel under `.atoll/dist/build/diagnostics/`; no failed candidate remains in the normal
+wheel output directory.
 
 Compiled functions and methods retain their source name, qualified name, documentation, annotations,
 signature, and sync, coroutine, generator, or async-generator shape. Async-generator wrappers

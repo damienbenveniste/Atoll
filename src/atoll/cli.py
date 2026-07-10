@@ -38,6 +38,7 @@ from atoll.commands.package import (
 from atoll.commands.scan import ScanOptions, execute_scan
 from atoll.commands.trial import TrialOptions, execute_trial
 from atoll.commands.verify import VerifyOptions, execute_verify
+from atoll.config import CompileConfigError
 from atoll.models import CompileAttempt, EnabledIslandConfig, PytestRunResult, VerifyResult
 from atoll.project import discover_project
 from atoll.report import (
@@ -556,21 +557,36 @@ def _run_source_clean_artifact_build(
     label: str,
 ) -> int:
     progress = _source_clean_progress_reporter()
-    result = execute_package(
-        PackageOptions(
-            root=root,
-            module_name=module_name,
-            output_dir=output_dir,
-            keep_install_tree=keep_install_tree,
-            progress=progress,
+    try:
+        result = execute_package(
+            PackageOptions(
+                root=root,
+                module_name=module_name,
+                output_dir=output_dir,
+                keep_install_tree=keep_install_tree,
+                progress=progress,
+            )
         )
-    )
+    except CompileConfigError as error:
+        print(f"Atoll compile configuration error: {error}", file=sys.stderr)
+        return 2
     report_paths = _write_source_clean_compile_report(result, module_name=module_name)
     _print_native_readiness_rejections(result)
     if not result.success:
         _print_compile_report_paths(report_paths)
         print(result.error or result.build.stderr)
         return 1
+    _print_source_clean_success(result, label=label, report_paths=report_paths)
+    return 0
+
+
+def _print_source_clean_success(
+    result: PackageCommandResult,
+    *,
+    label: str,
+    report_paths: tuple[Path, Path],
+) -> None:
+    """Print the compiled scope, fallbacks, performance status, and artifact paths."""
     compiled_modules = {
         *(island.source_module for island in result.islands),
         *(binding.source.module for binding in result.compiled_bindings),
@@ -605,9 +621,13 @@ def _run_source_clean_artifact_build(
             print(f"- {region_failure.variant_id} [{region_failure.backend}]: {first_line}")
     if result.install_tree_kept:
         print(f"Install tree: {result.install_root}")
+    if result.performance is not None:
+        if result.performance.status == "passed" and result.performance.speedup is not None:
+            print(f"Performance: {result.performance.speedup:.3f}x median speedup (passed).")
+        else:
+            print(f"Performance: {result.performance.status}.")
     print(f"Wheel: {result.wheel_path}")
     _print_compile_report_paths(report_paths)
-    return 0
 
 
 def _print_native_readiness_rejections(result: PackageCommandResult) -> None:
@@ -749,6 +769,9 @@ def _write_source_clean_compile_report(
             compiled_variants=result.compiled_variants,
             backend_assessments=result.backend_assessments,
             artifact_records=result.artifact_records,
+            verification_steps=result.verification_steps,
+            test_results=result.test_results,
+            performance=result.performance,
         )
     )
     json_path = result.project_root / ".atoll" / "compile-report.json"
@@ -759,8 +782,6 @@ def _write_source_clean_compile_report(
 
 
 def _source_clean_report_build(result: PackageCommandResult) -> CompileAttempt:
-    if not result.success:
-        return result.build
     return CompileAttempt(
         success=result.build.success,
         command=result.build.command,

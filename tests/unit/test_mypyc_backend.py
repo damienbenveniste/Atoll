@@ -94,7 +94,7 @@ def test_build_sidecars_detects_generated_artifact(
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
         assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         return []
 
     def fail_artifact_records(
@@ -148,7 +148,7 @@ def test_build_sidecars_reports_support_artifacts(
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
         assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         return []
 
     monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
@@ -186,7 +186,7 @@ def test_mypyc_adapter_returns_structured_primary_and_support_artifacts(
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
         assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         return []
 
     monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
@@ -248,7 +248,7 @@ def test_artifact_ownership_uses_logical_module_for_duplicate_stems(
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
         assert paths == ["first/shared.py", "second/shared.py"]
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         return []
 
     monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
@@ -301,7 +301,7 @@ def test_build_sidecars_captures_and_filters_native_stderr(
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
         assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         return []
 
     monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)
@@ -341,7 +341,7 @@ def test_build_sidecars_adds_source_roots_to_mypy_path(
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
         assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         seen_mypy_path.append(os.environ.get("MYPYPATH"))
         seen_cache_dir.append(os.environ.get("MYPY_CACHE_DIR"))
         return []
@@ -372,7 +372,7 @@ def test_build_sidecars_classifies_build_failure(
     sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
 
     def failing_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         raise RuntimeError(f"mypy type issue in {paths[0]}")
 
     monkeypatch.setattr(mypyc_backend, "mypycify", failing_mypycify)
@@ -398,7 +398,7 @@ def test_build_sidecars_captures_mypyc_system_exit(
     sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
 
     def failing_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         print(f"{paths[0]}:1: error: fixture type failure  [misc]")
         print("dep.py:1: error: Cannot find implementation or library stub  [import-not-found]")
         raise SystemExit(1)
@@ -436,7 +436,7 @@ def test_build_sidecars_classifies_native_build_failure(
     sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
 
     def failing_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         raise RuntimeError(f"compiler missing for {paths[0]}")
 
     monkeypatch.setattr(mypyc_backend, "mypycify", failing_mypycify)
@@ -462,7 +462,7 @@ def test_build_sidecars_handles_external_source_without_artifact(
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
         assert paths == [str(sidecar)]
-        assert target_dir == str(tmp_path / ".atoll" / "build" / "generated")
+        assert target_dir == ".atoll/build/generated"
         return []
 
     monkeypatch.setattr(mypyc_backend, "mypycify", fake_mypycify)

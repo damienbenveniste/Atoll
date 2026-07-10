@@ -450,9 +450,10 @@ def _build_paths(
             native_stderr,
         ):
             active_phase = ("mypycify", time.perf_counter())
+            generated_target = _source_arg(build_dir / "generated", project_root)
             ext_modules = mypycify(
                 [_source_arg(path, project_root) for path in paths],
-                target_dir=str(build_dir / "generated"),
+                target_dir=generated_target,
             )
             phase_timings.append(_phase_timing(active_phase))
             active_phase = ("build_ext", time.perf_counter())
@@ -467,6 +468,7 @@ def _build_paths(
             command_obj.inplace = False
             command_obj.build_lib = str(artifact_dir)
             command_obj.build_temp = str(build_dir / "temp")
+            _prepare_build_temp_source_dir(Path(command_obj.build_temp), generated_target)
             command_obj.ensure_finalized()
             command_obj.run()
             phase_timings.append(_phase_timing(active_phase))
@@ -603,6 +605,13 @@ def _source_arg(path: Path, project_root: Path) -> str:
         return path.resolve().relative_to(project_root.resolve()).as_posix()
     except ValueError:
         return str(path)
+
+
+def _prepare_build_temp_source_dir(build_temp: Path, source_dir: str) -> None:
+    """Create the object-file parent mirrored by setuptools for generated C sources."""
+    source_path = Path(source_dir)
+    relative_parts = source_path.parts[1:] if source_path.anchor else source_path.parts
+    build_temp.joinpath(*relative_parts).mkdir(parents=True, exist_ok=True)
 
 
 def _distribution_attrs(

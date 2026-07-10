@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Protocol, cast
 
 import pytest
-from packaging import tags
 
+from atoll import cli as cli_module
 from atoll.commands import package as package_command
 from atoll.models import (
     ArtifactRecord,
@@ -21,6 +21,7 @@ from atoll.models import (
     BackendCompileContext,
     BackendCompileResult,
     BindingTarget,
+    Blocker,
     CompilationUnit,
     CompileAttempt,
     CompiledRegionVariant,
@@ -35,6 +36,14 @@ from atoll.models import (
 )
 from atoll.project import DiscoveredProject, discover_project
 from atoll.report import CompilationReportInput, build_compilation_report
+from atoll.runtime.package_verify import PackageVerificationResult, VerificationStage
+from atoll.runtime.performance import (
+    BenchmarkGateConfig,
+    BenchmarkGateResult,
+    BenchmarkProgress,
+    CommandRunEvidence,
+    RuntimeMode,
+)
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 TYPED_FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
@@ -42,6 +51,28 @@ EXPECTED_REBUILDS = 2
 EXPECTED_PARTIAL_CACHE_BACKEND_CALLS = 3
 EXPECTED_READINESS_COUNT = 2
 EXPECTED_ATOMIC_SELECTION_COUNT = 2
+TEST_FAILURE_RETURN_CODE = 9
+
+
+@pytest.fixture(autouse=True)
+def stub_native_subprocess_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Package orchestration tests stop at the separately tested verification boundary."""
+
+    def verify(**kwargs: object) -> PackageVerificationResult:
+        stage = cast(VerificationStage, kwargs["stage"])
+        target = cast(Path, kwargs["target"])
+        return PackageVerificationResult(
+            stage=stage,
+            target=target,
+            command=("python", "verify"),
+            success=True,
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.0,
+        )
+
+    monkeypatch.setattr(package_command, "verify_package_subprocess", verify)
 
 
 class _Metadata(Protocol):
@@ -51,34 +82,33 @@ class _Metadata(Protocol):
     dependencies: tuple[str, ...]
 
 
-class _ProjectMetadataFactory(Protocol):
-    def __call__(
-        self,
-        *,
-        name: str,
-        version: str,
-        requires_python: str | None,
-        dependencies: tuple[str, ...],
-    ) -> _Metadata: ...
-
-
-class _WriteWheel(Protocol):
-    def __call__(
-        self,
-        *,
-        install_root: Path,
-        output_dir: Path,
-        metadata: _Metadata,
-    ) -> Path: ...
-
-
 class _CacheLookup(Protocol):
     hit: bool
+
+
+class _BaselinePayloadFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        wheel_path: Path | None,
+        build: CompileAttempt,
+        baseline_install_root: Path | None = None,
+        quality_project_root: Path | None = None,
+    ) -> object: ...
+
+
+class _QualityGateOutcomeView(Protocol):
+    success: bool
+    tests: tuple[CommandRunEvidence, ...]
+    performance: BenchmarkGateResult
+    error: str | None
 
 
 class _TypedSelection(Protocol):
     backend: Backend
     variant_id: str
+    region: TypedRegion
+    assessment: BackendAssessment
     members: tuple[SymbolId, ...]
     specialization: RegionSpecialization | None
     conditional_on_failure_of: str | None
@@ -115,6 +145,18 @@ class _FakeCompileBackend:
     def __init__(self, result: BackendCompileResult) -> None:
         self.result = result
         self.calls: list[tuple[CompilationUnit, ...]] = []
+        self.name = cast(Backend, result.attempt.command[0])
+
+    def fingerprint(
+        self,
+        unit: CompilationUnit,
+        context: BackendCompileContext,
+    ) -> str:
+        """Return a stable per-variant key for cache orchestration tests."""
+        _ = context
+        return hashlib.sha256(
+            f"{self.name}:{unit.region_id}:{unit.source_hash}".encode()
+        ).hexdigest()
 
     def compile(
         self,
@@ -131,14 +173,6 @@ def _package_attr(name: str) -> object:
     return vars(package_command)[name]
 
 
-_ProjectMetadata = cast(
-    _ProjectMetadataFactory,
-    _package_attr("_ProjectMetadata"),
-)
-_copy_install_payload = cast(
-    Callable[[tuple[Path, ...], Path], None],
-    _package_attr("_copy_install_payload"),
-)
 _copy_atoll_artifacts = cast(
     Callable[[tuple[Path, ...], Path], None],
     _package_attr("_copy_atoll_artifacts"),
@@ -196,12 +230,6 @@ _staged_module = cast(
 )
 _store_compile_cache = cast(Callable[..., None], _package_attr("_store_compile_cache"))
 _string = cast(Callable[[object], str | None], _package_attr("_string"))
-_wheel_payload = cast(
-    Callable[[Path], tuple[tuple[str, Path], ...]],
-    _package_attr("_wheel_payload"),
-)
-_wheel_tag = cast(Callable[[], str], _package_attr("_wheel_tag"))
-_write_wheel = cast(_WriteWheel, _package_attr("_write_wheel"))
 _selected_scans = cast(
     Callable[[DiscoveredProject, str | None], tuple[ModuleScan, ...]],
     _package_attr("_selected_scans"),
@@ -225,6 +253,18 @@ _member_requires_source_class = cast(
 _owner_disallows_method_binding = cast(
     Callable[[str | None, str, dict[str, LoweringDecision]], bool],
     _package_attr("_owner_disallows_method_binding"),
+)
+_BaselineWheelPayload = cast(
+    _BaselinePayloadFactory,
+    _package_attr("_BaselineWheelPayload"),
+)
+_run_configured_quality_gate = cast(
+    Callable[..., _QualityGateOutcomeView],
+    _package_attr("_run_configured_quality_gate"),
+)
+_print_source_clean_success = cast(
+    Callable[..., None],
+    vars(cli_module)["_print_source_clean_success"],
 )
 
 
@@ -403,6 +443,69 @@ def test_package_reports_build_failure_without_source_edits(
     assert result.cleanup_kept == (output_dir / "build",)
 
 
+@pytest.mark.parametrize("failed_stage", ["payload", "wheel"])
+def test_package_preserves_payload_for_subprocess_verification_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_stage: VerificationStage,
+) -> None:
+    """Routing failures keep the exact payload and rejected wheel under diagnostics."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+
+    def successful_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        assert kwargs
+        path = cast(tuple[Path, ...], args[0])[0]
+        artifact = tmp_path / f"{path.stem}{suffix}"
+        artifact.write_text("binary", encoding="utf-8")
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=(artifact,),
+            duration_seconds=0.1,
+        )
+
+    def verify(**kwargs: object) -> PackageVerificationResult:
+        stage = cast(VerificationStage, kwargs["stage"])
+        target = cast(Path, kwargs["target"])
+        success = stage != failed_stage
+        return PackageVerificationResult(
+            stage=stage,
+            target=target,
+            command=("python", "verify"),
+            success=success,
+            exit_code=0 if success else 1,
+            stdout="",
+            stderr="routing failed" if not success else "",
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+    monkeypatch.setattr(package_command, "verify_package_subprocess", verify)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+
+    assert result.success is False
+    assert result.error == "routing failed"
+    assert result.cleanup_removed == ()
+    assert result.cleanup_kept == (output_dir / "build", output_dir / "install")
+    assert (output_dir / "install").exists()
+    assert not tuple(output_dir.glob("*.whl"))
+    assert result.verification_steps[-1].stage == failed_stage
+    if failed_stage == "wheel":
+        assert result.verification_steps[-1].target.parent == output_dir / "build" / "diagnostics"
+
+
 def test_typed_region_build_retries_deterministic_mypyc_failure_with_cython(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -457,7 +560,8 @@ def test_typed_region_build_retries_deterministic_mypyc_failure_with_cython(
         context=_TypedRegionBuildContext(
             build_root=build_root,
             staged_source_roots=staged_source_roots,
-            cache_dir=tmp_path / "cache",
+            mypy_cache_dir=tmp_path / "mypy-cache",
+            compile_cache_dir=tmp_path / "compile-cache",
             progress=None,
         ),
         initial_failures=(),
@@ -526,7 +630,8 @@ def test_typed_region_build_does_not_compile_speculative_cython_after_mypyc_succ
         context=_TypedRegionBuildContext(
             build_root=build_root,
             staged_source_roots=staged_source_roots,
-            cache_dir=tmp_path / "cache",
+            mypy_cache_dir=tmp_path / "mypy-cache",
+            compile_cache_dir=tmp_path / "compile-cache",
             progress=None,
         ),
         initial_failures=(),
@@ -606,7 +711,8 @@ def test_atomic_class_build_conditionally_uses_method_fallback(
         context=_TypedRegionBuildContext(
             build_root=build_root,
             staged_source_roots=staged_source_roots,
-            cache_dir=tmp_path / "cache",
+            mypy_cache_dir=tmp_path / "mypy-cache",
+            compile_cache_dir=tmp_path / "compile-cache",
             progress=None,
         ),
         initial_failures=(),
@@ -664,7 +770,8 @@ def test_typed_region_build_records_real_cython_artifacts_after_mypyc_retry(
         context=_TypedRegionBuildContext(
             build_root=build_root,
             staged_source_roots=staged_source_roots,
-            cache_dir=tmp_path / "cache",
+            mypy_cache_dir=tmp_path / "mypy-cache",
+            compile_cache_dir=tmp_path / "compile-cache",
             progress=None,
         ),
         initial_failures=(),
@@ -825,6 +932,310 @@ def test_package_reports_progress_for_expensive_phases(
     assert any(message.startswith("writing wheel") for message in messages)
 
 
+def test_quality_gate_rejects_missing_source_stripped_project(tmp_path: Path) -> None:
+    """Configured commands cannot silently fall back to the target checkout."""
+    project = _quality_gate_project(
+        tmp_path,
+        ('test_command = ["python", "-c", "pass"]',),
+    )
+    baseline = _BaselineWheelPayload(
+        wheel_path=tmp_path / "baseline.whl",
+        build=_successful_attempt(),
+    )
+
+    outcome = _run_configured_quality_gate(
+        project=project,
+        baseline=baseline,
+        compiled_payload_root=tmp_path / "compiled",
+        progress=None,
+    )
+
+    assert outcome.success is False
+    assert outcome.error == "quality-gate project is missing"
+    assert outcome.performance.status == "invalid"
+
+
+def test_quality_gate_rejects_missing_benchmark_baseline(tmp_path: Path) -> None:
+    """Benchmarking requires a distinct unpacked baseline payload."""
+    project = _quality_gate_project(
+        tmp_path,
+        (
+            'test_command = ["python", "-c", "pass"]',
+            'benchmark_command = ["python", "bench.py"]',
+        ),
+    )
+    baseline = _BaselineWheelPayload(
+        wheel_path=tmp_path / "baseline.whl",
+        build=_successful_attempt(),
+        quality_project_root=tmp_path / "quality-project",
+    )
+
+    outcome = _run_configured_quality_gate(
+        project=project,
+        baseline=baseline,
+        compiled_payload_root=tmp_path / "compiled",
+        progress=None,
+    )
+
+    assert outcome.success is False
+    assert outcome.error == "baseline payload is missing"
+
+
+def test_quality_gate_reports_semantic_test_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed configured test stops before benchmarking and preserves exit evidence."""
+    project = _quality_gate_project(
+        tmp_path,
+        ('test_command = ["python", "-c", "raise SystemExit(9)"]',),
+    )
+    quality_root = tmp_path / "quality-project"
+    quality_root.mkdir()
+    baseline = _BaselineWheelPayload(
+        wheel_path=tmp_path / "baseline.whl",
+        build=_successful_attempt(),
+        quality_project_root=quality_root,
+    )
+    messages: list[str] = []
+
+    def failing_test(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: RuntimeMode,
+    ) -> CommandRunEvidence:
+        return CommandRunEvidence(
+            command=command,
+            project_root=project_root,
+            payload_root=payload_root,
+            mode=mode,
+            returncode=9,
+            stdout="",
+            stderr="",
+            duration_seconds=0.5,
+        )
+
+    monkeypatch.setattr(package_command, "run_performance_command", failing_test)
+
+    outcome = _run_configured_quality_gate(
+        project=project,
+        baseline=baseline,
+        compiled_payload_root=tmp_path / "compiled",
+        progress=messages.append,
+    )
+
+    assert outcome.success is False
+    assert outcome.error == "compiled semantic test command exited 9"
+    assert outcome.tests[0].returncode == TEST_FAILURE_RETURN_CODE
+    assert outcome.performance.reason == "compiled semantic test command failed"
+    assert messages == ["compiled semantic tests failed with exit 9 in 0.50s"]
+
+
+def test_source_clean_success_summary_lists_every_fallback_kind(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI success output distinguishes build, preflight, and typed-region fallbacks."""
+    project_root = tmp_path / "typed_region_project"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scan = _selected_scans(project, "typed_region_project.worker")[0]
+    selection = _selected_typed_method_regions((scan,))[0]
+    island = EnabledIslandConfig(
+        source_module=scan.module.name,
+        source_path=scan.module.path,
+        sidecar_module="_atoll_fixture",
+        sidecar_path=tmp_path / "_atoll_fixture.py",
+        symbols=("passthrough",),
+    )
+    failed_attempt = CompileAttempt(
+        success=False,
+        command=("compiler",),
+        stdout="",
+        stderr="",
+        artifact_paths=(),
+        duration_seconds=0.1,
+    )
+    result = package_command.PackageCommandResult(
+        success=True,
+        project_root=project_root,
+        output_dir=tmp_path / "dist",
+        install_root=tmp_path / "dist" / "install",
+        wheel_path=tmp_path / "dist" / "fixture.whl",
+        islands=(island,),
+        build=_successful_attempt(),
+        install_tree_kept=True,
+        skipped=(package_command.PackageBuildFailure(island=island, build=failed_attempt),),
+        preflight_skipped=(
+            package_command.PackagePreflightFailure(
+                scan=scan,
+                blockers=(Blocker(severity="hard", code="module", message="module blocker"),),
+            ),
+            package_command.PackagePreflightFailure(
+                scan=scan,
+                blockers=(
+                    Blocker(
+                        severity="hard",
+                        code="line",
+                        message="line blocker",
+                        lineno=7,
+                    ),
+                ),
+            ),
+        ),
+        region_skipped=(
+            package_command.PackageRegionBuildFailure(
+                region=selection.region,
+                variant_id=selection.variant_id,
+                backend=selection.backend,
+                assessment=selection.assessment,
+                build=failed_attempt,
+            ),
+        ),
+        performance=BenchmarkGateResult(
+            status="passed",
+            reason="fixture",
+            minimum_speedup=1.1,
+            baseline_median_seconds=1.2,
+            compiled_median_seconds=1.0,
+            speedup=1.2,
+            warmups=(),
+            samples=(),
+        ),
+    )
+
+    _print_source_clean_success(
+        result,
+        label="source-clean compile",
+        report_paths=(tmp_path / "report.json", tmp_path / "report.md"),
+    )
+
+    output = capsys.readouterr().out
+    assert "Skipped 1 module(s) that mypyc could not build." in output
+    assert f"- {scan.module.name}: failed" in output
+    assert f"- {scan.module.name}: module: module blocker" in output
+    assert f"- {scan.module.name}: line 7: line blocker" in output
+    assert "Kept 1 typed region(s) as interpreted fallback." in output
+    assert f"- {selection.variant_id} [{selection.backend}]: failed" in output
+    assert "Install tree:" in output
+    assert "Performance: 1.200x median speedup (passed)." in output
+
+
+def test_package_rejects_not_profitable_wheel_after_semantic_tests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured benchmark below threshold removes the candidate wheel."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + "\n".join(
+            (
+                "",
+                "[tool.atoll.compile]",
+                'test_command = ["python", "-m", "pytest", "-q"]',
+                'benchmark_command = ["python", "bench.py"]',
+                "benchmark_warmups = 0",
+                "benchmark_samples = 1",
+                "minimum_speedup = 1.10",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    test_modes: list[RuntimeMode] = []
+    target_project_root = project_root
+
+    def successful_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
+        assert kwargs
+        path = cast(tuple[Path, ...], args[0])[0]
+        artifact = tmp_path / f"{path.stem}{suffix}"
+        artifact.write_text("binary", encoding="utf-8")
+        return CompileAttempt(
+            success=True,
+            command=("mypyc",),
+            stdout="",
+            stderr="",
+            artifact_paths=(artifact,),
+            duration_seconds=0.1,
+        )
+
+    def passing_test_command(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: RuntimeMode,
+    ) -> CommandRunEvidence:
+        test_modes.append(mode)
+        assert project_root != target_project_root
+        assert not tuple((project_root / "src").rglob("*.py"))
+        return CommandRunEvidence(
+            command=command,
+            project_root=project_root,
+            payload_root=payload_root,
+            mode=mode,
+            returncode=0,
+            stdout="passed",
+            stderr="",
+            duration_seconds=0.5,
+        )
+
+    def rejecting_benchmark(
+        config: BenchmarkGateConfig,
+        *,
+        project_root: Path,
+        baseline_payload_root: Path,
+        compiled_payload_root: Path,
+        progress: Callable[[BenchmarkProgress], None] | None = None,
+    ) -> BenchmarkGateResult:
+        assert config.command == ("python", "bench.py")
+        assert project_root == project_root.resolve()
+        assert baseline_payload_root != compiled_payload_root
+        assert progress is not None
+        return BenchmarkGateResult(
+            status="not-profitable",
+            reason="compiled median speedup 1.020 is below threshold 1.100",
+            minimum_speedup=1.1,
+            baseline_median_seconds=1.02,
+            compiled_median_seconds=1.0,
+            speedup=1.02,
+            warmups=(),
+            samples=(),
+        )
+
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+    monkeypatch.setattr(package_command, "run_performance_command", passing_test_command)
+    monkeypatch.setattr(package_command, "run_benchmark_gate", rejecting_benchmark)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+
+    assert result.success is False
+    assert result.wheel_path is None
+    assert result.performance is not None
+    assert result.performance.status == "not-profitable"
+    assert result.error == result.performance.reason
+    assert test_modes == ["baseline", "compiled"]
+    assert not tuple(output_dir.glob("*.whl"))
+    assert (output_dir / "install").exists()
+    assert (output_dir / "build").exists()
+    diagnostic_wheels = tuple((output_dir / "build" / "diagnostics").glob("*.whl"))
+    assert diagnostic_wheels
+    assert result.verification_steps[-1].target == diagnostic_wheels[0]
+
+
 def test_package_reuses_compile_cache_for_unchanged_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -880,7 +1291,9 @@ def test_package_reuses_compile_cache_for_unchanged_inputs(
     assert second.success is True
     assert second.build.cache_status == "hit"
     assert calls == 1
-    assert tuple(timing.name for timing in second.build.phase_timings) == (
+    assert tuple(
+        timing.name for timing in second.build.phase_timings if timing.name.startswith("cache_")
+    ) == (
         "cache_lookup",
         "cache_restore",
     )
@@ -958,7 +1371,9 @@ def test_package_reuses_partial_compile_cache_for_unchanged_inputs(
     assert len(second.skipped) == 1
     assert "cached skip" in second.skipped[0].build.stderr
     assert calls == EXPECTED_PARTIAL_CACHE_BACKEND_CALLS
-    assert tuple(timing.name for timing in second.build.phase_timings) == (
+    assert tuple(
+        timing.name for timing in second.build.phase_timings if timing.name.startswith("cache_")
+    ) == (
         "cache_lookup",
         "cache_restore",
     )
@@ -1426,36 +1841,6 @@ def test_package_helpers_handle_flat_source_roots(tmp_path: Path) -> None:
     assert (build_root / "pkg" / "mod.py").exists()
 
 
-def test_copy_install_payload_filters_package_files(tmp_path: Path) -> None:
-    """Install payloads include importable files and native artifacts, not tests or docs."""
-    source_root = tmp_path / "source"
-    install_root = tmp_path / "install"
-    package_dir = source_root / "pkg"
-    tests_dir = source_root / "tests"
-    package_dir.mkdir(parents=True)
-    tests_dir.mkdir()
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (package_dir / "py.typed").write_text("", encoding="utf-8")
-    (package_dir / "data.txt").write_text("skip", encoding="utf-8")
-    (source_root / "top.py").write_text("VALUE = 2\n", encoding="utf-8")
-    (source_root / "README.md").write_text("skip", encoding="utf-8")
-    (tests_dir / "test_mod.py").write_text("skip", encoding="utf-8")
-    native = package_dir / f"native{importlib.machinery.EXTENSION_SUFFIXES[0]}"
-    native.write_text("", encoding="utf-8")
-
-    _copy_install_payload((source_root,), install_root)
-
-    assert (install_root / "pkg" / "__init__.py").exists()
-    assert (install_root / "pkg" / "mod.py").exists()
-    assert (install_root / "pkg" / "py.typed").exists()
-    assert (install_root / "pkg" / native.name).exists()
-    assert (install_root / "top.py").exists()
-    assert not (install_root / "pkg" / "data.txt").exists()
-    assert not (install_root / "README.md").exists()
-    assert not (install_root / "tests" / "test_mod.py").exists()
-
-
 def test_atoll_artifact_helpers_copy_artifacts_and_skip_same_file(tmp_path: Path) -> None:
     """Source-clean artifact helpers place compiled extensions under install `.atoll`."""
     source_root = tmp_path / "source"
@@ -1487,42 +1872,6 @@ def test_atoll_artifact_helpers_copy_artifacts_and_skip_same_file(tmp_path: Path
     assert copied.read_text(encoding="utf-8") == "binary"
     assert _artifact_dir(package_sidecar) == source_root / "pkg"
     assert _artifact_dir(external_sidecar) == source_root / ".atoll" / "artifacts"
-
-
-def test_wheel_writer_replaces_existing_wheel_and_records_metadata(tmp_path: Path) -> None:
-    """Wheel helper writes payload, metadata, WHEEL, and RECORD entries."""
-    install_root = tmp_path / "install"
-    package_dir = install_root / "pkg"
-    package_dir.mkdir(parents=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
-    output_dir = tmp_path / "dist"
-    metadata = _ProjectMetadata(
-        name="Demo-Project",
-        version="1.0-rc1",
-        requires_python=">=3.12",
-        dependencies=("requests>=2",),
-    )
-
-    first = _write_wheel(install_root=install_root, output_dir=output_dir, metadata=metadata)
-    second = _write_wheel(install_root=install_root, output_dir=output_dir, metadata=metadata)
-
-    assert first == second
-    with zipfile.ZipFile(second) as wheel:
-        names = set(wheel.namelist())
-        metadata_text = wheel.read("demo_project-1.0_rc1.dist-info/METADATA").decode()
-        wheel_text = wheel.read("demo_project-1.0_rc1.dist-info/WHEEL").decode()
-    assert _wheel_payload(install_root) == (
-        ("pkg/__init__.py", package_dir / "__init__.py"),
-        ("pkg/mod.py", package_dir / "mod.py"),
-    )
-    assert "pkg/mod.py" in names
-    assert "demo_project-1.0_rc1.dist-info/WHEEL" in names
-    assert "demo_project-1.0_rc1.dist-info/RECORD" in names
-    assert "Requires-Python: >=3.12" in metadata_text
-    assert "Requires-Dist: requests>=2" in metadata_text
-    assert f"Tag: {_wheel_tag()}" in wheel_text
-    assert _wheel_tag() in {str(tag) for tag in tags.sys_tags()}
 
 
 def test_project_metadata_falls_back_for_missing_or_dynamic_version(tmp_path: Path) -> None:
@@ -1587,3 +1936,29 @@ def test_package_helpers_report_missing_modules(tmp_path: Path) -> None:
             project,
             (tmp_path / "stage",),
         )
+
+
+def _quality_gate_project(
+    tmp_path: Path,
+    compile_lines: tuple[str, ...],
+) -> DiscoveredProject:
+    project_root = tmp_path / "quality-gate-project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + "\n".join(("", "[tool.atoll.compile]", *compile_lines, "")),
+        encoding="utf-8",
+    )
+    return discover_project(project_root)
+
+
+def _successful_attempt() -> CompileAttempt:
+    return CompileAttempt(
+        success=True,
+        command=("fixture",),
+        stdout="",
+        stderr="",
+        artifact_paths=(),
+        duration_seconds=0.0,
+    )

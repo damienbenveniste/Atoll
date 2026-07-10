@@ -1,4 +1,18 @@
 [project]
 name = "simple-project"
 version = "0.1.0"
+description = "Fixture metadata preserved by Atoll wheel overlays."
 requires-python = ">=3.12"
+
+[project.scripts]
+simple-project-rank = "app.ranking:normalize_features"
+
+[build-system]
+requires = ["setuptools>=69", "wheel>=0.43"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+app = ["data/*.json", "py.typed"]
