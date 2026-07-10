@@ -34,6 +34,7 @@ BackendDiagnosticCode = Literal[
 BindingKind = Literal["module", "class", "instance_method", "staticmethod", "classmethod"]
 BlockerSeverity = Literal["hard", "soft", "info"]
 CompileCacheStatus = Literal["disabled", "hit", "miss", "partial"]
+CandidateTrialStatus = Literal["accepted", "rejected", "failed-semantics", "unavailable"]
 Confidence = Literal["high", "medium", "low"]
 ConstantKind = Literal["literal_constant", "runtime_dynamic", "unknown"]
 DependencyKind = Literal[
@@ -1000,6 +1001,80 @@ class CompiledRegionVariant:
             raise ValueError("whole-callable variants cannot declare outlined native helpers")
         if len(set(self.native_helpers)) != len(self.native_helpers):
             raise ValueError("compiled region variant native helpers must be unique")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateTrial:
+    """Measured marginal-profitability decision for one compiled variant.
+
+    Candidate trials compare the previously accepted region allowlist with that
+    allowlist plus one candidate. They are diagnostic evidence only; the final
+    configured benchmark gate still decides whether a wheel is promoted.
+
+    Attributes:
+        id: Stable trial identity in profile order.
+        source_region_id: Backend-neutral source region represented by the candidate.
+        variant_id: Backend-specific compiled variant evaluated by the trial.
+        backend: Native compiler backend selected for this record.
+        lowering_mode: Whole-callable or outlined-block lowering mode.
+        symbols: Profiled source bindings represented by the candidate.
+        status: Accepted, rejected, failed-semantics, or unavailable decision.
+        reason: Concrete semantic or benchmark evidence supporting the decision.
+        marginal_speedup: Median speedup over the previously accepted set, when reliable.
+        fallback_reason: Deterministic reason a fallback backend or lowering mode was used.
+        profile_samples: Mapped project samples attributed to this candidate.
+        profile_coverage: Fraction of mapped project samples attributed to this candidate.
+        accepted_hot_coverage: Fraction of mapped project samples covered after the decision.
+        baseline_variants: Previously accepted variants used as the benchmark baseline.
+        trial_variants: Candidate combination used as the compiled benchmark side.
+        semantic_test_exit_code: Exit code from the candidate semantic test, when run.
+        semantic_test_duration_seconds: Candidate semantic-test duration, when run.
+        benchmark_status: Marginal benchmark gate status, or unavailable when not run.
+    """
+
+    id: str
+    source_region_id: str
+    variant_id: str
+    backend: Backend
+    lowering_mode: LoweringMode
+    symbols: tuple[str, ...]
+    status: CandidateTrialStatus
+    reason: str
+    marginal_speedup: float | None
+    fallback_reason: str | None
+    profile_samples: int
+    profile_coverage: float
+    accepted_hot_coverage: float
+    baseline_variants: tuple[str, ...]
+    trial_variants: tuple[str, ...]
+    semantic_test_exit_code: int | None
+    semantic_test_duration_seconds: float | None
+    benchmark_status: str
+
+    def __post_init__(self) -> None:
+        """Reject malformed trial evidence before it reaches a report.
+
+        Raises:
+            ValueError: If identities, symbols, counts, durations, coverage, or speedup evidence
+                are invalid.
+        """
+        if not self.id.strip() or not self.source_region_id.strip() or not self.variant_id.strip():
+            raise ValueError("candidate trial identities must be non-empty")
+        if not self.symbols or any(not symbol.strip() for symbol in self.symbols):
+            raise ValueError("candidate trial symbols must be non-empty")
+        if self.profile_samples < 0:
+            raise ValueError("candidate trial profile samples must be non-negative")
+        if not 0.0 <= self.profile_coverage <= 1.0:
+            raise ValueError("candidate trial profile coverage must be between 0 and 1")
+        if not 0.0 <= self.accepted_hot_coverage <= 1.0:
+            raise ValueError("candidate trial accepted coverage must be between 0 and 1")
+        if (
+            self.semantic_test_duration_seconds is not None
+            and self.semantic_test_duration_seconds < 0
+        ):
+            raise ValueError("candidate semantic-test duration must be non-negative")
+        if self.marginal_speedup is not None and self.marginal_speedup <= 0:
+            raise ValueError("candidate marginal speedup must be positive")
 
 
 @dataclass(frozen=True, slots=True)

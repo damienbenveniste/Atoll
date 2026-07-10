@@ -55,6 +55,7 @@ def test_run_performance_command_sets_child_env_without_mutating_parent(
     monkeypatch.setenv("PYTHONPATH", "existing")
     monkeypatch.setenv("ATOLL_DISABLE", "parent-disable")
     monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "parent-require")
+    monkeypatch.setenv("ATOLL_REGION_ALLOWLIST", "parent-region")
     monkeypatch.setattr(performance, "_perf_counter", _clock([1.5]))
 
     def fake_run(
@@ -95,12 +96,80 @@ def test_run_performance_command_sets_child_env_without_mutating_parent(
     assert child_env["PYTHONPATH"] == f"{(tmp_path / 'payload').resolve()}{os.pathsep}existing"
     assert child_env["ATOLL_REQUIRE_COMPILED"] == "1"
     assert "ATOLL_DISABLE" not in child_env
+    assert "ATOLL_REGION_ALLOWLIST" not in child_env
     assert os.environ["ATOLL_DISABLE"] == "parent-disable"
     assert os.environ["ATOLL_REQUIRE_COMPILED"] == "parent-require"
+    assert os.environ["ATOLL_REGION_ALLOWLIST"] == "parent-region"
     assert evidence.returncode == 0
     assert evidence.stdout == "out"
     assert evidence.stderr == "err"
     assert evidence.duration_seconds == pytest.approx(1.5)
+
+
+def test_run_performance_command_transports_sorted_region_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Region allowlists force compiled transport without mutating parent state."""
+    captured_env: dict[str, str] = {}
+    monkeypatch.setenv("ATOLL_DISABLE", "parent-disable")
+    monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "parent-require")
+    monkeypatch.setenv("ATOLL_REGION_ALLOWLIST", "parent-region")
+    monkeypatch.setattr(performance, "_perf_counter", _clock([0.5]))
+
+    def fake_run(
+        invocation: SubprocessInvocationView,
+    ) -> subprocess.CompletedProcess[str]:
+        captured_env.update(invocation.env)
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(performance, "_run_subprocess", fake_run)
+
+    run_performance_command(
+        ("python", "bench.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path / "payload",
+        mode="baseline",
+        region_allowlist=frozenset(("region-b", "region-a")),
+    )
+
+    assert "ATOLL_DISABLE" not in captured_env
+    assert captured_env["ATOLL_REQUIRE_COMPILED"] == "1"
+    assert captured_env["ATOLL_REGION_ALLOWLIST"] == "region-a\nregion-b"
+    assert os.environ["ATOLL_DISABLE"] == "parent-disable"
+    assert os.environ["ATOLL_REQUIRE_COMPILED"] == "parent-require"
+    assert os.environ["ATOLL_REGION_ALLOWLIST"] == "parent-region"
+
+
+def test_run_performance_command_transports_empty_region_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty allowlist is explicit and distinct from omitting the allowlist."""
+    captured_env: dict[str, str] = {}
+    monkeypatch.setenv("ATOLL_DISABLE", "parent-disable")
+    monkeypatch.setenv("ATOLL_REGION_ALLOWLIST", "parent-region")
+    monkeypatch.setattr(performance, "_perf_counter", _clock([0.5]))
+
+    def fake_run(
+        invocation: SubprocessInvocationView,
+    ) -> subprocess.CompletedProcess[str]:
+        captured_env.update(invocation.env)
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(performance, "_run_subprocess", fake_run)
+
+    run_performance_command(
+        ("python", "bench.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path / "payload",
+        mode="compiled",
+        region_allowlist=frozenset(),
+    )
+
+    assert "ATOLL_DISABLE" not in captured_env
+    assert captured_env["ATOLL_REQUIRE_COMPILED"] == "1"
+    assert captured_env["ATOLL_REGION_ALLOWLIST"] == ""
 
 
 def test_baseline_command_sets_disable_and_clears_require_compiled(
@@ -128,6 +197,46 @@ def test_baseline_command_sets_disable_and_clears_require_compiled(
 
     assert captured_env["ATOLL_DISABLE"] == "1"
     assert "ATOLL_REQUIRE_COMPILED" not in captured_env
+
+
+def test_benchmark_gate_passes_distinct_region_allowlists_to_each_side(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(performance, "_perf_counter", _clock([1.0, 1.0, 1.0, 1.0]))
+
+    def fake_run(
+        invocation: SubprocessInvocationView,
+    ) -> subprocess.CompletedProcess[str]:
+        allowlist = invocation.env["ATOLL_REGION_ALLOWLIST"]
+        require_compiled = invocation.env["ATOLL_REQUIRE_COMPILED"]
+        captured.append((str(invocation.cwd), require_compiled, allowlist))
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(performance, "_run_subprocess", fake_run)
+
+    result = run_benchmark_gate(
+        BenchmarkGateConfig(
+            command=("python", "bench.py"),
+            warmups=0,
+            samples=2,
+            minimum_speedup=1.0,
+        ),
+        project_root=tmp_path,
+        baseline_payload_root=tmp_path / "baseline",
+        compiled_payload_root=tmp_path / "compiled",
+        baseline_region_allowlist=frozenset(("baseline-b", "baseline-a")),
+        compiled_region_allowlist=frozenset(("compiled-a",)),
+    )
+
+    assert result.status == "passed"
+    assert captured == [
+        (str(tmp_path.resolve()), "1", "baseline-a\nbaseline-b"),
+        (str(tmp_path.resolve()), "1", "compiled-a"),
+        (str(tmp_path.resolve()), "1", "compiled-a"),
+        (str(tmp_path.resolve()), "1", "baseline-a\nbaseline-b"),
+    ]
 
 
 def test_benchmark_gate_runs_warmups_then_alternating_sample_pairs_and_medians(
@@ -244,6 +353,32 @@ def test_benchmark_gate_rejects_speedup_below_threshold(
     assert result.compiled_median_seconds == pytest.approx(0.85)
     assert result.speedup == pytest.approx(1.05 / 0.85)
     assert "below threshold" in result.reason
+
+
+def test_benchmark_gate_accepts_exact_marginal_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate meeting the 1.01 marginal threshold is retained."""
+    monkeypatch.setattr(performance, "_perf_counter", _clock([1.01, 1.0]))
+    monkeypatch.setattr(performance, "_run_subprocess", _successful_run)
+
+    result = run_benchmark_gate(
+        BenchmarkGateConfig(
+            command=("python", "bench.py"),
+            warmups=0,
+            samples=1,
+            minimum_speedup=1.01,
+        ),
+        project_root=tmp_path,
+        baseline_payload_root=tmp_path / "payload",
+        compiled_payload_root=tmp_path / "payload",
+        baseline_region_allowlist=frozenset(),
+        compiled_region_allowlist=frozenset({"candidate"}),
+    )
+
+    assert result.status == "passed"
+    assert result.speedup == pytest.approx(1.01)
 
 
 def test_benchmark_gate_marks_nonzero_subprocess_exit_invalid(

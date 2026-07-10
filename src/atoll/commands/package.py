@@ -12,6 +12,7 @@ import tomllib
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -28,7 +29,11 @@ from atoll.generation.outlined_region import (
     OUTLINED_REGION_GENERATOR_VERSION,
     generate_outlined_region,
 )
-from atoll.generation.region_shim import RegionShimConfig, insert_or_replace_region_shim
+from atoll.generation.region_shim import (
+    RegionShimConfig,
+    insert_or_replace_region_shim,
+    remove_region_shim,
+)
 from atoll.generation.typed_region import (
     TYPED_METHOD_GENERATOR_VERSION,
     TypedRegionGeneration,
@@ -44,6 +49,8 @@ from atoll.models import (
     BackendLoweringRequest,
     BindingTarget,
     Blocker,
+    CandidateTrial,
+    CandidateTrialStatus,
     CompilationUnit,
     CompileAttempt,
     CompileCacheStatus,
@@ -95,6 +102,10 @@ _COMPILER_BACKENDS: dict[Backend, CompilerBackend] = {
     "mypyc": MYPYC_BACKEND,
     "cython": CYTHON_BACKEND,
 }
+
+_CANDIDATE_BENCHMARK_WARMUPS = 1
+_CANDIDATE_BENCHMARK_SAMPLES = 3
+_CANDIDATE_MINIMUM_SPEEDUP = 1.01
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -188,6 +199,7 @@ class PackageCommandResult:
         test_results: Target-project command evidence used by quality gates.
         performance: Paired performance-gate evidence.
         profile: Unmeasured baseline profile and hot-candidate selection evidence.
+        candidate_trials: Greedy marginal-profitability decisions in profile order.
     """
 
     success: bool
@@ -216,6 +228,7 @@ class PackageCommandResult:
     test_results: tuple[CommandRunEvidence, ...] = ()
     performance: BenchmarkGateResult | None = None
     profile: ProfileResult | None = None
+    candidate_trials: tuple[CandidateTrial, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +351,7 @@ class _PreparedTypedRegion:
         conditional_on_failure_of: Preferred variant that must fail before this fallback runs.
         lowering_mode: Whether the compiled target owns the whole callable or native blocks.
         native_helpers: Private native helper names used by an outlined Python shell.
+        fallback_reason: Ordered deterministic backend failures preceding this successful variant.
     """
 
     generation: TypedRegionGeneration
@@ -348,6 +362,7 @@ class _PreparedTypedRegion:
     conditional_on_failure_of: str | None = None
     lowering_mode: LoweringMode = "whole-callable"
     native_helpers: tuple[str, ...] = ()
+    fallback_reason: str | None = None
 
     def __post_init__(self) -> None:
         """Require outlined variants to identify every native helper.
@@ -484,6 +499,7 @@ class _SourceCleanPromotionContext:
         baseline: Baseline wheel build evidence.
         verification_plan: Expected modules, regions, and artifacts for isolated verification.
         build: Captured native compilation attempt.
+        requires_native_artifact: Whether profile-guided selection must retain at least one region.
     """
 
     options: PackageOptions
@@ -494,6 +510,7 @@ class _SourceCleanPromotionContext:
     baseline: _BaselineWheelPayload
     verification_plan: PackageVerificationPlan
     build: CompileAttempt
+    requires_native_artifact: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,6 +572,109 @@ class _ProfilePreparation:
     baseline: _BaselineWheelPayload | None = None
     profile: ProfileResult | None = None
     failure: PackageCommandResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfitabilityCandidate:
+    """Compiled variant plus profile evidence used by greedy selection.
+
+    Attributes:
+        prepared: Successfully compiled variant available in the superset payload.
+        symbols: Profiled public bindings represented by the candidate.
+        profile_samples: Mapped project samples attributed to the candidate.
+        profile_coverage: Fraction of mapped project samples attributed to the candidate.
+        fallback_reason: Deterministic compiler rejection that selected a fallback variant.
+    """
+
+    prepared: _PreparedTypedRegion
+    symbols: tuple[str, ...]
+    profile_samples: int
+    profile_coverage: float
+    fallback_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfitabilitySelectionOutcome:
+    """Accepted variants and diagnostic timings from greedy candidate trials.
+
+    Attributes:
+        accepted: Successful variants retained in the final payload.
+        trials: Marginal semantic and benchmark decisions in profile order.
+        timings: Command timings appended to the overall compile attempt.
+    """
+
+    accepted: tuple[_PreparedTypedRegion, ...]
+    trials: tuple[CandidateTrial, ...] = ()
+    timings: tuple[CompilePhaseTiming, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfitabilitySelectionContext:
+    """Inputs required to evaluate compiled candidates without rebuilding them.
+
+    Attributes:
+        successful: Successfully compiled variants available in the superset payload.
+        skipped: Backend failures that may explain fallback selection.
+        profile: Baseline profile supplying candidate order and sample attribution.
+        project: Discovered target project configuration and modules.
+        baseline: Baseline wheel and source-stripped quality-project evidence.
+        payload_root: Superset staged payload controlled by the internal allowlist.
+        progress: Optional progress callback for long-running trials.
+    """
+
+    successful: tuple[_PreparedTypedRegion, ...]
+    skipped: tuple[PackageRegionBuildFailure, ...]
+    profile: ProfileResult
+    project: DiscoveredProject
+    baseline: _BaselineWheelPayload
+    payload_root: Path
+    progress: PackageProgress | None
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedPayloadFinalizationContext:
+    """Superset payload state needed to apply profile profitability decisions.
+
+    Attributes:
+        options: Validated command or generation options.
+        project: Discovered target project configuration and modules.
+        profile: Dynamic profile used for candidate order, when available.
+        baseline: Immutable interpreted payload used to rebuild the final install tree.
+        install_root: Superset payload evaluated by candidate trials.
+        staged_source_roots: Copied source roots containing shims and artifacts.
+        outcome: Native build results for every successfully compiled candidate.
+        overlay_error: Failure from staging the candidate superset, when present.
+    """
+
+    options: PackageOptions
+    project: DiscoveredProject
+    profile: ProfileResult | None
+    baseline: _BaselineWheelPayload
+    install_root: Path
+    staged_source_roots: tuple[Path, ...]
+    outcome: _TypedRegionBuildOutcome
+    overlay_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedPayloadFinalizationResult:
+    """Accepted payload subset and evidence passed to final promotion.
+
+    Attributes:
+        successful: Variants retained in the final staged payload.
+        artifacts: Native artifact records reachable from retained variants.
+        build: Build evidence including candidate semantic and benchmark timings.
+        trials: Greedy marginal-profitability decisions.
+        overlay_error: Failure rebuilding the accepted payload, when present.
+        profitability_applied: Whether dynamic candidate selection owned the final subset.
+    """
+
+    successful: tuple[_PreparedTypedRegion, ...]
+    artifacts: tuple[ArtifactRecord, ...]
+    build: CompileAttempt
+    trials: tuple[CandidateTrial, ...]
+    overlay_error: str | None
+    profitability_applied: bool
 
 
 def execute_package(options: PackageOptions) -> PackageCommandResult:
@@ -869,25 +989,32 @@ def _execute_typed_region_package(
 
     payload_started = time.perf_counter()
     _progress(options.progress, "binding compiled classes and callables in staged modules")
-    successful_shims = tuple(item.shim for item in outcome.successful)
-    _insert_region_shims(successful_shims)
-    _place_region_artifacts(
-        successful_shims,
-        outcome.build.artifact_paths,
-        outcome.artifacts,
-    )
-    report_artifact_paths = _source_clean_region_report_artifact_paths(
-        project.config.root,
-        outcome.artifacts,
-    )
-    for path in _prepared_source_paths(tuple(prepared)):
-        path.unlink(missing_ok=True)
-    overlay_error = _overlay_install_payload(
+    overlay_error = _stage_compiled_superset(
+        outcome,
+        tuple(prepared),
         staged_source_roots,
         install_root,
-        tuple(config.source_path for config in successful_shims),
     )
-    verification_plan = _typed_verification_plan(successful_shims, outcome.artifacts)
+    finalized = _finalize_typed_payload(
+        _TypedPayloadFinalizationContext(
+            options=options,
+            project=project,
+            profile=profile,
+            baseline=baseline,
+            install_root=install_root,
+            staged_source_roots=staged_source_roots,
+            outcome=outcome,
+            overlay_error=overlay_error,
+        )
+    )
+    accepted_successful = finalized.successful
+    accepted_shims = tuple(item.shim for item in accepted_successful)
+    accepted_artifacts = finalized.artifacts
+    report_artifact_paths = _source_clean_region_report_artifact_paths(
+        project.config.root,
+        accepted_artifacts,
+    )
+    verification_plan = _typed_verification_plan(accepted_shims, accepted_artifacts)
     promotion_context = _SourceCleanPromotionContext(
         options=options,
         project=project,
@@ -896,23 +1023,31 @@ def _execute_typed_region_package(
         install_root=install_root,
         baseline=baseline,
         verification_plan=verification_plan,
-        build=outcome.build,
+        build=finalized.build,
+        requires_native_artifact=finalized.profitability_applied,
     )
-    if overlay_error is None:
+    if finalized.overlay_error is None:
         _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
         promotion = _promote_source_clean_payload(promotion_context)
     else:
         promotion = _failed_promotion(
             promotion_context,
             _SourceCleanPromotionFailure(
-                build=replace(outcome.build, success=False, stderr=overlay_error),
+                build=replace(
+                    finalized.build,
+                    success=False,
+                    stderr=finalized.overlay_error,
+                ),
                 verification_steps=(),
-                error=overlay_error,
+                error=finalized.overlay_error,
             ),
         )
     cache_statuses = dict(outcome.cache_statuses)
     successful_regions = tuple(
-        {item.generation.region.id: item.generation.region for item in outcome.successful}.values()
+        {item.generation.region.id: item.generation.region for item in accepted_successful}.values()
+    )
+    successful_bindings = tuple(
+        binding for item in accepted_successful for binding in item.generation.bindings
     )
     successful_variants = tuple(
         CompiledRegionVariant(
@@ -924,7 +1059,7 @@ def _execute_typed_region_package(
             lowering_mode=item.lowering_mode,
             native_helpers=item.native_helpers,
         )
-        for item in outcome.successful
+        for item in accepted_successful
     )
     return PackageCommandResult(
         success=promotion.success,
@@ -946,12 +1081,13 @@ def _execute_typed_region_package(
         compiled_bindings=successful_bindings,
         compiled_variants=successful_variants,
         backend_assessments=prepared_assessments,
-        artifact_records=outcome.artifacts,
+        artifact_records=accepted_artifacts,
         region_skipped=outcome.skipped,
         verification_steps=promotion.verification_steps,
         test_results=promotion.test_results,
         performance=promotion.performance,
         profile=profile,
+        candidate_trials=finalized.trials,
     )
 
 
@@ -1324,7 +1460,7 @@ def _build_typed_regions(
             )
             continue
         candidate = item
-        rejected_attempts: list[CompileAttempt] = []
+        rejected_attempts: list[tuple[_PreparedTypedRegion, CompileAttempt]] = []
         while True:
             _progress(
                 context.progress,
@@ -1353,10 +1489,15 @@ def _build_typed_regions(
             if result.attempt.success:
                 attempts.extend(
                     _recovered_backend_attempt(attempt, candidate.unit.region_id)
-                    for attempt in rejected_attempts
+                    for _rejected, attempt in rejected_attempts
                 )
                 attempts.append(tagged_attempt)
-                successful.append(candidate)
+                successful.append(
+                    replace(
+                        candidate,
+                        fallback_reason=_fallback_attempt_reason(tuple(rejected_attempts)),
+                    )
+                )
                 artifacts.extend(result.artifacts)
                 cache_statuses.append((candidate.unit.region_id, result.attempt.cache_status))
                 successful_promises.add(item.unit.region_id)
@@ -1370,7 +1511,7 @@ def _build_typed_regions(
                 break
             fallback = candidate.fallback
             if fallback is not None and _should_retry_with_fallback(candidate, result):
-                rejected_attempts.append(tagged_attempt)
+                rejected_attempts.append((candidate, tagged_attempt))
                 _progress(
                     context.progress,
                     (
@@ -1381,7 +1522,7 @@ def _build_typed_regions(
                 )
                 candidate = fallback
                 continue
-            attempts.extend(rejected_attempts)
+            attempts.extend(attempt for _rejected, attempt in rejected_attempts)
             attempts.append(tagged_attempt)
             skipped.append(
                 PackageRegionBuildFailure(
@@ -1548,6 +1689,35 @@ def _failed_region_attempt(error: str) -> CompileAttempt:
     )
 
 
+def _stage_compiled_superset(
+    outcome: _TypedRegionBuildOutcome,
+    prepared: tuple[_PreparedTypedRegion, ...],
+    staged_source_roots: tuple[Path, ...],
+    install_root: Path,
+) -> str | None:
+    """Overlay every successful candidate before allowlist-driven trials.
+
+    Args:
+        outcome: Successful native variants, artifacts, and build evidence.
+        prepared: Generated units whose temporary source files must be removed.
+        staged_source_roots: Copied source roots containing staged wheel inputs.
+        install_root: Baseline payload receiving superset shims and artifacts.
+
+    Returns:
+        str | None: Normalized overlay failure text, or `None` on success.
+    """
+    shims = tuple(item.shim for item in outcome.successful)
+    _insert_region_shims(shims)
+    _place_region_artifacts(shims, outcome.build.artifact_paths, outcome.artifacts)
+    for path in _prepared_source_paths(prepared):
+        path.unlink(missing_ok=True)
+    return _overlay_install_payload(
+        staged_source_roots,
+        install_root,
+        tuple(config.source_path for config in shims),
+    )
+
+
 def _insert_region_shims(configs: tuple[RegionShimConfig, ...]) -> None:
     configs_by_path: dict[Path, list[RegionShimConfig]] = {}
     for config in configs:
@@ -1608,6 +1778,105 @@ def _source_clean_region_report_artifact_paths(
         root / PurePosixPath(path)
         for path in dict.fromkeys(record.install_relative_path for record in artifact_records)
     )
+
+
+def _artifact_records_for_prepared(
+    prepared: tuple[_PreparedTypedRegion, ...],
+    artifact_records: tuple[ArtifactRecord, ...],
+) -> tuple[ArtifactRecord, ...]:
+    """Return primary and colocated support artifacts for retained variants.
+
+    Args:
+        prepared: Compiled variants retained in the final staged payload.
+        artifact_records: Artifact records produced by the superset native build.
+
+    Returns:
+        tuple[ArtifactRecord, ...]: Records reachable from the retained variant directories.
+    """
+    accepted_ids = frozenset(item.unit.region_id for item in prepared)
+    accepted_directories = frozenset(item.shim.artifact_dir.name for item in prepared)
+    return tuple(
+        record
+        for record in artifact_records
+        if record.region_id in accepted_ids
+        or (
+            record.region_id == "__shared__"
+            and PurePosixPath(record.install_relative_path).parent.name in accepted_directories
+        )
+    )
+
+
+def _materialize_profitable_payload(
+    *,
+    baseline: _BaselineWheelPayload,
+    staged_source_roots: tuple[Path, ...],
+    install_root: Path,
+    superset: tuple[_PreparedTypedRegion, ...],
+    accepted: tuple[_PreparedTypedRegion, ...],
+) -> str | None:
+    """Rebuild the install payload from baseline with only profitable variants.
+
+    Candidate trials run against a superset payload controlled by an internal
+    allowlist. Before final verification, this function restores the immutable
+    baseline wheel payload, rewrites staged shims to the accepted subset, removes
+    rejected native directories, and overlays only the retained files.
+
+    Args:
+        baseline: Immutable interpreted payload prepared before profiling.
+        staged_source_roots: Copied source roots containing generated shims and artifacts.
+        install_root: Temporary payload rebuilt for final wheel promotion.
+        superset: Every successfully compiled candidate present during trials.
+        accepted: Marginally profitable variants retained for the final gate.
+
+    Returns:
+        str | None: Normalized materialization failure text, or `None` on success.
+    """
+    baseline_root = baseline.baseline_install_root
+    if baseline_root is None:
+        return "profile-guided payload cannot be rebuilt without a baseline payload"
+    accepted_ids = frozenset(item.unit.region_id for item in accepted)
+    try:
+        _rewrite_region_shims(superset, accepted_ids)
+        accepted_artifact_dirs = frozenset(item.shim.artifact_dir.resolve() for item in accepted)
+        for item in superset:
+            artifact_dir = item.shim.artifact_dir.resolve()
+            if artifact_dir not in accepted_artifact_dirs:
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+        _reset_dir(install_root)
+        shutil.copytree(baseline_root, install_root, dirs_exist_ok=True)
+        source_paths = tuple(dict.fromkeys(item.shim.source_path for item in accepted))
+        _overlay_staged_sources(staged_source_roots, install_root, source_paths)
+        _copy_atoll_artifacts(staged_source_roots, install_root)
+    except (OSError, ValueError) as error:
+        return f"profitable payload materialization failed: {error}"
+    return None
+
+
+def _rewrite_region_shims(
+    superset: tuple[_PreparedTypedRegion, ...],
+    accepted_ids: frozenset[str],
+) -> None:
+    """Replace superset staged shims with the accepted candidate subset.
+
+    Args:
+        superset: Every successfully compiled candidate present during trials.
+        accepted_ids: Variant IDs retained by greedy selection.
+    """
+    by_path: dict[Path, list[RegionShimConfig]] = {}
+    for item in superset:
+        by_path.setdefault(item.shim.source_path, []).append(item.shim)
+    for source_path, configs in by_path.items():
+        source_text = source_path.read_text(encoding="utf-8")
+        accepted = tuple(config for config in configs if config.region_id in accepted_ids)
+        if accepted:
+            updated = insert_or_replace_region_shim(source_text, accepted).new_text
+        else:
+            updated = remove_region_shim(
+                source_text,
+                source_module=configs[0].source_module,
+                filename=source_path.name,
+            ).new_text
+        source_path.write_text(updated, encoding="utf-8")
 
 
 def _typed_region_module_name(
@@ -2303,6 +2572,27 @@ def _append_phase_timing(
     )
 
 
+def _append_phase_timings(
+    attempt: CompileAttempt,
+    timings: tuple[CompilePhaseTiming, ...],
+) -> CompileAttempt:
+    """Append a batch of measured phases to one compile attempt.
+
+    Args:
+        attempt: Existing native build and packaging evidence.
+        timings: Additional semantic or benchmark phases to retain.
+
+    Returns:
+        CompileAttempt: Build evidence with cumulative duration and ordered phases.
+    """
+    return replace(
+        attempt,
+        duration_seconds=attempt.duration_seconds
+        + sum(timing.duration_seconds for timing in timings),
+        phase_timings=(*attempt.phase_timings, *timings),
+    )
+
+
 def _promote_source_clean_payload(
     context: _SourceCleanPromotionContext,
 ) -> _SourceCleanPromotionResult:
@@ -2336,12 +2626,14 @@ def _promote_source_clean_payload(
         )
 
     wheel_started = time.perf_counter()
-    _progress(context.options.progress, f"writing wheel to {context.output_dir}")
+    candidate_output = context.build_root / "candidate-dist"
+    _reset_dir(candidate_output)
+    _progress(context.options.progress, "writing wheel candidate for verification")
     try:
         wheel_path = repack_overlaid_wheel(
             baseline_wheel_path=baseline_wheel_path,
             payload_dir=context.install_root,
-            output_dir=context.output_dir,
+            output_dir=candidate_output,
             platform_tag=_wheel_tag(),
         )
     except (OSError, WheelOverlayError, zipfile.BadZipFile) as error:
@@ -2392,16 +2684,42 @@ def _promote_source_clean_payload(
         else _skipped_quality_gate(context.project.config.compile.minimum_speedup)
     )
     build = _append_quality_gate_timings(build, quality_gate)
-    if not quality_gate.success:
-        return _failed_promotion(
-            context,
-            _SourceCleanPromotionFailure(
+    promotion_failure = _quality_gate_promotion_failure(
+        context,
+        build,
+        verification_steps,
+        wheel_path,
+        quality_gate,
+    )
+    if promotion_failure is None:
+        promotion_started = time.perf_counter()
+        promoted_wheel = context.output_dir / wheel_path.name
+        try:
+            context.output_dir.mkdir(parents=True, exist_ok=True)
+            wheel_path.replace(promoted_wheel)
+        except OSError as error:
+            promotion_failure = _SourceCleanPromotionFailure(
                 build=build,
                 verification_steps=verification_steps,
-                error=quality_gate.error,
+                error=f"verified wheel promotion failed: {error}",
                 wheel_path=wheel_path,
                 quality_gate=quality_gate,
-            ),
+            )
+        else:
+            build = _append_phase_timing(
+                build,
+                name="wheel_promote",
+                duration_seconds=time.perf_counter() - promotion_started,
+                detail=promoted_wheel.name,
+            )
+            wheel_verification = replace(wheel_verification, target=promoted_wheel)
+            verification_steps = (payload_verification, wheel_verification)
+            wheel_path = promoted_wheel
+            _progress(context.options.progress, f"promoted verified wheel to {wheel_path}")
+    if promotion_failure is not None:
+        return _failed_promotion(
+            context,
+            promotion_failure,
         )
 
     cleanup_started = time.perf_counter()
@@ -2430,11 +2748,46 @@ def _promote_source_clean_payload(
     )
 
 
+def _quality_gate_promotion_failure(
+    context: _SourceCleanPromotionContext,
+    build: CompileAttempt,
+    verification_steps: tuple[PackageVerificationResult, ...],
+    wheel_path: Path,
+    quality_gate: _QualityGateOutcome,
+) -> _SourceCleanPromotionFailure | None:
+    """Normalize final-gate and empty-profile rejection before wheel publication.
+
+    Args:
+        context: Final source-clean promotion boundaries.
+        build: Build evidence including final quality-gate timings.
+        verification_steps: Successful payload and candidate-wheel verification.
+        wheel_path: Verified candidate wheel still under temporary build storage.
+        quality_gate: Final semantic and configured benchmark decision.
+
+    Returns:
+        _SourceCleanPromotionFailure | None: Promotion failure, or `None` when publication may run.
+    """
+    if not quality_gate.success:
+        error = quality_gate.error
+    elif context.requires_native_artifact and not context.verification_plan.artifacts:
+        error = "no profile-guided candidate met the 1.01x marginal speedup threshold"
+    else:
+        return None
+    return _SourceCleanPromotionFailure(
+        build=build,
+        verification_steps=verification_steps,
+        error=error,
+        wheel_path=wheel_path,
+        quality_gate=quality_gate,
+    )
+
+
 def _failed_promotion(
     context: _SourceCleanPromotionContext,
     failure: _SourceCleanPromotionFailure,
 ) -> _SourceCleanPromotionResult:
     verification_steps = failure.verification_steps
+    _remove_failed_wheels(context.project, context.output_dir)
     if failure.wheel_path is not None:
         retained_wheel = _retain_failed_wheel(context.build_root, failure.wheel_path)
         if retained_wheel is not None:
@@ -2444,8 +2797,6 @@ def _failed_promotion(
                 else step
                 for step in verification_steps
             )
-    else:
-        _remove_failed_wheels(context.project, context.output_dir)
     return _SourceCleanPromotionResult(
         success=False,
         wheel_path=None,
@@ -2482,6 +2833,449 @@ def _retain_failed_wheel(build_root: Path, wheel_path: Path) -> Path | None:
         wheel_path.unlink(missing_ok=True)
         return None
     return retained
+
+
+def _finalize_typed_payload(
+    context: _TypedPayloadFinalizationContext,
+) -> _TypedPayloadFinalizationResult:
+    """Apply greedy selection and rebuild the accepted payload when configured.
+
+    Args:
+        context: Candidate superset, profile, baseline, and staging boundaries.
+
+    Returns:
+        _TypedPayloadFinalizationResult: Accepted variants and final overlay evidence.
+    """
+    profitability = _ProfitabilitySelectionOutcome(accepted=context.outcome.successful)
+    overlay_error = context.overlay_error
+    profile = context.profile
+    build = context.outcome.build
+    profitability_applied = profile is not None and _profile_profitability_enabled(
+        context.options, context.project, profile
+    )
+    if overlay_error is None and profile is not None and profitability_applied:
+        profitability = _select_profitable_candidates(
+            _ProfitabilitySelectionContext(
+                successful=context.outcome.successful,
+                skipped=context.outcome.skipped,
+                profile=profile,
+                project=context.project,
+                baseline=context.baseline,
+                payload_root=context.install_root,
+                progress=context.options.progress,
+            )
+        )
+        build = _append_phase_timings(build, profitability.timings)
+        overlay_error = _materialize_profitable_payload(
+            baseline=context.baseline,
+            staged_source_roots=context.staged_source_roots,
+            install_root=context.install_root,
+            superset=context.outcome.successful,
+            accepted=profitability.accepted,
+        )
+    artifacts = _artifact_records_for_prepared(
+        profitability.accepted,
+        context.outcome.artifacts,
+    )
+    return _TypedPayloadFinalizationResult(
+        successful=profitability.accepted,
+        artifacts=artifacts,
+        build=build,
+        trials=profitability.trials,
+        overlay_error=overlay_error,
+        profitability_applied=profitability_applied,
+    )
+
+
+def _profile_profitability_enabled(
+    options: PackageOptions,
+    project: DiscoveredProject,
+    profile: ProfileResult | None,
+) -> bool:
+    """Return whether this invocation has an ordered dynamic candidate set.
+
+    Explicit member requests and unsupported profiling launchers retain static
+    all-at-once behavior. Their configured full benchmark still gates wheel
+    promotion, but Atoll does not invent a greedy order without profile evidence.
+
+    Args:
+        options: Validated command or generation options.
+        project: Discovered target project configuration and modules.
+        profile: Dynamic baseline profile, when configured and supported.
+
+    Returns:
+        bool: Whether marginal candidate selection should run.
+    """
+    return (
+        options.run_quality_gates
+        and not options.selected_members
+        and project.config.compile.benchmark_command is not None
+        and profile is not None
+        and profile.status == "profiled"
+        and bool(profile.selected_symbols)
+    )
+
+
+def _select_profitable_candidates(
+    context: _ProfitabilitySelectionContext,
+) -> _ProfitabilitySelectionOutcome:
+    """Greedily retain profile-ordered variants with measurable marginal value.
+
+    Each trial runs the semantic command once with the candidate combination,
+    then compares the currently accepted allowlist with that combination using
+    one warmup and three alternating benchmark pairs. Candidate decisions never
+    promote a wheel; the configured full benchmark remains the only performance
+    promotion gate.
+
+    Args:
+        context: Compiled candidates, profile, baseline, and subprocess boundaries.
+
+    Returns:
+        _ProfitabilitySelectionOutcome: Accepted variants, decisions, and command timings.
+    """
+    candidates = _profiled_profitability_candidates(
+        context.successful,
+        context.skipped,
+        context.profile,
+    )
+    test_command = context.project.config.compile.test_command
+    benchmark_command = context.project.config.compile.benchmark_command
+    quality_root = context.baseline.quality_project_root
+    if test_command is None or benchmark_command is None or quality_root is None:
+        reason = "candidate selection prerequisites are unavailable"
+        return _unavailable_candidate_selection(candidates, reason)
+
+    accepted: list[_PreparedTypedRegion] = []
+    accepted_symbols: set[str] = set()
+    profile_samples = {
+        member.symbol.stable_id: member.samples for member in context.profile.members
+    }
+    trials: list[CandidateTrial] = []
+    timings: list[CompilePhaseTiming] = []
+    candidate_count = len(candidates)
+    for index, candidate in enumerate(candidates, start=1):
+        prepared = candidate.prepared
+        variant_id = prepared.unit.region_id
+        baseline_ids = tuple(item.unit.region_id for item in accepted)
+        trial_ids = (*baseline_ids, variant_id)
+        _progress(
+            context.progress,
+            f"candidate {index}/{candidate_count} testing {variant_id} semantics",
+        )
+        semantic = run_performance_command(
+            test_command,
+            project_root=quality_root,
+            payload_root=context.payload_root,
+            mode="compiled",
+            region_allowlist=frozenset(trial_ids),
+        )
+        timings.append(
+            CompilePhaseTiming(
+                name="candidate_semantic_test",
+                duration_seconds=semantic.duration_seconds,
+                detail=f"{variant_id}; exit {semantic.returncode}",
+            )
+        )
+        if not semantic.succeeded:
+            status: CandidateTrialStatus = "failed-semantics"
+            reason = _command_failure_summary(semantic, "candidate semantic test failed")
+            benchmark_status = "not-run"
+            marginal_speedup = None
+        else:
+            _progress(
+                context.progress,
+                (
+                    f"candidate {index}/{candidate_count} benchmarking {variant_id} "
+                    f"against {len(baseline_ids)} accepted variant(s)"
+                ),
+            )
+
+            benchmark = run_benchmark_gate(
+                BenchmarkGateConfig(
+                    command=benchmark_command,
+                    warmups=_CANDIDATE_BENCHMARK_WARMUPS,
+                    samples=_CANDIDATE_BENCHMARK_SAMPLES,
+                    minimum_speedup=_CANDIDATE_MINIMUM_SPEEDUP,
+                ),
+                project_root=quality_root,
+                baseline_payload_root=context.payload_root,
+                compiled_payload_root=context.payload_root,
+                baseline_region_allowlist=frozenset(baseline_ids),
+                compiled_region_allowlist=frozenset(trial_ids),
+                progress=partial(_candidate_benchmark_progress, context.progress, variant_id),
+            )
+            timings.extend(_candidate_benchmark_timings(variant_id, benchmark))
+            benchmark_status = benchmark.status
+            marginal_speedup = benchmark.speedup
+            reason = benchmark.reason
+            if benchmark.status == "passed":
+                status = "accepted"
+                accepted.append(prepared)
+                accepted_symbols.update(candidate.symbols)
+            elif benchmark.status == "not-profitable":
+                status = "rejected"
+            else:
+                status = "unavailable"
+        accepted_coverage = _sample_coverage(
+            sum(profile_samples.get(symbol, 0) for symbol in accepted_symbols),
+            context.profile.mapped_project_samples,
+        )
+        trials.append(
+            CandidateTrial(
+                id=f"{index:02d}:{variant_id}",
+                source_region_id=prepared.generation.region.id,
+                variant_id=variant_id,
+                backend=prepared.generation.backend,
+                lowering_mode=prepared.lowering_mode,
+                symbols=candidate.symbols,
+                status=status,
+                reason=reason,
+                marginal_speedup=marginal_speedup,
+                fallback_reason=candidate.fallback_reason,
+                profile_samples=candidate.profile_samples,
+                profile_coverage=candidate.profile_coverage,
+                accepted_hot_coverage=accepted_coverage,
+                baseline_variants=baseline_ids,
+                trial_variants=trial_ids,
+                semantic_test_exit_code=semantic.returncode,
+                semantic_test_duration_seconds=semantic.duration_seconds,
+                benchmark_status=benchmark_status,
+            )
+        )
+        _progress(
+            context.progress,
+            (
+                f"candidate {index}/{candidate_count} {status}: {variant_id}; "
+                f"accepted hot coverage {accepted_coverage:.1%}"
+            ),
+        )
+    return _ProfitabilitySelectionOutcome(
+        accepted=tuple(accepted),
+        trials=tuple(trials),
+        timings=tuple(timings),
+    )
+
+
+def _profiled_profitability_candidates(
+    successful: tuple[_PreparedTypedRegion, ...],
+    skipped: tuple[PackageRegionBuildFailure, ...],
+    profile: ProfileResult,
+) -> tuple[_ProfitabilityCandidate, ...]:
+    """Order successful variants by their first profile-selected binding.
+
+    Args:
+        successful: Successfully compiled variants available for trials.
+        skipped: Backend failures retained as fallback explanations.
+        profile: Dynamic profile with a descending-hotness selected-symbol order.
+
+    Returns:
+        tuple[_ProfitabilityCandidate, ...]: Deduplicated candidates in profile order.
+    """
+    profile_samples = {member.symbol: member.samples for member in profile.members}
+    selected = frozenset(profile.selected_symbols)
+    by_symbol: dict[SymbolId, list[_PreparedTypedRegion]] = {}
+    for prepared in successful:
+        for binding in prepared.generation.bindings:
+            if binding.source in selected:
+                by_symbol.setdefault(binding.source, []).append(prepared)
+    ordered: list[_ProfitabilityCandidate] = []
+    seen: set[str] = set()
+    for symbol in profile.selected_symbols:
+        for prepared in by_symbol.get(symbol, ()):
+            variant_id = prepared.unit.region_id
+            if variant_id in seen:
+                continue
+            seen.add(variant_id)
+            represented = tuple(
+                dict.fromkeys(
+                    binding.source
+                    for binding in prepared.generation.bindings
+                    if binding.source in selected
+                )
+            )
+            samples = sum(profile_samples.get(member, 0) for member in represented)
+            ordered.append(
+                _ProfitabilityCandidate(
+                    prepared=prepared,
+                    symbols=tuple(member.stable_id for member in represented),
+                    profile_samples=samples,
+                    profile_coverage=_sample_coverage(samples, profile.mapped_project_samples),
+                    fallback_reason=_candidate_fallback_reason(prepared, skipped),
+                )
+            )
+    return tuple(ordered)
+
+
+def _candidate_fallback_reason(
+    prepared: _PreparedTypedRegion,
+    skipped: tuple[PackageRegionBuildFailure, ...],
+) -> str | None:
+    """Return the deterministic preferred-backend failure for a fallback variant.
+
+    Args:
+        prepared: Successful variant selected after backend retries.
+        skipped: Failed preferred variants retained by the package build.
+
+    Returns:
+        str | None: First diagnostic line explaining fallback selection.
+    """
+    if prepared.fallback_reason is not None:
+        return prepared.fallback_reason
+    preferred_id = prepared.conditional_on_failure_of
+    if preferred_id is None:
+        return None
+    failure = next((item for item in skipped if item.variant_id == preferred_id), None)
+    if failure is None:
+        return f"preferred variant {preferred_id} was unavailable"
+    return (
+        _first_diagnostic_line(failure.build.stderr) or f"preferred variant {preferred_id} failed"
+    )
+
+
+def _fallback_attempt_reason(
+    rejected: tuple[tuple[_PreparedTypedRegion, CompileAttempt], ...],
+) -> str | None:
+    """Describe the ordered backend chain preceding a successful fallback.
+
+    Args:
+        rejected: Prepared variants and deterministic failed attempts in retry order.
+
+    Returns:
+        str | None: Concise ordered fallback provenance, when retries occurred.
+    """
+    if not rejected:
+        return None
+    return "; ".join(
+        (
+            f"{prepared.generation.backend} {prepared.lowering_mode}: "
+            f"{_first_diagnostic_line(attempt.stderr) or 'compiler rejected variant'}"
+        )
+        for prepared, attempt in rejected
+    )
+
+
+def _unavailable_candidate_selection(
+    candidates: tuple[_ProfitabilityCandidate, ...],
+    reason: str,
+) -> _ProfitabilitySelectionOutcome:
+    """Represent a failed internal selection setup without accepting candidates.
+
+    Args:
+        candidates: Ordered compiled variants that could not be measured.
+        reason: Concrete missing prerequisite.
+
+    Returns:
+        _ProfitabilitySelectionOutcome: Unavailable decisions and an empty accepted set.
+    """
+    trials = tuple(
+        CandidateTrial(
+            id=f"{index:02d}:{candidate.prepared.unit.region_id}",
+            source_region_id=candidate.prepared.generation.region.id,
+            variant_id=candidate.prepared.unit.region_id,
+            backend=candidate.prepared.generation.backend,
+            lowering_mode=candidate.prepared.lowering_mode,
+            symbols=candidate.symbols,
+            status="unavailable",
+            reason=reason,
+            marginal_speedup=None,
+            fallback_reason=candidate.fallback_reason,
+            profile_samples=candidate.profile_samples,
+            profile_coverage=candidate.profile_coverage,
+            accepted_hot_coverage=0.0,
+            baseline_variants=(),
+            trial_variants=(candidate.prepared.unit.region_id,),
+            semantic_test_exit_code=None,
+            semantic_test_duration_seconds=None,
+            benchmark_status="not-run",
+        )
+        for index, candidate in enumerate(candidates, start=1)
+    )
+    return _ProfitabilitySelectionOutcome(accepted=(), trials=trials)
+
+
+def _candidate_benchmark_progress(
+    progress: PackageProgress | None,
+    variant_id: str,
+    event: BenchmarkProgress,
+) -> None:
+    """Render one marginal benchmark pair event with candidate context.
+
+    Args:
+        progress: Optional package progress callback.
+        variant_id: Candidate variant measured by this event.
+        event: Runtime benchmark phase notification.
+    """
+    _progress(
+        progress,
+        (
+            f"candidate benchmark {variant_id} {event.phase} pair {event.pair_index} "
+            f"{event.mode} completed in {event.duration_seconds:.2f}s"
+        ),
+    )
+
+
+def _candidate_benchmark_timings(
+    variant_id: str,
+    result: BenchmarkGateResult,
+) -> tuple[CompilePhaseTiming, ...]:
+    """Convert one marginal benchmark into ordered compile phase evidence.
+
+    Args:
+        variant_id: Candidate variant measured by the benchmark.
+        result: Marginal benchmark decision and child-process timings.
+
+    Returns:
+        tuple[CompilePhaseTiming, ...]: Warmup and sample timings for the compile report.
+    """
+    return tuple(
+        CompilePhaseTiming(
+            name="candidate_benchmark",
+            duration_seconds=run.duration_seconds,
+            detail=f"{variant_id}; {phase}; {run.mode}; {result.status}",
+        )
+        for phase, runs in (("warmup", result.warmups), ("sample", result.samples))
+        for run in runs
+    )
+
+
+def _command_failure_summary(result: CommandRunEvidence, fallback: str) -> str:
+    """Return a concise subprocess failure without discarding its exit status.
+
+    Args:
+        result: Failed candidate command evidence.
+        fallback: Description used when stderr is empty.
+
+    Returns:
+        str: First stderr line or an exit-code fallback.
+    """
+    return _first_diagnostic_line(result.stderr) or f"{fallback} with exit {result.returncode}"
+
+
+def _first_diagnostic_line(text: str) -> str | None:
+    """Return the first non-empty diagnostic line.
+
+    Args:
+        text: Compiler or subprocess diagnostic text.
+
+    Returns:
+        str | None: First non-empty stripped line, when present.
+    """
+    return next((line.strip() for line in text.splitlines() if line.strip()), None)
+
+
+def _sample_coverage(samples: int, total_samples: int) -> float:
+    """Return bounded mapped-project coverage for candidate evidence.
+
+    Args:
+        samples: Candidate or accepted-set sample count.
+        total_samples: Total samples mapped to project members.
+
+    Returns:
+        float: Coverage in the inclusive range zero through one.
+    """
+    if total_samples <= 0:
+        return 0.0
+    return min(samples / total_samples, 1.0)
 
 
 def _run_configured_quality_gate(

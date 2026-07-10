@@ -182,13 +182,23 @@ workload. It selects at most four in descending order until they cover 80% of ma
 samples. Unsupported launchers or insufficient samples use static selection, but still run the
 final benchmark gate.
 
-Profiling durations are excluded from performance medians. Atoll tests the compiled payload, runs
-alternating baseline/compiled benchmark pairs, and compares median durations. A median below 0.25
-seconds is rejected as too noisy. Failed tests, invalid measurements, or speedup below
-`minimum_speedup` remove the candidate wheel and are recorded in `.atoll/compile-report.*`; only a
-passing gate promotes the wheel. Commands run from a temporary copy that retains project tests and
-benchmark files but removes importable checkout modules, so a flat-layout checkout cannot shadow
-the baseline or compiled payload. On verification or gate failure, Atoll keeps
+For a supported profile, Atoll compiles the selected candidates once and evaluates them in hotness
+order. Each candidate combination runs the semantic command once, then one warmup and three
+alternating benchmark pairs compare it with the previously accepted set. A candidate is retained
+only when its marginal median speedup is at least `1.01x`. Rejected shims and native artifacts are
+removed before final packaging. The report records candidate coverage, lowering mode, fallback
+reason, marginal speedup, and the hot-path coverage retained by the accepted set.
+If every profiled candidate is rejected, Atoll still records the final full-gate evidence but does
+not publish a wheel with zero native regions.
+
+Profiling and candidate-trial durations are excluded from the final performance medians. Atoll then
+tests the accepted payload, runs the configured alternating baseline/compiled benchmark pairs, and
+compares median durations. A median below 0.25 seconds is rejected as too noisy. Failed tests,
+invalid measurements, or speedup below `minimum_speedup` remove the candidate wheel and are recorded
+in `.atoll/compile-report.*`; only this full gate promotes the wheel into `.atoll/dist`. Commands run
+from a temporary copy that retains project tests and benchmark files but removes importable checkout
+modules, so a flat-layout checkout cannot shadow the baseline or compiled payload. On verification
+or gate failure, Atoll keeps
 `.atoll/dist/install` and moves the rejected wheel under `.atoll/dist/build/diagnostics/` for
 inspection; no candidate remains in `.atoll/dist/*.whl`.
 

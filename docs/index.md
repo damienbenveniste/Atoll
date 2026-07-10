@@ -151,12 +151,22 @@ samples, considers candidates with at least 20 samples and 2% of workload sample
 most four in descending order until they cover 80% of mapped project samples. Unsupported launchers
 or insufficient samples fall back to static selection while retaining the final performance gate.
 
-Profiling time is excluded from benchmark medians. The compiled payload must pass the test command
-before Atoll runs alternating baseline/compiled subprocess pairs. Medians below 0.25 seconds are too
-noisy. Test failure, invalid timing, or speedup below the threshold removes the candidate wheel; the
-JSON and Markdown reports retain the command evidence and decision. Commands run from a temporary
-project copy that retains tests and benchmark files but removes importable checkout modules,
-preventing flat-layout source from shadowing either payload. Verification and gate failures keep
+For a supported profile, Atoll compiles the candidate superset once and tests candidates in hotness
+order through an internal region allowlist. Each candidate combination runs the semantic command
+once, then one warmup and three alternating benchmark pairs compare it with the accepted set. Atoll
+retains only candidates with at least `1.01x` marginal median speedup, rebuilds the payload from the
+baseline, and removes rejected shims and artifacts. Reports distinguish mapped coverage, selected
+hot coverage, accepted hot coverage, lowering mode, fallback reason, and marginal speedup.
+When every profiled candidate is rejected, Atoll records the final full-gate evidence but does not
+publish a wheel containing no native regions.
+
+Profiling and candidate trials are excluded from the final benchmark medians. The accepted payload
+must pass the test command before Atoll runs the configured alternating baseline/compiled subprocess
+pairs. Medians below 0.25 seconds are too noisy. Test failure, invalid timing, or speedup below the
+threshold removes the candidate wheel; the JSON and Markdown reports retain the command evidence and
+decision. The wheel remains under temporary build storage until this full gate passes. Commands run
+from a temporary project copy that retains tests and benchmark files but removes importable checkout
+modules, preventing flat-layout source from shadowing either payload. Verification and gate failures keep
 `.atoll/dist/install` and move the rejected wheel under `.atoll/dist/build/diagnostics/`; no failed
 candidate remains in the normal wheel output directory.
 

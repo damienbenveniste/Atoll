@@ -652,6 +652,7 @@ def _print_source_clean_success(
             print(f"- {region_failure.variant_id} [{region_failure.backend}]: {first_line}")
     if result.install_tree_kept:
         print(f"Install tree: {result.install_root}")
+    _print_candidate_trial_summary(result)
     if result.performance is not None:
         if result.performance.status == "passed" and result.performance.speedup is not None:
             print(f"Performance: {result.performance.speedup:.3f}x median speedup (passed).")
@@ -659,6 +660,22 @@ def _print_source_clean_success(
             print(f"Performance: {result.performance.status}.")
     print(f"Wheel: {result.wheel_path}")
     _print_compile_report_paths(report_paths)
+
+
+def _print_candidate_trial_summary(result: PackageCommandResult) -> None:
+    """Print accepted candidate count and retained hot-path coverage.
+
+    Args:
+        result: Source-clean compile result containing optional trial evidence.
+    """
+    if not result.candidate_trials:
+        return
+    accepted_trials = sum(trial.status == "accepted" for trial in result.candidate_trials)
+    accepted_coverage = result.candidate_trials[-1].accepted_hot_coverage
+    print(
+        f"Candidate trials: {accepted_trials}/{len(result.candidate_trials)} accepted; "
+        f"{accepted_coverage:.1%} mapped hot-path coverage."
+    )
 
 
 def _source_clean_progress_reporter(*, operation: str = "compile") -> Callable[[str], None]:
@@ -807,6 +824,7 @@ def _write_source_clean_compile_report(
             test_results=result.test_results,
             performance=result.performance,
             profile=result.profile,
+            candidate_trials=result.candidate_trials,
         )
     )
     json_path = result.project_root / ".atoll" / "compile-report.json"

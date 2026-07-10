@@ -28,6 +28,7 @@ from atoll.models import (
     Blocker,
     BlockerSeverity,
     CallSiteFact,
+    CandidateTrial,
     CompileAttempt,
     CompileCacheStatus,
     CompiledRegionVariant,
@@ -699,6 +700,7 @@ class CompilationSummaryReport(TypedDict):
         profile_status: Whether profile evidence was collected or static fallback was used.
         profile_mapped_coverage: Fraction of samples mapped to configured project modules.
         profile_selected_hot_coverage: Fraction of mapped samples covered by selected candidates.
+        profile_accepted_hot_coverage: Fraction of mapped samples covered by profitable candidates.
         duration_seconds: Elapsed wall-clock duration in seconds.
     """
 
@@ -722,6 +724,7 @@ class CompilationSummaryReport(TypedDict):
     profile_status: str
     profile_mapped_coverage: float
     profile_selected_hot_coverage: float
+    profile_accepted_hot_coverage: float
     duration_seconds: float
 
 
@@ -952,21 +955,45 @@ class CompilationCandidateTrialReport(TypedDict):
 
     Attributes:
         id: Stable candidate trial identifier.
-        region_id: Region variant evaluated by the trial.
+        region_id: Runtime allowlist variant evaluated by the trial.
+        source_region_id: Backend-neutral source region represented by the trial.
+        variant_id: Compatibility alias of `region_id`.
         backend: Native backend used by the candidate.
         lowering_mode: Whole-callable or outlined-block lowering mode.
+        symbols: Profiled source bindings represented by the candidate.
         status: Accepted, rejected, failed-semantics, or unavailable status.
         reason: Evidence supporting the candidate decision.
         marginal_speedup: Speedup over the previously accepted set, when measured.
+        fallback_reason: Preferred-backend failure that selected a fallback, when relevant.
+        profile_samples: Mapped project samples attributed to this candidate.
+        profile_coverage: Fraction of mapped project samples attributed to this candidate.
+        accepted_hot_coverage: Mapped hot-path coverage retained after this decision.
+        baseline_variants: Previously accepted variants used as the reference arm.
+        trial_variants: Candidate combination used as the measured compiled arm.
+        semantic_test_exit_code: Exit code from the candidate semantic command.
+        semantic_test_duration_seconds: Candidate semantic-test wall-clock duration.
+        benchmark_status: Marginal benchmark status, or not-run after semantic failure.
     """
 
     id: str
     region_id: str
+    source_region_id: str
+    variant_id: str
     backend: Backend
-    lowering_mode: str
+    lowering_mode: LoweringMode
+    symbols: list[str]
     status: str
     reason: str
     marginal_speedup: float | None
+    fallback_reason: str | None
+    profile_samples: int
+    profile_coverage: float
+    accepted_hot_coverage: float
+    baseline_variants: list[str]
+    trial_variants: list[str]
+    semantic_test_exit_code: int | None
+    semantic_test_duration_seconds: float | None
+    benchmark_status: str
 
 
 class CompilationSuspensionPlanReport(TypedDict):
@@ -1456,6 +1483,7 @@ class CompilationReportInput:
         test_results: Target-project command evidence used by quality gates.
         performance: Paired performance-gate evidence.
         profile: Profile-guided candidate evidence, or `None` for explicit static fallback.
+        candidate_trials: Greedy marginal-profitability decisions in profile order.
     """
 
     root: Path
@@ -1482,6 +1510,7 @@ class CompilationReportInput:
     test_results: tuple[CommandRunEvidence, ...] = ()
     performance: BenchmarkGateResult | None = None
     profile: ProfileResult | None = None
+    candidate_trials: tuple[CandidateTrial, ...] = ()
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -1619,6 +1648,10 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     )
     performance = _compilation_performance_report(report_input.root, report_input.performance)
     profile = _compilation_profile_report(report_input.profile)
+    candidate_trials = _candidate_trial_reports(report_input.candidate_trials)
+    accepted_hot_coverage = (
+        candidate_trials[-1]["accepted_hot_coverage"] if candidate_trials else 0.0
+    )
     backend_decisions = _backend_decision_reports(report_input.backend_assessments)
     suspension_plans = _suspension_plan_reports(
         report_input.typed_regions,
@@ -1677,6 +1710,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             "profile_status": profile["status"],
             "profile_mapped_coverage": profile["mapped_coverage"],
             "profile_selected_hot_coverage": profile["selected_hot_coverage"],
+            "profile_accepted_hot_coverage": accepted_hot_coverage,
             "duration_seconds": report_input.build.duration_seconds,
         },
         "build": {
@@ -1710,7 +1744,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         ],
         "performance": performance,
         "profile": profile,
-        "candidate_trials": [],
+        "candidate_trials": candidate_trials,
         "suspension_plans": suspension_plans,
         "backend_decisions": backend_decisions,
         "accepted_variants": accepted_variants,
@@ -1925,6 +1959,10 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         ),
         f"- Semantic tests: {_semantic_test_summary(report['tests'])}",
         f"- Performance: {report['summary']['performance_status']}",
+        (
+            "- Profitable hot-path coverage: "
+            f"{report['summary']['profile_accepted_hot_coverage']:.1%}"
+        ),
         f"- Build duration: {report['summary']['duration_seconds']:.3f}s",
         "",
         "## Verification Scope",
@@ -1933,6 +1971,7 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         "",
     ]
     _append_profile_guided_selection_markdown(lines, report["profile"])
+    _append_candidate_trials_markdown(lines, report["candidate_trials"])
     _append_suspension_plans_markdown(lines, report["suspension_plans"])
     if report["typed_regions"]:
         lines.extend(["## Planned Regions", ""])
@@ -2102,6 +2141,36 @@ def _append_profile_guided_selection_markdown(
             "",
         ]
     )
+
+
+def _append_candidate_trials_markdown(
+    lines: list[str],
+    trials: list[CompilationCandidateTrialReport],
+) -> None:
+    """Render marginal candidate decisions separately from the final benchmark gate.
+
+    Args:
+        lines: Mutable Markdown line buffer receiving the section.
+        trials: Ordered candidate semantic and benchmark decisions.
+    """
+    if not trials:
+        return
+    lines.extend(["## Candidate Profitability", ""])
+    for trial in trials:
+        speedup = (
+            f"{trial['marginal_speedup']:.3f}x"
+            if trial["marginal_speedup"] is not None
+            else "unavailable"
+        )
+        fallback = f"; fallback: {trial['fallback_reason']}" if trial["fallback_reason"] else ""
+        lines.append(
+            f"- `{trial['variant_id']}` [{trial['backend']}, {trial['lowering_mode']}]: "
+            f"{trial['status']}; marginal speedup {speedup}; "
+            f"candidate coverage {trial['profile_coverage']:.1%}; "
+            f"accepted coverage {trial['accepted_hot_coverage']:.1%}; "
+            f"{trial['reason']}{fallback}"
+        )
+    lines.append("")
 
 
 def _compiled_region_markdown(region: CompilationCompiledRegionReport) -> str:
@@ -2699,6 +2768,43 @@ def _compilation_performance_report(
         "warmups": [_compilation_command_run_report(root, run) for run in result.warmups],
         "samples": [_compilation_command_run_report(root, run) for run in result.samples],
     }
+
+
+def _candidate_trial_reports(
+    trials: tuple[CandidateTrial, ...],
+) -> list[CompilationCandidateTrialReport]:
+    """Serialize greedy candidate decisions without treating rejections as failures.
+
+    Args:
+        trials: Ordered semantic and marginal benchmark decisions.
+
+    Returns:
+        list[CompilationCandidateTrialReport]: JSON-compatible trial evidence in profile order.
+    """
+    return [
+        {
+            "id": trial.id,
+            "region_id": trial.variant_id,
+            "source_region_id": trial.source_region_id,
+            "variant_id": trial.variant_id,
+            "backend": trial.backend,
+            "lowering_mode": trial.lowering_mode,
+            "symbols": list(trial.symbols),
+            "status": trial.status,
+            "reason": trial.reason,
+            "marginal_speedup": trial.marginal_speedup,
+            "fallback_reason": trial.fallback_reason,
+            "profile_samples": trial.profile_samples,
+            "profile_coverage": trial.profile_coverage,
+            "accepted_hot_coverage": trial.accepted_hot_coverage,
+            "baseline_variants": list(trial.baseline_variants),
+            "trial_variants": list(trial.trial_variants),
+            "semantic_test_exit_code": trial.semantic_test_exit_code,
+            "semantic_test_duration_seconds": trial.semantic_test_duration_seconds,
+            "benchmark_status": trial.benchmark_status,
+        }
+        for trial in trials
+    ]
 
 
 def _compilation_profile_report(result: ProfileResult | None) -> CompilationProfileReport:

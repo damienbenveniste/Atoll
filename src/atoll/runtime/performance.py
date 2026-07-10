@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
-from typing import Literal
+from typing import Literal, TypedDict, Unpack
 
 RuntimeMode = Literal["baseline", "compiled"]
 BenchmarkPhase = Literal["warmup", "sample"]
@@ -185,12 +185,20 @@ class BenchmarkGateResult:
 ProgressCallback = Callable[[BenchmarkProgress], None]
 
 
+class _BenchmarkGateOptions(TypedDict, total=False):
+    progress: ProgressCallback | None
+    baseline_region_allowlist: frozenset[str] | None
+    compiled_region_allowlist: frozenset[str] | None
+
+
 @dataclass(frozen=True, slots=True)
 class _BenchmarkExecutionContext:
     command: tuple[str, ...]
     project_root: Path
     baseline_payload_root: Path
     compiled_payload_root: Path
+    baseline_region_allowlist: frozenset[str] | None
+    compiled_region_allowlist: frozenset[str] | None
     progress: ProgressCallback | None
 
 
@@ -200,6 +208,7 @@ def run_performance_command(
     project_root: Path,
     payload_root: Path,
     mode: RuntimeMode,
+    region_allowlist: frozenset[str] | None = None,
 ) -> CommandRunEvidence:
     """Execute one argv command under a controlled Atoll runtime mode.
 
@@ -207,20 +216,29 @@ def run_performance_command(
     and receives a copy of the current environment with `payload_root` prepended
     to `PYTHONPATH`. Baseline mode sets `ATOLL_DISABLE=1`; compiled mode sets
     `ATOLL_REQUIRE_COMPILED=1` and clears any inherited disable flag so the
-    compiled routing path is exercised.
+    compiled routing path is exercised. When `region_allowlist` is provided, the
+    child uses the compiled transport path regardless of `mode`, receives a
+    deterministic newline-separated `ATOLL_REGION_ALLOWLIST`, and treats an
+    empty allowlist as an explicit request to allow no regions. When no
+    allowlist is provided, inherited region allowlist state is cleared.
 
     Args:
         command: Command to validate, execute, or benchmark.
         project_root: Root directory of the target Python project.
         payload_root: Wheel payload root placed first on the child process import path.
         mode: Runtime mode selecting interpreted or compiled import behavior.
+        region_allowlist: Optional compiled-region identifiers available to the child process.
 
     Returns:
         CommandRunEvidence: Captured process output, status, mode, and elapsed duration.
     """
     resolved_project_root = project_root.resolve()
     resolved_payload_root = payload_root.resolve()
-    child_env = _runtime_environment(payload_root=resolved_payload_root, mode=mode)
+    child_env = _runtime_environment(
+        payload_root=resolved_payload_root,
+        mode=mode,
+        region_allowlist=region_allowlist,
+    )
     started = _perf_counter()
     completed = _run_subprocess(
         _SubprocessInvocation(
@@ -252,7 +270,7 @@ def run_benchmark_gate(
     project_root: Path,
     baseline_payload_root: Path,
     compiled_payload_root: Path,
-    progress: ProgressCallback | None = None,
+    **options: Unpack[_BenchmarkGateOptions],
 ) -> BenchmarkGateResult:
     """Run warmups and measured sample pairs, then decide profitability.
 
@@ -267,11 +285,17 @@ def run_benchmark_gate(
         project_root: Root directory of the target Python project.
         baseline_payload_root: Unpacked baseline wheel payload used for interpreted measurements.
         compiled_payload_root: Unpacked compiled wheel payload used for native measurements.
-        progress: Optional callback notified after each benchmark phase.
+        **options: Optional benchmark controls. `progress` receives phase notifications,
+            `baseline_region_allowlist` exposes region IDs to baseline-side child runs,
+            and `compiled_region_allowlist` exposes region IDs to compiled-side child runs.
 
     Returns:
         BenchmarkGateResult: Paired baseline and compiled samples plus the derived speedup decision.
     """
+    _reject_unexpected_benchmark_options(options)
+    progress = options.get("progress")
+    baseline_region_allowlist = options.get("baseline_region_allowlist")
+    compiled_region_allowlist = options.get("compiled_region_allowlist")
     if config.command is None:
         return BenchmarkGateResult(
             status="unbenchmarked",
@@ -288,6 +312,8 @@ def run_benchmark_gate(
         project_root=project_root,
         baseline_payload_root=baseline_payload_root,
         compiled_payload_root=compiled_payload_root,
+        baseline_region_allowlist=baseline_region_allowlist,
+        compiled_region_allowlist=compiled_region_allowlist,
         progress=progress,
     )
 
@@ -366,13 +392,37 @@ def run_benchmark_gate(
     )
 
 
-def _runtime_environment(*, payload_root: Path, mode: RuntimeMode) -> dict[str, str]:
+def _reject_unexpected_benchmark_options(options: _BenchmarkGateOptions) -> None:
+    allowed_options = {
+        "baseline_region_allowlist",
+        "compiled_region_allowlist",
+        "progress",
+    }
+    unexpected_options = set(options) - allowed_options
+    if unexpected_options:
+        unexpected_option = sorted(unexpected_options)[0]
+        raise TypeError(
+            f"run_benchmark_gate() got an unexpected keyword argument {unexpected_option!r}"
+        )
+
+
+def _runtime_environment(
+    *,
+    payload_root: Path,
+    mode: RuntimeMode,
+    region_allowlist: frozenset[str] | None,
+) -> dict[str, str]:
     child_env = dict(os.environ)
     existing_pythonpath = tuple(
         path for path in child_env.get("PYTHONPATH", "").split(os.pathsep) if path
     )
     child_env["PYTHONPATH"] = os.pathsep.join((str(payload_root), *existing_pythonpath))
-    if mode == "baseline":
+    child_env.pop("ATOLL_REGION_ALLOWLIST", None)
+    if region_allowlist is not None:
+        child_env.pop("ATOLL_DISABLE", None)
+        child_env["ATOLL_REQUIRE_COMPILED"] = "1"
+        child_env["ATOLL_REGION_ALLOWLIST"] = "\n".join(sorted(region_allowlist))
+    elif mode == "baseline":
         child_env["ATOLL_DISABLE"] = "1"
         child_env.pop("ATOLL_REQUIRE_COMPILED", None)
     else:
@@ -411,6 +461,11 @@ def _run_phase(
                     else context.compiled_payload_root
                 ),
                 mode=mode,
+                region_allowlist=(
+                    context.baseline_region_allowlist
+                    if mode == "baseline"
+                    else context.compiled_region_allowlist
+                ),
             )
             runs.append(run)
             if context.progress is not None:

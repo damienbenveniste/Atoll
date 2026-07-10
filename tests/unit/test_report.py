@@ -15,6 +15,7 @@ from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.models import (
     ArtifactRecord,
     BackendAssessment,
+    CandidateTrial,
     CompileAttempt,
     CompiledRegionVariant,
     CompilePhaseTiming,
@@ -324,6 +325,7 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
     assert report["summary"]["profile_status"] == "unconfigured"
     assert report["summary"]["profile_mapped_coverage"] == 0.0
     assert report["summary"]["profile_selected_hot_coverage"] == 0.0
+    assert report["summary"]["profile_accepted_hot_coverage"] == 0.0
     assert report["profile"] == {
         "status": "unconfigured",
         "reason": "no benchmark command configured; static candidate evidence only",
@@ -473,6 +475,28 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                 duration_seconds=0.25,
             ),
             profile=profile,
+            candidate_trials=(
+                CandidateTrial(
+                    id="01:score-cython",
+                    source_region_id="score-region",
+                    variant_id="score-cython",
+                    backend="cython",
+                    lowering_mode="whole-callable",
+                    symbols=("app.ranking::score_user",),
+                    status="accepted",
+                    reason="compiled median speedup 1.040 meets threshold 1.010",
+                    marginal_speedup=1.04,
+                    fallback_reason="mypyc rejected unresolved source TypeVars",
+                    profile_samples=120,
+                    profile_coverage=0.8,
+                    accepted_hot_coverage=0.8,
+                    baseline_variants=(),
+                    trial_variants=("score-cython",),
+                    semantic_test_exit_code=0,
+                    semantic_test_duration_seconds=0.2,
+                    benchmark_status="passed",
+                ),
+            ),
         )
     )
     markdown = render_compilation_markdown_report(report)
@@ -482,6 +506,30 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
     assert report["summary"]["profile_status"] == "profiled"
     assert report["summary"]["profile_mapped_coverage"] == PROFILE_MAPPED_COVERAGE
     assert report["summary"]["profile_selected_hot_coverage"] == PROFILE_SELECTED_HOT_COVERAGE
+    assert report["summary"]["profile_accepted_hot_coverage"] == PROFILE_SELECTED_HOT_COVERAGE
+    assert report["candidate_trials"] == [
+        {
+            "id": "01:score-cython",
+            "region_id": "score-cython",
+            "source_region_id": "score-region",
+            "variant_id": "score-cython",
+            "backend": "cython",
+            "lowering_mode": "whole-callable",
+            "symbols": ["app.ranking::score_user"],
+            "status": "accepted",
+            "reason": "compiled median speedup 1.040 meets threshold 1.010",
+            "marginal_speedup": 1.04,
+            "fallback_reason": "mypyc rejected unresolved source TypeVars",
+            "profile_samples": 120,
+            "profile_coverage": 0.8,
+            "accepted_hot_coverage": 0.8,
+            "baseline_variants": [],
+            "trial_variants": ["score-cython"],
+            "semantic_test_exit_code": 0,
+            "semantic_test_duration_seconds": 0.2,
+            "benchmark_status": "passed",
+        }
+    ]
     assert report["profile"]["sampling_policy"]["interval_ms"] == PROFILE_SAMPLING_INTERVAL_MS
     assert report["profile"]["child_passes"] == [
         {
@@ -498,6 +546,9 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
     assert report["profile"]["members"][0]["observation_capped"] is True
     assert report["profile"]["candidate_mapping_decisions"][1]["reason"] == "unmapped"
     assert report["profile"]["selected_symbols"] == ["app.ranking::score_user"]
+    assert "## Candidate Profitability" in markdown
+    assert "marginal speedup 1.040x" in markdown
+    assert "fallback: mypyc rejected unresolved source TypeVars" in markdown
     assert "SECRET_VALUE" not in serialized
     assert "repr(payload)" not in serialized
     assert "- Status: profiled" in markdown

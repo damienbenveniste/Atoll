@@ -170,10 +170,108 @@ def test_region_shim_renders_descriptor_and_status_contract(tmp_path: Path) -> N
     assert "_atoll_rollback" in rendered
     assert "ATOLL_DISABLE" in rendered
     assert "ATOLL_REQUIRE_COMPILED" in rendered
+    assert "ATOLL_REGION_ALLOWLIST" in rendered
     assert "__atoll_compiled_target__" in rendered
     assert "__atoll_python_fallback__" in rendered
     assert "_atoll_guards_pass" in rendered
     assert "_atoll_name_to_remove.startswith" in rendered
+
+
+def test_region_shim_activates_only_allowlisted_regions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidate trials can route one staged region without loading its peers."""
+    base = _config(tmp_path)
+    source_path = base.source_path
+    scale = replace(
+        base,
+        source_path=source_path,
+        region_id="region-scale",
+        compiled_module="_atoll_scale",
+        artifact_dir=source_path.parent / "artifacts-scale",
+        bindings=(_binding("scale", "instance_method"),),
+    )
+    score = replace(
+        scale,
+        region_id="region-score",
+        compiled_module="_atoll_score",
+        artifact_dir=source_path.parent / "artifacts-score",
+        bindings=(_binding("score", "instance_method"),),
+    )
+    source = """class Worker:
+    def scale(self, value: int) -> str:
+        return "source-scale"
+
+    def score(self, value: int) -> str:
+        return "source-score"
+"""
+    score.artifact_dir.mkdir(parents=True)
+    (score.artifact_dir / f"{score.compiled_module}.py").write_text(
+        'def Worker__score(self, value):\n    return "compiled-score"\n',
+        encoding="utf-8",
+    )
+    source_path.write_text(
+        insert_or_replace_region_shim(source, (scale, score)).new_text,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ATOLL_REGION_ALLOWLIST", score.region_id)
+    monkeypatch.setattr(importlib.machinery, "EXTENSION_SUFFIXES", (".py",))
+
+    spec = importlib.util.spec_from_file_location("shim_allowlist", source_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    assert module.Worker().scale(1) == "source-scale"
+    assert module.Worker().score(1) == "compiled-score"
+    statuses = module.__atoll_status__["regions"]
+    assert statuses[scale.region_id]["selected"] is False
+    assert statuses[scale.region_id]["active"] is False
+    assert statuses[score.region_id]["selected"] is True
+    assert statuses[score.region_id]["active"] is True
+    assert module.__atoll_status__["compiled"] is True
+
+
+@pytest.mark.parametrize("allowlist", ["", "other-module-region"])
+def test_region_shim_treats_unmatched_allowlist_as_intentional_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    allowlist: str,
+) -> None:
+    """Modules outside the candidate set retain source behavior without strict errors."""
+    config = replace(
+        _config(tmp_path),
+        source_path=tmp_path / "pkg" / "worker.py",
+        artifact_dir=tmp_path / "pkg" / "missing-artifacts",
+        bindings=(_binding("scale", "instance_method"),),
+    )
+    source = """class Worker:
+    def scale(self, value: int) -> str:
+        return "source-scale"
+"""
+    monkeypatch.setenv("ATOLL_REGION_ALLOWLIST", allowlist)
+    monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "1")
+
+    config.source_path.parent.mkdir(parents=True, exist_ok=True)
+    config.source_path.write_text(
+        insert_or_replace_region_shim(source, (config,)).new_text,
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("shim_empty_allowlist", config.source_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    assert module.Worker().scale(1) == "source-scale"
+    region_status = module.__atoll_status__["regions"][config.region_id]
+    assert region_status["selected"] is False
+    assert region_status["active"] is False
+    assert module.__atoll_status__["compiled"] is True
 
 
 def test_region_shim_renders_atomic_class_identity_checks(tmp_path: Path) -> None:

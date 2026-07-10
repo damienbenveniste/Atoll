@@ -15,8 +15,10 @@ import pytest
 
 from atoll import cli as cli_module
 from atoll.commands import package as package_command
+from atoll.generation.region_shim import RegionShimConfig
 from atoll.models import (
     ArtifactRecord,
+    ArtifactRole,
     Backend,
     BackendAssessment,
     BackendCompileContext,
@@ -38,11 +40,16 @@ from atoll.models import (
 )
 from atoll.project import DiscoveredProject, discover_project
 from atoll.report import CompilationReportInput, build_compilation_report
-from atoll.runtime.package_verify import PackageVerificationResult, VerificationStage
+from atoll.runtime.package_verify import (
+    PackageVerificationPlan,
+    PackageVerificationResult,
+    VerificationStage,
+)
 from atoll.runtime.performance import (
     BenchmarkGateConfig,
     BenchmarkGateResult,
     BenchmarkProgress,
+    BenchmarkStatus,
     CommandRunEvidence,
     RuntimeMode,
 )
@@ -59,6 +66,8 @@ EXPECTED_ATOMIC_SELECTION_COUNT = 2
 TEST_FAILURE_RETURN_CODE = 9
 RANKING_BINDING_COUNT = 3
 OUTLINED_COMPILE_CALL_COUNT = 2
+_CANDIDATE_SPEEDUP = 1.01
+EXPECTED_FINAL_TEST_RESULTS = 2
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +117,12 @@ class _QualityGateOutcomeView(Protocol):
     error: str | None
 
 
+class _PromotionResultView(Protocol):
+    success: bool
+    wheel_path: Path | None
+    error: str | None
+
+
 class _SelectedScans(Protocol):
     def __call__(
         self,
@@ -145,6 +160,8 @@ class _PreparedTypedRegion(Protocol):
     conditional_on_failure_of: str | None
     lowering_mode: LoweringMode
     native_helpers: tuple[str, ...]
+    fallback_reason: str | None
+    shim: RegionShimConfig
 
 
 class _TypedRegionOutcome(Protocol):
@@ -278,6 +295,17 @@ _selected_typed_regions = cast(
 _prepare_typed_region = cast(
     Callable[..., _PreparedTypedRegion], _package_attr("_prepare_typed_region")
 )
+_artifact_records_for_prepared = cast(
+    Callable[
+        [tuple[_PreparedTypedRegion, ...], tuple[ArtifactRecord, ...]],
+        tuple[ArtifactRecord, ...],
+    ],
+    _package_attr("_artifact_records_for_prepared"),
+)
+_materialize_profitable_payload = cast(
+    Callable[..., str | None],
+    _package_attr("_materialize_profitable_payload"),
+)
 _SelectedTypedRegion = cast(Callable[..., _TypedSelection], _package_attr("_SelectedTypedRegion"))
 _RequestedCallableVariant = cast(Callable[..., object], _package_attr("_RequestedCallableVariant"))
 _staged_typed_selection = cast(
@@ -317,6 +345,18 @@ _BaselineWheelPayload = cast(
 _run_configured_quality_gate = cast(
     Callable[..., _QualityGateOutcomeView],
     _package_attr("_run_configured_quality_gate"),
+)
+_QualityGateOutcome = cast(
+    Callable[..., _QualityGateOutcomeView],
+    _package_attr("_QualityGateOutcome"),
+)
+_SourceCleanPromotionContext = cast(
+    Callable[..., object],
+    _package_attr("_SourceCleanPromotionContext"),
+)
+_promote_source_clean_payload = cast(
+    Callable[[object], _PromotionResultView],
+    _package_attr("_promote_source_clean_payload"),
 )
 _print_source_clean_success = cast(
     Callable[..., None],
@@ -921,6 +961,92 @@ def test_prepare_typed_region_appends_outlined_cython_fallback(tmp_path: Path) -
     assert outlined.unit.region_id.endswith("@cython-outline")
 
 
+def test_artifact_filter_keeps_only_accepted_region_support_files(tmp_path: Path) -> None:
+    """Shared support records follow their collision-resistant variant directory."""
+    accepted, _build_root, _staged_source_roots = _prepare_outlined_coroutine_fixture(tmp_path)
+    assert accepted.fallback is not None
+    rejected = accepted.fallback
+    digest = "0" * 64
+
+    def record(
+        prepared: _PreparedTypedRegion,
+        *,
+        region_id: str,
+        role: ArtifactRole,
+        filename: str,
+    ) -> ArtifactRecord:
+        return ArtifactRecord(
+            region_id=region_id,
+            backend=prepared.generation.backend,
+            logical_module=prepared.unit.logical_module,
+            role=role,
+            install_relative_path=f"{prepared.unit.install_relative_dir}/{filename}",
+            digest=digest,
+            abi="cp312",
+            platform_tag="test-platform",
+        )
+
+    accepted_primary = record(
+        accepted,
+        region_id=accepted.unit.region_id,
+        role="primary",
+        filename="accepted.so",
+    )
+    accepted_support = record(
+        accepted,
+        region_id="__shared__",
+        role="support",
+        filename="accepted-support.so",
+    )
+    rejected_primary = record(
+        rejected,
+        region_id=rejected.unit.region_id,
+        role="primary",
+        filename="rejected.so",
+    )
+    rejected_support = record(
+        rejected,
+        region_id="__shared__",
+        role="support",
+        filename="rejected-support.so",
+    )
+
+    filtered = _artifact_records_for_prepared(
+        (accepted,),
+        (accepted_primary, accepted_support, rejected_primary, rejected_support),
+    )
+
+    assert filtered == (accepted_primary, accepted_support)
+
+
+def test_rejected_module_keeps_baseline_wheel_source_bytes(tmp_path: Path) -> None:
+    """A module with no accepted candidate is not overlaid from the copied checkout."""
+    rejected, build_root, staged_source_roots = _prepare_outlined_coroutine_fixture(tmp_path)
+    rejected.shim.source_path.write_text("staged checkout bytes\n", encoding="utf-8")
+    baseline_root = build_root / "baseline-install"
+    baseline_module = baseline_root / "typed_region_project" / "outline_worker.py"
+    baseline_module.parent.mkdir(parents=True)
+    baseline_module.write_text("baseline wheel bytes\n", encoding="utf-8")
+    install_root = tmp_path / "install"
+
+    error = _materialize_profitable_payload(
+        baseline=_BaselineWheelPayload(
+            wheel_path=build_root / "baseline.whl",
+            build=_successful_attempt(),
+            baseline_install_root=baseline_root,
+        ),
+        staged_source_roots=staged_source_roots,
+        install_root=install_root,
+        superset=(rejected,),
+        accepted=(),
+    )
+
+    assert error is None
+    assert (install_root / "typed_region_project" / "outline_worker.py").read_text(
+        encoding="utf-8"
+    ) == "baseline wheel bytes\n"
+
+
 def test_typed_region_build_retries_whole_callable_failure_with_outline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -989,6 +1115,10 @@ def test_typed_region_build_retries_whole_callable_failure_with_outline(
     assert len(outcome.successful) == 1
     assert outcome.successful[0].lowering_mode == "outlined-block"
     assert outcome.successful[0].native_helpers
+    assert outcome.successful[0].fallback_reason == (
+        "mypyc whole-callable: MYPYC_TYPE_ERROR: fixture; "
+        "cython whole-callable: CYTHON_COMPILE_ERROR: whole callable fixture"
+    )
     assert "outlined Cython" in outcome.build.stdout
 
 
@@ -1156,6 +1286,9 @@ def test_typed_region_build_retries_deterministic_mypyc_failure_with_cython(
     assert outcome.build.stderr == ""
     assert "compiled" in outcome.build.stdout
     assert [item.generation.backend for item in outcome.successful] == ["cython"]
+    assert outcome.successful[0].fallback_reason == (
+        "mypyc whole-callable: MYPYC_TYPE_ERROR: fixture"
+    )
     assert outcome.skipped == ()
     assert len(mypyc.calls) == 1
     assert len(cython.calls) == 1
@@ -2028,6 +2161,79 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
     assert result.verification_steps[-1].target == diagnostic_wheels[0]
 
 
+def test_profiled_promotion_rejects_a_wheel_without_profitable_regions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full gate still runs, but an all-rejected profile cannot publish a no-op wheel."""
+    project = _quality_gate_project(tmp_path, ())
+    output_dir = tmp_path / "out"
+    build_root = output_dir / "build"
+    install_root = output_dir / "install"
+    build_root.mkdir(parents=True)
+    install_root.mkdir(parents=True)
+    baseline_wheel = build_root / "baseline.whl"
+    baseline_wheel.write_bytes(b"baseline")
+    gate_calls = 0
+
+    def repack(**kwargs: object) -> Path:
+        candidate_output = cast(Path, kwargs["output_dir"])
+        candidate_output.mkdir(parents=True, exist_ok=True)
+        candidate = candidate_output / "candidate.whl"
+        candidate.write_bytes(b"candidate")
+        return candidate
+
+    def pass_full_gate(**kwargs: object) -> object:
+        nonlocal gate_calls
+        assert kwargs
+        gate_calls += 1
+        return _QualityGateOutcome(
+            success=True,
+            tests=(),
+            performance=BenchmarkGateResult(
+                status="passed",
+                reason="fixture full gate passed",
+                minimum_speedup=0.5,
+                baseline_median_seconds=1.0,
+                compiled_median_seconds=1.0,
+                speedup=1.0,
+                warmups=(),
+                samples=(),
+            ),
+        )
+
+    monkeypatch.setattr(package_command, "repack_overlaid_wheel", repack)
+    monkeypatch.setattr(package_command, "_run_configured_quality_gate", pass_full_gate)
+
+    result = _promote_source_clean_payload(
+        _SourceCleanPromotionContext(
+            options=package_command.PackageOptions(root=project.config.root),
+            project=project,
+            output_dir=output_dir,
+            build_root=build_root,
+            install_root=install_root,
+            baseline=_BaselineWheelPayload(
+                wheel_path=baseline_wheel,
+                build=_successful_attempt(),
+            ),
+            verification_plan=PackageVerificationPlan(
+                modules=(),
+                regions=(),
+                artifacts=(),
+            ),
+            build=_successful_attempt(),
+            requires_native_artifact=True,
+        )
+    )
+
+    assert gate_calls == 1
+    assert result.success is False
+    assert result.wheel_path is None
+    assert result.error == "no profile-guided candidate met the 1.01x marginal speedup threshold"
+    assert not tuple(output_dir.glob("*.whl"))
+    assert tuple((build_root / "diagnostics").glob("*.whl"))
+
+
 def test_package_profiles_before_backend_selection_and_scopes_hot_members(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2061,7 +2267,9 @@ minimum_speedup = 1.10
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
+        region_allowlist: frozenset[str] | None = None,
     ) -> CommandRunEvidence:
+        del region_allowlist
         events.append(f"test:{mode}")
         return CommandRunEvidence(
             command=command,
@@ -2177,9 +2385,166 @@ minimum_speedup = 1.10
         "profile",
         "selection",
         "test:compiled",
+        "test:compiled",
     ]
     assert "benchmark sample pair 1 baseline completed in 0.12s" in progress_messages
     assert {binding.source.qualname for binding in result.compiled_bindings} == {"rank_candidates"}
+
+
+def test_package_greedily_keeps_only_profitable_profile_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile order drives marginal trials and rejected artifacts never reach the wheel."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + """
+
+[tool.atoll.compile]
+test_command = ["python", "-c", "pass"]
+benchmark_command = ["python", "bench.py"]
+benchmark_warmups = 1
+benchmark_samples = 7
+minimum_speedup = 1.10
+""",
+        encoding="utf-8",
+    )
+    zero_lifecycle = LifecycleCounts(
+        start=0,
+        return_=0,
+        yield_=0,
+        resume=0,
+        unwind=0,
+        throw=0,
+    )
+    observed_allowlists: list[frozenset[str] | None] = []
+    benchmark_thresholds: list[float] = []
+
+    def run_test(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: RuntimeMode,
+        region_allowlist: frozenset[str] | None = None,
+    ) -> CommandRunEvidence:
+        observed_allowlists.append(region_allowlist)
+        return CommandRunEvidence(
+            command=command,
+            project_root=project_root,
+            payload_root=payload_root,
+            mode=mode,
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.5,
+        )
+
+    def profile_baseline(*args: object, **kwargs: object) -> ProfileResult:
+        assert args
+        assert kwargs
+        return replace(
+            unconfigured_profile(),
+            status="profiled",
+            reason="two hot fixture members",
+            launch_kind="script",
+            total_samples=200,
+            mapped_project_samples=180,
+            mapped_coverage=0.9,
+            lifecycle=zero_lifecycle,
+            members=(
+                ProfiledMember(
+                    module="app.ranking",
+                    qualname="rank_candidates",
+                    samples=120,
+                    coverage=0.6,
+                    call_count=10,
+                    lifecycle=zero_lifecycle,
+                    signatures=(),
+                    polymorphic_overflow=False,
+                ),
+                ProfiledMember(
+                    module="app.ranking",
+                    qualname="normalize_features",
+                    samples=60,
+                    coverage=0.3,
+                    call_count=10,
+                    lifecycle=zero_lifecycle,
+                    signatures=(),
+                    polymorphic_overflow=False,
+                ),
+            ),
+        )
+
+    def benchmark(
+        config: BenchmarkGateConfig,
+        **kwargs: object,
+    ) -> BenchmarkGateResult:
+        benchmark_thresholds.append(config.minimum_speedup)
+        if config.minimum_speedup == _CANDIDATE_SPEEDUP:
+            candidate_index = benchmark_thresholds.count(_CANDIDATE_SPEEDUP)
+            speedup = 1.02 if candidate_index == 1 else 1.005
+            status: BenchmarkStatus = "passed" if candidate_index == 1 else "not-profitable"
+            assert kwargs["baseline_payload_root"] == kwargs["compiled_payload_root"]
+            assert "baseline_region_allowlist" in kwargs
+            assert "compiled_region_allowlist" in kwargs
+        else:
+            speedup = 1.12
+            status = "passed"
+            assert kwargs["baseline_payload_root"] != kwargs["compiled_payload_root"]
+        return BenchmarkGateResult(
+            status=status,
+            reason=f"fixture speedup {speedup:.3f}",
+            minimum_speedup=config.minimum_speedup,
+            baseline_median_seconds=speedup,
+            compiled_median_seconds=1.0,
+            speedup=speedup,
+            warmups=(),
+            samples=(),
+        )
+
+    monkeypatch.setattr(package_command, "run_performance_command", run_test)
+    monkeypatch.setattr(package_command, "run_baseline_profile", profile_baseline)
+    monkeypatch.setattr(package_command, "run_benchmark_gate", benchmark)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+
+    assert result.success is True
+    assert result.wheel_path is not None
+    assert [trial.status for trial in result.candidate_trials] == ["accepted", "rejected"]
+    assert result.candidate_trials[0].symbols == ("app.ranking::rank_candidates",)
+    assert result.candidate_trials[1].symbols == ("app.ranking::normalize_features",)
+    assert result.candidate_trials[0].accepted_hot_coverage == pytest.approx(2 / 3)
+    assert result.candidate_trials[1].accepted_hot_coverage == pytest.approx(2 / 3)
+    assert result.candidate_trials[0].marginal_speedup == pytest.approx(1.02)
+    assert result.performance is not None
+    assert result.performance.speedup == pytest.approx(1.12)
+    assert {binding.source.qualname for binding in result.compiled_bindings} == {"rank_candidates"}
+    assert benchmark_thresholds == [_CANDIDATE_SPEEDUP, _CANDIDATE_SPEEDUP, 1.1]
+    assert observed_allowlists[0] is None
+    assert observed_allowlists[1] == frozenset({result.candidate_trials[0].variant_id})
+    assert observed_allowlists[2] == frozenset(
+        trial.variant_id for trial in result.candidate_trials
+    )
+    assert observed_allowlists[3] is None
+    assert len(result.test_results) == EXPECTED_FINAL_TEST_RESULTS
+    with zipfile.ZipFile(result.wheel_path) as wheel:
+        native_entries = {
+            name
+            for name in wheel.namelist()
+            if any(name.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES)
+        }
+    assert native_entries == {record.install_relative_path for record in result.artifact_records}
 
 
 def test_package_stops_before_profiling_when_baseline_semantics_fail(

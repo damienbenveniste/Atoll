@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from atoll.cli import main
+from atoll.commands import package as package_command
 from atoll.commands.package import PackageCommandResult, PackagePreflightFailure
 from atoll.models import Blocker, CompileAttempt, ModuleId, ModuleScan
 from atoll.runtime.performance import run_performance_command
@@ -171,9 +172,11 @@ def test_compile_runs_semantic_gate_without_flat_checkout_shadowing(
 
 def test_compile_profiles_configured_benchmark_before_hot_region_selection(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A real configured workload profiles, selects, compiles, and reports hot symbols."""
+    """A real workload profiles hot symbols and packages only profitable trial results."""
     project_root = tmp_path / "profiled_project"
+    monkeypatch.setattr(package_command, "_CANDIDATE_MINIMUM_SPEEDUP", 0.01)
     shutil.copytree(FIXTURE_ROOT, project_root)
     benchmark_path = project_root / "benchmark.py"
     benchmark_path.write_text(
@@ -217,6 +220,11 @@ for _ in range(ITERATIONS):
     compiled = {
         binding["source"] for region in report["compiled_regions"] for binding in region["bindings"]
     }
+    trials = report["candidate_trials"]
+    trial_symbols = {symbol for trial in trials for symbol in trial["symbols"]}
+    accepted_symbols = {
+        symbol for trial in trials if trial["status"] == "accepted" for symbol in trial["symbols"]
+    }
     assert exit_code == 0
     assert report["version"] == PROFILE_REPORT_SCHEMA_VERSION
     assert report["success"] is True
@@ -227,11 +235,13 @@ for _ in range(ITERATIONS):
     assert profile["selected_hot_coverage"] > 0
     assert [run["pass_kind"] for run in profile["child_passes"]] == ["sampling", "types"]
     assert selected
-    assert compiled == selected
-    assert report["summary"]["symbols"] == len(selected)
+    assert trial_symbols == selected
+    assert compiled == accepted_symbols
+    assert report["summary"]["symbols"] == len(accepted_symbols)
+    assert report["summary"]["profile_accepted_hot_coverage"] == trials[-1]["accepted_hot_coverage"]
     assert report["performance"]["status"] == "passed"
     assert {timing["name"] for timing in report["build"]["phase_timings"]}.issuperset(
-        {"profile_sampling", "profile_types"}
+        {"profile_sampling", "profile_types", "candidate_semantic_test", "candidate_benchmark"}
     )
     assert not (project_root / ".atoll" / "dist" / "build").exists()
     assert not (project_root / ".atoll" / "dist" / "install").exists()
