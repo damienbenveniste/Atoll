@@ -2,11 +2,29 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
-from atoll.models import ModuleId
+from atoll.models import ModuleId, ModuleScan, RegionSpecialization
+
+
+def _scan_source(tmp_path: Path, name: str, lines: list[str]) -> ModuleScan:
+    module_path = tmp_path / f"{name}.py"
+    module_path.write_text("\n".join(lines), encoding="utf-8")
+    return enrich_island_analysis(scan_module(ModuleId(name=name, path=module_path)))
+
+
+def _specializations(
+    tmp_path: Path, name: str, lines: list[str]
+) -> tuple[RegionSpecialization, ...]:
+    scan = _scan_source(tmp_path, name, lines)
+    return tuple(
+        specialization for region in scan.typed_regions for specialization in region.specializations
+    )
 
 
 def test_typed_regions_group_safe_class_methods_atomically(tmp_path: Path) -> None:
@@ -216,3 +234,639 @@ def test_region_loss_ledger_keeps_explicit_any_and_generics_visible(tmp_path: Pa
         dependency.kind == "annotation" and dependency.role == "typing"
         for dependency in generic_region.dependencies
     )
+
+
+def test_direct_concrete_subclass_specializes_method_without_rewriting_base(
+    tmp_path: Path,
+) -> None:
+    """A non-generic direct subclass adds concrete evidence while the base stays generic."""
+    lines = [
+        "class GenericBox[T]:",
+        "    def echo(self, value: T) -> T:",
+        "        return value",
+        "",
+        "class IntBox(GenericBox[int]):",
+        "    pass",
+        "",
+    ]
+    first = _scan_source(tmp_path, "subclass_specialization", lines)
+    second = _scan_source(tmp_path, "subclass_specialization", lines)
+
+    region = next(
+        region
+        for region in first.typed_regions
+        if any(member.id.qualname == "GenericBox.echo" for member in region.members)
+    )
+    specialization = region.specializations[0]
+    second_specialization = next(
+        specialization
+        for region in second.typed_regions
+        for specialization in region.specializations
+        if specialization.source_member.qualname == "GenericBox.echo"
+    )
+
+    assert specialization.id == second_specialization.id
+    assert specialization.origin == "concrete_subclass"
+    assert specialization.source_owner_class == "GenericBox"
+    assert specialization.target_owner_class == "IntBox"
+    assert specialization.substitutions == (("T", "int"),)
+    assert specialization.guards[0].parameter_name == "value"
+    assert specialization.guards[0].positional_index == 1
+    assert specialization.guards[0].nominal_type_paths == ("int",)
+    assert specialization.guards[0].allow_none is False
+    assert all(binding.concrete for binding in specialization.type_bindings)
+    assert {binding.annotation for binding in specialization.type_bindings} == {"int"}
+    assert (
+        next(
+            decision
+            for decision in region.decisions
+            if decision.target == "subclass_specialization::GenericBox.echo"
+        ).action
+        == "fallback"
+    )
+    assert (
+        next(
+            binding for binding in region.type_bindings if binding.name == "GenericBox.echo.value"
+        ).annotation
+        == "T"
+    )
+
+
+def test_subclass_specialization_supports_union_none_and_nominal_guards(
+    tmp_path: Path,
+) -> None:
+    """Scalar, None, and nominal union annotations produce constant-time guards."""
+    specializations = _specializations(
+        tmp_path,
+        "union_nominal",
+        [
+            "class Payload:",
+            "    pass",
+            "",
+            "class GenericBox[T]:",
+            "    def maybe(self, value: T | None) -> T | None:",
+            "        return value",
+            "",
+            "class PayloadBox(GenericBox[Payload]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    specialization = specializations[0]
+
+    assert specialization.substitutions == (("T", "Payload"),)
+    assert specialization.guards[0].annotation == "Payload | None"
+    assert specialization.guards[0].nominal_type_paths == ("Payload",)
+    assert specialization.guards[0].allow_none is True
+    assert {binding.annotation for binding in specialization.type_bindings} == {"Payload | None"}
+
+
+def test_subclass_specialization_rejects_containers_and_unresolved_generics(
+    tmp_path: Path,
+) -> None:
+    """Container and still-generic subclass evidence is not treated as concrete."""
+    specializations = _specializations(
+        tmp_path,
+        "rejected_subclasses",
+        [
+            "class GenericBox[T]:",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class ListBox(GenericBox[list[int]]):",
+            "    pass",
+            "",
+            "class OtherBox[U](GenericBox[U]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_subclass_specialization_rejects_generic_field_usage(tmp_path: Path) -> None:
+    """A method that reads a generic field is not specialized from subclass evidence."""
+    specializations = _specializations(
+        tmp_path,
+        "generic_field_usage",
+        [
+            "class GenericBox[T]:",
+            "    stored: T",
+            "",
+            "    def get(self) -> T:",
+            "        return self.stored",
+            "",
+            "class IntBox(GenericBox[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_top_level_closed_call_specializes_generic_function(tmp_path: Path) -> None:
+    """A single agreeing direct call infers a concrete top-level function binding."""
+    specializations = _specializations(
+        tmp_path,
+        "closed_call",
+        [
+            "def identity[T](value: T) -> T:",
+            "    return value",
+            "",
+            "RESULT = identity(1)",
+            "",
+        ],
+    )
+
+    specialization = specializations[0]
+
+    assert specialization.origin == "closed_call"
+    assert specialization.source_member.qualname == "identity"
+    assert specialization.target_owner_class is None
+    assert specialization.substitutions == (("T", "int"),)
+    assert specialization.guards[0].positional_index == 0
+    assert specialization.guards[0].nominal_type_paths == ("int",)
+    assert all(binding.concrete for binding in specialization.type_bindings)
+    assert {binding.annotation for binding in specialization.type_bindings} == {"int"}
+    assert all("Any" not in binding.annotation for binding in specialization.type_bindings)
+
+
+def test_closed_call_infers_nominal_enclosing_parameter(tmp_path: Path) -> None:
+    """Concrete enclosing parameter annotations can close a direct generic call."""
+    specializations = _specializations(
+        tmp_path,
+        "nominal_call",
+        [
+            "class Payload:",
+            "    pass",
+            "",
+            "def identity[T](value: T) -> T:",
+            "    return value",
+            "",
+            "def use(payload: Payload) -> Payload:",
+            "    return identity(payload)",
+            "",
+        ],
+    )
+
+    specialization = next(
+        specialization
+        for specialization in specializations
+        if specialization.source_member.qualname == "identity"
+    )
+
+    assert specialization.substitutions == (("T", "Payload"),)
+    assert specialization.guards[0].nominal_type_paths == ("Payload",)
+    assert {binding.annotation for binding in specialization.type_bindings} == {"Payload"}
+
+
+def test_conflicting_closed_calls_leave_generic_function_interpreted(tmp_path: Path) -> None:
+    """Disagreeing direct calls do not produce a specialization."""
+    specializations = _specializations(
+        tmp_path,
+        "conflicting_calls",
+        [
+            "def identity[T](value: T) -> T:",
+            "    return value",
+            "",
+            "FIRST = identity(1)",
+            "SECOND = identity('x')",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_unresolved_generic_enclosing_call_is_not_specialized(tmp_path: Path) -> None:
+    """An enclosing generic parameter is unresolved closed-call evidence."""
+    specializations = _specializations(
+        tmp_path,
+        "unresolved_enclosing_call",
+        [
+            "def identity[T](value: T) -> T:",
+            "    return value",
+            "",
+            "def use[U](value: U) -> U:",
+            "    return identity(value)",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_subclass_specialization_preserves_overrides_dunders_and_dynamic_targets(
+    tmp_path: Path,
+) -> None:
+    """Specialization never replaces subclass behavior or unsafe class machinery."""
+    specializations = _specializations(
+        tmp_path,
+        "unsafe_specialization_targets",
+        [
+            "class GenericBox[T]:",
+            "    def __init__(self, value: T) -> None:",
+            "        self.value = value",
+            "",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class OverridingBox(GenericBox[int]):",
+            "    def echo(self, value: int) -> int:",
+            "        return value + 1",
+            "",
+            "class DynamicBox(GenericBox[int]):",
+            "    def __getattr__(self, name: str) -> object:",
+            "        raise AttributeError(name)",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_subclass_specialization_rejects_semantic_any_alias(tmp_path: Path) -> None:
+    """An imported Any alias cannot be misclassified as a nominal runtime class."""
+    any_import = f"from typing import {chr(65)}ny as DynamicValue"
+    specializations = _specializations(
+        tmp_path,
+        "any_specialization",
+        [
+            any_import,
+            "",
+            "class GenericBox[T]:",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class DynamicBox(GenericBox[DynamicValue]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_subclass_specialization_accepts_quoted_typing_union_guard(tmp_path: Path) -> None:
+    """Quoted Union and Optional forms still lower to constant-time nominal checks."""
+    specializations = _specializations(
+        tmp_path,
+        "typing_union_specialization",
+        [
+            "from typing import Union",
+            "",
+            "class GenericBox[T]:",
+            "    def echo(self, value: 'Union[T, None]') -> 'Union[T, None]':",
+            "        return value",
+            "",
+            "class IntBox(GenericBox[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    specialization = specializations[0]
+    assert specialization.guards[0].annotation == "Union[int, None]"
+    assert specialization.guards[0].nominal_type_paths == ("int",)
+    assert specialization.guards[0].allow_none is True
+
+
+def test_subclass_specialization_requires_every_method_typevar_to_close(
+    tmp_path: Path,
+) -> None:
+    """A method-scoped TypeVar cannot disappear when only the owner TypeVar is bound."""
+    specializations = _specializations(
+        tmp_path,
+        "partially_closed_method",
+        [
+            "class GenericBox[T]:",
+            "    def choose[U](self, left: T, right: U) -> tuple[T, U]:",
+            "        return left, right",
+            "",
+            "class IntBox(GenericBox[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_legacy_generic_base_can_specialize_a_direct_concrete_subclass(
+    tmp_path: Path,
+) -> None:
+    """Legacy Generic and TypeVar declarations retain the same direct-binding contract."""
+    specializations = _specializations(
+        tmp_path,
+        "legacy_generic_specialization",
+        [
+            "from typing import Generic, TypeVar",
+            "",
+            "T = TypeVar('T')",
+            "",
+            "class GenericBox(Generic[T]):",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class IntBox(GenericBox[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    specialization = specializations[0]
+    assert specialization.substitutions == (("T", "int"),)
+    assert specialization.target_owner_class == "IntBox"
+
+
+def test_closed_generic_method_call_specializes_on_its_source_owner(tmp_path: Path) -> None:
+    """A typed self.method call can close a method-scoped TypeVar without rebinding a base."""
+    specializations = _specializations(
+        tmp_path,
+        "closed_method_call",
+        [
+            "class Worker:",
+            "    def identity[T](self, value: T) -> T:",
+            "        return value",
+            "",
+            "    def use(self, value: int) -> int:",
+            "        return self.identity(value)",
+            "",
+        ],
+    )
+
+    specialization = next(
+        item for item in specializations if item.source_member.qualname == "Worker.identity"
+    )
+    assert specialization.origin == "closed_call"
+    assert specialization.target_owner_class == "Worker"
+    assert specialization.substitutions == (("T", "int"),)
+    assert specialization.guards[0].positional_index == 1
+
+
+def test_closed_call_ignores_a_shadowed_generic_function_name(tmp_path: Path) -> None:
+    """A local binding with the same name cannot provide false specialization evidence."""
+    specializations = _specializations(
+        tmp_path,
+        "shadowed_closed_call",
+        [
+            "def identity[T](value: T) -> T:",
+            "    return value",
+            "",
+            "def use(value: int) -> int:",
+            "    identity = lambda item: item + 1",
+            "    return identity(value)",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_transitive_generic_subclass_resolves_ancestor_substitutions(tmp_path: Path) -> None:
+    """Concrete arguments flow through a safe same-module generic inheritance chain."""
+    specializations = _specializations(
+        tmp_path,
+        "transitive_specialization",
+        [
+            "class GenericBox[T]:",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class MiddleBox[T](GenericBox[T]):",
+            "    pass",
+            "",
+            "class IntBox(MiddleBox[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    specialization = next(
+        item for item in specializations if item.source_member.qualname == "GenericBox.echo"
+    )
+    assert specialization.target_owner_class == "IntBox"
+    assert specialization.substitutions == (("T", "int"),)
+
+
+def test_transitive_specialization_preserves_intermediate_override(tmp_path: Path) -> None:
+    """An intermediate generic override hides the ancestor implementation."""
+    specializations = _specializations(
+        tmp_path,
+        "transitive_override",
+        [
+            "class GenericBox[T]:",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class MiddleBox[T](GenericBox[T]):",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class IntBox(MiddleBox[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    assert {item.source_member.qualname for item in specializations} == {"MiddleBox.echo"}
+
+
+def test_specialization_models_reject_incomplete_runtime_evidence(tmp_path: Path) -> None:
+    """Malformed guards and non-concrete specialization records fail immediately."""
+    specialization = _specializations(
+        tmp_path,
+        "specialization_validation",
+        [
+            "class GenericBox[T]:",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class IntBox(GenericBox[int]):",
+            "    pass",
+            "",
+        ],
+    )[0]
+    guard = specialization.guards[0]
+
+    with pytest.raises(ValueError, match="parameter_name"):
+        replace(guard, parameter_name=" ")
+    with pytest.raises(ValueError, match="non-negative"):
+        replace(guard, positional_index=-1)
+    with pytest.raises(ValueError, match="annotation"):
+        replace(guard, annotation="")
+    with pytest.raises(ValueError, match="name a type"):
+        replace(guard, nominal_type_paths=(), allow_none=False)
+    with pytest.raises(ValueError, match="nominal paths"):
+        replace(guard, nominal_type_paths=("",))
+    with pytest.raises(ValueError, match="id must be non-empty"):
+        replace(specialization, id="")
+    with pytest.raises(ValueError, match="at least one substitution"):
+        replace(specialization, substitutions=())
+    with pytest.raises(ValueError, match="substitutions must be non-empty"):
+        replace(specialization, substitutions=(("T", ""),))
+    with pytest.raises(ValueError, match="unique TypeVars"):
+        replace(specialization, substitutions=(("T", "int"), ("T", "str")))
+    with pytest.raises(ValueError, match="type bindings must be concrete"):
+        replace(
+            specialization,
+            type_bindings=(replace(specialization.type_bindings[0], concrete=False),),
+        )
+    with pytest.raises(ValueError, match="distinct source and target"):
+        replace(specialization, target_owner_class="GenericBox")
+    with pytest.raises(ValueError, match="retain its source owner"):
+        replace(specialization, origin="closed_call")
+
+
+def test_multiple_generic_bases_preserve_python_mro_precedence(tmp_path: Path) -> None:
+    """Only the first visible generic implementation may bind on a target subclass."""
+    specializations = _specializations(
+        tmp_path,
+        "multiple_generic_bases",
+        [
+            "class First[T]:",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class Second[T]:",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class Final(First[int], Second[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    assert {item.source_member.qualname for item in specializations} == {"First.echo"}
+
+
+def test_runtime_typevar_use_keeps_legacy_generic_method_interpreted(tmp_path: Path) -> None:
+    """A TypeVar used as a runtime value is not an annotation-only substitution."""
+    specializations = _specializations(
+        tmp_path,
+        "runtime_typevar",
+        [
+            "from typing import Generic, TypeVar, cast",
+            "",
+            "T = TypeVar('T')",
+            "",
+            "class GenericBox(Generic[T]):",
+            "    def echo(self, value: T) -> T:",
+            "        return cast(T, value)",
+            "",
+            "class IntBox(GenericBox[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_qualified_external_base_does_not_match_local_generic_basename(tmp_path: Path) -> None:
+    """Only an unqualified same-module base can provide specialization evidence."""
+    specializations = _specializations(
+        tmp_path,
+        "qualified_external_base",
+        [
+            "import external",
+            "",
+            "class GenericBox[T]:",
+            "    def echo(self, value: T) -> T:",
+            "        return value",
+            "",
+            "class ExternalBox(external.GenericBox[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_shadowed_class_receiver_does_not_close_generic_method(tmp_path: Path) -> None:
+    """A capitalized local parameter cannot resolve to a same-module class."""
+    specializations = _specializations(
+        tmp_path,
+        "shadowed_class_receiver",
+        [
+            "class Worker:",
+            "    @staticmethod",
+            "    def identity[T](value: T) -> T:",
+            "        return value",
+            "",
+            "class Other:",
+            "    pass",
+            "",
+            "def use(Worker: type[Other], value: int) -> int:",
+            "    return Worker.identity(value)",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_rebound_module_class_does_not_close_generic_method(tmp_path: Path) -> None:
+    """A reassigned class name cannot resolve calls to its earlier definition."""
+    specializations = _specializations(
+        tmp_path,
+        "rebound_class_receiver",
+        [
+            "class Worker:",
+            "    @staticmethod",
+            "    def identity[T](value: T) -> T:",
+            "        return value",
+            "",
+            "class Other:",
+            "    pass",
+            "",
+            "Worker = Other",
+            "RESULT = Worker.identity(1)",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_duplicate_call_arguments_do_not_close_generic_function(tmp_path: Path) -> None:
+    """A call that Python rejects cannot provide valid TypeVar inference evidence."""
+    specializations = _specializations(
+        tmp_path,
+        "duplicate_call_arguments",
+        [
+            "def identity[T](value: T) -> T:",
+            "    return value",
+            "",
+            "RESULT = identity(1, value=2)",
+            "",
+        ],
+    )
+
+    assert specializations == ()
+
+
+def test_literal_getattr_of_generic_field_remains_interpreted(tmp_path: Path) -> None:
+    """A dynamic spelling of a generic field read receives the same field blocker."""
+    specializations = _specializations(
+        tmp_path,
+        "generic_field_getattr",
+        [
+            "class GenericBox[T]:",
+            "    stored: T",
+            "",
+            "    def get(self) -> T:",
+            "        return getattr(self, 'stored')",
+            "",
+            "class IntBox(GenericBox[int]):",
+            "    pass",
+            "",
+        ],
+    )
+
+    assert specializations == ()

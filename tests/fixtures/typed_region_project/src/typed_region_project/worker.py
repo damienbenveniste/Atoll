@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Iterator
 from typing import Self
 
-from .helpers import twice
+from .helpers import Payload, twice
 
 
 def passthrough(value: int) -> int:
@@ -64,6 +64,30 @@ class Worker:
                     value = value + 1 if received is None else received
         finally:
             self.closed = True
+
+
+class Pairer[T]:
+    """Generic base retained as Python while concrete subclasses may specialize."""
+
+    def pair(self, value: T) -> tuple[T, T]:
+        """Return two references to the input without narrowing the public generic API."""
+        return value, value
+
+
+class IntPairer(Pairer[int]):
+    """Concrete specialization target for the inherited ``pair`` method."""
+
+
+class OptionalPairer[T]:
+    """Generic base whose specialization accepts a nominal value or None."""
+
+    def maybe_pair(self, value: T | None) -> tuple[T | None, T | None]:
+        """Return the optional input twice while preserving generic fallback."""
+        return value, value
+
+
+class PayloadPairer(OptionalPairer[Payload]):
+    """Nominal union specialization target used by wheel acceptance tests."""
 
 
 class DynamicWorker:

@@ -54,9 +54,9 @@ mypyc changes Python frame semantics.
 ## Compile candidates
 
 Use `compile` for the normal workflow. It copies the target package into a temporary Atoll build
-area, inserts shims only in that copy, compiles generated function islands or typed method regions,
-writes a platform wheel, and removes the temporary install tree. The original source files are left
-untouched.
+area, inserts shims only in that copy, compiles generated function islands or typed callable
+regions, writes a platform wheel, and removes the temporary install tree. The original source files
+are left untouched.
 
 ```bash
 uv run atoll compile app.ranking
@@ -67,8 +67,10 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
-For typed methods, the report's `compiled_regions` section names each backend variant, every
-descriptor-aware binding, and the artifact paths associated with that variant.
+For typed callables, the report's `compiled_regions` section names each backend variant, every
+descriptor-aware binding, its runtime guards and concrete target owner, and the artifact paths
+associated with that variant. Typed-region entries retain the original generic declaration plus
+the specialization origin, substitutions, and concrete type bindings.
 
 Before mypyc runs, Atoll regenerates each scan candidate independently and retains only leaf
 kernels whose complete generated function set has concrete builtin annotations and repeated
@@ -86,6 +88,15 @@ annotation typing and C-type inference are disabled so Python integer and contai
 not silently narrowed. Dynamic owner classes, dunder methods, unresolved generics, and explicit
 `Any` remain interpreted.
 
+Generic definitions remain the authoritative Python fallback. Atoll may compile a separate
+specialization when every TypeVar closes from a same-module concrete subclass or an unambiguous
+same-module call with statically concrete inputs. An inherited specialization is installed only on
+the concrete subclass, never on its generic base. The wrapper routes to native code only after
+constant-time checks for scalar or nominal classes, `None`, or unions of those; incompatible calls
+use the captured Python function. Parameterized containers, generic defaults or variadics,
+conflicting call sites, unresolved TypeVars, semantic `Any`, subclass overrides, and dynamic owner
+classes remain interpreted.
+
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
 staging, cache lookup or restore, mypyc batch or retry builds, wheel writing, and cleanup. Compile
 reports include cache status plus subphase timings such as `mypycify` and `build_ext`. Duplicate
@@ -99,10 +110,11 @@ mypyc diagnostic. Module-level typing diagnostics, such as unsupported `TypeVar`
 arguments, remain visible in scan and compile reports. A function from such a module is compiled
 only when its generated kernel still preserves concrete native types.
 
-Atoll v1 source-clean compile targets top-level typed leaf kernels and safe typed methods. It does
-not yet replace whole classes or treat object-rich orchestration as one native unit. Large gains are
-therefore expected only when meaningful application time is spent inside accepted CPU-bound code;
-successful compilation is not a speedup claim.
+Atoll v1 source-clean compile targets top-level typed leaf kernels, safe typed methods, and narrowly
+guarded concrete generic specializations. It does not yet replace whole classes or treat
+object-rich orchestration as one native unit. Large gains are therefore expected only when
+meaningful application time is spent inside accepted CPU-bound code; successful compilation is not
+a speedup claim.
 
 Compiled exports retain the source function or method's name, qualified name, documentation,
 annotations, signature, and sync, coroutine, generator, or async-generator shape. Async-generator

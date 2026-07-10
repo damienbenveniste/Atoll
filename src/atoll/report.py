@@ -38,7 +38,9 @@ from atoll.models import (
     MypyDiagnostic,
     ParameterKind,
     PytestRunResult,
+    RuntimeTypeGuard,
     ScanResult,
+    SpecializationOrigin,
     SymbolId,
     SymbolKind,
     TypedRegion,
@@ -248,8 +250,33 @@ class BindingTargetReport(TypedDict):
     compiled_name: str
     kind: BindingKind
     owner_class: str | None
+    target_owner_class: str | None
     execution_kind: ExecutionKind
     required: bool
+    guards: list[RuntimeTypeGuardReport]
+
+
+class RuntimeTypeGuardReport(TypedDict):
+    """Constant-time input check required before specialized native routing."""
+
+    parameter_name: str
+    positional_index: int | None
+    annotation: str
+    nominal_type_paths: list[str]
+    allow_none: bool
+
+
+class RegionSpecializationReport(TypedDict):
+    """Concrete TypeVar binding layered on an unchanged generic declaration."""
+
+    id: str
+    source_member: str
+    source_owner_class: str | None
+    target_owner_class: str | None
+    origin: SpecializationOrigin
+    substitutions: list[list[str]]
+    guards: list[RuntimeTypeGuardReport]
+    type_bindings: list[TypeBindingReport]
 
 
 class TypedRegionReport(TypedDict):
@@ -263,6 +290,7 @@ class TypedRegionReport(TypedDict):
     type_bindings: list[TypeBindingReport]
     bindings: list[BindingTargetReport]
     decisions: list[LoweringDecisionReport]
+    specializations: list[RegionSpecializationReport]
 
 
 class ModuleReport(TypedDict):
@@ -425,14 +453,16 @@ class CompilationIslandReport(TypedDict):
 
 
 class CompilationCompiledBindingReport(TypedDict):
-    """One method binding that a compiled region promises at runtime."""
+    """One guarded function or descriptor promised by a compiled region."""
 
     source: str
     compiled_name: str
     kind: BindingKind
     owner_class: str | None
+    target_owner_class: str | None
     execution_kind: ExecutionKind
     required: bool
+    guards: list[RuntimeTypeGuardReport]
 
 
 class CompilationCompiledRegionReport(TypedDict):
@@ -810,8 +840,10 @@ def _compiled_region_variant_report(
                 "compiled_name": binding.compiled_name,
                 "kind": binding.kind,
                 "owner_class": binding.owner_class,
+                "target_owner_class": binding.target_owner_class,
                 "execution_kind": binding.execution_kind,
                 "required": binding.required,
+                "guards": [_runtime_guard_report(guard) for guard in binding.guards],
             }
             for binding in bindings
         ],
@@ -939,14 +971,19 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
 
 def _compiled_region_markdown(region: CompilationCompiledRegionReport) -> str:
     backend = region["backend"] or "unknown backend"
-    bindings = ", ".join(
-        f"{binding['source']} ({binding['kind']})" for binding in region["bindings"]
-    )
+    bindings = ", ".join(_compiled_binding_markdown(binding) for binding in region["bindings"])
     artifacts = ", ".join(region["artifacts"]) or "no recorded artifacts"
     return (
         f"- `{region['variant_id']}` [{backend}] for region `{region['id']}`: "
         f"{bindings}; artifacts: {artifacts}"
     )
+
+
+def _compiled_binding_markdown(binding: CompilationCompiledBindingReport) -> str:
+    target = binding["target_owner_class"]
+    target_text = f" -> {target}" if target is not None else ""
+    guard_text = f", {len(binding['guards'])} guard(s)" if binding["guards"] else ""
+    return f"{binding['source']}{target_text} ({binding['kind']}{guard_text})"
 
 
 def _append_compiled_regions_markdown(
@@ -1187,8 +1224,10 @@ def _typed_region_report(region: TypedRegion) -> TypedRegionReport:
                 "compiled_name": binding.compiled_name,
                 "kind": binding.kind,
                 "owner_class": binding.owner_class,
+                "target_owner_class": binding.target_owner_class,
                 "execution_kind": binding.execution_kind,
                 "required": binding.required,
+                "guards": [_runtime_guard_report(guard) for guard in binding.guards],
             }
             for binding in region.bindings
         ],
@@ -1200,6 +1239,39 @@ def _typed_region_report(region: TypedRegion) -> TypedRegionReport:
             }
             for decision in region.decisions
         ],
+        "specializations": [
+            {
+                "id": specialization.id,
+                "source_member": specialization.source_member.stable_id,
+                "source_owner_class": specialization.source_owner_class,
+                "target_owner_class": specialization.target_owner_class,
+                "origin": specialization.origin,
+                "substitutions": [list(item) for item in specialization.substitutions],
+                "guards": [_runtime_guard_report(guard) for guard in specialization.guards],
+                "type_bindings": [
+                    {
+                        "name": binding.name,
+                        "annotation": binding.annotation,
+                        "source": binding.source,
+                        "concrete": binding.concrete,
+                        "substitutions": [list(item) for item in binding.substitutions],
+                    }
+                    for binding in specialization.type_bindings
+                ],
+            }
+            for specialization in region.specializations
+        ],
+    }
+
+
+def _runtime_guard_report(guard: RuntimeTypeGuard) -> RuntimeTypeGuardReport:
+    """Serialize one runtime guard without exposing target code objects."""
+    return {
+        "parameter_name": guard.parameter_name,
+        "positional_index": guard.positional_index,
+        "annotation": guard.annotation,
+        "nominal_type_paths": list(guard.nominal_type_paths),
+        "allow_none": guard.allow_none,
     }
 
 

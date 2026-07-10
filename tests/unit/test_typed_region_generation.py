@@ -11,7 +11,10 @@ import pytest
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
-from atoll.generation.typed_region import generate_typed_method_region
+from atoll.generation.typed_region import (
+    TypedRegionGenerationOptions,
+    generate_typed_method_region,
+)
 from atoll.models import ModuleId, ModuleScan
 
 
@@ -162,7 +165,7 @@ def test_cython_generation_preserves_async_generator_source(tmp_path: Path) -> N
         region,
         (stream,),
         output_path=tmp_path / "generated.py",
-        backend="cython",
+        options=TypedRegionGenerationOptions(backend="cython"),
     )
 
     assert generation.backend == "cython"
@@ -340,3 +343,109 @@ class Worker:
             (scale,),
             output_path=tmp_path / "generated.py",
         )
+
+
+def test_generation_specializes_generic_method_only_for_concrete_subclass(
+    tmp_path: Path,
+) -> None:
+    """A subclass specialization rewrites annotations but retains generic source IR."""
+    source_path = tmp_path / "generic_worker.py"
+    source_path.write_text(
+        """class Pairer[T]:
+    def normalize(self, value: T) -> T:
+        return value
+
+    def pair(self, value: T) -> tuple[T, T]:
+        normalized = self.normalize(value)
+        return normalized, normalized
+
+class IntPairer(Pairer[int]):
+    pass
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="generic_worker", path=source_path)))
+    region = next(region for region in scan.typed_regions if region.specializations)
+    specialization = next(
+        item
+        for item in region.specializations
+        if item.target_owner_class == "IntPairer" and item.source_member.qualname == "Pairer.pair"
+    )
+    output = tmp_path / "specialized.py"
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (specialization.source_member,),
+        output_path=output,
+        options=TypedRegionGenerationOptions(specialization=specialization),
+    )
+
+    binding = generation.bindings[0]
+    tree = ast.parse(generation.source_text)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == binding.compiled_name
+    )
+    value_annotation = function.args.args[1].annotation
+    assert value_annotation is not None
+    assert function.returns is not None
+    assert ast.unparse(value_annotation) == "int"
+    assert ast.unparse(function.returns) == "tuple[int, int]"
+    assert function.type_params == []
+    assert "class _AtollIntPairer(Protocol)" in generation.source_text
+    assert "def normalize(self, value: int) -> int" in generation.source_text
+    assert "Any" not in generation.source_text
+    assert binding.owner_class == "Pairer"
+    assert binding.target_owner_class == "IntPairer"
+    assert binding.guards == specialization.guards
+    assert generation.specialization == specialization
+    original = next(
+        member for member in region.members if member.id == specialization.source_member
+    )
+    assert "value: T" in original.source_text
+
+
+def test_generation_specializes_closed_generic_function_without_owner_facade(
+    tmp_path: Path,
+) -> None:
+    """A closed call produces a module binding with concrete annotations and guards."""
+    source_path = tmp_path / "generic_function.py"
+    source_path.write_text(
+        """def pair_value[T](value: T) -> tuple[T, T]:
+    return value, value
+
+def pair_int(value: int) -> tuple[int, int]:
+    return pair_value(value)
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="generic_function", path=source_path)))
+    region = next(region for region in scan.typed_regions if region.specializations)
+    specialization = next(item for item in region.specializations if item.origin == "closed_call")
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (specialization.source_member,),
+        output_path=tmp_path / "specialized_function.py",
+        options=TypedRegionGenerationOptions(specialization=specialization),
+    )
+
+    binding = generation.bindings[0]
+    tree = ast.parse(generation.source_text)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == binding.compiled_name
+    )
+    assert binding.kind == "module"
+    assert binding.owner_class is None
+    assert binding.target_owner_class is None
+    assert binding.guards[0].parameter_name == "value"
+    assert function.args.args[0].annotation is not None
+    assert function.returns is not None
+    assert ast.unparse(function.args.args[0].annotation) == "int"
+    assert ast.unparse(function.returns) == "tuple[int, int]"
+    assert "Protocol" not in generation.source_text

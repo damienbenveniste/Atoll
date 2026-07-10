@@ -28,6 +28,7 @@ from atoll.models import (
     EnabledIslandConfig,
     ModuleId,
     ModuleScan,
+    RegionSpecialization,
     TypedRegion,
 )
 from atoll.project import DiscoveredProject, discover_project
@@ -74,6 +75,7 @@ class _CacheLookup(Protocol):
 
 class _TypedSelection(Protocol):
     backend: Backend
+    specialization: RegionSpecialization | None
 
 
 class _TypedGeneration(Protocol):
@@ -205,6 +207,44 @@ _build_typed_regions = cast(
 )
 _TypedRegionBuildContext = cast(Callable[..., object], _package_attr("_TypedRegionBuildContext"))
 _compiler_backends = cast(dict[Backend, object], _package_attr("_COMPILER_BACKENDS"))
+
+
+def test_typed_region_selection_prefers_mypyc_for_safe_specializations(
+    tmp_path: Path,
+) -> None:
+    """Subclass and closed-call specializations enter the normal automatic routing path."""
+    project_root = tmp_path / "typed_region_project"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+
+    worker_selections = _selected_typed_method_regions(
+        _selected_scans(project, "typed_region_project.worker")
+    )
+    worker_specializations = tuple(
+        selection.specialization
+        for selection in worker_selections
+        if selection.specialization is not None
+    )
+    function_selections = _selected_typed_method_regions(
+        _selected_scans(project, "typed_region_project.generic_functions")
+    )
+
+    assert {
+        (specialization.origin, specialization.target_owner_class)
+        for specialization in worker_specializations
+    } == {
+        ("concrete_subclass", "IntPairer"),
+        ("concrete_subclass", "PayloadPairer"),
+    }
+    assert all(
+        selection.backend == "mypyc"
+        for selection in worker_selections
+        if selection.specialization is not None
+    )
+    assert len(function_selections) == 1
+    assert function_selections[0].backend == "mypyc"
+    assert function_selections[0].specialization is not None
+    assert function_selections[0].specialization.origin == "closed_call"
 
 
 def test_package_reports_build_failure_without_source_edits(

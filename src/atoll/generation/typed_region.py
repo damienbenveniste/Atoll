@@ -1,9 +1,10 @@
-"""Lower typed class methods into backend-ready source-clean compilation units.
+"""Lower typed callables into backend-ready source-clean compilation units.
 
 The lowerer operates only on scanner evidence and never imports the target
 project. It preserves explicit annotations and executable bodies, supplies a
-narrow structural owner type for implicit ``self`` and ``cls`` parameters, and
-writes generated source only inside a caller-owned temporary build tree.
+narrow structural owner type for implicit ``self`` and ``cls`` parameters,
+applies only analysis-proven generic substitutions, and writes generated source
+only inside a caller-owned temporary build tree.
 """
 
 from __future__ import annotations
@@ -20,11 +21,12 @@ from atoll.models import (
     ImportRecord,
     ModuleScan,
     RegionMember,
+    RegionSpecialization,
     SymbolId,
     TypedRegion,
 )
 
-TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-method-v1"
+TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-method-v2"
 _SUPPORTED_BINDINGS = frozenset({"instance_method", "staticmethod", "classmethod"})
 _SUPPORTED_EXECUTION_KINDS = frozenset({"sync", "generator", "coroutine"})
 
@@ -46,6 +48,18 @@ class TypedRegionGeneration:
     selected_members: tuple[SymbolId, ...]
     bindings: tuple[BindingTarget, ...]
     backend: Backend
+    specialization: RegionSpecialization | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TypedRegionGenerationOptions:
+    """Backend and optional analysis-proven specialization for one generated unit."""
+
+    backend: Backend = "mypyc"
+    specialization: RegionSpecialization | None = None
+
+
+_DEFAULT_GENERATION_OPTIONS = TypedRegionGenerationOptions()
 
 
 def generate_typed_method_region(
@@ -54,17 +68,29 @@ def generate_typed_method_region(
     selected_members: tuple[SymbolId, ...],
     *,
     output_path: Path,
-    backend: Backend = "mypyc",
+    options: TypedRegionGenerationOptions = _DEFAULT_GENERATION_OPTIONS,
 ) -> TypedRegionGeneration:
-    """Write one preserved typed-method module for a native backend.
+    """Write one preserved or concretely specialized callable module.
 
-    Only method-level binding is supported here. Async generators deliberately
-    remain for the Cython milestone, and unsafe decorators or unresolved member
-    identifiers fail before any generated file is written.
+    Ordinary selections retain their source annotations exactly. A generic
+    selection must provide analysis-produced specialization evidence; this
+    function never infers substitutions or erases unresolved types. Unsafe
+    decorators and unresolved member identifiers fail before a file is written.
     """
-    members = _selected_region_members(region, selected_members, backend)
-    bindings = tuple(_binding_target(member) for member in members)
-    source_text = _generated_source(scan, members, bindings, backend)
+    members = _selected_region_members(
+        region,
+        selected_members,
+        options.backend,
+        options.specialization,
+    )
+    bindings = tuple(_binding_target(member, options.specialization) for member in members)
+    source_text = _generated_source(
+        scan,
+        members,
+        bindings,
+        options.backend,
+        options.specialization,
+    )
     source_hash = hashlib.sha256(source_text.encode()).hexdigest()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(source_text, encoding="utf-8")
@@ -76,7 +102,8 @@ def generate_typed_method_region(
         source_hash=source_hash,
         selected_members=selected_members,
         bindings=bindings,
-        backend=backend,
+        backend=options.backend,
+        specialization=options.specialization,
     )
 
 
@@ -84,19 +111,33 @@ def _selected_region_members(
     region: TypedRegion,
     selected_members: tuple[SymbolId, ...],
     backend: Backend,
+    specialization: RegionSpecialization | None,
 ) -> tuple[RegionMember, ...]:
     if not selected_members:
-        raise ValueError("typed method generation requires at least one selected member")
+        raise ValueError("typed callable generation requires at least one selected member")
     if len(set(selected_members)) != len(selected_members):
-        raise ValueError("typed method generation received duplicate selected members")
+        raise ValueError("typed callable generation received duplicate selected members")
     by_id = {member.id: member for member in region.members}
     unknown = tuple(symbol for symbol in selected_members if symbol not in by_id)
     if unknown:
         names = ", ".join(symbol.stable_id for symbol in unknown)
         raise ValueError(f"selected members are outside typed region {region.id}: {names}")
     members = tuple(by_id[symbol] for symbol in selected_members)
+    if specialization is not None and (
+        len(members) != 1 or members[0].id != specialization.source_member
+    ):
+        raise ValueError(
+            f"specialization {specialization.id} must select only "
+            f"{specialization.source_member.stable_id}"
+        )
     for member in members:
-        if member.kind != "method" or member.binding_kind not in _SUPPORTED_BINDINGS:
+        method_binding = member.kind == "method" and member.binding_kind in _SUPPORTED_BINDINGS
+        specialized_function = (
+            specialization is not None
+            and member.kind == "function"
+            and member.binding_kind == "module"
+        )
+        if not method_binding and not specialized_function:
             raise ValueError(f"unsupported typed-region binding: {member.id.stable_id}")
         execution_supported = member.execution_kind in _SUPPORTED_EXECUTION_KINDS or (
             backend == "cython" and member.execution_kind == "async_generator"
@@ -106,7 +147,7 @@ def _selected_region_members(
                 f"unsupported typed-region execution kind {member.execution_kind}: "
                 f"{member.id.stable_id}"
             )
-        decorators = _method_node(member).decorator_list
+        decorators = _callable_node(member).decorator_list
         unknown_decorators = tuple(
             ast.unparse(decorator)
             for decorator in decorators
@@ -125,8 +166,14 @@ def _generated_source(
     members: tuple[RegionMember, ...],
     bindings: tuple[BindingTarget, ...],
     backend: Backend,
+    specialization: RegionSpecialization | None,
 ) -> str:
-    owners = tuple(sorted({member.owner_class for member in members if member.owner_class}))
+    owner_names: set[str] = set()
+    for binding in bindings:
+        owner = binding.target_owner_class or binding.owner_class
+        if owner is not None:
+            owner_names.add(owner)
+    owners = tuple(sorted(owner_names))
     imports = tuple(
         _preserved_import(scan, record)
         for record in scan.imports
@@ -136,7 +183,7 @@ def _generated_source(
         record.source_text for record in scan.constants if record.kind == "literal_constant"
     )
     sections: list[str] = ["from __future__ import annotations"]
-    if backend == "mypyc":
+    if backend == "mypyc" and owners:
         sections.extend(("", "from typing import Protocol"))
     if imports:
         sections.extend(("", *dict.fromkeys(imports)))
@@ -144,10 +191,37 @@ def _generated_source(
         sections.extend(("", *constants))
     if backend == "mypyc":
         for owner in owners:
-            sections.extend(("", _owner_facade(scan, owner)))
+            source_owner = (
+                specialization.source_owner_class
+                if specialization is not None and specialization.target_owner_class == owner
+                else None
+            )
+            sections.extend(
+                (
+                    "",
+                    _owner_facade(
+                        scan,
+                        owner,
+                        source_owner=source_owner,
+                        substitutions=(
+                            specialization.substitutions if specialization is not None else ()
+                        ),
+                    ),
+                )
+            )
     binding_by_source = {binding.source: binding for binding in bindings}
     for member in members:
-        sections.extend(("", _lowered_method(member, binding_by_source[member.id], backend)))
+        sections.extend(
+            (
+                "",
+                _lowered_callable(
+                    member,
+                    binding_by_source[member.id],
+                    backend,
+                    specialization,
+                ),
+            )
+        )
     return "\n".join(sections).rstrip() + "\n"
 
 
@@ -179,28 +253,44 @@ def _preserved_import(scan: ModuleScan, record: ImportRecord) -> str:
     return ast.unparse(statement)
 
 
-def _owner_facade(scan: ModuleScan, owner: str) -> str:
-    class_symbol = next(
-        (
-            symbol
-            for symbol in scan.symbols
-            if symbol.kind == "class" and symbol.id.qualname == owner
-        ),
-        None,
+def _owner_facade(
+    scan: ModuleScan,
+    owner: str,
+    *,
+    source_owner: str | None = None,
+    substitutions: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """Render a structural receiver facade, including safe inherited evidence."""
+    owner_order = tuple(dict.fromkeys(item for item in (source_owner, owner) if item is not None))
+    class_symbols = tuple(
+        symbol
+        for owner_name in owner_order
+        for symbol in scan.symbols
+        if symbol.kind == "class" and symbol.id.qualname == owner_name
     )
     body: list[ast.stmt] = []
-    if class_symbol is not None:
-        body.extend(
+    fields = {field.name: field for class_symbol in class_symbols for field in class_symbol.fields}
+    for field in fields.values():
+        annotation = ast.parse(field.annotation, mode="eval").body
+        if substitutions:
+            annotation = _substituted_annotation(annotation, _parsed_substitutions(substitutions))
+        body.append(
             ast.AnnAssign(
                 target=ast.Name(id=field.name, ctx=ast.Store()),
-                annotation=ast.parse(field.annotation, mode="eval").body,
+                annotation=annotation,
                 value=None,
                 simple=1,
             )
-            for field in class_symbol.fields
         )
-    for symbol in scan.symbols:
-        if symbol.kind != "method" or symbol.owner_class != owner:
+    methods = {
+        symbol.id.qualname.rsplit(".", maxsplit=1)[-1]: symbol
+        for owner_name in owner_order
+        for symbol in scan.symbols
+        if symbol.kind == "method" and symbol.owner_class == owner_name
+    }
+    substitution_names = {name for name, _ in substitutions}
+    for symbol in methods.values():
+        if set(symbol.scope_type_parameters) - substitution_names:
             continue
         if symbol.return_annotation is None:
             continue
@@ -219,7 +309,10 @@ def _owner_facade(scan: ModuleScan, owner: str) -> str:
         )
         if member is None:
             continue
-        node = _method_node(member)
+        node = _callable_node(member)
+        if substitutions:
+            _specialize_annotations(node, substitutions)
+            node.type_params = []
         node.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
         node.decorator_list = [
             decorator
@@ -240,17 +333,23 @@ def _owner_facade(scan: ModuleScan, owner: str) -> str:
     return ast.unparse(ast.fix_missing_locations(facade))
 
 
-def _lowered_method(
+def _lowered_callable(
     member: RegionMember,
     binding: BindingTarget,
     backend: Backend,
+    specialization: RegionSpecialization | None,
 ) -> str:
-    node = _method_node(member)
+    node = _callable_node(member)
     node.name = binding.compiled_name
     node.decorator_list = []
+    if specialization is not None:
+        _specialize_annotations(node, specialization.substitutions)
+        node.type_params = []
     if backend == "cython":
         return ast.unparse(ast.fix_missing_locations(node))
-    owner = _required_owner(member)
+    if binding.kind == "module":
+        return ast.unparse(ast.fix_missing_locations(node))
+    owner = binding.target_owner_class or _required_owner(member)
     _rewrite_signature_owner_types(node, owner)
     first = _first_positional_parameter(node)
     if member.binding_kind == "instance_method":
@@ -270,7 +369,7 @@ def _lowered_method(
     return ast.unparse(ast.fix_missing_locations(node))
 
 
-def _method_node(member: RegionMember) -> ast.FunctionDef | ast.AsyncFunctionDef:
+def _callable_node(member: RegionMember) -> ast.FunctionDef | ast.AsyncFunctionDef:
     tree = ast.parse(textwrap.dedent(member.source_text))
     node = next(
         (
@@ -292,14 +391,101 @@ def _first_positional_parameter(
     return parameters[0] if parameters else None
 
 
-def _binding_target(member: RegionMember) -> BindingTarget:
+def _binding_target(
+    member: RegionMember,
+    specialization: RegionSpecialization | None,
+) -> BindingTarget:
+    target_owner = specialization.target_owner_class if specialization is not None else None
+    compiled_name = member.id.qualname.replace(".", "__")
+    if specialization is not None:
+        target = target_owner or member.id.qualname
+        label = target.replace(".", "__")
+        member_name = member.id.qualname.rsplit(".", maxsplit=1)[-1]
+        compiled_name = f"{label}__{member_name}__{specialization.id[-12:]}"
     return BindingTarget(
         source=member.id,
-        compiled_name=member.id.qualname.replace(".", "__"),
+        compiled_name=compiled_name,
         kind=member.binding_kind,
         owner_class=member.owner_class,
         execution_kind=member.execution_kind,
+        target_owner_class=target_owner,
+        guards=specialization.guards if specialization is not None else (),
     )
+
+
+def _specialize_annotations(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    substitutions: tuple[tuple[str, str], ...],
+) -> None:
+    """Apply complete TypeVar substitutions only inside annotation positions."""
+    if not substitutions:
+        raise ValueError("generic specialization requires at least one type substitution")
+    parsed = _parsed_substitutions(substitutions)
+    parameters = (
+        *node.args.posonlyargs,
+        *node.args.args,
+        *node.args.kwonlyargs,
+        *((node.args.vararg,) if node.args.vararg is not None else ()),
+        *((node.args.kwarg,) if node.args.kwarg is not None else ()),
+    )
+    for parameter in parameters:
+        if parameter.annotation is not None:
+            parameter.annotation = _substituted_annotation(parameter.annotation, parsed)
+    if node.returns is not None:
+        node.returns = _substituted_annotation(node.returns, parsed)
+    for descendant in ast.walk(node):
+        if isinstance(descendant, ast.AnnAssign):
+            descendant.annotation = _substituted_annotation(descendant.annotation, parsed)
+    unresolved = {
+        name
+        for annotation in (
+            *(parameter.annotation for parameter in parameters if parameter.annotation is not None),
+            *((node.returns,) if node.returns is not None else ()),
+            *(
+                descendant.annotation
+                for descendant in ast.walk(node)
+                if isinstance(descendant, ast.AnnAssign)
+            ),
+        )
+        for name in parsed
+        if any(isinstance(item, ast.Name) and item.id == name for item in ast.walk(annotation))
+    }
+    if unresolved:
+        raise ValueError(
+            "generic specialization left unresolved type parameter(s): "
+            + ", ".join(sorted(unresolved))
+        )
+
+
+def _parsed_substitutions(
+    substitutions: tuple[tuple[str, str], ...],
+) -> dict[str, ast.expr]:
+    return {name: ast.parse(annotation, mode="eval").body for name, annotation in substitutions}
+
+
+def _substituted_annotation(
+    annotation: ast.expr,
+    substitutions: dict[str, ast.expr],
+) -> ast.expr:
+    expression = _unquoted_annotation(annotation)
+    rewritten = _TypeParameterAnnotationRewriter(substitutions).visit(expression)
+    if not isinstance(rewritten, ast.expr):
+        raise TypeError("type-parameter specialization produced a non-expression")
+    return rewritten
+
+
+class _TypeParameterAnnotationRewriter(ast.NodeTransformer):
+    """Replace TypeVar names in one annotation without touching runtime code."""
+
+    def __init__(self, substitutions: dict[str, ast.expr]) -> None:
+        self.substitutions = substitutions
+
+    def visit_Name(self, node: ast.Name) -> ast.expr:
+        """Return a fresh parsed replacement for a specialized TypeVar name."""
+        replacement = self.substitutions.get(node.id)
+        if replacement is None:
+            return node
+        return ast.copy_location(ast.parse(ast.unparse(replacement), mode="eval").body, node)
 
 
 def _required_owner(member: RegionMember) -> str:

@@ -32,7 +32,7 @@ uv run atoll compile
 ```
 
 `compile` copies the target package into a temporary Atoll build area, inserts shims only in that
-copy, compiles generated function islands or typed method regions, writes a platform wheel, and
+copy, compiles generated function islands or typed callable regions, writes a platform wheel, and
 removes the temporary install tree. Pass a module name to limit the operation to one source module.
 The original source files are left untouched.
 
@@ -40,8 +40,10 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
-For typed methods, `compiled_regions` records each backend variant, its descriptor-aware bindings,
-and its native artifact paths.
+For typed callables, `compiled_regions` records each backend variant, descriptor-aware bindings,
+runtime guards, concrete target owners, and native artifact paths. Typed-region entries preserve
+the original generic declaration and list specialization origins, substitutions, and concrete type
+bindings separately.
 
 Before mypyc runs, Atoll regenerates each scan candidate independently and retains only leaf
 kernels whose complete generated function set has concrete builtin annotations and repeated
@@ -58,6 +60,14 @@ execution shapes or deterministic mypyc type failures. Cython annotation typing 
 inference are disabled to preserve Python integer and container semantics. Dynamic owners, dunder
 methods, unresolved generics, and explicit `Any` remain interpreted fallback.
 
+Generic definitions remain the Python fallback. Atoll creates a separate specialization only when
+every TypeVar closes from a same-module concrete subclass or an unambiguous same-module call with
+statically concrete inputs. Subclass specializations bind only to the concrete subclass. Runtime
+routing checks scalar or nominal classes, `None`, and unions of those in constant time, then calls
+the original Python function when a guard fails. Parameterized containers, defaults or variadics
+that carry TypeVars, conflicting calls, unresolved TypeVars, semantic `Any`, subclass overrides,
+and dynamic owner classes stay interpreted.
+
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
 staging, cache lookup or restore, mypyc batch or retry builds, wheel writing, and cleanup. Compile
 reports include cache status plus subphase timings such as `mypycify` and `build_ext`. Duplicate
@@ -72,10 +82,11 @@ Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments
 scan and compile reports. A function from such a module is compiled only when its generated kernel
 still preserves concrete native types.
 
-Atoll v1 source-clean compile targets top-level typed leaf kernels and safe typed methods. It does
-not yet replace whole classes or treat object-rich orchestration as one native unit. Large gains are
-expected only when meaningful application time is spent inside accepted CPU-bound code; successful
-compilation is not a speedup claim.
+Atoll v1 source-clean compile targets top-level typed leaf kernels, safe typed methods, and narrowly
+guarded concrete generic specializations. It does not yet replace whole classes or treat
+object-rich orchestration as one native unit. Large gains are expected only when meaningful
+application time is spent inside accepted CPU-bound code; successful compilation is not a speedup
+claim.
 
 Compiled exports retain the source function or method's name, qualified name, documentation,
 annotations, signature, and sync, coroutine, generator, or async-generator shape. Async-generator

@@ -38,6 +38,7 @@ from atoll.generation.sidecar import (
 )
 from atoll.generation.typed_region import (
     TypedRegionGeneration,
+    TypedRegionGenerationOptions,
     generate_typed_method_region,
 )
 from atoll.models import (
@@ -57,6 +58,7 @@ from atoll.models import (
     LoweringDecision,
     ModuleId,
     ModuleScan,
+    RegionSpecialization,
     SymbolId,
     TypedRegion,
 )
@@ -169,7 +171,7 @@ class _SelectedModule:
 
 @dataclass(frozen=True, slots=True)
 class _SelectedTypedRegion:
-    """One typed region and method subset selected for the mypyc vertical slice."""
+    """One typed region and callable subset selected for a backend variant."""
 
     scan: ModuleScan
     region: TypedRegion
@@ -177,6 +179,7 @@ class _SelectedTypedRegion:
     backend: Backend
     assessment: BackendAssessment
     members: tuple[SymbolId, ...]
+    specialization: RegionSpecialization | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -450,7 +453,7 @@ def _handle_no_native_islands(
     if context.selected:
         _progress(
             options.progress,
-            "no function islands passed native readiness; trying typed method regions",
+            "no function islands passed native readiness; trying typed callable regions",
         )
         return _execute_typed_region_package(
             options=options,
@@ -576,7 +579,7 @@ def _execute_typed_region_package(
         )
 
     payload_started = time.perf_counter()
-    _progress(options.progress, "binding compiled methods in staged source modules")
+    _progress(options.progress, "binding compiled callables in staged source modules")
     successful_shims = tuple(item.shim for item in outcome.successful)
     _insert_region_shims(successful_shims)
     _place_region_artifacts(successful_shims, outcome.build.artifact_paths)
@@ -660,9 +663,8 @@ def _prepare_typed_region(
 ) -> _PreparedTypedRegion:
     staged_module = _staged_module(selection.scan.module, project, staged_source_roots)
     staged_scan = enrich_island_analysis(scan_module(staged_module))
-    staged_region = next(
-        region for region in staged_scan.typed_regions if region.id == selection.region.id
-    )
+    staged_selection = _staged_typed_selection(staged_scan, selection)
+    staged_region = staged_selection.region
     staged = _StagedTypedRegionContext(
         build_root=build_root,
         staged_source_root=_staged_source_root(
@@ -674,14 +676,14 @@ def _prepare_typed_region(
         scan=staged_scan,
         region=staged_region,
     )
-    prepared = _prepare_backend_variant(staged, selection)
-    if selection.backend != "mypyc":
+    prepared = _prepare_backend_variant(staged, staged_selection)
+    if staged_selection.backend != "mypyc":
         return prepared
     cython_assessment = CYTHON_BACKEND.assess(staged_region)
-    if not set(selection.members) <= set(cython_assessment.supported_members):
+    if not set(staged_selection.members) <= set(cython_assessment.supported_members):
         return prepared
     fallback_selection = replace(
-        selection,
+        staged_selection,
         variant_id=f"{staged_region.id}@cython-mypyc-fallback",
         backend="cython",
         assessment=cython_assessment,
@@ -691,6 +693,41 @@ def _prepare_typed_region(
     except (SyntaxError, ValueError):
         return prepared
     return replace(prepared, fallback=fallback)
+
+
+def _staged_typed_selection(
+    staged_scan: ModuleScan,
+    selection: _SelectedTypedRegion,
+) -> _SelectedTypedRegion:
+    """Rebind a deterministic selection to equivalent evidence in the copied tree."""
+    if selection.specialization is None:
+        staged_region = next(
+            region for region in staged_scan.typed_regions if region.id == selection.region.id
+        )
+        return replace(selection, scan=staged_scan, region=staged_region)
+    staged_source_region = next(
+        region
+        for region in staged_scan.typed_regions
+        if any(
+            specialization.id == selection.specialization.id
+            for specialization in region.specializations
+        )
+    )
+    staged_specialization = next(
+        specialization
+        for specialization in staged_source_region.specializations
+        if specialization.id == selection.specialization.id
+    )
+    staged_region = _specialized_region(staged_source_region, staged_specialization)
+    backend = _compiler_backend(selection.backend)
+    return replace(
+        selection,
+        scan=staged_scan,
+        region=staged_region,
+        assessment=backend.assess(staged_region),
+        members=(staged_specialization.source_member,),
+        specialization=staged_specialization,
+    )
 
 
 def _prepare_backend_variant(
@@ -709,7 +746,10 @@ def _prepare_backend_variant(
         staged.region,
         selection.members,
         output_path=generated_path,
-        backend=selection.backend,
+        options=TypedRegionGenerationOptions(
+            backend=selection.backend,
+            specialization=selection.specialization,
+        ),
     )
     unit = _compiler_backend(selection.backend).lower(
         BackendLoweringRequest(
@@ -1050,13 +1090,14 @@ def _progress_compile_selection(
     selected_regions: tuple[_SelectedTypedRegion, ...],
 ) -> None:
     function_count = sum(len(module.symbols) for module in selected_modules)
-    method_count = sum(len(region.members) for region in selected_regions)
+    callable_count = sum(len(region.members) for region in selected_regions)
+    specialization_count = sum(region.specialization is not None for region in selected_regions)
     _progress(
         progress,
         (
             f"selected {len(selected_modules)} candidate module(s), {function_count} "
-            f"function(s), and {len(selected_regions)} typed method backend variant(s), "
-            f"{method_count} method(s)"
+            f"function(s), and {len(selected_regions)} typed callable backend variant(s), "
+            f"{callable_count} callable(s), {specialization_count} specialization(s)"
         ),
     )
 
@@ -1656,7 +1697,72 @@ def _selected_typed_method_regions(
                         members=cython_members,
                     )
                 )
+            for specialization in region.specializations:
+                specialized_region = _specialized_region(region, specialization)
+                mypyc_assessment = MYPYC_BACKEND.assess(specialized_region)
+                if specialization.source_member in mypyc_assessment.supported_members:
+                    selected.append(
+                        _SelectedTypedRegion(
+                            scan=scan,
+                            region=specialized_region,
+                            variant_id=f"{specialization.id}@mypyc",
+                            backend="mypyc",
+                            assessment=mypyc_assessment,
+                            members=(specialization.source_member,),
+                            specialization=specialization,
+                        )
+                    )
+                    continue
+                cython_assessment = CYTHON_BACKEND.assess(specialized_region)
+                if specialization.source_member in cython_assessment.supported_members:
+                    selected.append(
+                        _SelectedTypedRegion(
+                            scan=scan,
+                            region=specialized_region,
+                            variant_id=f"{specialization.id}@cython",
+                            backend="cython",
+                            assessment=cython_assessment,
+                            members=(specialization.source_member,),
+                            specialization=specialization,
+                        )
+                    )
     return tuple(selected)
+
+
+def _specialized_region(
+    source_region: TypedRegion,
+    specialization: RegionSpecialization,
+) -> TypedRegion:
+    """Materialize one backend-assessable view without changing generic source IR."""
+    member = next(item for item in source_region.members if item.id == specialization.source_member)
+    source_hash = hashlib.sha256(
+        f"{source_region.source_hash}:{specialization.id}".encode()
+    ).hexdigest()
+    return TypedRegion(
+        id=specialization.id,
+        source_module=source_region.source_module,
+        members=(member,),
+        dependencies=tuple(
+            dependency
+            for dependency in source_region.dependencies
+            if dependency.src == specialization.source_member
+        ),
+        type_bindings=specialization.type_bindings,
+        bindings=(),
+        decisions=(
+            LoweringDecision(
+                target=specialization.source_member.stable_id,
+                action="specialize",
+                reason=(
+                    "all generic parameters resolved from "
+                    + specialization.origin.replace("_", " ")
+                ),
+            ),
+        ),
+        source_hash=source_hash,
+        atomic_class=False,
+        specializations=(specialization,),
+    )
 
 
 def _eligible_typed_methods(

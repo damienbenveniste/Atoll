@@ -16,7 +16,13 @@ from atoll.generation.region_shim import (
     remove_region_shim,
     render_region_shim,
 )
-from atoll.models import BindingKind, BindingTarget, ExecutionKind, SymbolId
+from atoll.models import (
+    BindingKind,
+    BindingTarget,
+    ExecutionKind,
+    RuntimeTypeGuard,
+    SymbolId,
+)
 
 FALLBACK_RESULT = 4
 
@@ -77,7 +83,50 @@ def test_region_shim_renders_descriptor_and_status_contract(tmp_path: Path) -> N
     assert "ATOLL_DISABLE" in rendered
     assert "ATOLL_REQUIRE_COMPILED" in rendered
     assert "__atoll_compiled_target__" in rendered
+    assert "__atoll_python_fallback__" in rendered
+    assert "_atoll_guards_pass" in rendered
     assert "_atoll_name_to_remove.startswith" in rendered
+
+
+def test_region_shim_renders_subclass_target_and_constant_time_guard(tmp_path: Path) -> None:
+    """Specialized methods read the base descriptor but bind only the target subclass."""
+    source_path = tmp_path / "worker.py"
+    binding = BindingTarget(
+        source=SymbolId(module="pkg.worker", qualname="Pairer.pair"),
+        compiled_name="IntPairer__pair__specialized",
+        kind="instance_method",
+        owner_class="Pairer",
+        target_owner_class="IntPairer",
+        execution_kind="sync",
+        guards=(
+            RuntimeTypeGuard(
+                parameter_name="value",
+                positional_index=1,
+                annotation="int | None",
+                nominal_type_paths=("int",),
+                allow_none=True,
+            ),
+        ),
+    )
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=source_path,
+        region_id="pairer@int",
+        backend="mypyc",
+        compiled_module="compiled_pairer",
+        artifact_dir=tmp_path / "artifacts",
+        bindings=(binding,),
+    )
+
+    rendered = render_region_shim((config,))
+
+    compile(rendered, "worker.py", "exec")
+    assert "'source_owner_class': 'Pairer'" in rendered
+    assert "'target_owner_class': 'IntPairer'" in rendered
+    assert "'qualname': 'IntPairer.pair'" in rendered
+    assert "'nominal_type_paths': ('int',)" in rendered
+    assert "if _atoll_guard_check(_atoll_guards, args, kwargs)" in rendered
+    assert "except Exception:" in rendered
 
 
 def test_region_shim_insertion_is_idempotent_and_removable(tmp_path: Path) -> None:
@@ -167,9 +216,22 @@ def test_region_shim_config_rejects_invalid_promises(tmp_path: Path) -> None:
             bindings=(replace(binding, source=SymbolId("other", "Worker.scale")),),
         )
     with pytest.raises(ValueError, match="unsupported region shim binding"):
-        replace(config, bindings=(replace(binding, kind="module"),))
+        replace(config, bindings=(replace(binding, kind="class"),))
     with pytest.raises(ValueError, match="owner class"):
         replace(config, bindings=(replace(binding, owner_class=None),))
+    with pytest.raises(ValueError, match="module region shim binding"):
+        replace(
+            config,
+            bindings=(
+                BindingTarget(
+                    source=SymbolId("pkg.worker", "score"),
+                    compiled_name="score",
+                    kind="module",
+                    owner_class="Worker",
+                    execution_kind="sync",
+                ),
+            ),
+        )
 
 
 def test_region_shim_rejects_ambiguous_config_sets_and_markers(tmp_path: Path) -> None:

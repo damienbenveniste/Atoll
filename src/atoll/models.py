@@ -68,6 +68,7 @@ TypeBindingSource = Literal[
     "type_parameter",
     "import",
 ]
+SpecializationOrigin = Literal["concrete_subclass", "closed_call"]
 Visibility = Literal["public", "private"]
 
 _SHA256_HEX_LENGTH = 64
@@ -293,11 +294,91 @@ class SymbolRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeTypeGuard:
+    """Constant-time runtime type evidence for one specialized input.
+
+    The guard describes only checks that can be performed from the object
+    already passed by the caller. `positional_index` counts the original Python
+    parameter position, including `self` or `cls` for methods; keyword-only
+    parameters use `None` because there is no stable positional slot. The
+    nominal paths are syntactic type names such as `int` or `models.Payload`,
+    and `allow_none` records a separate `None` acceptance branch.
+    """
+
+    parameter_name: str
+    positional_index: int | None
+    annotation: str
+    nominal_type_paths: tuple[str, ...]
+    allow_none: bool
+
+    def __post_init__(self) -> None:
+        """Reject guards that cannot describe a constant-time nominal check."""
+        if not self.parameter_name.strip():
+            raise ValueError("runtime type guard parameter_name must be non-empty")
+        if self.positional_index is not None and self.positional_index < 0:
+            raise ValueError("runtime type guard positional_index must be non-negative")
+        if not self.annotation.strip():
+            raise ValueError("runtime type guard annotation must be non-empty")
+        if not self.allow_none and not self.nominal_type_paths:
+            raise ValueError("runtime type guard must name a type or allow None")
+        if any(not path.strip() for path in self.nominal_type_paths):
+            raise ValueError("runtime type guard nominal paths must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class RegionSpecialization:
+    """Concrete specialization evidence layered on an unchanged typed region.
+
+    Specializations never rewrite the source member, original type bindings, or
+    generic fallback decisions. They record a target owner or closed call that
+    proves a concrete binding, the substitutions that made all emitted
+    `type_bindings` concrete, and runtime guards required to dispatch to the
+    specialized binding in constant time.
+    """
+
+    id: str
+    source_member: SymbolId
+    source_owner_class: str | None
+    target_owner_class: str | None
+    origin: SpecializationOrigin
+    substitutions: tuple[tuple[str, str], ...]
+    guards: tuple[RuntimeTypeGuard, ...]
+    type_bindings: tuple[TypeBinding, ...]
+
+    def __post_init__(self) -> None:
+        """Validate that specialization evidence is concrete and self-contained."""
+        if not self.id.strip():
+            raise ValueError("region specialization id must be non-empty")
+        if not self.substitutions:
+            raise ValueError("region specialization requires at least one substitution")
+        if any(
+            not type_var.strip() or not annotation.strip()
+            for type_var, annotation in self.substitutions
+        ):
+            raise ValueError("region specialization substitutions must be non-empty")
+        names = tuple(type_var for type_var, _ in self.substitutions)
+        if len(names) != len(set(names)):
+            raise ValueError("region specialization substitutions must use unique TypeVars")
+        if any(not binding.concrete for binding in self.type_bindings):
+            raise ValueError("region specialization type bindings must be concrete")
+        if self.origin == "concrete_subclass" and (
+            self.source_owner_class is None
+            or self.target_owner_class is None
+            or self.source_owner_class == self.target_owner_class
+        ):
+            raise ValueError("concrete subclass specialization requires distinct source and target")
+        if self.origin == "closed_call" and self.target_owner_class != self.source_owner_class:
+            raise ValueError("closed-call specialization must retain its source owner")
+
+
+@dataclass(frozen=True, slots=True)
 class BindingTarget:
     """One source binding that a compiled region promises to replace.
 
     `source` is always the public source identity. `compiled_name` is private
     backend output and may differ for lowered methods or specializations.
+    `target_owner_class` and `guards` are empty for ordinary bindings and are
+    reserved for bindings that install a concrete specialization.
     """
 
     source: SymbolId
@@ -306,6 +387,8 @@ class BindingTarget:
     owner_class: str | None
     execution_kind: ExecutionKind
     required: bool = True
+    target_owner_class: str | None = None
+    guards: tuple[RuntimeTypeGuard, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +460,7 @@ class TypedRegion:
     decisions: tuple[LoweringDecision, ...]
     source_hash: str
     atomic_class: bool = False
+    specializations: tuple[RegionSpecialization, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

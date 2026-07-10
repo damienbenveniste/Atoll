@@ -39,10 +39,19 @@ class RegionShimConfig:
         for binding in self.bindings:
             if binding.source.module != self.source_module:
                 raise ValueError("region shim binding belongs to another source module")
-            if binding.kind not in {"instance_method", "staticmethod", "classmethod"}:
+            if binding.kind not in {
+                "module",
+                "instance_method",
+                "staticmethod",
+                "classmethod",
+            }:
                 raise ValueError(f"unsupported region shim binding: {binding.kind}")
-            if binding.owner_class is None:
+            if binding.kind != "module" and binding.owner_class is None:
                 raise ValueError("method region shim binding requires an owner class")
+            if binding.kind == "module" and (
+                binding.owner_class is not None or binding.target_owner_class is not None
+            ):
+                raise ValueError("module region shim binding cannot name an owner class")
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,11 +85,11 @@ def remove_region_shim(
 
 
 def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
-    """Render a self-contained staged-wheel loader for compiled methods."""
+    """Render a staged-wheel loader for guarded functions and descriptors."""
     source_module = _validate_configs(configs)
     regions = tuple(_runtime_region(config) for config in configs)
     promised_symbols = tuple(
-        binding.source.qualname for config in configs for binding in config.bindings
+        _binding_runtime_qualname(binding) for config in configs for binding in config.bindings
     )
     return "\n".join(
         [
@@ -88,6 +97,7 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "# This staged-wheel block is managed by Atoll. Do not edit manually.",
             "try:",
             "    _atoll_preexisting_names = frozenset(globals())",
+            "    import builtins as _atoll_builtins",
             "    import functools as _atoll_functools",
             "    import importlib.machinery as _atoll_machinery",
             "    import importlib.util as _atoll_util",
@@ -96,11 +106,64 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "    import pathlib as _atoll_pathlib",
             "    import sys as _atoll_sys",
             "",
-            "    def _atoll_bind(_atoll_source, _atoll_target):",
+            "    def _atoll_resolve_type(_atoll_path):",
+            "        _atoll_parts = _atoll_path.split('.')",
+            "        _atoll_value = globals().get(_atoll_parts[0])",
+            "        if _atoll_value is None:",
+            "            _atoll_value = getattr(_atoll_builtins, _atoll_parts[0])",
+            "        for _atoll_part in _atoll_parts[1:]:",
+            "            _atoll_value = getattr(_atoll_value, _atoll_part)",
+            "        if not isinstance(_atoll_value, type):",
+            "            raise TypeError(f'Atoll guard is not a nominal type: {_atoll_path}')",
+            "        return _atoll_value",
+            "",
+            "    def _atoll_resolve_guards(_atoll_guards):",
+            "        return tuple(",
+            "            {",
+            "                **_atoll_guard,",
+            "                'types': tuple(",
+            "                    _atoll_resolve_type(_atoll_path)",
+            "                    for _atoll_path in _atoll_guard['nominal_type_paths']",
+            "                ),",
+            "            }",
+            "            for _atoll_guard in _atoll_guards",
+            "        )",
+            "",
+            "    def _atoll_guards_pass(_atoll_guards, _atoll_args, _atoll_kwargs):",
+            "        for _atoll_guard in _atoll_guards:",
+            "            _atoll_index = _atoll_guard['positional_index']",
+            "            _atoll_parameter = _atoll_guard['parameter_name']",
+            "            if _atoll_index is not None and _atoll_index < len(_atoll_args):",
+            "                _atoll_value = _atoll_args[_atoll_index]",
+            "            elif _atoll_parameter in _atoll_kwargs:",
+            "                _atoll_value = _atoll_kwargs[_atoll_parameter]",
+            "            else:",
+            "                return False",
+            "            if _atoll_value is None and _atoll_guard['allow_none']:",
+            "                continue",
+            "            if _atoll_guard['types']:",
+            "                try:",
+            "                    _atoll_matches = isinstance(",
+            "                        _atoll_value, _atoll_guard['types']",
+            "                    )",
+            "                except Exception:",
+            "                    return False",
+            "                if _atoll_matches:",
+            "                    continue",
+            "            return False",
+            "        return True",
+            "",
+            "    def _atoll_bind(_atoll_source, _atoll_target, _atoll_guards):",
+            "        _atoll_guard_check = _atoll_guards_pass",
             "        if _atoll_inspect.isasyncgenfunction(_atoll_source):",
             "            @_atoll_functools.wraps(_atoll_source)",
             "            async def _atoll_wrapped(*args, **kwargs):",
-            "                _atoll_generator = _atoll_target(*args, **kwargs)",
+            "                _atoll_callable = (",
+            "                    _atoll_target",
+            "                    if _atoll_guard_check(_atoll_guards, args, kwargs)",
+            "                    else _atoll_source",
+            "                )",
+            "                _atoll_generator = _atoll_callable(*args, **kwargs)",
             "                try:",
             "                    _atoll_value = await _atoll_generator.__anext__()",
             "                    while True:",
@@ -125,20 +188,37 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "        elif _atoll_inspect.iscoroutinefunction(_atoll_source):",
             "            @_atoll_functools.wraps(_atoll_source)",
             "            async def _atoll_wrapped(*args, **kwargs):",
-            "                return await _atoll_target(*args, **kwargs)",
+            "                _atoll_callable = (",
+            "                    _atoll_target",
+            "                    if _atoll_guard_check(_atoll_guards, args, kwargs)",
+            "                    else _atoll_source",
+            "                )",
+            "                return await _atoll_callable(*args, **kwargs)",
             "        elif _atoll_inspect.isgeneratorfunction(_atoll_source):",
             "            @_atoll_functools.wraps(_atoll_source)",
             "            def _atoll_wrapped(*args, **kwargs):",
-            "                return (yield from _atoll_target(*args, **kwargs))",
+            "                _atoll_callable = (",
+            "                    _atoll_target",
+            "                    if _atoll_guard_check(_atoll_guards, args, kwargs)",
+            "                    else _atoll_source",
+            "                )",
+            "                return (yield from _atoll_callable(*args, **kwargs))",
             "        else:",
             "            @_atoll_functools.wraps(_atoll_source)",
             "            def _atoll_wrapped(*args, **kwargs):",
-            "                return _atoll_target(*args, **kwargs)",
+            "                _atoll_callable = (",
+            "                    _atoll_target",
+            "                    if _atoll_guard_check(_atoll_guards, args, kwargs)",
+            "                    else _atoll_source",
+            "                )",
+            "                return _atoll_callable(*args, **kwargs)",
             "        try:",
             "            _atoll_wrapped.__signature__ = _atoll_inspect.signature(_atoll_source)",
             "        except (TypeError, ValueError):",
             "            pass",
             "        _atoll_wrapped.__atoll_compiled_target__ = _atoll_target",
+            "        _atoll_wrapped.__atoll_python_fallback__ = _atoll_source",
+            "        _atoll_wrapped.__atoll_runtime_guards__ = _atoll_guards",
             "        return _atoll_wrapped",
             "",
             f"    _atoll_regions = {regions!r}",
@@ -220,33 +300,56 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "                        _atoll_binding_status",
             "                    )",
             "                    try:",
-            '                        _atoll_owner = globals()[_atoll_binding["owner_class"]]',
-            '                        _atoll_name = _atoll_binding["qualname"].rsplit(".", 1)[-1]',
-            "                        _atoll_descriptor = vars(_atoll_owner)[_atoll_name]",
-            '                        if _atoll_binding["kind"] == "staticmethod":',
-            "                            _atoll_source = _atoll_descriptor.__func__",
-            '                        elif _atoll_binding["kind"] == "classmethod":',
-            "                            _atoll_source = _atoll_descriptor.__func__",
+            "                        _atoll_source_qualname = (",
+            '                            _atoll_binding["source_qualname"]',
+            "                        )",
+            '                        _atoll_name = _atoll_source_qualname.rsplit(".", 1)[-1]',
+            '                        if _atoll_binding["kind"] == "module":',
+            "                            _atoll_source = globals()[_atoll_name]",
+            "                            _atoll_target_owner = None",
             "                        else:",
-            "                            _atoll_source = _atoll_descriptor",
+            "                            _atoll_source_owner = globals()[",
+            '                                _atoll_binding["source_owner_class"]',
+            "                            ]",
+            "                            _atoll_target_owner = globals()[",
+            '                                _atoll_binding["target_owner_class"]',
+            "                            ]",
+            "                            _atoll_descriptor = vars(_atoll_source_owner)[",
+            "                                _atoll_name",
+            "                            ]",
+            '                            if _atoll_binding["kind"] in {',
+            '                                "staticmethod", "classmethod"',
+            "                            }:",
+            "                                _atoll_source = _atoll_descriptor.__func__",
+            "                            else:",
+            "                                _atoll_source = _atoll_descriptor",
             "                        _atoll_target = getattr(",
             '                            _atoll_mod, _atoll_binding["compiled_name"]',
             "                        )",
-            "                        _atoll_wrapped = _atoll_bind(_atoll_source, _atoll_target)",
-            '                        if _atoll_binding["kind"] == "staticmethod":',
+            "                        _atoll_guards = _atoll_resolve_guards(",
+            '                            _atoll_binding["guards"]',
+            "                        )",
+            "                        _atoll_wrapped = _atoll_bind(",
+            "                            _atoll_source, _atoll_target, _atoll_guards",
+            "                        )",
+            '                        if _atoll_binding["kind"] == "module":',
+            "                            globals()[_atoll_name] = _atoll_wrapped",
+            '                        elif _atoll_binding["kind"] == "staticmethod":',
             "                            setattr(",
-            "                                _atoll_owner,",
+            "                                _atoll_target_owner,",
             "                                _atoll_name,",
             "                                staticmethod(_atoll_wrapped),",
             "                            )",
             '                        elif _atoll_binding["kind"] == "classmethod":',
             "                            setattr(",
-            "                                _atoll_owner,",
+            "                                _atoll_target_owner,",
             "                                _atoll_name,",
             "                                classmethod(_atoll_wrapped),",
             "                            )",
             "                        else:",
-            "                            setattr(_atoll_owner, _atoll_name, _atoll_wrapped)",
+            "                            setattr(",
+            "                                _atoll_target_owner, _atoll_name, _atoll_wrapped",
+            "                            )",
             '                        _atoll_binding_status["active"] = True',
             '                        _atoll_binding_status["compiled"] = True',
             "                    except Exception as _atoll_binding_error:",
@@ -312,16 +415,36 @@ def _runtime_region(config: RegionShimConfig) -> dict[str, object]:
         "artifact_relative": _relative_path_text(config.source_path.parent, config.artifact_dir),
         "bindings": tuple(
             {
-                "qualname": binding.source.qualname,
+                "qualname": _binding_runtime_qualname(binding),
+                "source_qualname": binding.source.qualname,
                 "compiled_name": binding.compiled_name,
                 "kind": binding.kind,
-                "owner_class": binding.owner_class,
+                "source_owner_class": binding.owner_class,
+                "target_owner_class": binding.target_owner_class or binding.owner_class,
                 "execution_kind": binding.execution_kind,
                 "required": binding.required,
+                "guards": tuple(
+                    {
+                        "parameter_name": guard.parameter_name,
+                        "positional_index": guard.positional_index,
+                        "annotation": guard.annotation,
+                        "nominal_type_paths": guard.nominal_type_paths,
+                        "allow_none": guard.allow_none,
+                    }
+                    for guard in binding.guards
+                ),
             }
             for binding in config.bindings
         ),
     }
+
+
+def _binding_runtime_qualname(binding: BindingTarget) -> str:
+    """Return the binding key users see, including concrete subclass targets."""
+    member_name = binding.source.qualname.rsplit(".", maxsplit=1)[-1]
+    if binding.target_owner_class is not None:
+        return f"{binding.target_owner_class}.{member_name}"
+    return binding.source.qualname
 
 
 def _validate_configs(configs: tuple[RegionShimConfig, ...]) -> str:
