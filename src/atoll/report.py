@@ -959,7 +959,7 @@ def write_compilation_markdown_report(path: Path, report: CompilationReport) -> 
 def render_compilation_markdown_report(report: CompilationReport) -> str:
     """Render a concise Markdown report for a build or compile attempt."""
     status = "success" if report["success"] else "failed"
-    module_filter = report["module_filter"] or "all enabled modules"
+    module_filter = report["module_filter"] or "all discovered modules"
     lines = [
         "# Atoll Compilation Report",
         "",
@@ -970,18 +970,16 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         f"- Status: {status}",
         f"- Module filter: {module_filter}",
         f"- Wheel: {_optional_path(report['wheel_path'])}",
-        f"- Islands: {report['summary']['islands']}",
+        f"- Legacy islands: {report['summary']['islands']}",
         f"- Typed regions: {report['summary']['typed_regions']}",
         f"- Compiled regions: {report['summary']['compiled_regions']}",
         f"- Symbols: {report['summary']['symbols']}",
-        f"- Native-ready scan candidates: {report['summary']['native_ready_symbols']}",
-        f"- Rejected scan candidates: {report['summary']['native_rejected_symbols']}",
         f"- Artifacts: {report['summary']['artifacts']}",
         f"- Support artifacts: {report['summary']['support_artifacts']}",
         f"- Skipped modules: {report['summary']['skipped_modules']}",
         f"- Preflight blockers: {report['summary']['preflight_blockers']}",
-        f"- Verified islands: {report['summary']['verified']}",
-        f"- Verification failures: {report['summary']['verify_failures']}",
+        f"- Legacy island verifications: {report['summary']['verified']}",
+        f"- Legacy verification failures: {report['summary']['verify_failures']}",
         f"- Subprocess verifications: {report['summary']['subprocess_verifications']}",
         (
             "- Subprocess verification failures: "
@@ -995,28 +993,9 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         "",
         _verification_scope_text(report["mode"]),
         "",
-        "## Native Readiness",
-        "",
-        (
-            "Scan scores estimate extraction safety. Source-clean compile separately checks the "
-            "generated code for concrete native types and repeated primitive work before mypyc."
-        ),
-        "",
     ]
-    if report["native_readiness"]:
-        lines.extend(
-            (
-                f"- `{readiness['source_module']}.{readiness['symbol']}`: "
-                f"{'ready' if readiness['eligible'] else 'rejected'} "
-                f"({readiness['score']}/100)"
-                + (f"; {'; '.join(readiness['reasons'])}" if readiness["reasons"] else "")
-            )
-            for readiness in report["native_readiness"]
-        )
-    else:
-        lines.append("- Not evaluated for this compilation mode.")
     if report["typed_regions"]:
-        lines.extend(["", "### Planned Regions", ""])
+        lines.extend(["## Planned Regions", ""])
         lines.extend(
             f"- `{region['id']}`: " + ", ".join(member["id"] for member in region["members"])
             for region in report["typed_regions"]

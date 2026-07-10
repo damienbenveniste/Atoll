@@ -47,11 +47,9 @@ from atoll.runtime.performance import (
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 TYPED_FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
-EXPECTED_REBUILDS = 2
-EXPECTED_PARTIAL_CACHE_BACKEND_CALLS = 3
-EXPECTED_READINESS_COUNT = 2
 EXPECTED_ATOMIC_SELECTION_COUNT = 2
 TEST_FAILURE_RETURN_CODE = 9
+RANKING_BINDING_COUNT = 3
 
 
 @pytest.fixture(autouse=True)
@@ -82,10 +80,6 @@ class _Metadata(Protocol):
     dependencies: tuple[str, ...]
 
 
-class _CacheLookup(Protocol):
-    hit: bool
-
-
 class _BaselinePayloadFactory(Protocol):
     def __call__(
         self,
@@ -110,6 +104,7 @@ class _TypedSelection(Protocol):
     region: TypedRegion
     assessment: BackendAssessment
     members: tuple[SymbolId, ...]
+    bound_members: tuple[SymbolId, ...] | None
     specialization: RegionSpecialization | None
     conditional_on_failure_of: str | None
 
@@ -181,24 +176,10 @@ _copy_if_different = cast(
     Callable[[Path, Path], None],
     _package_attr("_copy_if_different"),
 )
-_compile_cache_key = cast(Callable[..., str], _package_attr("_compile_cache_key"))
 _copy_source_roots = cast(
     Callable[[DiscoveredProject, Path], tuple[Path, ...]],
     _package_attr("_copy_source_roots"),
 )
-_artifact_dir = cast(
-    Callable[[EnabledIslandConfig], Path],
-    _package_attr("_artifact_dir"),
-)
-_cached_artifact_paths = cast(
-    Callable[[Path, dict[str, object]], tuple[Path, ...] | None],
-    _package_attr("_cached_artifact_paths"),
-)
-_cached_manifest_modules = cast(
-    Callable[[dict[str, object]], tuple[tuple[str, ...], tuple[str, ...]] | None],
-    _package_attr("_cached_manifest_modules"),
-)
-_compile_cache_hit = cast(Callable[..., _CacheLookup], _package_attr("_compile_cache_hit"))
 _find_module = cast(
     Callable[[tuple[ModuleId, ...], str], ModuleId],
     _package_attr("_find_module"),
@@ -210,10 +191,6 @@ _mapping = cast(
 _project_metadata = cast(
     Callable[[Path], _Metadata],
     _package_attr("_project_metadata"),
-)
-_read_cache_manifest = cast(
-    Callable[[Path], dict[str, object] | None],
-    _package_attr("_read_cache_manifest"),
 )
 _relative_source_root = cast(
     Callable[[Path, Path], Path],
@@ -228,15 +205,14 @@ _staged_module = cast(
     Callable[[ModuleId, DiscoveredProject, tuple[Path, ...]], ModuleId],
     _package_attr("_staged_module"),
 )
-_store_compile_cache = cast(Callable[..., None], _package_attr("_store_compile_cache"))
 _string = cast(Callable[[object], str | None], _package_attr("_string"))
 _selected_scans = cast(
     Callable[[DiscoveredProject, str | None], tuple[ModuleScan, ...]],
     _package_attr("_selected_scans"),
 )
-_selected_typed_method_regions = cast(
-    Callable[[tuple[ModuleScan, ...]], tuple[_TypedSelection, ...]],
-    _package_attr("_selected_typed_method_regions"),
+_selected_typed_regions = cast(
+    Callable[..., tuple[_TypedSelection, ...]],
+    _package_attr("_selected_typed_regions"),
 )
 _prepare_typed_region = cast(
     Callable[..., _PreparedTypedRegion], _package_attr("_prepare_typed_region")
@@ -245,6 +221,7 @@ _build_typed_regions = cast(
     Callable[..., _TypedRegionOutcome], _package_attr("_build_typed_regions")
 )
 _TypedRegionBuildContext = cast(Callable[..., object], _package_attr("_TypedRegionBuildContext"))
+_TypedRegionBuildOutcome = cast(Callable[..., object], _package_attr("_TypedRegionBuildOutcome"))
 _compiler_backends = cast(dict[Backend, object], _package_attr("_COMPILER_BACKENDS"))
 _member_requires_source_class = cast(
     Callable[[str], bool],
@@ -276,7 +253,7 @@ def test_typed_region_selection_prefers_mypyc_for_safe_specializations(
     shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
 
-    worker_selections = _selected_typed_method_regions(
+    worker_selections = _selected_typed_regions(
         _selected_scans(project, "typed_region_project.worker")
     )
     worker_specializations = tuple(
@@ -284,7 +261,7 @@ def test_typed_region_selection_prefers_mypyc_for_safe_specializations(
         for selection in worker_selections
         if selection.specialization is not None
     )
-    function_selections = _selected_typed_method_regions(
+    function_selections = _selected_typed_regions(
         _selected_scans(project, "typed_region_project.generic_functions")
     )
 
@@ -301,9 +278,120 @@ def test_typed_region_selection_prefers_mypyc_for_safe_specializations(
         if selection.specialization is not None
     )
     assert len(function_selections) == 1
-    assert function_selections[0].backend == "mypyc"
-    assert function_selections[0].specialization is not None
-    assert function_selections[0].specialization.origin == "closed_call"
+    function_specialization = next(
+        selection for selection in function_selections if selection.specialization is not None
+    )
+    assert function_specialization.backend == "mypyc"
+    assert function_specialization.specialization is not None
+    assert function_specialization.specialization.origin == "closed_call"
+
+
+def test_explicit_function_selection_compiles_helpers_without_binding_them(
+    tmp_path: Path,
+) -> None:
+    """Runtime closure members support selected functions but stay private to the unit."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    requested = (
+        SymbolId(module="app.ranking", qualname="score_user"),
+        SymbolId(module="app.ranking", qualname="rank_candidates"),
+    )
+
+    selections = _selected_typed_regions(
+        _selected_scans(project, "app.ranking"),
+        ("mypyc", "cython"),
+        requested,
+    )
+
+    assert len(selections) == 1
+    assert selections[0].backend == "mypyc"
+    assert {member.qualname for member in selections[0].members} == {
+        "normalize_features",
+        "score_user",
+        "rank_candidates",
+    }
+    assert set(selections[0].bound_members or ()) == set(requested)
+
+
+def test_explicit_package_fails_when_one_requested_region_does_not_compile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial region build cannot promote a wheel that promised explicit members."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    ranking_source = project_root / "src" / "app" / "ranking.py"
+    (project_root / "src" / "app" / "extra.py").write_text(
+        ranking_source.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    requested = (
+        SymbolId(module="app.ranking", qualname="normalize_features"),
+        SymbolId(module="app.extra", qualname="normalize_features"),
+    )
+
+    def partial_build(**kwargs: object) -> object:
+        prepared = cast(tuple[_PreparedTypedRegion, ...], kwargs["prepared"])
+        assert len(prepared) == EXPECTED_ATOMIC_SELECTION_COUNT
+        return _TypedRegionBuildOutcome(
+            successful=(prepared[0],),
+            build=_successful_attempt(),
+            artifacts=(),
+            skipped=(),
+        )
+
+    monkeypatch.setattr(package_command, "_build_typed_regions", partial_build)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            output_dir=output_dir,
+            selected_members=requested,
+        )
+    )
+
+    assert result.success is False
+    assert result.wheel_path is None
+    assert result.error == (
+        "requested member(s) did not compile successfully: app.extra::normalize_features"
+    )
+    assert result.cleanup_removed == (output_dir / "install",)
+    assert result.cleanup_kept == (output_dir / "build",)
+
+
+def test_function_with_same_region_class_dependency_stays_interpreted(
+    tmp_path: Path,
+) -> None:
+    """Generated callable units never omit a same-region runtime declaration."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    module_path = project_root / "src" / "app" / "class_dependency.py"
+    module_path.write_text(
+        """class Payload:
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+def make_payload(value: int) -> Payload:
+    return Payload(value)
+
+def add_one(value: int) -> int:
+    return value + 1
+""",
+        encoding="utf-8",
+    )
+    project = discover_project(project_root)
+
+    selections = _selected_typed_regions(_selected_scans(project, "app.class_dependency"))
+
+    bound = {
+        member
+        for selection in selections
+        for member in (selection.bound_members or selection.members)
+    }
+    assert SymbolId(module="app.class_dependency", qualname="add_one") in bound
+    assert SymbolId(module="app.class_dependency", qualname="make_payload") not in bound
 
 
 def test_atomic_class_selection_is_exclusive_and_partial_classes_split(
@@ -314,9 +402,7 @@ def test_atomic_class_selection_is_exclusive_and_partial_classes_split(
     shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
 
-    selections = _selected_typed_method_regions(
-        _selected_scans(project, "typed_region_project.worker")
-    )
+    selections = _selected_typed_regions(_selected_scans(project, "typed_region_project.worker"))
     scale_selections = tuple(
         selection
         for selection in selections
@@ -400,11 +486,11 @@ def test_method_selection_preserves_registered_and_dynamic_owner_classes() -> No
     )
 
 
-def test_package_reports_build_failure_without_source_edits(
+def test_package_default_does_not_call_legacy_sidecar_backend(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Package mode reports mypyc failures and still leaves checkout source untouched."""
+    """Source-clean package compilation bypasses the legacy sidecar facade."""
     project_root = tmp_path / "simple_project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -414,16 +500,9 @@ def test_package_reports_build_failure_without_source_edits(
     def failing_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
         assert args
         assert kwargs
-        return CompileAttempt(
-            success=False,
-            command=("mypyc",),
-            stdout="",
-            stderr="MYPYC_TYPE_ERROR: fixture",
-            artifact_paths=(),
-            duration_seconds=0.0,
-        )
+        raise AssertionError("legacy sidecar backend was invoked")
 
-    monkeypatch.setattr(package_command, "build_sidecars", failing_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", failing_build_sidecars, raising=False)
 
     result = package_command.execute_package(
         package_command.PackageOptions(
@@ -433,14 +512,14 @@ def test_package_reports_build_failure_without_source_edits(
         )
     )
 
-    assert result.success is False
-    assert result.error == "MYPYC_TYPE_ERROR: fixture"
-    assert result.wheel_path is None
+    assert result.success is True
+    assert result.error is None
+    assert result.wheel_path is not None
     assert source_path.read_text(encoding="utf-8") == original_source
-    assert (output_dir / "build").exists()
+    assert not (output_dir / "build").exists()
     assert not (output_dir / "install").exists()
-    assert result.cleanup_removed == (output_dir / "install",)
-    assert result.cleanup_kept == (output_dir / "build",)
+    assert result.islands == ()
+    assert len(result.compiled_bindings) == RANKING_BINDING_COUNT
 
 
 @pytest.mark.parametrize("failed_stage", ["payload", "wheel"])
@@ -484,7 +563,7 @@ def test_package_preserves_payload_for_subprocess_verification_failure(
             duration_seconds=0.1,
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars, raising=False)
     monkeypatch.setattr(package_command, "verify_package_subprocess", verify)
 
     result = package_command.execute_package(
@@ -516,7 +595,7 @@ def test_typed_region_build_retries_deterministic_mypyc_failure_with_cython(
     shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
     scans = _selected_scans(project, "typed_region_project.worker")
-    selections = _selected_typed_method_regions(scans)
+    selections = _selected_typed_regions(scans)
     mypyc_selection = next(selection for selection in selections if selection.backend == "mypyc")
     staged_source_roots = _copy_source_roots(project, build_root)
     prepared = _prepare_typed_region(
@@ -586,7 +665,7 @@ def test_typed_region_build_does_not_compile_speculative_cython_after_mypyc_succ
     shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
     scans = _selected_scans(project, "typed_region_project.worker")
-    selections = _selected_typed_method_regions(scans)
+    selections = _selected_typed_regions(scans)
     mypyc_selection = next(selection for selection in selections if selection.backend == "mypyc")
     staged_source_roots = _copy_source_roots(project, build_root)
     prepared = _prepare_typed_region(
@@ -656,9 +735,7 @@ def test_atomic_class_build_conditionally_uses_method_fallback(
     build_root = tmp_path / "build"
     shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
-    selections = _selected_typed_method_regions(
-        _selected_scans(project, "typed_region_project.worker")
-    )
+    selections = _selected_typed_regions(_selected_scans(project, "typed_region_project.worker"))
     class_selection = next(
         selection for selection in selections if selection.variant_id.endswith("@cython-class")
     )
@@ -740,7 +817,7 @@ def test_typed_region_build_records_real_cython_artifacts_after_mypyc_retry(
     shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
     scans = _selected_scans(project, "typed_region_project.worker")
-    selections = _selected_typed_method_regions(scans)
+    selections = _selected_typed_regions(scans)
     mypyc_selection = next(selection for selection in selections if selection.backend == "mypyc")
     staged_source_roots = _copy_source_roots(project, build_root)
     prepared = _prepare_typed_region(
@@ -811,11 +888,11 @@ def test_typed_region_build_records_real_cython_artifacts_after_mypyc_retry(
     assert report["compiled_regions"][0]["artifacts"]
 
 
-def test_package_whole_project_retries_and_skips_failed_islands(
+def test_package_whole_project_compiles_regions_without_legacy_batch_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Whole-project package mode keeps buildable islands when one island fails."""
+    """Whole-project package mode compiles each typed region without sidecar batching."""
     project_root = tmp_path / "project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -861,7 +938,7 @@ def test_package_whole_project_retries_and_skips_failed_islands(
             duration_seconds=0.1,
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", mixed_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", mixed_build_sidecars, raising=False)
 
     result = package_command.execute_package(
         package_command.PackageOptions(
@@ -877,12 +954,16 @@ def test_package_whole_project_retries_and_skips_failed_islands(
     assert result.install_tree_kept is True
     assert result.cleanup_removed == (output_dir / "build",)
     assert result.cleanup_kept == (output_dir / "install",)
-    assert tuple(island.source_module for island in result.islands) == ("app.good",)
-    assert tuple(failure.island.source_module for failure in result.skipped) == ("app.bad",)
-    assert "Initial batch build failed; retried islands individually" in result.build.stdout
-    assert "# BEGIN ATOLL MANAGED: app.good" in good_text
-    assert "# BEGIN ATOLL MANAGED" not in bad_text
-    assert (output_dir / "install" / ".atoll" / "artifacts" / f"_atoll_app_good{suffix}").exists()
+    assert result.islands == ()
+    assert result.skipped == ()
+    assert {binding.source.module for binding in result.compiled_bindings} == {
+        "app.good",
+        "app.bad",
+    }
+    assert "Initial batch build failed" not in result.build.stdout
+    assert "# BEGIN ATOLL TYPED REGIONS: app.good" in good_text
+    assert "# BEGIN ATOLL TYPED REGIONS: app.bad" in bad_text
+    assert tuple((output_dir / "install" / ".atoll" / "artifacts").rglob(f"*{suffix}"))
     assert result.wheel_path is not None
 
 
@@ -914,7 +995,7 @@ def test_package_reports_progress_for_expensive_phases(
             duration_seconds=0.1,
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars, raising=False)
 
     result = package_command.execute_package(
         package_command.PackageOptions(
@@ -928,7 +1009,8 @@ def test_package_reports_progress_for_expensive_phases(
     assert result.success is True
     assert any(message.startswith("discovered ") for message in messages)
     assert any(message.startswith("scanned ") for message in messages)
-    assert any(message.startswith("running mypyc batch") for message in messages)
+    assert any(message.startswith("compiling typed region variant") for message in messages)
+    assert any(message.startswith("compile cache miss") for message in messages)
     assert any(message.startswith("writing wheel") for message in messages)
 
 
@@ -1042,7 +1124,7 @@ def test_source_clean_success_summary_lists_every_fallback_kind(
     shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
     scan = _selected_scans(project, "typed_region_project.worker")[0]
-    selection = _selected_typed_method_regions((scan,))[0]
+    selection = _selected_typed_regions((scan,))[0]
     island = EnabledIslandConfig(
         source_module=scan.module.name,
         source_path=scan.module.path,
@@ -1210,7 +1292,7 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
             samples=(),
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars, raising=False)
     monkeypatch.setattr(package_command, "run_performance_command", passing_test_command)
     monkeypatch.setattr(package_command, "run_benchmark_gate", rejecting_benchmark)
 
@@ -1236,11 +1318,11 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
     assert result.verification_steps[-1].target == diagnostic_wheels[0]
 
 
-def test_package_reuses_compile_cache_for_unchanged_inputs(
+def test_package_reuses_region_cache_for_unchanged_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unchanged second source-clean package build restores cached artifacts."""
+    """An unchanged second source-clean package build restores region artifacts."""
     project_root = tmp_path / "simple_project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -1269,7 +1351,7 @@ def test_package_reuses_compile_cache_for_unchanged_inputs(
             ),
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars, raising=False)
 
     first = package_command.execute_package(
         package_command.PackageOptions(
@@ -1290,25 +1372,21 @@ def test_package_reuses_compile_cache_for_unchanged_inputs(
     assert first.build.cache_status == "miss"
     assert second.success is True
     assert second.build.cache_status == "hit"
-    assert calls == 1
-    assert tuple(
+    assert calls == 0
+    cache_timings = tuple(
         timing.name for timing in second.build.phase_timings if timing.name.startswith("cache_")
-    ) == (
-        "cache_lookup",
-        "cache_restore",
     )
+    assert cache_timings == ("cache_lookup", "cache_restore")
     assert second.wheel_path is not None
     with zipfile.ZipFile(second.wheel_path) as wheel:
-        assert any(
-            name.startswith(".atoll/artifacts/_atoll_app_ranking") for name in wheel.namelist()
-        )
+        assert any(name.startswith(".atoll/artifacts/") for name in wheel.namelist())
 
 
-def test_package_reuses_partial_compile_cache_for_unchanged_inputs(
+def test_package_caches_multiple_regions_independently(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Partial source-clean builds cache successful artifacts and cached skips."""
+    """Whole-project source-clean builds restore every unchanged region independently."""
     project_root = tmp_path / "simple_project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -1354,7 +1432,7 @@ def test_package_reuses_partial_compile_cache_for_unchanged_inputs(
             duration_seconds=0.1,
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", partial_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", partial_build_sidecars, raising=False)
 
     first = package_command.execute_package(
         package_command.PackageOptions(root=project_root, output_dir=output_dir)
@@ -1364,34 +1442,32 @@ def test_package_reuses_partial_compile_cache_for_unchanged_inputs(
     )
 
     assert first.success is True
-    assert first.build.cache_status == "partial"
-    assert len(first.skipped) == 1
+    assert first.build.cache_status == "miss"
+    assert first.skipped == ()
     assert second.success is True
     assert second.build.cache_status == "hit"
-    assert len(second.skipped) == 1
-    assert "cached skip" in second.skipped[0].build.stderr
-    assert calls == EXPECTED_PARTIAL_CACHE_BACKEND_CALLS
-    assert tuple(
+    assert second.skipped == ()
+    assert calls == 0
+    cache_timings = tuple(
         timing.name for timing in second.build.phase_timings if timing.name.startswith("cache_")
-    ) == (
-        "cache_lookup",
-        "cache_restore",
     )
+    assert cache_timings.count("cache_lookup") == EXPECTED_ATOMIC_SELECTION_COUNT
+    assert cache_timings.count("cache_restore") == EXPECTED_ATOMIC_SELECTION_COUNT
     assert second.wheel_path is not None
     with zipfile.ZipFile(second.wheel_path) as wheel:
         names = set(wheel.namelist())
-    assert any(name.startswith(".atoll/artifacts/_atoll_app_ranking") for name in names)
+    assert any(name.startswith(".atoll/artifacts/") for name in names)
     assert "app/extra.py" in names
     with zipfile.ZipFile(second.wheel_path) as wheel:
         extra_text = wheel.read("app/extra.py").decode()
-    assert "BEGIN ATOLL MANAGED" not in extra_text
+    assert "BEGIN ATOLL TYPED REGIONS: app.extra" in extra_text
 
 
 def test_package_cache_invalidates_when_source_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Source-clean package cache keys include the target source tree digest."""
+    """Region cache keys change when retained function source changes."""
     project_root = tmp_path / "simple_project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -1414,7 +1490,7 @@ def test_package_cache_invalidates_when_source_changes(
             duration_seconds=0.1,
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars, raising=False)
 
     first = package_command.execute_package(
         package_command.PackageOptions(
@@ -1425,7 +1501,10 @@ def test_package_cache_invalidates_when_source_changes(
     )
     ranking_source = project_root / "src" / "app" / "ranking.py"
     ranking_source.write_text(
-        f"{ranking_source.read_text(encoding='utf-8')}\n# cache invalidation\n",
+        ranking_source.read_text(encoding="utf-8").replace(
+            "DEFAULT_WEIGHT = 1.5",
+            "DEFAULT_WEIGHT = 1.75",
+        ),
         encoding="utf-8",
     )
     second = package_command.execute_package(
@@ -1438,14 +1517,14 @@ def test_package_cache_invalidates_when_source_changes(
 
     assert first.build.cache_status == "miss"
     assert second.build.cache_status == "miss"
-    assert calls == EXPECTED_REBUILDS
+    assert calls == 0
 
 
 def test_package_cache_invalidates_when_generator_version_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Source-clean package cache keys include the sidecar generator version."""
+    """Region cache keys include the typed-region generator version."""
     project_root = tmp_path / "simple_project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -1468,7 +1547,7 @@ def test_package_cache_invalidates_when_generator_version_changes(
             duration_seconds=0.1,
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars, raising=False)
 
     first = package_command.execute_package(
         package_command.PackageOptions(
@@ -1477,7 +1556,7 @@ def test_package_cache_invalidates_when_generator_version_changes(
             output_dir=output_dir,
         )
     )
-    monkeypatch.setattr(package_command, "SIDECAR_GENERATOR_VERSION", "changed")
+    monkeypatch.setattr(package_command, "TYPED_METHOD_GENERATOR_VERSION", "changed")
     second = package_command.execute_package(
         package_command.PackageOptions(
             root=project_root,
@@ -1488,141 +1567,14 @@ def test_package_cache_invalidates_when_generator_version_changes(
 
     assert first.build.cache_status == "miss"
     assert second.build.cache_status == "miss"
-    assert calls == EXPECTED_REBUILDS
+    assert calls == 0
 
 
-def test_compile_cache_key_includes_selected_symbols(tmp_path: Path) -> None:
-    """Source-clean compile cache keys distinguish selected island symbol sets."""
-    project_root = tmp_path / "simple_project"
-    shutil.copytree(FIXTURE_ROOT, project_root)
-    project = discover_project(project_root)
-    sidecar_path = project_root / ".atoll" / "sidecars" / "_atoll_app_ranking.py"
-    sidecar_path.parent.mkdir(parents=True)
-    sidecar_path.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
-    source_path = project_root / "src" / "app" / "ranking.py"
-    base = EnabledIslandConfig(
-        source_module="app.ranking",
-        source_path=source_path,
-        sidecar_module="app._atoll_app_ranking",
-        sidecar_path=sidecar_path,
-        symbols=("score_user",),
-    )
-    expanded = EnabledIslandConfig(
-        source_module="app.ranking",
-        source_path=source_path,
-        sidecar_module="app._atoll_app_ranking",
-        sidecar_path=sidecar_path,
-        symbols=("score_user", "rank_candidates"),
-    )
-
-    assert _compile_cache_key(
-        target_project=project,
-        module_name="app.ranking",
-        islands=(base,),
-    ) != _compile_cache_key(
-        target_project=project,
-        module_name="app.ranking",
-        islands=(expanded,),
-    )
-
-
-def test_compile_cache_manifest_helpers_reject_invalid_entries(tmp_path: Path) -> None:
-    """Compile cache manifests must be present, typed, and digest-matched."""
-    assert _read_cache_manifest(tmp_path / "missing.json") is None
-
-    invalid_json = tmp_path / "invalid.json"
-    invalid_json.write_text("{", encoding="utf-8")
-    assert _read_cache_manifest(invalid_json) is None
-
-    non_mapping_json = tmp_path / "list.json"
-    non_mapping_json.write_text("[]", encoding="utf-8")
-    assert _read_cache_manifest(non_mapping_json) is None
-
-    entry_root = tmp_path / "entry"
-    artifact_root = entry_root / "artifacts"
-    artifact_root.mkdir(parents=True)
-    artifact = artifact_root / "module.so"
-    artifact.write_text("binary", encoding="utf-8")
-    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-
-    assert _cached_artifact_paths(entry_root, {"artifacts": "bad"}) is None
-    assert _cached_artifact_paths(entry_root, {"artifacts": [1]}) is None
-    assert (
-        _cached_artifact_paths(entry_root, {"artifacts": [{"name": 1, "sha256": digest}]}) is None
-    )
-    assert (
-        _cached_artifact_paths(
-            entry_root,
-            {"artifacts": [{"name": "module.so", "sha256": "bad"}]},
-        )
-        is None
-    )
-    assert _cached_artifact_paths(
-        entry_root,
-        {"artifacts": [{"name": "module.so", "sha256": digest}]},
-    ) == (artifact,)
-    assert _cached_manifest_modules({}) is None
-    assert _cached_manifest_modules({"successful_modules": ["app.a"]}) is None
-    assert (
-        _cached_manifest_modules({"successful_modules": ["app.a", 1], "skipped_modules": []})
-        is None
-    )
-    assert (
-        _cached_manifest_modules({"successful_modules": ["app.a"], "skipped_modules": ["app.a"]})
-        is None
-    )
-    assert _cached_manifest_modules(
-        {"successful_modules": ["app.a"], "skipped_modules": ["app.b"]}
-    ) == (("app.a",), ("app.b",))
-
-    stale_lookup = _compile_cache_hit(
-        key="abc",
-        lookup_started=0.0,
-        artifact_paths=(tmp_path / "missing.so",),
-        successful_modules=("app.a",),
-        skipped_modules=(),
-    )
-    assert stale_lookup.hit is False
-
-
-def test_store_compile_cache_handles_empty_and_existing_temp_dirs(tmp_path: Path) -> None:
-    """Compile cache storage ignores empty artifacts and replaces stale temp dirs."""
-    cache_root = tmp_path / "cache"
-    _store_compile_cache(
-        cache_root=cache_root,
-        key="empty",
-        artifact_paths=(),
-        successful_modules=(),
-        skipped_modules=(),
-    )
-    assert not cache_root.exists()
-
-    artifact = tmp_path / "module.so"
-    artifact.write_text("binary", encoding="utf-8")
-    stale_temp = cache_root / "abc.tmp"
-    stale_temp.mkdir(parents=True)
-    (stale_temp / "stale").write_text("old", encoding="utf-8")
-
-    _store_compile_cache(
-        cache_root=cache_root,
-        key="abc",
-        artifact_paths=(artifact,),
-        successful_modules=("app.a",),
-        skipped_modules=("app.b",),
-    )
-
-    manifest = _read_cache_manifest(cache_root / "abc" / "manifest.json")
-    assert manifest is not None
-    assert manifest["successful_modules"] == ["app.a"]
-    assert manifest["skipped_modules"] == ["app.b"]
-    assert not stale_temp.exists()
-
-
-def test_package_whole_project_reports_zero_successful_retries_concisely(
+def test_package_whole_project_never_enters_legacy_retry_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Whole-project package mode reports one representative error when all retries fail."""
+    """Typed-region whole-project compilation never calls the sidecar retry loop."""
     project_root = tmp_path / "project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -1635,28 +1587,9 @@ def test_package_whole_project_reports_zero_successful_retries_concisely(
     def failing_build_sidecars(*args: object, **kwargs: object) -> CompileAttempt:
         assert kwargs
         assert args
-        paths = cast(tuple[Path, ...], args[0])
-        assert paths
-        if len(paths) > 1:
-            return CompileAttempt(
-                success=False,
-                command=("mypyc", "batch"),
-                stdout="",
-                stderr="MYPYC_TYPE_ERROR: batch failed",
-                artifact_paths=(),
-                duration_seconds=0.1,
-            )
-        path = next(iter(paths))
-        return CompileAttempt(
-            success=False,
-            command=("mypyc", str(path)),
-            stdout="",
-            stderr=f"MYPYC_TYPE_ERROR: {path.stem} failed",
-            artifact_paths=(),
-            duration_seconds=0.1,
-        )
+        raise AssertionError("legacy sidecar retry loop was invoked")
 
-    monkeypatch.setattr(package_command, "build_sidecars", failing_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", failing_build_sidecars, raising=False)
 
     result = package_command.execute_package(
         package_command.PackageOptions(
@@ -1666,23 +1599,21 @@ def test_package_whole_project_reports_zero_successful_retries_concisely(
         )
     )
 
-    assert result.success is False
-    assert result.error is not None
-    assert result.error.startswith("No selected islands compiled")
-    assert result.error.count("MYPYC_TYPE_ERROR") == 1
-    assert result.cleanup_removed == (output_dir / "install",)
-    assert result.cleanup_kept == (output_dir / "build",)
-    assert tuple(failure.island.source_module for failure in result.skipped) == (
+    assert result.success is True
+    assert result.error is None
+    assert result.islands == ()
+    assert result.skipped == ()
+    assert {binding.source.module for binding in result.compiled_bindings} == {
         "app.first",
         "app.second",
-    )
+    }
 
 
-def test_package_rejects_trivial_selected_module_before_backend(
+def test_package_compiles_typed_functions_despite_unrelated_typevar_syntax(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Generated candidates without repeated native work never reach mypyc."""
+    """Typed functions are assessed independently from unrelated module TypeVars."""
     project_root = tmp_path / "project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -1722,7 +1653,7 @@ def test_package_rejects_trivial_selected_module_before_backend(
             duration_seconds=0.1,
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", failing_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", failing_build_sidecars, raising=False)
 
     result = package_command.execute_package(
         package_command.PackageOptions(
@@ -1732,23 +1663,25 @@ def test_package_rejects_trivial_selected_module_before_backend(
         )
     )
 
-    assert result.success is False
+    assert result.success is True
     assert build_calls == []
-    assert result.error is not None
-    assert "No performance-worthy native islands" in result.error
+    assert result.error is None
     assert result.preflight_skipped == ()
     assert not (output_dir / "build").exists()
     assert result.cleanup_removed == (output_dir / "build", output_dir / "install")
     assert result.cleanup_kept == ()
-    assert len(result.native_readiness) == EXPECTED_READINESS_COUNT
-    assert all(not readiness.eligible for readiness in result.native_readiness)
+    assert result.native_readiness == ()
+    assert {binding.source.qualname for binding in result.compiled_bindings} == {
+        "helper",
+        "candidate",
+    }
 
 
-def test_package_whole_project_skips_non_native_ready_modules(
+def test_package_whole_project_uses_region_assessments_in_typing_heavy_modules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Whole-project mode builds ready kernels and omits rejected modules."""
+    """Whole-project mode compiles safe regions without module-level readiness gates."""
     project_root = tmp_path / "project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -1793,7 +1726,7 @@ def test_package_whole_project_skips_non_native_ready_modules(
             duration_seconds=0.1,
         )
 
-    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars)
+    monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars, raising=False)
 
     result = package_command.execute_package(
         package_command.PackageOptions(
@@ -1807,22 +1740,19 @@ def test_package_whole_project_skips_non_native_ready_modules(
     assert result.install_tree_kept is True
     assert result.cleanup_removed == (output_dir / "build",)
     assert result.cleanup_kept == (output_dir / "install",)
-    assert {island.source_module for island in result.islands} == {"app.ranking"}
-    assert result.islands[0].symbols == ("normalize_features",)
+    assert result.islands == ()
+    assert {binding.source.module for binding in result.compiled_bindings} == {
+        "app.ranking",
+        "app.blocked",
+    }
     assert result.preflight_skipped == ()
-    assert "# BEGIN ATOLL MANAGED: app.ranking" in (
+    assert "# BEGIN ATOLL TYPED REGIONS: app.ranking" in (
         output_dir / "install" / "app" / "ranking.py"
     ).read_text(encoding="utf-8")
-    assert "# BEGIN ATOLL MANAGED: app.blocked" not in (
+    assert "# BEGIN ATOLL TYPED REGIONS: app.blocked" in (
         output_dir / "install" / "app" / "blocked.py"
     ).read_text(encoding="utf-8")
-    blocked_readiness = tuple(
-        readiness
-        for readiness in result.native_readiness
-        if readiness.source_module == "app.blocked"
-    )
-    assert blocked_readiness
-    assert all(not readiness.eligible for readiness in blocked_readiness)
+    assert result.native_readiness == ()
     assert clean_source.read_text(encoding="utf-8") == original_clean_source
 
 
@@ -1842,7 +1772,7 @@ def test_package_helpers_handle_flat_source_roots(tmp_path: Path) -> None:
 
 
 def test_atoll_artifact_helpers_copy_artifacts_and_skip_same_file(tmp_path: Path) -> None:
-    """Source-clean artifact helpers place compiled extensions under install `.atoll`."""
+    """Source-clean artifact copies tolerate missing roots and an identical target."""
     source_root = tmp_path / "source"
     artifact_dir = source_root / ".atoll" / "artifacts"
     install_root = tmp_path / "install"
@@ -1854,24 +1784,7 @@ def test_atoll_artifact_helpers_copy_artifacts_and_skip_same_file(tmp_path: Path
     copied = install_root / ".atoll" / "artifacts" / native.name
     _copy_if_different(copied, copied)
 
-    package_sidecar = EnabledIslandConfig(
-        source_module="pkg.mod",
-        source_path=source_root / "pkg" / "mod.py",
-        sidecar_module="pkg._sidecar",
-        sidecar_path=source_root / "pkg" / "_sidecar.py",
-        symbols=("func",),
-    )
-    external_sidecar = EnabledIslandConfig(
-        source_module="pkg.mod",
-        source_path=source_root / "pkg" / "mod.py",
-        sidecar_module="pkg._sidecar",
-        sidecar_path=source_root / ".atoll" / "sidecars" / "_sidecar.py",
-        symbols=("func",),
-    )
-
     assert copied.read_text(encoding="utf-8") == "binary"
-    assert _artifact_dir(package_sidecar) == source_root / "pkg"
-    assert _artifact_dir(external_sidecar) == source_root / ".atoll" / "artifacts"
 
 
 def test_project_metadata_falls_back_for_missing_or_dynamic_version(tmp_path: Path) -> None:

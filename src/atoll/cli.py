@@ -152,29 +152,41 @@ def _build_parser() -> argparse.ArgumentParser:
     clean.add_argument("--cache", action="store_true", help="remove Atoll cache and build dirs")
     clean.add_argument("--artifacts", action="store_true", help="remove compiled sidecar artifacts")
     clean.add_argument("--all", action="store_true", help="remove all Atoll-generated outputs")
-    trial = subparsers.add_parser("trial", help="compile and test candidates in a temp overlay")
+    trial = subparsers.add_parser(
+        "trial",
+        help="compile and test selected typed regions in a temporary wheel",
+    )
     trial.add_argument("--root", type=Path, default=Path(), help="project root")
     trial.add_argument("--candidate", default=None, help="candidate like app.module::symbol,helper")
     trial.add_argument("--top", type=int, default=None, help="try the top N scan candidates")
-    trial.add_argument("--test", default=None, help='pytest command, for example "pytest tests"')
+    trial.add_argument(
+        "--test",
+        default=None,
+        help='pytest command run against the compiled payload, for example "pytest tests"',
+    )
     trial.add_argument(
         "--benchmark",
         default=None,
-        help='pytest benchmark command, for example "pytest benchmarks"',
+        help='pytest workload run after tests; checks exit status, for example "pytest benchmarks"',
     )
-    trial.add_argument("--keep-temp", action="store_true", help="keep the temporary overlay")
+    trial.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="keep the temporary wheel and install payload",
+    )
     compiled = trial.add_mutually_exclusive_group()
     compiled.add_argument(
         "--require-compiled",
         action="store_true",
         default=True,
-        help="require compiled extension routing after build",
+        help="require selected bindings to use compiled extensions during tests",
     )
     compiled.add_argument(
+        "--allow-interpreted",
         "--allow-python-sidecar",
         action="store_false",
         dest="require_compiled",
-        help="do not require compiled extension routing after build",
+        help="allow interpreted fallback during trial commands",
     )
     return parser
 
@@ -571,7 +583,6 @@ def _run_source_clean_artifact_build(
         print(f"Atoll compile configuration error: {error}", file=sys.stderr)
         return 2
     report_paths = _write_source_clean_compile_report(result, module_name=module_name)
-    _print_native_readiness_rejections(result)
     if not result.success:
         _print_compile_report_paths(report_paths)
         print(result.error or result.build.stderr)
@@ -630,24 +641,13 @@ def _print_source_clean_success(
     _print_compile_report_paths(report_paths)
 
 
-def _print_native_readiness_rejections(result: PackageCommandResult) -> None:
-    """Explain scan candidates rejected after generated-code analysis."""
-    rejected = tuple(readiness for readiness in result.native_readiness if not readiness.eligible)
-    if not rejected:
-        return
-    print(f"Rejected {len(rejected)} scan candidate symbol(s) after native-readiness analysis.")
-    for readiness in rejected[:10]:
-        reason = "; ".join(readiness.reasons) or "not native-ready"
-        print(f"- {readiness.source_module}.{readiness.symbol}: {reason}")
-
-
-def _source_clean_progress_reporter() -> Callable[[str], None]:
+def _source_clean_progress_reporter(*, operation: str = "compile") -> Callable[[str], None]:
     started = time.perf_counter()
 
     def progress(message: str) -> None:
         """Print elapsed source-clean compile progress messages to stderr."""
         elapsed = time.perf_counter() - started
-        print(f"Atoll compile [{elapsed:6.2f}s] {message}", file=sys.stderr)
+        print(f"Atoll {operation} [{elapsed:6.2f}s] {message}", file=sys.stderr)
 
     return progress
 
@@ -711,12 +711,22 @@ def _run_trial(args: argparse.Namespace) -> int:
             benchmark_command=args.benchmark,
             keep_temp=args.keep_temp,
             require_compiled=args.require_compiled,
+            progress=_source_clean_progress_reporter(operation="trial"),
         )
     )
     if result.error is not None:
         print(result.error)
-    print(f"Atoll trial overlay: {result.overlay_root}")
-    print(f"Atoll trial enabled {len(result.enabled)} island(s).")
+    print(
+        f"Atoll trial selected {len(result.selections)} candidate(s), "
+        f"{len(result.selected)} member(s), and compiled "
+        f"{len(result.compiled_bindings)} public binding(s)."
+    )
+    if result.artifact_root.exists():
+        print(f"Atoll trial artifacts: {result.artifact_root}")
+        if result.wheel_path is not None:
+            print(f"Atoll trial wheel: {result.wheel_path}")
+    else:
+        print("Atoll trial temporary artifacts cleaned.")
     if result.test_exit_code is not None:
         print(f"Atoll trial test exit code: {result.test_exit_code}")
     if result.benchmark_exit_code is not None:

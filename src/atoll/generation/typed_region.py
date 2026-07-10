@@ -170,13 +170,11 @@ def _validate_atomic_class_selection(region: TypedRegion, class_member: RegionMe
 def _validate_callable_selection(
     member: RegionMember,
     backend: Backend,
-    specialization: RegionSpecialization | None,
+    _specialization: RegionSpecialization | None,
 ) -> None:
     method_binding = member.kind == "method" and member.binding_kind in _SUPPORTED_BINDINGS
-    specialized_function = (
-        specialization is not None and member.kind == "function" and member.binding_kind == "module"
-    )
-    if not method_binding and not specialized_function:
+    module_function = member.kind == "function" and member.binding_kind == "module"
+    if not method_binding and not module_function:
         raise ValueError(f"unsupported typed-region binding: {member.id.stable_id}")
     execution_supported = member.execution_kind in _SUPPORTED_EXECUTION_KINDS or (
         backend == "cython" and member.execution_kind == "async_generator"

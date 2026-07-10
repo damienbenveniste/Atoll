@@ -22,8 +22,8 @@ from atoll.cli import main
 from atoll.runtime.performance import run_performance_command
 
 FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
-COMPILED_SYMBOL_COUNT = 10
-COMPILED_REGION_COUNT = 6
+COMPILED_SYMBOL_COUNT = 11
+COMPILED_REGION_COUNT = 7
 SCALE_RESULT = 23
 PARSED_RESULT = 7
 ADJUSTED_RESULT = 6
@@ -112,6 +112,7 @@ class _CompileReport(TypedDict):
     build: dict[str, object]
     compiled_regions: list[_CompiledRegionReport]
     typed_regions: list[_TypedRegionReport]
+    native_readiness: list[object]
 
 
 def test_compile_builds_and_routes_typed_methods_without_source_edits(
@@ -300,7 +301,8 @@ def _assert_worker_compile_report(report: _CompileReport) -> None:
     assert summary["symbols"] == COMPILED_SYMBOL_COUNT
     assert summary["islands"] == 0
     assert summary["compiled_regions"] == COMPILED_REGION_COUNT
-    assert summary["native_rejected_symbols"] == 1
+    assert summary["native_rejected_symbols"] == 0
+    assert report["native_readiness"] == []
     assert report["build"]["command"] == ["atoll", "source-clean-build"]
     compiled_regions = report["compiled_regions"]
     worker_mypyc_regions = tuple(

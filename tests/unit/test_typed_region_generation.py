@@ -235,6 +235,119 @@ def test_cython_generation_preserves_async_generator_source(tmp_path: Path) -> N
     assert "_AtollWorker" not in generation.source_text
 
 
+def test_generation_preserves_ordinary_module_functions(tmp_path: Path) -> None:
+    """Unspecialized module functions lower without owner facades or type erasure."""
+    source_path = tmp_path / "ordinary_functions.py"
+    source_path.write_text(
+        """from collections.abc import Iterator
+
+LIMIT = 4
+
+def scale(value: int) -> int:
+    return value * LIMIT
+
+async def score(value: int) -> int:
+    return value + LIMIT
+
+def values(limit: int) -> Iterator[int]:
+    for value in range(limit):
+        yield scale(value)
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(
+        scan_module(ModuleId(name="ordinary_functions", path=source_path))
+    )
+    selected_generations = {
+        member.id.qualname: generate_typed_method_region(
+            scan,
+            region,
+            (member.id,),
+            output_path=tmp_path / f"{member.id.qualname}.py",
+        )
+        for region in scan.typed_regions
+        for member in region.members
+        if member.id.qualname in {"scale", "score", "values"}
+    }
+
+    assert set(selected_generations) == {"scale", "score", "values"}
+    scale_generation = selected_generations["scale"]
+    score_generation = selected_generations["score"]
+    values_generation = selected_generations["values"]
+    scale_tree = ast.parse(scale_generation.source_text)
+    score_tree = ast.parse(score_generation.source_text)
+    values_tree = ast.parse(values_generation.source_text)
+    scale_function = next(node for node in scale_tree.body if isinstance(node, ast.FunctionDef))
+    score_function = next(
+        node for node in score_tree.body if isinstance(node, ast.AsyncFunctionDef)
+    )
+    values_function = next(node for node in values_tree.body if isinstance(node, ast.FunctionDef))
+
+    assert scale_generation.bindings[0].kind == "module"
+    assert score_generation.bindings[0].kind == "module"
+    assert values_generation.bindings[0].kind == "module"
+    assert scale_function.name == "scale"
+    assert score_function.name == "score"
+    assert values_function.name == "values"
+    scale_annotation = scale_function.args.args[0].annotation
+    scale_return = scale_function.returns
+    assert scale_annotation is not None
+    assert scale_return is not None
+    assert ast.unparse(scale_annotation) == "int"
+    assert ast.unparse(scale_return) == "int"
+    assert isinstance(score_function, ast.AsyncFunctionDef)
+    assert any(isinstance(node, ast.Yield) for node in ast.walk(values_function))
+    assert "Protocol" not in scale_generation.source_text
+    assert "_Atoll" not in values_generation.source_text
+
+
+def test_cython_generation_preserves_ordinary_async_generator_function(
+    tmp_path: Path,
+) -> None:
+    """The Cython backend accepts ordinary module async generators."""
+    source_path = tmp_path / "ordinary_async_generator.py"
+    source_path.write_text(
+        """from collections.abc import AsyncIterator
+
+async def stream(limit: int) -> AsyncIterator[int]:
+    for value in range(limit):
+        yield value
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(
+        scan_module(ModuleId(name="ordinary_async_generator", path=source_path))
+    )
+    region = next(
+        region
+        for region in scan.typed_regions
+        if any(member.id.qualname == "stream" for member in region.members)
+    )
+    stream = next(member.id for member in region.members if member.id.qualname == "stream")
+
+    with pytest.raises(ValueError, match="async_generator"):
+        generate_typed_method_region(
+            scan,
+            region,
+            (stream,),
+            output_path=tmp_path / "generated_mypyc.py",
+        )
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (stream,),
+        output_path=tmp_path / "generated_cython.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    assert generation.backend == "cython"
+    assert generation.bindings[0].kind == "module"
+    assert "async def stream" in generation.source_text
+    assert "yield value" in generation.source_text
+    assert "Protocol" not in generation.source_text
+
+
 def test_generation_validates_member_selection(tmp_path: Path) -> None:
     """Empty, duplicate, foreign, and non-method selections fail before writes."""
     scan = _scan(tmp_path)

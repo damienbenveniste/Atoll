@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import inspect
 import json
 import shutil
 import sys
@@ -14,20 +12,12 @@ import pytest
 
 from atoll.cli import main
 from atoll.commands.package import PackageCommandResult, PackagePreflightFailure
-from atoll.models import (
-    Blocker,
-    CompileAttempt,
-    EnabledIslandConfig,
-    ModuleId,
-    ModuleScan,
-    ProjectConfig,
-)
-from atoll.runtime.verify import verify_islands
+from atoll.models import Blocker, CompileAttempt, ModuleId, ModuleScan
+from atoll.runtime.performance import run_performance_command
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXIT_USAGE = 2
-RANKING_SYMBOL_COUNT = 1
-REJECTED_SYMBOL_COUNT = 2
+RANKING_SYMBOL_COUNT = 3
 GATE_FAILURE_CODE = 7
 
 
@@ -58,16 +48,17 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     assert not (project_root / ".atoll" / "compilation-report.json").exists()
     assert report["mode"] == "source-clean"
     assert report["wheel_path"] == f".atoll/dist/{wheel_path.name}"
-    assert report["summary"]["islands"] == 1
+    assert report["summary"]["islands"] == 0
+    assert report["summary"]["compiled_regions"] == 1
     assert report["summary"]["symbols"] == RANKING_SYMBOL_COUNT
-    assert report["summary"]["native_ready_symbols"] == 1
-    assert report["summary"]["native_rejected_symbols"] == REJECTED_SYMBOL_COUNT
-    readiness_by_symbol = {
-        readiness["symbol"]: readiness for readiness in report["native_readiness"]
+    assert report["summary"]["native_ready_symbols"] == 0
+    assert report["summary"]["native_rejected_symbols"] == 0
+    assert report["native_readiness"] == []
+    assert {binding["source"] for binding in report["compiled_regions"][0]["bindings"]} == {
+        "app.ranking::normalize_features",
+        "app.ranking::score_user",
+        "app.ranking::rank_candidates",
     }
-    assert readiness_by_symbol["normalize_features"]["eligible"] is True
-    assert readiness_by_symbol["score_user"]["eligible"] is False
-    assert readiness_by_symbol["rank_candidates"]["eligible"] is False
     assert report["build"]["cache_status"] == "miss"
     assert report["performance"]["status"] == "unbenchmarked"
     assert report["performance"]["speedup"] is None
@@ -82,7 +73,7 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     assert "Compile reports:" in captured.out
     assert "Atoll compile [" in captured.err
     assert "discovering project" in captured.err
-    assert "running mypyc batch" in captured.err
+    assert "compiling typed region variant" in captured.err
     assert "cleaned temporary outputs" in captured.err
     with zipfile.ZipFile(wheel_path) as wheel:
         names = set(wheel.namelist())
@@ -93,10 +84,7 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     assert "app/py.typed" in names
     assert any(name.endswith(".dist-info/entry_points.txt") for name in names)
     assert "Summary: Fixture metadata preserved by Atoll wheel overlays." in metadata
-    assert any(
-        name.startswith(".atoll/artifacts/_atoll_app_ranking") and name.endswith(".so")
-        for name in names
-    )
+    assert any(name.startswith(".atoll/artifacts/") and name.endswith(".so") for name in names)
     artifact_names = sorted(
         name for name in names if name.startswith(".atoll/artifacts/") and name.endswith(".so")
     )
@@ -138,9 +126,7 @@ def test_compile_uses_cache_on_unchanged_second_run(
     assert not (output_dir / "build").exists()
     assert not (output_dir / "install").exists()
     with zipfile.ZipFile(wheel_path) as wheel:
-        assert any(
-            name.startswith(".atoll/artifacts/_atoll_app_ranking") for name in wheel.namelist()
-        )
+        assert any(name.startswith(".atoll/artifacts/") for name in wheel.namelist())
 
 
 def test_compile_runs_semantic_gate_without_flat_checkout_shadowing(
@@ -177,6 +163,64 @@ def test_compile_runs_semantic_gate_without_flat_checkout_shadowing(
     assert report["test_results"][0]["mode"] == "compiled"
     assert report["test_results"][0]["returncode"] == 0
     assert report["performance"]["status"] == "unbenchmarked"
+
+
+def test_compile_keeps_same_module_class_dependent_function_interpreted(
+    tmp_path: Path,
+) -> None:
+    """A missing class declaration cannot hide behind import-only wheel verification."""
+    project_root = tmp_path / "class_dependency_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    module_path = project_root / "src" / "app" / "class_dependency.py"
+    module_path.write_text(
+        """class Payload:
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+def make_payload(value: int) -> Payload:
+    return Payload(value)
+
+def add_one(value: int) -> int:
+    return value + 1
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "compile",
+            "app.class_dependency",
+            "--root",
+            str(project_root),
+            "--keep-install-tree",
+        ]
+    )
+
+    install_root = project_root / ".atoll" / "dist" / "install"
+    report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    probe = run_performance_command(
+        (
+            sys.executable,
+            "-c",
+            (
+                "import app.class_dependency as module; "
+                "assert module.add_one(3) == 4; "
+                "assert hasattr(module.add_one, '__atoll_compiled_target__'); "
+                "assert module.make_payload(5).value == 5; "
+                "assert not hasattr(module.make_payload, '__atoll_compiled_target__')"
+            ),
+        ),
+        project_root=project_root,
+        payload_root=install_root,
+        mode="compiled",
+    )
+
+    assert exit_code == 0
+    assert probe.succeeded is True
+    assert report["summary"]["symbols"] == 1
+    assert report["compiled_regions"][0]["bindings"][0]["source"] == (
+        "app.class_dependency::add_one"
+    )
 
 
 def test_compile_rejects_wheel_after_real_semantic_gate_failure(tmp_path: Path) -> None:
@@ -292,58 +336,33 @@ def test_compile_can_keep_install_tree_for_debugging(
     assert exit_code == 0
     assert source_path.read_text(encoding="utf-8") == original_source
     assert "# BEGIN ATOLL MANAGED" not in original_source
-    assert "# BEGIN ATOLL MANAGED: app.ranking" in install_source.read_text(encoding="utf-8")
+    assert "# BEGIN ATOLL TYPED REGIONS: app.ranking" in install_source.read_text(encoding="utf-8")
     assert not (output_dir / "build").exists()
     assert not (install_root / "app" / "_atoll_app_ranking.py").exists()
-    assert _extension_artifacts(install_root / ".atoll" / "artifacts", "_atoll_app_ranking")
+    assert tuple((install_root / ".atoll" / "artifacts").rglob("*.so"))
     assert report["cleanup"]["removed"] == [".atoll/dist/build"]
     assert report["cleanup"]["kept"] == [".atoll/dist/install"]
 
-    result = verify_islands(
-        ProjectConfig(
-            root=install_root,
-            source_roots=(install_root,),
-            backend="mypyc",
-            cache_dir=output_dir / "cache",
-            report_dir=output_dir,
-            islands=(
-                EnabledIslandConfig(
-                    source_module="app.ranking",
-                    source_path=install_source,
-                    sidecar_module="app._atoll_app_ranking",
-                    sidecar_path=install_root / ".atoll" / "sidecars" / "_atoll_app_ranking.py",
-                    symbols=("normalize_features",),
-                ),
+    probe = run_performance_command(
+        (
+            sys.executable,
+            "-c",
+            (
+                "import app.ranking as ranking; "
+                "assert ranking.normalize_features([1.0, 3.0]) == [0.25, 0.75]; "
+                "assert hasattr(ranking.normalize_features, '__atoll_compiled_target__')"
             ),
         ),
-        require_compiled=True,
-    )[0]
-
-    assert result.error is None
-    assert result.compiled is True
-    ranking = importlib.import_module("app.ranking")
-    normalize_features = ranking.normalize_features
-    native_target = normalize_features.__atoll_compiled_target__
-    assert inspect.isfunction(normalize_features)
-    wrapped_normalize_features = inspect.unwrap(normalize_features)
-    assert inspect.signature(normalize_features) == inspect.signature(wrapped_normalize_features)
-    assert normalize_features.__name__ == "normalize_features"
-    assert normalize_features.__qualname__ == "normalize_features"
-    assert normalize_features.__module__ == "app.ranking"
-    assert normalize_features.__doc__ == "Normalize feature values by their total."
-    assert normalize_features.__annotations__ == wrapped_normalize_features.__annotations__
-    assert native_target.__module__ == "app._atoll_app_ranking"
-    assert not hasattr(ranking, "_atoll_bind_compiled")
-    assert not hasattr(ranking, "_atoll_functools")
-    assert not hasattr(ranking, "_atoll_inspect")
+        project_root=project_root,
+        payload_root=install_root,
+        mode="compiled",
+    )
+    assert probe.succeeded is True
     with zipfile.ZipFile(wheel_path) as wheel:
         names = set(wheel.namelist())
     assert "app/ranking.py" in names
     assert "app/types.py" in names
-    assert any(
-        name.startswith(".atoll/artifacts/_atoll_app_ranking") and name.endswith(".so")
-        for name in names
-    )
+    assert any(name.startswith(".atoll/artifacts/") and name.endswith(".so") for name in names)
     assert any(name.endswith(".dist-info/METADATA") for name in names)
     assert any(name.endswith(".dist-info/WHEEL") for name in names)
     assert any(name.endswith(".dist-info/RECORD") for name in names)
@@ -353,7 +372,7 @@ def test_package_command_reports_no_candidates(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Package mode reports when no modules contain candidate islands."""
+    """Package mode reports when no modules contain supported typed regions."""
     (tmp_path / "src" / "pkg").mkdir(parents=True)
     (tmp_path / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
 
@@ -362,16 +381,16 @@ def test_package_command_reports_no_candidates(
     captured = capsys.readouterr()
     report = json.loads((tmp_path / ".atoll" / "compile-report.json").read_text())
     assert exit_code == 1
-    assert "scan found no candidate islands" in captured.out
+    assert "scan found no backend-supported typed regions" in captured.out
     assert report["success"] is False
-    assert report["build"]["stderr"] == "scan found no candidate islands"
+    assert report["build"]["stderr"] == "scan found no backend-supported typed regions"
 
 
 def test_compile_reports_no_candidates_from_source_clean_default(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Source-clean compile reports when no modules contain candidate islands."""
+    """Source-clean compile reports when no modules contain supported typed regions."""
     (tmp_path / "src" / "pkg").mkdir(parents=True)
     (tmp_path / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
 
@@ -379,7 +398,7 @@ def test_compile_reports_no_candidates_from_source_clean_default(
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "scan found no candidate islands" in captured.out
+    assert "scan found no backend-supported typed regions" in captured.out
 
 
 def test_compile_reports_preflight_skipped_modules(
@@ -439,11 +458,11 @@ def test_compile_reports_preflight_skipped_modules(
     assert report["preflight_blockers"][0]["module"] == "pkg.blocked"
 
 
-def test_compile_rejects_typevar_erased_functions_before_mypyc(
+def test_compile_keeps_unresolved_generic_functions_interpreted(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """TypeVar-erased generated functions are not reported as native compilation."""
+    """Unresolved public generics remain fallback without generated type erasure."""
     (tmp_path / "src" / "pkg").mkdir(parents=True)
     (tmp_path / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "pyproject.toml").write_text(
@@ -478,14 +497,14 @@ def test_compile_rejects_typevar_erased_functions_before_mypyc(
     captured = capsys.readouterr()
     report = json.loads((tmp_path / ".atoll" / "compile-report.json").read_text())
     assert exit_code == 1
-    assert "Rejected 2 scan candidate symbol(s)" in captured.out
-    assert "mypyc was not invoked" in captured.out
+    assert "scan found no backend-supported typed regions" in captured.out
     assert report["success"] is False
     assert report["summary"]["preflight_blockers"] == 0
     assert report["summary"]["symbols"] == 0
     assert report["summary"]["typed_regions"] == 1
     assert report["typed_regions"][0]["decisions"][0]["action"] == "fallback"
-    assert report["summary"]["native_rejected_symbols"] == REJECTED_SYMBOL_COUNT
+    assert report["summary"]["native_rejected_symbols"] == 0
+    assert report["native_readiness"] == []
     assert report["build"]["command"] == []
     assert not tuple(output_dir.glob("*.whl"))
 
@@ -526,11 +545,3 @@ def test_compile_source_clean_default_rejects_test_gate(
     captured = capsys.readouterr()
     assert exit_code == EXIT_USAGE
     assert "--test requires --in-place" in captured.out
-
-
-def _extension_artifacts(directory: Path, stem: str) -> tuple[Path, ...]:
-    return tuple(
-        path
-        for suffix in importlib.machinery.EXTENSION_SUFFIXES
-        for path in directory.glob(f"{stem}*{suffix}")
-    )

@@ -2,7 +2,7 @@
 
 Trial mode uses this module to execute supported pytest commands in a spawned
 child process. The child receives an adjusted `PYTHONPATH` and optional
-`ATOLL_REQUIRE_COMPILED` flag so tests exercise the overlay routing path.
+`ATOLL_REQUIRE_COMPILED` flag so tests exercise the staged install payload.
 """
 
 from __future__ import annotations
@@ -98,5 +98,8 @@ def _configure_test_environment(
             *existing_pythonpath,
         ]
     )
+    os.environ.pop("ATOLL_DISABLE", None)
     if require_compiled:
         os.environ["ATOLL_REQUIRE_COMPILED"] = "1"
+    else:
+        os.environ.pop("ATOLL_REQUIRE_COMPILED", None)

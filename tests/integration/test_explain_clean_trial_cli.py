@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.machinery
+import json
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -75,13 +77,15 @@ def test_clean_command_removes_cache_and_compiled_artifacts(tmp_path: Path) -> N
     assert not build_dir.exists()
 
 
-def test_trial_command_builds_overlay_and_runs_pytest(
+def test_trial_command_builds_typed_region_wheel_and_runs_pytest(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """`atoll trial` compiles an overlay sidecar and runs fixture tests/benchmarks."""
+    """`atoll trial` compiles selected regions and runs fixture tests/benchmarks."""
     project_root = tmp_path / "simple_project"
     shutil.copytree(FIXTURE_ROOT, project_root)
+    source_path = project_root / "src" / "app" / "ranking.py"
+    original_source = source_path.read_bytes()
 
     exit_code = main(
         [
@@ -100,4 +104,46 @@ def test_trial_command_builds_overlay_and_runs_pytest(
 
     captured = capsys.readouterr()
     assert exit_code == 0
+    assert source_path.read_bytes() == original_source
+    assert (
+        "Atoll trial selected 1 candidate(s), 2 member(s), and compiled 2 public binding(s)."
+        in captured.out
+    )
+    assert "Atoll trial temporary artifacts cleaned." in captured.out
     assert "Atoll trial benchmark exit code: 0" in captured.out
+    assert not (project_root / ".atoll" / "cache").exists()
+
+
+def test_trial_owns_its_gates_instead_of_running_compile_policy(
+    tmp_path: Path,
+) -> None:
+    """Trial flags run once even when normal compile policy would reject the wheel."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + "\n".join(
+            (
+                "",
+                "[tool.atoll.compile]",
+                (f'test_command = [{json.dumps(sys.executable)}, "-c", "raise SystemExit(9)"]'),
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "trial",
+            "--root",
+            str(project_root),
+            "--candidate",
+            "app.ranking::score_user",
+            "--test",
+            "python -m pytest tests",
+        ]
+    )
+
+    assert exit_code == 0

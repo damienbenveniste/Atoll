@@ -1,9 +1,9 @@
-"""Implementation of the `atoll trial` command.
+"""Compile and validate selected typed regions without modifying checkout sources.
 
-Trial mode copies source roots into a temporary overlay, inserts Atoll shims
-there, compiles sidecars, verifies runtime routing, and optionally runs target
-pytest commands with the overlay first on `PYTHONPATH`. The original project
-tree is not modified.
+Trial keeps the scan-candidate selection UX but delegates compilation, backend
+selection, wheel overlay, native artifact verification, and caching to the same
+source-clean package pipeline used by ``atoll compile``. Its temporary install
+payload exists only to run optional pytest commands and is removed by default.
 """
 
 from __future__ import annotations
@@ -15,26 +15,28 @@ from pathlib import Path
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
-from atoll.backends.mypyc import build_sidecars
-from atoll.config import write_atoll_config
-from atoll.generation.shim import insert_or_replace_shim
-from atoll.generation.sidecar import default_sidecar_module, expected_sidecar_path, generate_sidecar
+from atoll.commands.package import (
+    PackageCommandResult,
+    PackageOptions,
+    PackageProgress,
+    execute_package,
+)
 from atoll.models import (
+    BindingTarget,
     EnabledIslandConfig,
     IslandCandidate,
     ModuleId,
     ModuleScan,
-    ProjectConfig,
-    VerifyResult,
+    PytestRunResult,
+    SymbolId,
 )
 from atoll.project import DiscoveredProject, discover_project
 from atoll.runtime.test_runner import run_pytest_command
-from atoll.runtime.verify import verify_islands
 
 
 @dataclass(frozen=True, slots=True)
 class TrialOptions:
-    """User-facing options for selecting and validating overlay candidates."""
+    """User-facing options for selecting and validating compiled regions."""
 
     root: Path
     candidate: str | None = None
@@ -43,149 +45,156 @@ class TrialOptions:
     benchmark_command: str | None = None
     keep_temp: bool = False
     require_compiled: bool = True
+    progress: PackageProgress | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class TrialCommandResult:
-    """Outcome of a temporary overlay trial run.
+    """Outcome of a source-clean typed-region trial.
 
-    The overlay path is returned for diagnostics. Unless `keep_temp` is set, the
-    path will already have been removed after command completion.
+    ``artifact_root`` contains the temporary wheel and install payload only when
+    ``keep_temp`` is enabled. ``overlay_root`` and ``enabled`` remain read-only
+    compatibility views for callers written against the legacy overlay trial.
     """
 
     success: bool
-    overlay_root: Path
-    enabled: tuple[EnabledIslandConfig, ...]
+    artifact_root: Path
+    selected: tuple[SymbolId, ...]
+    compiled_bindings: tuple[BindingTarget, ...]
+    wheel_path: Path | None
     test_exit_code: int | None
     benchmark_exit_code: int | None
     error: str | None = None
+    selections: tuple[TrialSelection, ...] = ()
+    package_result: PackageCommandResult | None = None
+    test_result: PytestRunResult | None = None
+    benchmark_result: PytestRunResult | None = None
+
+    @property
+    def overlay_root(self) -> Path:
+        """Return the temporary artifact root under the legacy property name."""
+        return self.artifact_root
+
+    @property
+    def enabled(self) -> tuple[EnabledIslandConfig, ...]:
+        """Return an empty legacy sidecar view; trial no longer enables islands."""
+        return ()
 
 
 def execute_trial(options: TrialOptions) -> TrialCommandResult:
-    """Run selected Atoll islands in a temporary compiled overlay.
+    """Compile selected typed members and run optional pytest gates.
 
-    Errors are converted into result objects so the CLI can report a failed trial
-    without losing overlay context. Test and benchmark commands run only after
-    compilation and verification succeed.
+    All compilation and routing verification is delegated to
+    :func:`atoll.commands.package.execute_package`. Errors are normalized into a
+    result so the CLI can report the temporary artifact location when retained.
     """
     try:
         project = discover_project(options.root)
         selections = _select_islands(project, options)
     except Exception as error:
-        return TrialCommandResult(
-            success=False,
-            overlay_root=Path(),
-            enabled=(),
-            test_exit_code=None,
-            benchmark_exit_code=None,
-            error=repr(error),
-        )
+        return _failed_result(error=repr(error))
     if not selections:
-        return TrialCommandResult(
-            success=False,
-            overlay_root=Path(),
-            enabled=(),
-            test_exit_code=None,
-            benchmark_exit_code=None,
-            error="no trial candidates selected",
-        )
-    overlay_root = Path(tempfile.mkdtemp(prefix="atoll-trial-"))
+        return _failed_result(error="no trial candidates selected")
+
+    selected = _selected_member_ids(selections)
+    artifact_root = Path(tempfile.mkdtemp(prefix="atoll-trial-"))
+    package: PackageCommandResult | None = None
     try:
-        overlay_source_roots = _copy_source_roots(project, overlay_root)
-        overlay_islands = tuple(
-            _prepare_overlay_island(selection, project, overlay_root, overlay_source_roots)
-            for selection in selections
+        package = execute_package(
+            PackageOptions(
+                root=project.config.root,
+                output_dir=artifact_root / "dist",
+                keep_install_tree=True,
+                progress=options.progress,
+                selected_members=selected,
+                cache_dir=artifact_root / "cache",
+                run_quality_gates=False,
+            )
         )
-        write_atoll_config(overlay_root, overlay_islands)
-        compile_attempt = build_sidecars(
-            tuple(island.sidecar_path for island in overlay_islands),
-            project_root=overlay_root,
-            build_dir=overlay_root / ".atoll" / "build",
-            source_roots=overlay_source_roots,
-        )
-        if not compile_attempt.success:
-            return _trial_result(
+        if not package.success:
+            return _finalize(
                 TrialCommandResult(
                     success=False,
-                    overlay_root=overlay_root,
-                    enabled=overlay_islands,
+                    artifact_root=artifact_root,
+                    selected=selected,
+                    compiled_bindings=package.compiled_bindings,
+                    wheel_path=None,
                     test_exit_code=None,
                     benchmark_exit_code=None,
-                    error=compile_attempt.stderr,
+                    error=package.error or package.build.stderr,
+                    selections=selections,
+                    package_result=package,
                 ),
                 options,
             )
-        verify_config = ProjectConfig(
-            root=overlay_root,
-            source_roots=overlay_source_roots,
-            backend="mypyc",
-            cache_dir=overlay_root / ".atoll" / "cache",
-            report_dir=overlay_root / ".atoll",
-            islands=overlay_islands,
-        )
-        verify_results = verify_islands(verify_config, require_compiled=options.require_compiled)
-        verify_error = _verify_error(verify_results)
-        if verify_error is not None:
-            return _trial_result(
-                TrialCommandResult(
-                    success=False,
-                    overlay_root=overlay_root,
-                    enabled=overlay_islands,
-                    test_exit_code=None,
-                    benchmark_exit_code=None,
-                    error=verify_error,
-                ),
-                options,
-            )
-        test_exit = _run_test_command(
+        test_result = _run_test_command(
             options.test_command,
-            options.root,
-            overlay_source_roots,
+            project.config.root,
+            package.install_root,
             require_compiled=options.require_compiled,
         )
-        benchmark_exit = None
-        if test_exit in (None, 0):
-            benchmark_exit = _run_test_command(
+        benchmark_result = None
+        if test_result is None or test_result.success:
+            benchmark_result = _run_test_command(
                 options.benchmark_command,
-                options.root,
-                overlay_source_roots,
+                project.config.root,
+                package.install_root,
                 require_compiled=options.require_compiled,
             )
-        return _trial_result(
+        return _finalize(
             TrialCommandResult(
-                success=(test_exit is None or test_exit == 0)
-                and (benchmark_exit is None or benchmark_exit == 0),
-                overlay_root=overlay_root,
-                enabled=overlay_islands,
-                test_exit_code=test_exit,
-                benchmark_exit_code=benchmark_exit,
+                success=(test_result is None or test_result.success)
+                and (benchmark_result is None or benchmark_result.success),
+                artifact_root=artifact_root,
+                selected=selected,
+                compiled_bindings=package.compiled_bindings,
+                wheel_path=package.wheel_path,
+                test_exit_code=(test_result.exit_code if test_result is not None else None),
+                benchmark_exit_code=(
+                    benchmark_result.exit_code if benchmark_result is not None else None
+                ),
+                selections=selections,
+                package_result=package,
+                test_result=test_result,
+                benchmark_result=benchmark_result,
             ),
             options,
         )
     except Exception as error:
-        return _trial_result(
+        return _finalize(
             TrialCommandResult(
                 success=False,
-                overlay_root=overlay_root,
-                enabled=(),
+                artifact_root=artifact_root,
+                selected=selected,
+                compiled_bindings=(package.compiled_bindings if package is not None else ()),
+                wheel_path=(package.wheel_path if package is not None else None),
                 test_exit_code=None,
                 benchmark_exit_code=None,
                 error=repr(error),
+                selections=selections,
+                package_result=package,
             ),
             options,
         )
 
 
 @dataclass(frozen=True, slots=True)
-class _Selection:
+class TrialSelection:
+    """One scan candidate retained as a typed-region trial selection."""
+
     module: ModuleId
     symbols: tuple[str, ...]
 
 
-def _select_islands(project: DiscoveredProject, options: TrialOptions) -> tuple[_Selection, ...]:
+def _select_islands(
+    project: DiscoveredProject,
+    options: TrialOptions,
+) -> tuple[TrialSelection, ...]:
     if options.candidate is not None:
         module_name, symbols = _parse_candidate(options.candidate)
-        return (_Selection(module=_find_module(project.modules, module_name), symbols=symbols),)
+        module = _find_module(project.modules, module_name)
+        _validate_explicit_symbols(module, symbols)
+        return (TrialSelection(module=module, symbols=symbols),)
     limit = options.top if options.top is not None else 1
     candidates = sorted(
         (
@@ -201,77 +210,61 @@ def _select_islands(project: DiscoveredProject, options: TrialOptions) -> tuple[
     )
 
 
-def _copy_source_roots(
-    project: DiscoveredProject,
-    overlay_root: Path,
-) -> tuple[Path, ...]:
-    overlay_roots: list[Path] = []
-    for source_root in project.config.source_roots:
-        destination = overlay_root / _relative_source_root(project.config.root, source_root)
-        if destination.resolve() == overlay_root.resolve():
-            _copytree_contents(source_root, destination)
-        else:
-            shutil.copytree(source_root, destination, ignore=_copy_ignore)
-        overlay_roots.append(destination)
-    return tuple(overlay_roots)
-
-
-def _prepare_overlay_island(
-    selection: _Selection,
-    project: DiscoveredProject,
-    overlay_root: Path,
-    overlay_source_roots: tuple[Path, ...],
-) -> EnabledIslandConfig:
-    overlay_module = _overlay_module(selection.module, project, overlay_source_roots)
-    scan = enrich_island_analysis(scan_module(overlay_module))
-    sidecar_module = default_sidecar_module(selection.module.name)
-    island = EnabledIslandConfig(
-        source_module=selection.module.name,
-        source_path=overlay_module.path,
-        sidecar_module=sidecar_module,
-        sidecar_path=expected_sidecar_path(overlay_root, sidecar_module),
-        symbols=selection.symbols,
+def _selected_member_ids(selections: tuple[TrialSelection, ...]) -> tuple[SymbolId, ...]:
+    """Return stable, de-duplicated member identities in candidate order."""
+    members = (
+        SymbolId(module=selection.module.name, qualname=symbol)
+        for selection in selections
+        for symbol in selection.symbols
     )
-    generation = generate_sidecar(scan, island)
-    island.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-    island.sidecar_path.write_text(generation.source_text, encoding="utf-8")
-    source_text = island.source_path.read_text(encoding="utf-8")
-    island.source_path.write_text(
-        insert_or_replace_shim(source_text, island).new_text, encoding="utf-8"
-    )
-    return island
+    return tuple(dict.fromkeys(members))
 
 
 def _run_test_command(
     command: str | None,
     root: Path,
-    overlay_source_roots: tuple[Path, ...],
+    install_root: Path,
     *,
     require_compiled: bool,
-) -> int | None:
+) -> PytestRunResult | None:
     if command is None:
         return None
-    result = run_pytest_command(
+    return run_pytest_command(
         command,
         root=root,
-        source_roots=overlay_source_roots,
+        source_roots=(install_root,),
         require_compiled=require_compiled,
     )
-    return result.exit_code
 
 
-def _trial_result(result: TrialCommandResult, options: TrialOptions) -> TrialCommandResult:
-    if not options.keep_temp and result.overlay_root.exists():
-        shutil.rmtree(result.overlay_root)
+def _finalize(result: TrialCommandResult, options: TrialOptions) -> TrialCommandResult:
+    if not options.keep_temp and result.artifact_root.exists():
+        shutil.rmtree(result.artifact_root)
     return result
+
+
+def _failed_result(*, error: str) -> TrialCommandResult:
+    return TrialCommandResult(
+        success=False,
+        artifact_root=Path(),
+        selected=(),
+        compiled_bindings=(),
+        wheel_path=None,
+        test_exit_code=None,
+        benchmark_exit_code=None,
+        error=error,
+    )
 
 
 def _scan_candidate_module(module: ModuleId) -> ModuleScan:
     return enrich_island_analysis(scan_module(module))
 
 
-def _selection_from_candidate(module: ModuleId, candidate: IslandCandidate) -> _Selection:
-    return _Selection(module=module, symbols=tuple(symbol.qualname for symbol in candidate.symbols))
+def _selection_from_candidate(module: ModuleId, candidate: IslandCandidate) -> TrialSelection:
+    return TrialSelection(
+        module=module,
+        symbols=tuple(symbol.qualname for symbol in candidate.symbols),
+    )
 
 
 def _parse_candidate(value: str) -> tuple[str, tuple[str, ...]]:
@@ -282,63 +275,24 @@ def _parse_candidate(value: str) -> tuple[str, tuple[str, ...]]:
     return module_name, symbols
 
 
+def _validate_explicit_symbols(module: ModuleId, symbols: tuple[str, ...]) -> None:
+    """Keep the legacy candidate contract limited to top-level functions."""
+    scan = _scan_candidate_module(module)
+    functions = frozenset(
+        symbol.id.qualname
+        for symbol in scan.symbols
+        if symbol.kind == "function" and "." not in symbol.id.qualname
+    )
+    unsupported = tuple(symbol for symbol in symbols if symbol not in functions)
+    if unsupported:
+        raise ValueError(
+            "trial candidate symbols must be top-level functions in "
+            f"{module.name}: {', '.join(unsupported)}"
+        )
+
+
 def _find_module(modules: tuple[ModuleId, ...], module_name: str) -> ModuleId:
     for module in modules:
         if module.name == module_name:
             return module
     raise ValueError(f"module not found under configured source roots: {module_name}")
-
-
-def _overlay_module(
-    module: ModuleId,
-    project: DiscoveredProject,
-    overlay_source_roots: tuple[Path, ...],
-) -> ModuleId:
-    for index, source_root in enumerate(project.config.source_roots):
-        try:
-            relative = module.path.relative_to(source_root)
-        except ValueError:
-            continue
-        return ModuleId(name=module.name, path=overlay_source_roots[index] / relative)
-    raise ValueError(f"module is outside configured source roots: {module.name}")
-
-
-def _relative_source_root(root: Path, source_root: Path) -> Path:
-    try:
-        return source_root.relative_to(root)
-    except ValueError:
-        return Path(f"source_{abs(hash(source_root))}")
-
-
-def _copy_ignore(_directory: str, names: list[str]) -> set[str]:
-    ignored = {
-        ".git",
-        ".atoll",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        "__pycache__",
-        "build",
-        "dist",
-    }
-    return {name for name in names if name in ignored or name.endswith((".so", ".pyd"))}
-
-
-def _copytree_contents(source: Path, destination: Path) -> None:
-    ignored_names = _copy_ignore(str(source), [item.name for item in source.iterdir()])
-    for item in source.iterdir():
-        if item.name in ignored_names:
-            continue
-        target = destination / item.name
-        if item.is_dir():
-            shutil.copytree(item, target, ignore=_copy_ignore)
-        else:
-            shutil.copy2(item, target)
-
-
-def _verify_error(results: tuple[VerifyResult, ...]) -> str | None:
-    for result in results:
-        error = getattr(result, "error", None)
-        if isinstance(error, str):
-            return error
-    return None

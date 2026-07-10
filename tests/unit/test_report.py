@@ -303,8 +303,8 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
     assert report["native_readiness"][1]["symbol"] == "score_user"
     assert report["native_readiness"][1]["eligible"] is False
     assert "normal PEP 517 wheel" in markdown
-    assert "Scan scores estimate extraction safety" in markdown
-    assert "`app.ranking.score_user`: rejected (30/100)" in markdown
+    assert "Scan scores estimate extraction safety" not in markdown
+    assert "`app.ranking.score_user`: rejected (30/100)" not in markdown
     assert "- Wheel: `.atoll/dist/app-0+atoll-cp312.whl`" in markdown
     assert "## Skipped Modules" in markdown
     assert "`app.blocked` (src/app/blocked.py:4)" in markdown

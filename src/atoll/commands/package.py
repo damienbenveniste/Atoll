@@ -4,18 +4,14 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import importlib.machinery
-import json
 import re
 import shutil
-import sys
 import textwrap
 import time
 import tomllib
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from importlib import metadata as importlib_metadata
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -23,18 +19,11 @@ from packaging import tags
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
-from atoll.analysis.native_readiness import NativeReadiness, analyze_native_readiness
+from atoll.analysis.native_readiness import NativeReadiness
 from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
-from atoll.backends.mypyc import MYPYC_BACKEND, build_sidecars
+from atoll.backends.mypyc import MYPYC_BACKEND
 from atoll.generation.region_shim import RegionShimConfig, insert_or_replace_region_shim
-from atoll.generation.shim import insert_or_replace_shim, remove_shim
-from atoll.generation.sidecar import (
-    SIDECAR_GENERATOR_VERSION,
-    default_sidecar_module,
-    expected_sidecar_path,
-    generate_sidecar,
-)
 from atoll.generation.typed_region import (
     TYPED_METHOD_GENERATOR_VERSION,
     TypedRegionGeneration,
@@ -108,9 +97,6 @@ _GENERATED_DIR_NAMES = frozenset(
         "site-packages",
     }
 )
-_COMPILE_CACHE_VERSION = 2
-_CACHE_INPUT_SUFFIXES = frozenset({".py", ".pyi", ".toml"})
-_CACHE_INPUT_NAMES = frozenset({"py.typed"})
 _PEP517_IGNORED_NAMES = frozenset(
     {
         ".atoll",
@@ -129,13 +115,24 @@ _PEP517_IGNORED_NAMES = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class PackageOptions:
-    """User-facing options for building an installable Atoll artifact."""
+    """Options for building an installable source-clean Atoll artifact.
+
+    ``selected_members`` is an internal selection boundary used by trial mode.
+    Empty selection compiles every backend-supported typed region in scope;
+    explicit selections also retain their same-region runtime dependencies.
+    ``cache_dir`` can isolate reusable state for a temporary caller, and
+    ``run_quality_gates=False`` delegates semantic and benchmark commands to
+    that caller without weakening wheel routing verification.
+    """
 
     root: Path
     module_name: str | None = None
     output_dir: Path | None = None
     keep_install_tree: bool = False
     progress: PackageProgress | None = None
+    selected_members: tuple[SymbolId, ...] = ()
+    cache_dir: Path | None = None
+    run_quality_gates: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,12 +202,6 @@ class _ProjectMetadata:
 
 
 @dataclass(frozen=True, slots=True)
-class _SelectedModule:
-    scan: ModuleScan
-    symbols: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _SelectedTypedRegion:
     """One typed region and member subset selected for a backend variant."""
 
@@ -220,6 +211,7 @@ class _SelectedTypedRegion:
     backend: Backend
     assessment: BackendAssessment
     members: tuple[SymbolId, ...]
+    bound_members: tuple[SymbolId, ...] | None = None
     specialization: RegionSpecialization | None = None
     conditional_on_failure_of: str | None = None
 
@@ -277,41 +269,6 @@ class _TypedRegionPackageContext:
     typed_regions: tuple[TypedRegion, ...]
     preflight_skipped: tuple[PackagePreflightFailure, ...]
     native_readiness: tuple[NativeReadiness, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedModule:
-    """Generated module after performance-worthiness filtering."""
-
-    island: EnabledIslandConfig | None
-    native_readiness: tuple[NativeReadiness, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _PackageBuildOutcome:
-    successful: tuple[EnabledIslandConfig, ...]
-    build: CompileAttempt
-    skipped: tuple[PackageBuildFailure, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _PackageBuildContext:
-    target_project: DiscoveredProject
-    module_name: str | None
-    project_root: Path
-    source_roots: tuple[Path, ...]
-    allow_partial: bool
-    progress: PackageProgress | None
-
-
-@dataclass(frozen=True, slots=True)
-class _CompileCacheLookup:
-    key: str
-    hit: bool
-    artifact_paths: tuple[Path, ...]
-    successful_modules: tuple[str, ...]
-    skipped_modules: tuple[str, ...]
-    phase_timings: tuple[CompilePhaseTiming, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,7 +332,13 @@ class _SourceCleanPromotionFailure:
 
 
 def execute_package(options: PackageOptions) -> PackageCommandResult:
-    """Build an install tree and wheel containing Atoll compiled islands."""
+    """Build a source-clean wheel from backend-neutral typed regions.
+
+    Generated sidecars and generated-code native-readiness analysis are
+    deliberately excluded from this command. Explicit in-place workflows retain
+    their sidecar implementation, while default compile uses scanner IR, backend
+    assessments, and per-region fallback throughout.
+    """
     _progress(options.progress, f"discovering project at {options.root.resolve()}")
     project = discover_project(options.root)
     _progress(
@@ -383,233 +346,55 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         f"discovered {len(project.modules)} module(s); scan scope: {options.module_name or 'all'}",
     )
     scan_started = time.perf_counter()
-    scans = _selected_scans(project, options.module_name)
+    scans = _selected_scans(project, options.module_name, options.selected_members)
     typed_regions = tuple(region for scan in scans for region in scan.typed_regions)
     _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
-    selected = _selected_modules(scans)
-    selected_typed_regions = _selected_typed_method_regions(
+    selected_typed_regions = _selected_typed_regions(
         scans,
         project.config.compile.backends,
+        options.selected_members,
     )
-    _progress_compile_selection(options.progress, selected, selected_typed_regions)
-    if not selected and not selected_typed_regions:
+    _progress_compile_selection(
+        options.progress,
+        selected_typed_regions,
+        requested_members=options.selected_members,
+    )
+    missing_members = _missing_requested_members(
+        options.selected_members,
+        selected_typed_regions,
+    )
+    if missing_members:
+        missing_text = ", ".join(member.stable_id for member in missing_members)
+        _remove_failed_wheels(
+            project,
+            _resolve_output_dir(project.config.root, options.output_dir),
+        )
         return _failed_result(
             project.config.root,
             options.output_dir,
-            "scan found no candidate islands",
+            f"requested member(s) are not backend-supported typed regions: {missing_text}",
             typed_regions=typed_regions,
         )
-    if not selected:
-        return _execute_typed_region_package(
-            options=options,
-            project=project,
-            context=_TypedRegionPackageContext(
-                selected=selected_typed_regions,
-                typed_regions=typed_regions,
-                preflight_skipped=(),
-                native_readiness=(),
-            ),
+    if not selected_typed_regions:
+        _remove_failed_wheels(
+            project,
+            _resolve_output_dir(project.config.root, options.output_dir),
         )
-
-    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
-    build_root = output_dir / "build"
-    install_root = output_dir / "install"
-    _progress(options.progress, f"resetting temporary build roots in {output_dir}")
-    _reset_dir(build_root)
-    _reset_dir(install_root)
-
-    copy_started = time.perf_counter()
-    _progress(options.progress, "copying source roots into temporary build tree")
-    staged_source_roots = _copy_source_roots(project, build_root)
-    _progress(options.progress, f"copied source roots in {_duration(copy_started)}")
-    sidecar_started = time.perf_counter()
-    _progress(
-        options.progress,
-        (
-            f"analyzing {sum(len(module.symbols) for module in selected)} generated "
-            "candidate symbol(s) for native readiness"
-        ),
-    )
-    prepared_modules = tuple(
-        _prepare_staged_island(
-            project=project,
-            staged_source_roots=staged_source_roots,
-            selected_module=selected_module,
-        )
-        for selected_module in selected
-    )
-    native_readiness = tuple(
-        readiness
-        for prepared_module in prepared_modules
-        for readiness in prepared_module.native_readiness
-    )
-    islands = tuple(
-        prepared_module.island
-        for prepared_module in prepared_modules
-        if prepared_module.island is not None
-    )
-    native_ready_symbols = sum(readiness.eligible for readiness in native_readiness)
-    _progress(
-        options.progress,
-        (
-            f"native readiness accepted {native_ready_symbols}/{len(native_readiness)} "
-            f"symbol(s) across {len(islands)} module(s) in {_duration(sidecar_started)}"
-        ),
-    )
-    if not islands:
-        return _handle_no_native_islands(
-            options=options,
-            project=project,
-            build_root=build_root,
-            context=_TypedRegionPackageContext(
-                selected=selected_typed_regions,
-                typed_regions=typed_regions,
-                preflight_skipped=(),
-                native_readiness=native_readiness,
-            ),
-        )
-    baseline = _prepare_baseline_wheel_payload(
-        project=project,
-        build_root=build_root,
-        install_root=install_root,
-        progress=options.progress,
-    )
-    if baseline.wheel_path is None:
-        _remove_failed_wheels(project, output_dir)
-        cleanup_removed = _remove_tree(install_root)
-        return PackageCommandResult(
-            success=False,
-            project_root=project.config.root,
-            output_dir=output_dir,
-            install_root=install_root,
-            wheel_path=None,
-            islands=(),
-            build=baseline.build,
-            error=baseline.build.stderr,
-            cleanup_removed=cleanup_removed,
-            cleanup_kept=(build_root,),
-            preflight_skipped=(),
-            native_readiness=native_readiness,
+        return _failed_result(
+            project.config.root,
+            options.output_dir,
+            "scan found no backend-supported typed regions",
             typed_regions=typed_regions,
         )
-    outcome = _build_package_islands(
-        islands,
-        _PackageBuildContext(
-            target_project=project,
-            module_name=options.module_name,
-            project_root=build_root,
-            source_roots=staged_source_roots,
-            allow_partial=options.module_name is None,
-            progress=options.progress,
-        ),
-    )
-    outcome = replace(outcome, build=_combine_baseline_and_native(baseline.build, outcome.build))
-    if not outcome.build.success:
-        _progress(options.progress, "build failed; keeping build tree for diagnostics")
-        _remove_failed_wheels(project, output_dir)
-        cleanup_removed = _remove_tree(install_root)
-        return PackageCommandResult(
-            success=False,
-            project_root=project.config.root,
-            output_dir=output_dir,
-            install_root=install_root,
-            wheel_path=None,
-            islands=outcome.successful,
-            build=outcome.build,
-            error=outcome.build.stderr,
-            cleanup_removed=cleanup_removed,
-            cleanup_kept=(build_root,),
-            skipped=outcome.skipped,
-            preflight_skipped=(),
-            native_readiness=native_readiness,
-            typed_regions=typed_regions,
-        )
-
-    payload_started = time.perf_counter()
-    _progress(options.progress, "placing compiled artifacts into install payload")
-    _place_compiled_artifacts(outcome.successful, outcome.build.artifact_paths)
-    report_artifact_paths = _source_clean_report_artifact_paths(
-        project.config.root,
-        outcome.build.artifact_paths,
-    )
-    _remove_generated_sidecar_sources(outcome.successful)
-    overlay_error = _overlay_install_payload(
-        staged_source_roots,
-        install_root,
-        tuple(island.source_path for island in outcome.successful),
-    )
-    verification_plan = _legacy_verification_plan(
-        outcome.successful,
-        outcome.build.artifact_paths,
-    )
-    promotion_context = _SourceCleanPromotionContext(
+    return _execute_typed_region_package(
         options=options,
         project=project,
-        output_dir=output_dir,
-        build_root=build_root,
-        install_root=install_root,
-        baseline=baseline,
-        verification_plan=verification_plan,
-        build=outcome.build,
-    )
-    if overlay_error is None:
-        _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
-        promotion = _promote_source_clean_payload(promotion_context)
-    else:
-        promotion = _failed_promotion(
-            promotion_context,
-            _SourceCleanPromotionFailure(
-                build=replace(outcome.build, success=False, stderr=overlay_error),
-                verification_steps=(),
-                error=overlay_error,
-            ),
-        )
-    return PackageCommandResult(
-        success=promotion.success,
-        project_root=project.config.root,
-        output_dir=output_dir,
-        install_root=install_root,
-        wheel_path=promotion.wheel_path,
-        islands=outcome.successful,
-        build=promotion.build,
-        install_tree_kept=options.keep_install_tree and promotion.success,
-        cleanup_removed=promotion.cleanup_removed,
-        cleanup_kept=promotion.cleanup_kept,
-        report_artifact_paths=report_artifact_paths,
-        error=promotion.error,
-        skipped=outcome.skipped,
-        native_readiness=native_readiness,
-        typed_regions=typed_regions,
-        verification_steps=promotion.verification_steps,
-        test_results=promotion.test_results,
-        performance=promotion.performance,
-    )
-
-
-def _handle_no_native_islands(
-    *,
-    options: PackageOptions,
-    project: DiscoveredProject,
-    build_root: Path,
-    context: _TypedRegionPackageContext,
-) -> PackageCommandResult:
-    """Try selected method regions before reporting no native-ready work."""
-    if context.selected:
-        _progress(
-            options.progress,
-            "no function islands passed native readiness; trying typed regions",
-        )
-        return _execute_typed_region_package(
-            options=options,
-            project=project,
-            context=context,
-        )
-    return _no_native_ready_result(
-        project=project,
-        build_root=build_root,
-        native_readiness=context.native_readiness,
-        preflight_skipped=context.preflight_skipped,
-        typed_regions=context.typed_regions,
+        context=_TypedRegionPackageContext(
+            selected=selected_typed_regions,
+            typed_regions=typed_regions,
+            preflight_skipped=(),
+            native_readiness=(),
+        ),
     )
 
 
@@ -637,6 +422,7 @@ def _execute_typed_region_package(
         build_root=build_root,
         install_root=install_root,
         progress=options.progress,
+        run_quality_gates=options.run_quality_gates,
     )
     if baseline.wheel_path is None:
         _remove_failed_wheels(project, output_dir)
@@ -720,8 +506,12 @@ def _execute_typed_region_package(
         context=_TypedRegionBuildContext(
             build_root=build_root,
             staged_source_roots=staged_source_roots,
-            mypy_cache_dir=project.config.cache_dir / "mypy" / "source-clean",
-            compile_cache_dir=project.config.cache_dir / "compile" / "regions",
+            mypy_cache_dir=(options.cache_dir or project.config.cache_dir)
+            / "mypy"
+            / "source-clean",
+            compile_cache_dir=(options.cache_dir or project.config.cache_dir)
+            / "compile"
+            / "regions",
             progress=options.progress,
         ),
         initial_failures=tuple(preparation_failures),
@@ -745,6 +535,44 @@ def _execute_typed_region_package(
             preflight_skipped=context.preflight_skipped,
             native_readiness=context.native_readiness,
             typed_regions=context.typed_regions,
+            backend_assessments=tuple(selection.assessment for selection in context.selected),
+            artifact_records=outcome.artifacts,
+            region_skipped=outcome.skipped,
+        )
+
+    successful_bindings = tuple(
+        binding for item in outcome.successful for binding in item.generation.bindings
+    )
+    compiled_sources = frozenset(binding.source for binding in successful_bindings)
+    missing_compiled = tuple(
+        member for member in options.selected_members if member not in compiled_sources
+    )
+    if missing_compiled:
+        missing_text = ", ".join(member.stable_id for member in missing_compiled)
+        error = f"requested member(s) did not compile successfully: {missing_text}"
+        failed_build = replace(outcome.build, success=False, stderr=error)
+        _remove_failed_wheels(project, output_dir)
+        cleanup_removed = _remove_tree(install_root)
+        return PackageCommandResult(
+            success=False,
+            project_root=project.config.root,
+            output_dir=output_dir,
+            install_root=install_root,
+            wheel_path=None,
+            islands=(),
+            build=failed_build,
+            cleanup_removed=cleanup_removed,
+            cleanup_kept=(build_root,),
+            error=error,
+            preflight_skipped=context.preflight_skipped,
+            native_readiness=context.native_readiness,
+            typed_regions=context.typed_regions,
+            compiled_regions=tuple(
+                {
+                    item.generation.region.id: item.generation.region for item in outcome.successful
+                }.values()
+            ),
+            compiled_bindings=successful_bindings,
             backend_assessments=tuple(selection.assessment for selection in context.selected),
             artifact_records=outcome.artifacts,
             region_skipped=outcome.skipped,
@@ -796,9 +624,6 @@ def _execute_typed_region_package(
     cache_statuses = dict(outcome.cache_statuses)
     successful_regions = tuple(
         {item.generation.region.id: item.generation.region for item in outcome.successful}.values()
-    )
-    successful_bindings = tuple(
-        binding for item in outcome.successful for binding in item.generation.bindings
     )
     successful_variants = tuple(
         CompiledRegionVariant(
@@ -935,6 +760,12 @@ def _prepare_backend_variant(
             specialization=selection.specialization,
         ),
     )
+    if selection.bound_members is not None:
+        bound = frozenset(selection.bound_members)
+        generation = replace(
+            generation,
+            bindings=tuple(binding for binding in generation.bindings if binding.source in bound),
+        )
     unit = _compiler_backend(selection.backend).lower(
         BackendLoweringRequest(
             region=staged.region,
@@ -1017,6 +848,16 @@ def _build_typed_regions(
             backend_context,
             cache_root=context.compile_cache_dir,
         )
+        if result.attempt.cache_status == "hit":
+            _progress(
+                context.progress,
+                f"compile cache hit for typed region variant {item.unit.region_id}",
+            )
+        elif result.attempt.cache_status == "miss":
+            _progress(
+                context.progress,
+                f"compile cache miss for typed region variant {item.unit.region_id}",
+            )
         tagged_attempt = _tag_region_timings(result.attempt, item.unit.region_id)
         if result.attempt.success:
             attempts.append(tagged_attempt)
@@ -1273,47 +1114,6 @@ def _compiler_backend(backend: Backend) -> CompilerBackend:
     return _COMPILER_BACKENDS[backend]
 
 
-def _no_native_ready_result(
-    *,
-    project: DiscoveredProject,
-    build_root: Path,
-    native_readiness: tuple[NativeReadiness, ...],
-    preflight_skipped: tuple[PackagePreflightFailure, ...],
-    typed_regions: tuple[TypedRegion, ...],
-) -> PackageCommandResult:
-    """Return a clean failure without invoking mypyc or retaining a stale wheel."""
-    output_dir = build_root.parent
-    install_root = output_dir / "install"
-    _remove_failed_wheels(project, output_dir)
-    cleanup_removed = (*_remove_tree(build_root), *_remove_tree(install_root))
-    error = (
-        "No performance-worthy native islands remain after generated-code analysis. "
-        f"Rejected {len(native_readiness)} scan candidate symbol(s); mypyc was not invoked. "
-        "See the compile report for native-readiness reasons."
-    )
-    return PackageCommandResult(
-        success=False,
-        project_root=project.config.root,
-        output_dir=output_dir,
-        install_root=install_root,
-        wheel_path=None,
-        islands=(),
-        build=CompileAttempt(
-            success=False,
-            command=(),
-            stdout="",
-            stderr=error,
-            artifact_paths=(),
-            duration_seconds=0.0,
-        ),
-        cleanup_removed=cleanup_removed,
-        error=error,
-        preflight_skipped=preflight_skipped,
-        native_readiness=native_readiness,
-        typed_regions=typed_regions,
-    )
-
-
 def _failed_result(
     root: Path,
     output_dir: Path | None,
@@ -1358,18 +1158,21 @@ def _progress(progress: PackageProgress | None, message: str) -> None:
 
 def _progress_compile_selection(
     progress: PackageProgress | None,
-    selected_modules: tuple[_SelectedModule, ...],
     selected_regions: tuple[_SelectedTypedRegion, ...],
+    *,
+    requested_members: tuple[SymbolId, ...] = (),
 ) -> None:
-    function_count = sum(len(module.symbols) for module in selected_modules)
     member_count = sum(len(region.members) for region in selected_regions)
     specialization_count = sum(region.specialization is not None for region in selected_regions)
+    requested_text = (
+        f" for {len(requested_members)} explicitly requested member(s)" if requested_members else ""
+    )
     _progress(
         progress,
         (
-            f"selected {len(selected_modules)} candidate module(s), {function_count} "
-            f"function(s), and {len(selected_regions)} typed region backend variant(s), "
-            f"{member_count} member(s), {specialization_count} specialization(s)"
+            f"selected {len(selected_regions)} typed region backend variant(s), "
+            f"{member_count} member binding(s), {specialization_count} specialization(s)"
+            f"{requested_text}"
         ),
     )
 
@@ -1384,6 +1187,7 @@ def _prepare_baseline_wheel_payload(
     build_root: Path,
     install_root: Path,
     progress: PackageProgress | None,
+    run_quality_gates: bool,
 ) -> _BaselineWheelPayload:
     """Build and unpack the target project's normal wheel from a clean copy."""
     copied_project = build_root / "pep517-project"
@@ -1454,7 +1258,7 @@ def _prepare_baseline_wheel_payload(
     )
     baseline_install_root: Path | None = None
     baseline_copy_timing: tuple[CompilePhaseTiming, ...] = ()
-    if project.config.compile.benchmark_command is not None:
+    if run_quality_gates and project.config.compile.benchmark_command is not None:
         baseline_started = time.perf_counter()
         baseline_install_root = build_root / "baseline-install"
         shutil.copytree(install_root, baseline_install_root)
@@ -1466,7 +1270,7 @@ def _prepare_baseline_wheel_payload(
             ),
         )
     quality_project_root: Path | None = None
-    if (
+    if run_quality_gates and (
         project.config.compile.test_command is not None
         or project.config.compile.benchmark_command is not None
     ):
@@ -1555,23 +1359,6 @@ def _typed_verification_plan(
             (module, tuple(region_ids)) for module, region_ids in sorted(regions_by_module.items())
         ),
         artifacts=tuple(artifacts[path] for path in sorted(artifacts)),
-    )
-
-
-def _legacy_verification_plan(
-    islands: tuple[EnabledIslandConfig, ...],
-    artifact_paths: tuple[Path, ...],
-) -> PackageVerificationPlan:
-    return PackageVerificationPlan(
-        modules=tuple(sorted(island.source_module for island in islands)),
-        regions=(),
-        artifacts=tuple(
-            VerificationArtifact(
-                path=f".atoll/artifacts/{artifact.name}",
-                digest=_file_digest(artifact),
-            )
-            for artifact in sorted(artifact_paths)
-        ),
     )
 
 
@@ -1711,11 +1498,15 @@ def _promote_source_clean_payload(
             ),
         )
 
-    quality_gate = _run_configured_quality_gate(
-        project=context.project,
-        baseline=context.baseline,
-        compiled_payload_root=context.install_root,
-        progress=context.options.progress,
+    quality_gate = (
+        _run_configured_quality_gate(
+            project=context.project,
+            baseline=context.baseline,
+            compiled_payload_root=context.install_root,
+            progress=context.options.progress,
+        )
+        if context.options.run_quality_gates
+        else _skipped_quality_gate(context.project.config.compile.minimum_speedup)
     )
     build = _append_quality_gate_timings(build, quality_gate)
     if not quality_gate.success:
@@ -1903,6 +1694,25 @@ def _invalid_quality_gate(minimum_speedup: float, reason: str) -> _QualityGateOu
     )
 
 
+def _skipped_quality_gate(minimum_speedup: float) -> _QualityGateOutcome:
+    """Record that a caller owns semantic and performance gates for this build."""
+    return _QualityGateOutcome(
+        success=True,
+        tests=(),
+        performance=BenchmarkGateResult(
+            status="unbenchmarked",
+            reason="quality gates delegated to the calling workflow",
+            minimum_speedup=minimum_speedup,
+            baseline_median_seconds=None,
+            compiled_median_seconds=None,
+            speedup=None,
+            warmups=(),
+            samples=(),
+        ),
+        error=None,
+    )
+
+
 def _benchmark_progress(progress: PackageProgress | None, event: BenchmarkProgress) -> None:
     sample = event.pair_index + 1
     _progress(
@@ -1943,297 +1753,6 @@ def _append_quality_gate_timings(
     )
 
 
-def _progress_phase_timings(
-    progress: PackageProgress | None,
-    timings: tuple[CompilePhaseTiming, ...],
-) -> None:
-    for timing in timings:
-        detail = f" ({timing.detail})" if timing.detail else ""
-        _progress(progress, f"{timing.name} completed in {timing.duration_seconds:.2f}s{detail}")
-
-
-def _lookup_compile_cache(
-    *,
-    target_project: DiscoveredProject,
-    module_name: str | None,
-    islands: tuple[EnabledIslandConfig, ...],
-) -> _CompileCacheLookup:
-    key = _compile_cache_key(
-        target_project=target_project,
-        module_name=module_name,
-        islands=islands,
-    )
-    cache_root = target_project.config.cache_dir / "compile"
-    lookup_started = time.perf_counter()
-    entry_root = cache_root / key
-    manifest = _read_cache_manifest(entry_root / "manifest.json")
-    if manifest is None or manifest.get("version") != _COMPILE_CACHE_VERSION:
-        return _compile_cache_miss(key, lookup_started, "miss")
-    if manifest.get("key") != key:
-        return _compile_cache_miss(key, lookup_started, "key mismatch")
-    artifacts = _cached_artifact_paths(entry_root, manifest)
-    if artifacts is None:
-        return _compile_cache_miss(key, lookup_started, "stale")
-    cached_modules = _cached_manifest_modules(manifest)
-    if cached_modules is None:
-        return _compile_cache_miss(key, lookup_started, "stale")
-    successful_modules, skipped_modules = cached_modules
-    current_modules = {island.source_module for island in islands}
-    if set(successful_modules) | set(skipped_modules) != current_modules:
-        return _compile_cache_miss(key, lookup_started, "selection mismatch")
-    return _compile_cache_hit(
-        key=key,
-        lookup_started=lookup_started,
-        artifact_paths=artifacts,
-        successful_modules=successful_modules,
-        skipped_modules=skipped_modules,
-    )
-
-
-def _compile_cache_hit(
-    *,
-    key: str,
-    lookup_started: float,
-    artifact_paths: tuple[Path, ...],
-    successful_modules: tuple[str, ...],
-    skipped_modules: tuple[str, ...],
-) -> _CompileCacheLookup:
-    lookup_timing = CompilePhaseTiming(
-        name="cache_lookup",
-        duration_seconds=time.perf_counter() - lookup_started,
-        detail="hit" if not skipped_modules else "partial hit",
-    )
-    restore_started = time.perf_counter()
-    restored = tuple(path for path in artifact_paths if path.exists())
-    restore_timing = CompilePhaseTiming(
-        name="cache_restore",
-        duration_seconds=time.perf_counter() - restore_started,
-        detail=f"{len(restored)} artifact(s)",
-    )
-    if len(restored) != len(artifact_paths):
-        return _CompileCacheLookup(
-            key=key,
-            hit=False,
-            artifact_paths=(),
-            successful_modules=(),
-            skipped_modules=(),
-            phase_timings=(
-                lookup_timing,
-                CompilePhaseTiming(
-                    name="cache_restore",
-                    duration_seconds=restore_timing.duration_seconds,
-                    detail="stale",
-                ),
-            ),
-        )
-    return _CompileCacheLookup(
-        key=key,
-        hit=True,
-        artifact_paths=restored,
-        successful_modules=successful_modules,
-        skipped_modules=skipped_modules,
-        phase_timings=(lookup_timing, restore_timing),
-    )
-
-
-def _compile_cache_miss(
-    key: str,
-    lookup_started: float,
-    detail: str,
-) -> _CompileCacheLookup:
-    return _CompileCacheLookup(
-        key=key,
-        hit=False,
-        artifact_paths=(),
-        successful_modules=(),
-        skipped_modules=(),
-        phase_timings=(
-            CompilePhaseTiming(
-                name="cache_lookup",
-                duration_seconds=time.perf_counter() - lookup_started,
-                detail=detail,
-            ),
-        ),
-    )
-
-
-def _read_cache_manifest(path: Path) -> dict[str, object] | None:
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    raw = cast(dict[object, object], data)
-    return {str(key): value for key, value in raw.items()}
-
-
-def _cached_artifact_paths(
-    entry_root: Path,
-    manifest: dict[str, object],
-) -> tuple[Path, ...] | None:
-    raw_artifacts = manifest.get("artifacts")
-    if not isinstance(raw_artifacts, list):
-        return None
-    paths: list[Path] = []
-    for raw_artifact in cast(list[object], raw_artifacts):
-        if not isinstance(raw_artifact, dict):
-            return None
-        artifact = cast(dict[object, object], raw_artifact)
-        name = artifact.get("name")
-        digest = artifact.get("sha256")
-        if not isinstance(name, str) or not isinstance(digest, str):
-            return None
-        path = entry_root / "artifacts" / name
-        if not path.exists() or _file_digest(path) != digest:
-            return None
-        paths.append(path)
-    return tuple(paths)
-
-
-def _cached_manifest_modules(
-    manifest: dict[str, object],
-) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
-    successful = _string_tuple_manifest_field(manifest, "successful_modules")
-    skipped = _string_tuple_manifest_field(manifest, "skipped_modules")
-    if successful is None or skipped is None:
-        return None
-    if set(successful) & set(skipped):
-        return None
-    return successful, skipped
-
-
-def _string_tuple_manifest_field(
-    manifest: dict[str, object],
-    field: str,
-) -> tuple[str, ...] | None:
-    raw = manifest.get(field)
-    if not isinstance(raw, list):
-        return None
-    values: list[str] = []
-    for item in cast(list[object], raw):
-        if not isinstance(item, str):
-            return None
-        values.append(item)
-    return tuple(values)
-
-
-def _store_compile_cache(
-    *,
-    cache_root: Path,
-    key: str,
-    artifact_paths: tuple[Path, ...],
-    successful_modules: tuple[str, ...],
-    skipped_modules: tuple[str, ...],
-) -> None:
-    if not artifact_paths:
-        return
-    cache_root.mkdir(parents=True, exist_ok=True)
-    entry_root = cache_root / key
-    temp_root = cache_root / f"{key}.tmp"
-    if temp_root.exists():
-        shutil.rmtree(temp_root)
-    artifact_root = temp_root / "artifacts"
-    artifact_root.mkdir(parents=True)
-    manifest_artifacts: list[dict[str, str]] = []
-    for artifact in artifact_paths:
-        destination = artifact_root / artifact.name
-        shutil.copy2(artifact, destination)
-        manifest_artifacts.append({"name": artifact.name, "sha256": _file_digest(destination)})
-    manifest = {
-        "version": _COMPILE_CACHE_VERSION,
-        "key": key,
-        "artifacts": manifest_artifacts,
-        "successful_modules": list(successful_modules),
-        "skipped_modules": list(skipped_modules),
-    }
-    (temp_root / "manifest.json").write_text(
-        f"{json.dumps(manifest, indent=2, sort_keys=True)}\n",
-        encoding="utf-8",
-    )
-    if entry_root.exists():
-        shutil.rmtree(entry_root)
-    temp_root.rename(entry_root)
-
-
-def _compile_cache_key(
-    *,
-    target_project: DiscoveredProject,
-    module_name: str | None,
-    islands: tuple[EnabledIslandConfig, ...],
-) -> str:
-    payload = {
-        "version": _COMPILE_CACHE_VERSION,
-        "python_tag": _python_tag(),
-        "wheel_tag": _wheel_tag(),
-        "extension_suffixes": list(importlib.machinery.EXTENSION_SUFFIXES),
-        "atoll_version": _installed_version("atoll"),
-        "mypy_version": _installed_version("mypy"),
-        "setuptools_version": _installed_version("setuptools"),
-        "sidecar_generator_version": SIDECAR_GENERATOR_VERSION,
-        "module_filter": module_name,
-        "source_tree_digest": _source_tree_digest(target_project),
-        "source_roots": [
-            _path_text(target_project.config.root, source_root)
-            for source_root in target_project.config.source_roots
-        ],
-        "islands": [
-            {
-                "source_module": island.source_module,
-                "sidecar_module": island.sidecar_module,
-                "symbols": list(island.symbols),
-                "sidecar_sha256": _file_digest(island.sidecar_path),
-            }
-            for island in islands
-        ],
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _source_tree_digest(project: DiscoveredProject) -> str:
-    digest = hashlib.sha256()
-    for path in _cache_input_paths(project):
-        digest.update(_path_text(project.config.root, path).encode())
-        digest.update(b"\0")
-        digest.update(_file_digest(path).encode())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _cache_input_paths(project: DiscoveredProject) -> tuple[Path, ...]:
-    paths: set[Path] = set()
-    pyproject = project.config.root / "pyproject.toml"
-    if pyproject.exists():
-        paths.add(pyproject)
-    for source_root in project.config.source_roots:
-        for path in source_root.rglob("*"):
-            if not path.is_file() or _is_ignored_cache_input(path, source_root):
-                continue
-            if path.suffix in _CACHE_INPUT_SUFFIXES or path.name in _CACHE_INPUT_NAMES:
-                paths.add(path)
-    return tuple(sorted(paths))
-
-
-def _is_ignored_cache_input(path: Path, source_root: Path) -> bool:
-    relative_parts = path.relative_to(source_root).parts
-    return any(
-        part in _GENERATED_DIR_NAMES
-        or part in {".nox", ".tox", ".venv", "venv"}
-        or part.endswith((".egg-info", ".dist-info"))
-        for part in relative_parts
-    )
-
-
-def _installed_version(package: str) -> str:
-    try:
-        return importlib_metadata.version(package)
-    except importlib_metadata.PackageNotFoundError:
-        return "unknown"
-
-
 def _file_digest(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -2242,363 +1761,237 @@ def _file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _build_package_islands(
-    islands: tuple[EnabledIslandConfig, ...],
-    context: _PackageBuildContext,
-) -> _PackageBuildOutcome:
-    cache_lookup = _lookup_compile_cache(
-        target_project=context.target_project,
-        module_name=context.module_name,
-        islands=islands,
-    )
-    if cache_lookup.hit:
-        _progress(context.progress, f"compile cache hit: {cache_lookup.key[:12]}")
-        _progress_phase_timings(context.progress, cache_lookup.phase_timings)
-        successful_modules = set(cache_lookup.successful_modules)
-        skipped_modules = set(cache_lookup.skipped_modules)
-        successful_islands = tuple(
-            island for island in islands if island.source_module in successful_modules
-        )
-        skipped = tuple(
-            _cached_skipped_failure(island, cache_lookup.key)
-            for island in islands
-            if island.source_module in skipped_modules
-        )
-        for failure in skipped:
-            _remove_staged_island(failure.island)
-        return _PackageBuildOutcome(
-            successful=successful_islands,
-            build=CompileAttempt(
-                success=True,
-                command=("atoll", "compile-cache", "restore", cache_lookup.key[:12]),
-                stdout=(
-                    "compile cache hit"
-                    if not skipped
-                    else f"compile cache hit; restored {len(successful_islands)} island(s), "
-                    f"kept {len(skipped)} cached skip(s)"
-                ),
-                stderr="",
-                artifact_paths=cache_lookup.artifact_paths,
-                duration_seconds=sum(
-                    timing.duration_seconds for timing in cache_lookup.phase_timings
-                ),
-                phase_timings=cache_lookup.phase_timings,
-                cache_status="hit",
-            ),
-            skipped=skipped,
-        )
-    _progress(context.progress, f"compile cache miss: {cache_lookup.key[:12]}")
-    batch_started = time.perf_counter()
-    _progress(context.progress, f"running mypyc batch for {len(islands)} island(s)")
-    batch = build_sidecars(
-        tuple(island.sidecar_path for island in islands),
-        project_root=context.project_root,
-        build_dir=context.project_root / ".atoll" / "build",
-        source_roots=context.source_roots,
-        cache_dir=context.target_project.config.cache_dir / "mypy" / "source-clean",
-    )
-    batch = replace(
-        batch,
-        phase_timings=(*cache_lookup.phase_timings, *batch.phase_timings),
-        cache_status="miss",
-    )
-    if batch.success:
-        cache_store_started = time.perf_counter()
-        _store_compile_cache(
-            cache_root=context.target_project.config.cache_dir / "compile",
-            key=cache_lookup.key,
-            artifact_paths=batch.artifact_paths,
-            successful_modules=tuple(island.source_module for island in islands),
-            skipped_modules=(),
-        )
-        batch = replace(
-            batch,
-            phase_timings=(
-                *batch.phase_timings,
-                CompilePhaseTiming(
-                    name="cache_store",
-                    duration_seconds=time.perf_counter() - cache_store_started,
-                    detail="stored",
-                ),
-            ),
-        )
-        _progress_phase_timings(context.progress, batch.phase_timings)
-        _progress(context.progress, f"mypyc batch succeeded in {_duration(batch_started)}")
-        return _PackageBuildOutcome(successful=islands, build=batch, skipped=())
-    if not context.allow_partial or len(islands) <= 1:
-        _progress(context.progress, f"mypyc batch failed in {_duration(batch_started)}")
-        return _PackageBuildOutcome(successful=(), build=batch, skipped=())
-    _progress(
-        context.progress,
-        f"mypyc batch failed in {_duration(batch_started)}; retrying islands individually",
-    )
-    outcome = _build_package_islands_individually(
-        islands,
-        context,
-        batch_failure=batch,
-    )
-    if not outcome.build.success:
-        return outcome
-    cache_store_started = time.perf_counter()
-    _store_compile_cache(
-        cache_root=context.target_project.config.cache_dir / "compile",
-        key=cache_lookup.key,
-        artifact_paths=outcome.build.artifact_paths,
-        successful_modules=tuple(island.source_module for island in outcome.successful),
-        skipped_modules=tuple(failure.island.source_module for failure in outcome.skipped),
-    )
-    return _PackageBuildOutcome(
-        successful=outcome.successful,
-        build=replace(
-            outcome.build,
-            phase_timings=(
-                *outcome.build.phase_timings,
-                CompilePhaseTiming(
-                    name="cache_store",
-                    duration_seconds=time.perf_counter() - cache_store_started,
-                    detail="stored partial",
-                ),
-            ),
-        ),
-        skipped=outcome.skipped,
-    )
-
-
-def _cached_skipped_failure(island: EnabledIslandConfig, key: str) -> PackageBuildFailure:
-    return PackageBuildFailure(
-        island=island,
-        build=CompileAttempt(
-            success=False,
-            command=("atoll", "compile-cache", "skip", key[:12]),
-            stdout="",
-            stderr=f"cached skip: previous mypyc build failed for {island.source_module}",
-            artifact_paths=(),
-            duration_seconds=0.0,
-            cache_status="hit",
-        ),
-    )
-
-
-def _build_package_islands_individually(
-    islands: tuple[EnabledIslandConfig, ...],
-    context: _PackageBuildContext,
-    *,
-    batch_failure: CompileAttempt,
-) -> _PackageBuildOutcome:
-    successful: list[EnabledIslandConfig] = []
-    skipped: list[PackageBuildFailure] = []
-    attempts: list[CompileAttempt] = []
-    for index, island in enumerate(islands, start=1):
-        retry_started = time.perf_counter()
-        _progress(context.progress, f"retrying {island.source_module} ({index}/{len(islands)})")
-        attempt = build_sidecars(
-            (island.sidecar_path,),
-            project_root=context.project_root,
-            build_dir=context.project_root / ".atoll" / "retry-builds" / island.sidecar_path.stem,
-            source_roots=context.source_roots,
-            cache_dir=context.target_project.config.cache_dir / "mypy" / "source-clean",
-        )
-        attempts.append(attempt)
-        if attempt.success:
-            successful.append(island)
-            _progress(
-                context.progress,
-                f"compiled {island.source_module} in {_duration(retry_started)}",
-            )
-            continue
-        skipped.append(PackageBuildFailure(island=island, build=attempt))
-        _remove_staged_island(island)
-        _progress(context.progress, f"skipped {island.source_module} in {_duration(retry_started)}")
-    combined = _combine_package_attempts(
-        batch_failure=batch_failure,
-        attempts=tuple(attempts),
-        successful_count=len(successful),
-        skipped_count=len(skipped),
-    )
-    return _PackageBuildOutcome(
-        successful=tuple(successful),
-        build=combined,
-        skipped=tuple(skipped),
-    )
-
-
-def _combine_package_attempts(
-    *,
-    batch_failure: CompileAttempt,
-    attempts: tuple[CompileAttempt, ...],
-    successful_count: int,
-    skipped_count: int,
-) -> CompileAttempt:
-    artifact_paths = tuple(path for attempt in attempts for path in attempt.artifact_paths)
-    stdout_parts = [
-        (
-            "Initial batch build failed; retried islands individually. "
-            f"Compiled {successful_count}, skipped {skipped_count}."
-        )
-    ]
-    failed_attempts = tuple(attempt for attempt in attempts if not attempt.success)
-    stderr_parts = (
-        [_no_successful_retry_error(failed_attempts, batch_failure)]
-        if successful_count == 0
-        else [batch_failure.stderr, *(attempt.stderr for attempt in failed_attempts)]
-    )
-    return CompileAttempt(
-        success=successful_count > 0,
-        command=("mypyc", "partial-package-build"),
-        stdout="\n".join(part for part in stdout_parts if part),
-        stderr="\n\n".join(part for part in stderr_parts if part),
-        artifact_paths=artifact_paths,
-        duration_seconds=batch_failure.duration_seconds
-        + sum(attempt.duration_seconds for attempt in attempts),
-        phase_timings=(
-            *batch_failure.phase_timings,
-            *(timing for attempt in attempts for timing in attempt.phase_timings),
-        ),
-        cache_status="partial",
-    )
-
-
-def _no_successful_retry_error(
-    attempts: tuple[CompileAttempt, ...],
-    batch_failure: CompileAttempt,
-) -> str:
-    first_failure = next((attempt.stderr for attempt in attempts if attempt.stderr), "")
-    if not first_failure:
-        first_failure = batch_failure.stderr
-    return "\n".join(
-        part
-        for part in (
-            "No selected islands compiled after retrying them individually.",
-            first_failure,
-        )
-        if part
-    )
-
-
 def _selected_scans(
     project: DiscoveredProject,
     module_name: str | None,
+    selected_members: tuple[SymbolId, ...] = (),
 ) -> tuple[ModuleScan, ...]:
-    modules = (_find_module(project.modules, module_name),) if module_name else project.modules
+    selected_module_names = tuple(dict.fromkeys(member.module for member in selected_members))
+    if module_name is not None and any(name != module_name for name in selected_module_names):
+        raise ValueError("selected members must belong to the requested module scope")
+    if selected_module_names:
+        modules = tuple(_find_module(project.modules, name) for name in selected_module_names)
+    elif module_name:
+        modules = (_find_module(project.modules, module_name),)
+    else:
+        modules = project.modules
     return tuple(enrich_island_analysis(scan_module(module)) for module in modules)
 
 
-def _selected_modules(
-    scans: tuple[ModuleScan, ...],
-) -> tuple[_SelectedModule, ...]:
-    selected: list[_SelectedModule] = []
-    for scan in scans:
-        symbols = _candidate_symbols(scan)
-        if symbols:
-            selected.append(_SelectedModule(scan=scan, symbols=symbols))
-    return tuple(selected)
-
-
-def _supported_members(assessment: BackendAssessment | None) -> set[SymbolId]:
-    if assessment is None:
-        return set()
-    return set(assessment.supported_members)
-
-
-def _selected_typed_method_regions(
+def _selected_typed_regions(
     scans: tuple[ModuleScan, ...],
     backends: tuple[Backend, ...] = ("mypyc", "cython"),
+    requested_members: tuple[SymbolId, ...] = (),
 ) -> tuple[_SelectedTypedRegion, ...]:
+    """Select backend variants for typed callables and safe atomic classes.
+
+    Explicit requests are expanded only along same-region runtime call edges.
+    This keeps trial selection precise while ensuring copied callables retain
+    every eligible helper required by their executable bodies.
+    """
     selected: list[_SelectedTypedRegion] = []
+    requested = frozenset(requested_members)
     for scan in scans:
         for region in scan.typed_regions:
-            decisions = {decision.target: decision for decision in region.decisions}
-            mypyc_assessment = MYPYC_BACKEND.assess(region) if "mypyc" in backends else None
-            cython_assessment = CYTHON_BACKEND.assess(region) if "cython" in backends else None
-            atomic_class_member = (
-                _eligible_atomic_class(region, cython_assessment)
-                if cython_assessment is not None
-                else None
-            )
-            atomic_variant_id: str | None = None
-            if atomic_class_member is not None and cython_assessment is not None:
-                atomic_variant_id = f"{region.id}@cython-class"
-                selected.append(
-                    _SelectedTypedRegion(
-                        scan=scan,
-                        region=region,
-                        variant_id=atomic_variant_id,
-                        backend="cython",
-                        assessment=cython_assessment,
-                        members=(atomic_class_member,),
-                    )
-                )
-            eligible = _eligible_typed_methods(region, decisions)
-            mypyc_supported = _supported_members(mypyc_assessment)
-            mypyc_members = tuple(member for member in eligible if member in mypyc_supported)
-            if mypyc_members and mypyc_assessment is not None:
-                selected.append(
-                    _SelectedTypedRegion(
-                        scan=scan,
-                        region=region,
-                        variant_id=f"{region.id}@mypyc",
-                        backend="mypyc",
-                        assessment=mypyc_assessment,
-                        members=mypyc_members,
-                        conditional_on_failure_of=atomic_variant_id,
-                    )
-                )
-            cython_supported = _supported_members(cython_assessment)
-            cython_members = tuple(
-                member
-                for member in eligible
-                if member not in mypyc_supported and member in cython_supported
-            )
-            if cython_members and cython_assessment is not None:
-                selected.append(
-                    _SelectedTypedRegion(
-                        scan=scan,
-                        region=region,
-                        variant_id=f"{region.id}@cython",
-                        backend="cython",
-                        assessment=cython_assessment,
-                        members=cython_members,
-                        conditional_on_failure_of=atomic_variant_id,
-                    )
-                )
-            for specialization in region.specializations:
-                specialized_region = _specialized_region(region, specialization)
-                specialized_mypyc = (
-                    MYPYC_BACKEND.assess(specialized_region) if "mypyc" in backends else None
-                )
-                if specialized_mypyc is not None and (
-                    specialization.source_member in specialized_mypyc.supported_members
-                ):
-                    selected.append(
-                        _SelectedTypedRegion(
-                            scan=scan,
-                            region=specialized_region,
-                            variant_id=f"{specialization.id}@mypyc",
-                            backend="mypyc",
-                            assessment=specialized_mypyc,
-                            members=(specialization.source_member,),
-                            specialization=specialization,
-                        )
-                    )
-                    continue
-                specialized_cython = (
-                    CYTHON_BACKEND.assess(specialized_region) if "cython" in backends else None
-                )
-                if specialized_cython is not None and (
-                    specialization.source_member in specialized_cython.supported_members
-                ):
-                    selected.append(
-                        _SelectedTypedRegion(
-                            scan=scan,
-                            region=specialized_region,
-                            variant_id=f"{specialization.id}@cython",
-                            backend="cython",
-                            assessment=specialized_cython,
-                            members=(specialization.source_member,),
-                            specialization=specialization,
-                        )
-                    )
+            selected.extend(_selected_region_variants(scan, region, backends, requested))
     return tuple(selected)
+
+
+def _selected_region_variants(
+    scan: ModuleScan,
+    region: TypedRegion,
+    backends: tuple[Backend, ...],
+    requested: frozenset[SymbolId],
+) -> tuple[_SelectedTypedRegion, ...]:
+    region_member_ids = frozenset(member.id for member in region.members)
+    if requested and not requested.intersection(region_member_ids):
+        return ()
+    decisions = {decision.target: decision for decision in region.decisions}
+    mypyc_assessment = MYPYC_BACKEND.assess(region) if "mypyc" in backends else None
+    cython_assessment = CYTHON_BACKEND.assess(region) if "cython" in backends else None
+    eligible = _eligible_typed_callables(region, decisions)
+    if requested:
+        closure = _runtime_member_closure(region, eligible, requested)
+        requested_variants = list(
+            _selected_requested_callable_variant(
+                scan,
+                region,
+                closure,
+                requested,
+                backends,
+            )
+        )
+        requested_variants.extend(
+            variant
+            for specialization in region.specializations
+            if specialization.source_member in requested
+            for variant in (
+                _selected_specialization_variant(scan, region, specialization, backends),
+            )
+            if variant is not None
+        )
+        return tuple(requested_variants)
+    variants: list[_SelectedTypedRegion] = []
+    atomic_variant_id = _append_atomic_class_variant(
+        variants,
+        scan,
+        region,
+        cython_assessment,
+        requested,
+    )
+    mypyc_members, mypyc_bound = _backend_callable_members(
+        region,
+        eligible,
+        mypyc_assessment,
+        excluded=(),
+    )
+    if mypyc_assessment is not None and mypyc_members:
+        variants.append(
+            _SelectedTypedRegion(
+                scan=scan,
+                region=region,
+                variant_id=f"{region.id}@mypyc",
+                backend="mypyc",
+                assessment=mypyc_assessment,
+                members=mypyc_members,
+                bound_members=mypyc_bound,
+                conditional_on_failure_of=atomic_variant_id,
+            )
+        )
+    cython_members, cython_bound = _backend_callable_members(
+        region,
+        eligible,
+        cython_assessment,
+        excluded=mypyc_bound,
+    )
+    if cython_assessment is not None and cython_members:
+        variants.append(
+            _SelectedTypedRegion(
+                scan=scan,
+                region=region,
+                variant_id=f"{region.id}@cython",
+                backend="cython",
+                assessment=cython_assessment,
+                members=cython_members,
+                bound_members=cython_bound,
+                conditional_on_failure_of=atomic_variant_id,
+            )
+        )
+    for specialization in region.specializations:
+        if requested and specialization.source_member not in requested:
+            continue
+        variant = _selected_specialization_variant(scan, region, specialization, backends)
+        if variant is not None:
+            variants.append(variant)
+    return tuple(variants)
+
+
+def _selected_requested_callable_variant(
+    scan: ModuleScan,
+    region: TypedRegion,
+    closure: tuple[SymbolId, ...],
+    requested: frozenset[SymbolId],
+    backends: tuple[Backend, ...],
+) -> tuple[_SelectedTypedRegion, ...]:
+    """Choose one backend that supports a requested callable closure in full."""
+    if not closure:
+        return ()
+    closure_set = frozenset(closure)
+    bound_members = tuple(member for member in closure if member in requested)
+    for backend in backends:
+        assessment = _compiler_backend(backend).assess(region)
+        if closure_set <= frozenset(assessment.supported_members):
+            return (
+                _SelectedTypedRegion(
+                    scan=scan,
+                    region=region,
+                    variant_id=f"{region.id}@{backend}",
+                    backend=backend,
+                    assessment=assessment,
+                    members=closure,
+                    bound_members=bound_members,
+                ),
+            )
+    return ()
+
+
+def _backend_callable_members(
+    region: TypedRegion,
+    eligible: tuple[SymbolId, ...],
+    assessment: BackendAssessment | None,
+    *,
+    excluded: tuple[SymbolId, ...],
+) -> tuple[tuple[SymbolId, ...], tuple[SymbolId, ...]]:
+    """Return complete generated closure members and public backend bindings."""
+    if assessment is None:
+        return (), ()
+    supported = frozenset(assessment.supported_members)
+    excluded_set = frozenset(excluded)
+    generated: set[SymbolId] = set()
+    bound: set[SymbolId] = set()
+    for member in eligible:
+        if member in excluded_set:
+            continue
+        closure = _runtime_member_closure(region, eligible, frozenset({member}))
+        if closure and frozenset(closure) <= supported:
+            generated.update(closure)
+            bound.add(member)
+    region_order = tuple(member.id for member in region.members)
+    return (
+        tuple(member for member in region_order if member in generated),
+        tuple(member for member in region_order if member in bound),
+    )
+
+
+def _append_atomic_class_variant(
+    variants: list[_SelectedTypedRegion],
+    scan: ModuleScan,
+    region: TypedRegion,
+    assessment: BackendAssessment | None,
+    requested: frozenset[SymbolId],
+) -> str | None:
+    region_members = frozenset(member.id for member in region.members)
+    atomic_member = (
+        _eligible_atomic_class(region, assessment)
+        if assessment is not None and (not requested or region_members <= requested)
+        else None
+    )
+    if atomic_member is None or assessment is None:
+        return None
+    variant_id = f"{region.id}@cython-class"
+    variants.append(
+        _SelectedTypedRegion(
+            scan=scan,
+            region=region,
+            variant_id=variant_id,
+            backend="cython",
+            assessment=assessment,
+            members=(atomic_member,),
+        )
+    )
+    return variant_id
+
+
+def _selected_specialization_variant(
+    scan: ModuleScan,
+    region: TypedRegion,
+    specialization: RegionSpecialization,
+    backends: tuple[Backend, ...],
+) -> _SelectedTypedRegion | None:
+    specialized_region = _specialized_region(region, specialization)
+    for backend in backends:
+        assessment = _compiler_backend(backend).assess(specialized_region)
+        if specialization.source_member in assessment.supported_members:
+            return _SelectedTypedRegion(
+                scan=scan,
+                region=specialized_region,
+                variant_id=f"{specialization.id}@{backend}",
+                backend=backend,
+                assessment=assessment,
+                members=(specialization.source_member,),
+                specialization=specialization,
+            )
+    return None
 
 
 def _eligible_atomic_class(
@@ -2660,24 +2053,69 @@ def _specialized_region(
     )
 
 
-def _eligible_typed_methods(
+def _eligible_typed_callables(
     region: TypedRegion,
     decisions: dict[str, LoweringDecision],
 ) -> tuple[SymbolId, ...]:
     return tuple(
         member.id
         for member in region.members
-        if member.kind == "method"
-        and member.binding_kind in {"instance_method", "staticmethod", "classmethod"}
-        and not member.id.qualname.rsplit(".", 1)[-1].startswith("__")
-        and decisions[member.id.stable_id].action == "preserve"
-        and not _owner_disallows_method_binding(
-            member.owner_class,
-            region.source_module.name,
-            decisions,
+        if (
+            (member.kind == "function" and member.binding_kind == "module")
+            or (
+                member.kind == "method"
+                and member.binding_kind in {"instance_method", "staticmethod", "classmethod"}
+                and not member.id.qualname.rsplit(".", 1)[-1].startswith("__")
+                and not _owner_disallows_method_binding(
+                    member.owner_class,
+                    region.source_module.name,
+                    decisions,
+                )
+                and not _member_requires_source_class(member.source_text)
+            )
         )
-        and not _member_requires_source_class(member.source_text)
+        and decisions[member.id.stable_id].action == "preserve"
     )
+
+
+def _runtime_member_closure(
+    region: TypedRegion,
+    eligible: tuple[SymbolId, ...],
+    requested: frozenset[SymbolId],
+) -> tuple[SymbolId, ...]:
+    """Return a complete eligible callable closure, or empty when one edge is unsafe."""
+    eligible_set = frozenset(eligible)
+    selected = set(requested.intersection(eligible_set))
+    changed = True
+    while changed:
+        changed = False
+        for dependency in region.dependencies:
+            if dependency.src not in selected or dependency.role != "runtime":
+                continue
+            if not isinstance(dependency.dst, SymbolId):
+                continue
+            if (
+                dependency.dst.module == region.source_module.name
+                and dependency.dst not in eligible_set
+            ):
+                return ()
+            if dependency.dst in eligible_set and dependency.dst not in selected:
+                selected.add(dependency.dst)
+                changed = True
+    return tuple(member.id for member in region.members if member.id in selected)
+
+
+def _missing_requested_members(
+    requested: tuple[SymbolId, ...],
+    selected: tuple[_SelectedTypedRegion, ...],
+) -> tuple[SymbolId, ...]:
+    """Return explicit requests not covered by any selected backend variant."""
+    covered: set[SymbolId] = set()
+    for selection in selected:
+        covered.update(selection.bound_members or selection.members)
+        if selection.variant_id.endswith("@cython-class"):
+            covered.update(member.id for member in selection.region.members)
+    return tuple(member for member in requested if member not in covered)
 
 
 def _owner_disallows_method_binding(
@@ -2722,70 +2160,6 @@ def _member_requires_source_class(source_text: str) -> bool:
     )
 
 
-def _candidate_symbols(scan: ModuleScan) -> tuple[str, ...]:
-    candidates = {symbol for candidate in scan.island_candidates for symbol in candidate.symbols}
-    return tuple(
-        symbol.id.qualname
-        for symbol in scan.symbols
-        if symbol.id in candidates and symbol.kind == "function"
-    )
-
-
-def _prepare_staged_island(
-    *,
-    project: DiscoveredProject,
-    staged_source_roots: tuple[Path, ...],
-    selected_module: _SelectedModule,
-) -> _PreparedModule:
-    staged_module = _staged_module(selected_module.scan.module, project, staged_source_roots)
-    staged_source_root = _staged_source_root(
-        selected_module.scan.module,
-        project,
-        staged_source_roots,
-    )
-    staged_scan = enrich_island_analysis(scan_module(staged_module))
-    sidecar_module = default_sidecar_module(staged_module.name)
-    sidecar_path = expected_sidecar_path(staged_source_root, sidecar_module)
-    native_readiness: list[NativeReadiness] = []
-    for symbol in selected_module.symbols:
-        probe = EnabledIslandConfig(
-            source_module=staged_module.name,
-            source_path=staged_module.path,
-            sidecar_module=sidecar_module,
-            sidecar_path=sidecar_path,
-            symbols=(symbol,),
-        )
-        generation = generate_sidecar(staged_scan, probe)
-        native_readiness.append(
-            analyze_native_readiness(
-                source_module=staged_module.name,
-                exported_symbol=symbol,
-                generated_source=generation.source_text,
-            )
-        )
-    eligible_symbols = tuple(
-        readiness.symbol for readiness in native_readiness if readiness.eligible
-    )
-    if not eligible_symbols:
-        return _PreparedModule(island=None, native_readiness=tuple(native_readiness))
-    island = EnabledIslandConfig(
-        source_module=staged_module.name,
-        source_path=staged_module.path,
-        sidecar_module=sidecar_module,
-        sidecar_path=sidecar_path,
-        symbols=eligible_symbols,
-    )
-    sidecar = generate_sidecar(staged_scan, island)
-    island.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-    island.sidecar_path.write_text(sidecar.source_text, encoding="utf-8")
-    source_text = island.source_path.read_text(encoding="utf-8")
-    island.source_path.write_text(
-        insert_or_replace_shim(source_text, island).new_text,
-        encoding="utf-8",
-    )
-    return _PreparedModule(island=island, native_readiness=tuple(native_readiness))
-
-
 def _copy_source_roots(
     project: DiscoveredProject,
     build_root: Path,
@@ -2801,60 +2175,10 @@ def _copy_source_roots(
     return tuple(staged_roots)
 
 
-def _place_compiled_artifacts(
-    islands: tuple[EnabledIslandConfig, ...],
-    artifact_paths: tuple[Path, ...],
-) -> None:
-    island_artifacts = {
-        artifact
-        for island in islands
-        for artifact in artifact_paths
-        if artifact.name.startswith(f"{island.sidecar_path.stem}.")
-    }
-    support_artifacts = tuple(
-        artifact for artifact in artifact_paths if artifact not in island_artifacts
-    )
-    target_dirs = tuple(sorted({_artifact_dir(island) for island in islands}))
-    for island in islands:
-        target_dir = _artifact_dir(island)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        for artifact in artifact_paths:
-            if artifact.name.startswith(f"{island.sidecar_path.stem}."):
-                _copy_if_different(artifact, target_dir / artifact.name)
-    for target_dir in target_dirs:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        for artifact in support_artifacts:
-            _copy_if_different(artifact, target_dir / artifact.name)
-
-
-def _source_clean_report_artifact_paths(
-    root: Path,
-    artifact_paths: tuple[Path, ...],
-) -> tuple[Path, ...]:
-    return tuple(root / ".atoll" / "artifacts" / artifact.name for artifact in artifact_paths)
-
-
-def _artifact_dir(island: EnabledIslandConfig) -> Path:
-    if island.sidecar_path.parent.name == "sidecars":
-        return island.sidecar_path.parent.parent / "artifacts"
-    return island.sidecar_path.parent
-
-
 def _copy_if_different(source: Path, destination: Path) -> None:
     if source.resolve() == destination.resolve():
         return
     shutil.copy2(source, destination)
-
-
-def _remove_generated_sidecar_sources(islands: tuple[EnabledIslandConfig, ...]) -> None:
-    for island in islands:
-        island.sidecar_path.unlink(missing_ok=True)
-
-
-def _remove_staged_island(island: EnabledIslandConfig) -> None:
-    source_text = island.source_path.read_text(encoding="utf-8")
-    island.source_path.write_text(remove_shim(source_text, island).new_text, encoding="utf-8")
-    island.sidecar_path.unlink(missing_ok=True)
 
 
 def _overlay_staged_sources(
@@ -2958,10 +2282,6 @@ def _project_metadata(root: Path) -> _ProjectMetadata:
 
 def _wheel_tag() -> str:
     return str(next(tags.sys_tags()))
-
-
-def _python_tag() -> str:
-    return f"cp{sys.version_info.major}{sys.version_info.minor}"
 
 
 def _wheel_safe_name(value: str) -> str:
@@ -3101,13 +2421,6 @@ def _find_module(modules: tuple[ModuleId, ...], module_name: str) -> ModuleId:
         if module.name == module_name:
             return module
     raise ValueError(f"module not found under configured source roots: {module_name}")
-
-
-def _path_text(root: Path, path: Path) -> str:
-    try:
-        return path.resolve().relative_to(root.resolve()).as_posix()
-    except ValueError:
-        return str(path)
 
 
 def _mapping(value: object) -> dict[str, object]:
