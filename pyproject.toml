@@ -94,6 +94,7 @@ convention = "google"
 "src/atoll/runtime/package_verify.py" = ["S603"]
 "src/atoll/runtime/performance.py" = ["S603"]
 "src/atoll/wheel_overlay.py" = ["S603"]
+"scripts/run_pydantic_graph_benchmark.py" = ["S603"]
 "tests/**/*.py" = ["D", "S101"]
 
 
@@ -112,7 +113,7 @@ show_error_codes = true
 minversion = "8.4"
 testpaths = ["tests"]
 norecursedirs = ["tests/fixtures"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 addopts = [
     "--strict-config",
     "--strict-markers",

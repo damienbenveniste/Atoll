@@ -191,6 +191,11 @@ reason, marginal speedup, and the hot-path coverage retained by the accepted set
 If every profiled candidate is rejected, Atoll still records the final full-gate evidence but does
 not publish a wheel with zero native regions.
 
+Atoll's manual [Pydantic Graph hard benchmark](benchmarks/pydantic_graph/README.md) pins a difficult
+async orchestration workload, compiles it twice, and retains cold/warm reports, source hashes, and
+native compiler probe evidence. It enforces the `1.10x` final gate and is intentionally separate
+from normal CI so ordinary correctness checks do not depend on host timing.
+
 Profiling and candidate-trial durations are excluded from the final performance medians. Atoll then
 tests the accepted payload, runs the configured alternating baseline/compiled benchmark pairs, and
 compares median durations. A median below 0.25 seconds is rejected as too noisy. Failed tests,

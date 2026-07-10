@@ -1,0 +1,130 @@
+"""Deterministic Pydantic Graph workload used by Atoll's manual hard benchmark."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+from itertools import pairwise
+
+from pydantic_graph import Graph, GraphBuilder, StepContext
+from pydantic_graph.join import reduce_sum
+
+DEFAULT_REPETITIONS = 5
+DEFAULT_WIDTH = 5000
+DEFAULT_BUILD_REPETITIONS = 120
+DEFAULT_CHAIN_LENGTH = 400
+VERIFY_REPETITIONS = 2
+VERIFY_WIDTH = 16
+VERIFY_BUILD_REPETITIONS = 2
+VERIFY_CHAIN_LENGTH = 12
+
+
+def build_runtime_graph(width: int) -> Graph[None, None, None, int]:
+    """Build one fan-out, transform, and reducing graph for repeated execution."""
+    builder = GraphBuilder(output_type=int)
+
+    @builder.step
+    async def generate(ctx: StepContext[None, None, None]) -> list[int]:
+        del ctx
+        return list(range(width))
+
+    @builder.step
+    async def transform(ctx: StepContext[None, None, int]) -> int:
+        del ctx
+        return 1
+
+    collect = builder.join(reduce_sum, initial=0)
+    builder.add(
+        builder.edge_from(builder.start_node).to(generate),
+        builder.edge_from(generate).map().to(transform),
+        builder.edge_from(transform).to(collect),
+        builder.edge_from(collect).to(builder.end_node),
+    )
+    return builder.build()
+
+
+def build_stress_builder(chain_length: int) -> GraphBuilder[None, None, None, int]:
+    """Create a large typed graph whose repeated normalization is deterministic."""
+    builder = GraphBuilder(output_type=int)
+
+    async def passthrough(ctx: StepContext[None, None, int]) -> int:
+        return ctx.inputs
+
+    steps = [builder.step(passthrough, node_id=f"chain_{index}") for index in range(chain_length)]
+    edges = [builder.edge_from(builder.start_node).to(steps[0])]
+    edges.extend(
+        builder.edge_from(source).to(target) for source, target in pairwise(steps)
+    )
+    edges.append(builder.edge_from(steps[-1]).to(builder.end_node))
+    builder.add(*edges)
+    return builder
+
+
+def run_build_workload(build_repetitions: int, chain_length: int) -> int:
+    """Repeat real GraphBuilder normalization and validate its stable structure."""
+    builder = build_stress_builder(chain_length)
+    checksum = 0
+    expected_nodes = chain_length + 2
+    expected_edges = chain_length + 1
+    for _ in range(build_repetitions):
+        graph = builder.build(validate_graph_structure=False)
+        observed_edges = sum(len(paths) for paths in graph.edges_by_source.values())
+        if len(graph.nodes) != expected_nodes or observed_edges != expected_edges:
+            raise AssertionError("repeated graph normalization changed the graph structure")
+        checksum += len(graph.nodes) + observed_edges
+    return checksum
+
+
+async def run_workload(
+    repetitions: int,
+    width: int,
+    build_repetitions: int,
+    chain_length: int,
+) -> int:
+    """Exercise graph construction and execution under one reproducible workload."""
+    graph = build_runtime_graph(width)
+    checksum = 0
+    for _ in range(repetitions):
+        checksum += await graph.run(infer_name=False)
+    return checksum + run_build_workload(build_repetitions, chain_length)
+
+
+def expected_checksum(
+    repetitions: int,
+    width: int,
+    build_repetitions: int,
+    chain_length: int,
+) -> int:
+    """Compute the graph result independently from Pydantic Graph execution."""
+    one_run = width
+    graph_shape = build_repetitions * (2 * chain_length + 3)
+    return repetitions * one_run + graph_shape
+
+
+def main() -> int:
+    """Run either the short semantic check or the stable CPU-bound benchmark."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--repetitions", type=int, default=DEFAULT_REPETITIONS)
+    parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
+    parser.add_argument("--build-repetitions", type=int, default=DEFAULT_BUILD_REPETITIONS)
+    parser.add_argument("--chain-length", type=int, default=DEFAULT_CHAIN_LENGTH)
+    args = parser.parse_args()
+    repetitions = VERIFY_REPETITIONS if args.verify else args.repetitions
+    width = VERIFY_WIDTH if args.verify else args.width
+    build_repetitions = (
+        VERIFY_BUILD_REPETITIONS if args.verify else args.build_repetitions
+    )
+    chain_length = VERIFY_CHAIN_LENGTH if args.verify else args.chain_length
+    observed = asyncio.run(
+        run_workload(repetitions, width, build_repetitions, chain_length)
+    )
+    expected = expected_checksum(repetitions, width, build_repetitions, chain_length)
+    if observed != expected:
+        raise AssertionError(f"checksum {observed}; expected {expected}")
+    print(observed)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

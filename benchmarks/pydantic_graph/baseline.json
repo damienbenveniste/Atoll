@@ -1,0 +1,16 @@
+{
+  "atoll_revision": "77d95c0",
+  "cold_mypycify_invocations": 10,
+  "cold_mypycify_seconds": 192.70191520900698,
+  "compiler": "Apple clang 17.0.0",
+  "cython_version": "3.2.8",
+  "metric": "sum of compile-report build.phase_timings where name is mypycify",
+  "measured_at": "2026-07-10",
+  "mypy_mypyc_version": "2.2.0",
+  "platform": "macOS 26 arm64",
+  "pydantic_ai_revision": "e6ff64409f74124de581068be644a3dbf8999e7d",
+  "python_version": "3.12.7",
+  "setuptools_version": "83.0.0",
+  "target_mypycify_seconds": 96.35095760450349,
+  "wheel_version": "0.47.0"
+}

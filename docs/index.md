@@ -160,6 +160,12 @@ hot coverage, accepted hot coverage, lowering mode, fallback reason, and margina
 When every profiled candidate is rejected, Atoll records the final full-gate evidence but does not
 publish a wheel containing no native regions.
 
+The repository also contains a manual Pydantic Graph hard benchmark. It pins one external revision,
+uses a deterministic async graph workload, compiles cold and warm, and verifies source hashes,
+region-cache restoration, compiler invocations, marginal candidate gains, and the `1.10x` final
+gate. It runs only through an explicit GitHub workflow dispatch or the repository script; normal CI
+does not enforce host-dependent wall-clock ratios.
+
 Profiling and candidate trials are excluded from the final benchmark medians. The accepted payload
 must pass the test command before Atoll runs the configured alternating baseline/compiled subprocess
 pairs. Medians below 0.25 seconds are too noisy. Test failure, invalid timing, or speedup below the
