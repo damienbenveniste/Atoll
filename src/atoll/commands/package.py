@@ -24,6 +24,10 @@ from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
 from atoll.backends.mypyc import MYPYC_BACKEND
+from atoll.generation.outlined_region import (
+    OUTLINED_REGION_GENERATOR_VERSION,
+    generate_outlined_region,
+)
 from atoll.generation.region_shim import RegionShimConfig, insert_or_replace_region_shim
 from atoll.generation.typed_region import (
     TYPED_METHOD_GENERATOR_VERSION,
@@ -47,6 +51,7 @@ from atoll.models import (
     CompilePhaseTiming,
     EnabledIslandConfig,
     LoweringDecision,
+    LoweringMode,
     ModuleId,
     ModuleScan,
     RegionSpecialization,
@@ -331,6 +336,8 @@ class _PreparedTypedRegion:
         shim: Managed region shim edit for the staged source.
         fallback: Fallback variant attempted after the preferred backend fails.
         conditional_on_failure_of: Preferred variant that must fail before this fallback runs.
+        lowering_mode: Whether the compiled target owns the whole callable or native blocks.
+        native_helpers: Private native helper names used by an outlined Python shell.
     """
 
     generation: TypedRegionGeneration
@@ -339,6 +346,19 @@ class _PreparedTypedRegion:
     shim: RegionShimConfig
     fallback: _PreparedTypedRegion | None = None
     conditional_on_failure_of: str | None = None
+    lowering_mode: LoweringMode = "whole-callable"
+    native_helpers: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Require outlined variants to identify every native helper.
+
+        Raises:
+            ValueError: If lowering mode and helper metadata contradict each other.
+        """
+        if self.lowering_mode == "outlined-block" and not self.native_helpers:
+            raise ValueError("outlined prepared regions require native helpers")
+        if self.lowering_mode == "whole-callable" and self.native_helpers:
+            raise ValueError("whole-callable prepared regions cannot declare native helpers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -767,6 +787,7 @@ def _execute_typed_region_package(
             profile=profile,
         )
 
+    prepared_assessments = _prepared_backend_assessments(tuple(prepared))
     outcome = _build_typed_regions(
         prepared=tuple(prepared),
         context=_TypedRegionBuildContext(
@@ -801,7 +822,7 @@ def _execute_typed_region_package(
             preflight_skipped=context.preflight_skipped,
             native_readiness=context.native_readiness,
             typed_regions=context.typed_regions,
-            backend_assessments=tuple(selection.assessment for selection in context.selected),
+            backend_assessments=prepared_assessments,
             artifact_records=outcome.artifacts,
             region_skipped=outcome.skipped,
             profile=profile,
@@ -840,7 +861,7 @@ def _execute_typed_region_package(
                 }.values()
             ),
             compiled_bindings=successful_bindings,
-            backend_assessments=tuple(selection.assessment for selection in context.selected),
+            backend_assessments=prepared_assessments,
             artifact_records=outcome.artifacts,
             region_skipped=outcome.skipped,
             profile=profile,
@@ -900,6 +921,8 @@ def _execute_typed_region_package(
             backend=item.generation.backend,
             bindings=item.generation.bindings,
             cache_status=cache_statuses.get(item.unit.region_id, "disabled"),
+            lowering_mode=item.lowering_mode,
+            native_helpers=item.native_helpers,
         )
         for item in outcome.successful
     )
@@ -922,7 +945,7 @@ def _execute_typed_region_package(
         compiled_regions=successful_regions,
         compiled_bindings=successful_bindings,
         compiled_variants=successful_variants,
-        backend_assessments=tuple(selection.assessment for selection in context.selected),
+        backend_assessments=prepared_assessments,
         artifact_records=outcome.artifacts,
         region_skipped=outcome.skipped,
         verification_steps=promotion.verification_steps,
@@ -954,9 +977,14 @@ def _prepare_typed_region(
         scan=staged_scan,
         region=staged_region,
     )
-    prepared = _prepare_backend_variant(staged, staged_selection)
+    try:
+        prepared = _prepare_backend_variant(staged, staged_selection)
+    except (SyntaxError, ValueError):
+        if staged_selection.backend != "cython":
+            raise
+        return _prepare_outlined_backend_variant(staged, staged_selection)
     if staged_selection.backend != "mypyc":
-        return prepared
+        return _attach_outlined_fallback(staged, staged_selection, prepared)
     cython_assessment = CYTHON_BACKEND.assess(staged_region)
     if not set(staged_selection.members) <= set(cython_assessment.supported_members):
         return prepared
@@ -969,8 +997,122 @@ def _prepare_typed_region(
     try:
         fallback = _prepare_backend_variant(staged, fallback_selection)
     except (SyntaxError, ValueError):
-        return prepared
+        try:
+            fallback = _prepare_outlined_backend_variant(staged, fallback_selection)
+        except (SyntaxError, ValueError):
+            return prepared
+    else:
+        fallback = _attach_outlined_fallback(staged, fallback_selection, fallback)
     return replace(prepared, fallback=fallback)
+
+
+def _attach_outlined_fallback(
+    staged: _StagedTypedRegionContext,
+    selection: _SelectedTypedRegion,
+    prepared: _PreparedTypedRegion,
+) -> _PreparedTypedRegion:
+    """Append an outlined Cython fallback when one suspension binding is precise.
+
+    Args:
+        staged: Staged source-clean package and native build context.
+        selection: Whole-callable Cython selection being prepared.
+        prepared: Successfully lowered whole-callable variant.
+
+    Returns:
+        _PreparedTypedRegion: Whole-callable variant with an optional outlined fallback.
+    """
+    try:
+        outlined = _prepare_outlined_backend_variant(staged, selection)
+    except (SyntaxError, ValueError):
+        return prepared
+    return replace(prepared, fallback=outlined)
+
+
+def _prepare_outlined_backend_variant(
+    staged: _StagedTypedRegionContext,
+    selection: _SelectedTypedRegion,
+) -> _PreparedTypedRegion:
+    """Lower planner-approved synchronous blocks into one private Cython unit.
+
+    Args:
+        staged: Staged source-clean package and native build context.
+        selection: Cython selection with exactly one promised suspension binding.
+
+    Returns:
+        _PreparedTypedRegion: Outlined native helpers and staged Python shell contract.
+
+    Raises:
+        ValueError: If specialization, binding selection, or suspension planning is ambiguous.
+    """
+    if selection.backend != "cython" or selection.specialization is not None:
+        raise ValueError("outlined lowering requires an unspecialized Cython selection")
+    binding = _outlined_binding(selection)
+    variant_id = f"{staged.region.id}@cython-outline"
+    logical_module = _typed_region_module_name(staged.region, "cython", variant_id)
+    generated_path = staged.build_root / f"{logical_module}.py"
+    outlined = generate_outlined_region(
+        staged.region,
+        binding.source,
+        binding,
+        output_path=generated_path,
+    )
+    generation = TypedRegionGeneration(
+        region=staged.region,
+        logical_module=logical_module,
+        source_path=outlined.source_path,
+        source_text=outlined.source_text,
+        source_hash=outlined.source_hash,
+        selected_members=(binding.source,),
+        bindings=(binding,),
+        backend="cython",
+    )
+    unit = CYTHON_BACKEND.lower(
+        BackendLoweringRequest(
+            region=staged.region,
+            source_path=generated_path,
+            logical_module=logical_module,
+            install_relative_dir=_region_artifact_relative_dir(variant_id),
+            members=(binding.source,),
+            variant_id=variant_id,
+        )
+    )
+    return _PreparedTypedRegion(
+        generation=generation,
+        assessment=CYTHON_BACKEND.assess(staged.region),
+        unit=unit,
+        shim=RegionShimConfig(
+            source_module=staged.module.name,
+            source_path=staged.module.path,
+            region_id=variant_id,
+            backend="cython",
+            compiled_module=logical_module,
+            artifact_dir=staged.staged_source_root / unit.install_relative_dir,
+            bindings=(binding,),
+            outlined_shell=outlined.shell,
+        ),
+        conditional_on_failure_of=selection.conditional_on_failure_of,
+        lowering_mode="outlined-block",
+        native_helpers=outlined.helper_names,
+    )
+
+
+def _outlined_binding(selection: _SelectedTypedRegion) -> BindingTarget:
+    promised = (
+        frozenset(selection.bound_members)
+        if selection.bound_members is not None
+        else frozenset(selection.members)
+    )
+    if selection.slice_root is not None:
+        promised = frozenset((selection.slice_root,))
+    bindings = tuple(
+        binding
+        for binding in selection.region.bindings
+        if binding.source in promised
+        and binding.execution_kind in {"coroutine", "generator", "async_generator"}
+    )
+    if len(bindings) != 1:
+        raise ValueError("outlined lowering requires exactly one promised suspension binding")
+    return bindings[0]
 
 
 def _staged_typed_selection(
@@ -1116,14 +1258,37 @@ def _prepared_source_paths(
     Returns:
         tuple[Path, ...]: Source paths consumed by the backend compilation unit.
     """
-    return tuple(
-        path
-        for item in prepared
-        for path in (
-            item.generation.source_path,
-            *((item.fallback.generation.source_path,) if item.fallback is not None else ()),
-        )
-    )
+    paths: list[Path] = []
+    for item in prepared:
+        candidate: _PreparedTypedRegion | None = item
+        while candidate is not None:
+            paths.append(candidate.generation.source_path)
+            candidate = candidate.fallback
+    return tuple(dict.fromkeys(paths))
+
+
+def _prepared_backend_assessments(
+    prepared: tuple[_PreparedTypedRegion, ...],
+) -> tuple[BackendAssessment, ...]:
+    """Return one assessment per semantic region and prepared backend.
+
+    Args:
+        prepared: Preferred variants and their deterministic fallback chains.
+
+    Returns:
+        tuple[BackendAssessment, ...]: Deduplicated assessments in preparation order.
+    """
+    assessments: dict[tuple[str, Backend], BackendAssessment] = {}
+    for item in prepared:
+        candidate: _PreparedTypedRegion | None = item
+        while candidate is not None:
+            assessment = candidate.assessment
+            assessments.setdefault(
+                (assessment.region_id, assessment.backend),
+                assessment,
+            )
+            candidate = candidate.fallback
+    return tuple(assessments.values())
 
 
 def _build_typed_regions(
@@ -1143,7 +1308,10 @@ def _build_typed_regions(
         build_dir=context.build_root / ".atoll" / "build",
         source_roots=context.staged_source_roots,
         cache_dir=context.mypy_cache_dir,
-        backend_options=(("typed_region_generator", TYPED_METHOD_GENERATOR_VERSION),),
+        backend_options=(
+            ("typed_region_generator", TYPED_METHOD_GENERATOR_VERSION),
+            ("outlined_region_generator", OUTLINED_REGION_GENERATOR_VERSION),
+        ),
     )
     for index, item in enumerate(prepared, start=1):
         if (
@@ -1155,90 +1323,80 @@ def _build_typed_regions(
                 f"class variant succeeded; skipped method fallback {item.unit.region_id}",
             )
             continue
-        _progress(
-            context.progress,
-            (
-                f"compiling typed region variant {index}/{len(prepared)} with "
-                f"{item.generation.backend}: {item.unit.region_id}"
-            ),
-        )
-        result = _compile_typed_variant(
-            item,
-            backend_context,
-            cache_root=context.compile_cache_dir,
-        )
-        if result.attempt.cache_status == "hit":
+        candidate = item
+        rejected_attempts: list[CompileAttempt] = []
+        while True:
             _progress(
                 context.progress,
-                f"compile cache hit for typed region variant {item.unit.region_id}",
+                (
+                    f"compiling typed region variant {index}/{len(prepared)} with "
+                    f"{candidate.generation.backend} ({candidate.lowering_mode}): "
+                    f"{candidate.unit.region_id}"
+                ),
             )
-        elif result.attempt.cache_status == "miss":
-            _progress(
-                context.progress,
-                f"compile cache miss for typed region variant {item.unit.region_id}",
-            )
-        tagged_attempt = _tag_region_timings(result.attempt, item.unit.region_id)
-        if result.attempt.success:
-            attempts.append(tagged_attempt)
-            successful.append(item)
-            artifacts.extend(result.artifacts)
-            cache_statuses.append((item.unit.region_id, result.attempt.cache_status))
-            successful_promises.add(item.unit.region_id)
-            _progress(context.progress, f"compiled typed region variant {item.unit.region_id}")
-            continue
-        failure_item = item
-        failure_result = result
-        if _should_retry_with_cython(item, result) and item.fallback is not None:
-            fallback = item.fallback
-            _progress(
-                context.progress,
-                f"retrying deterministic mypyc failure with Cython: {fallback.unit.region_id}",
-            )
-            fallback_result = _compile_typed_variant(
-                fallback,
+            result = _compile_typed_variant(
+                candidate,
                 backend_context,
                 cache_root=context.compile_cache_dir,
             )
-            fallback_attempt = _tag_region_timings(
-                fallback_result.attempt,
-                fallback.unit.region_id,
-            )
-            if fallback_result.attempt.success:
+            if result.attempt.cache_status == "hit":
+                _progress(
+                    context.progress,
+                    f"compile cache hit for typed region variant {candidate.unit.region_id}",
+                )
+            elif result.attempt.cache_status == "miss":
+                _progress(
+                    context.progress,
+                    f"compile cache miss for typed region variant {candidate.unit.region_id}",
+                )
+            tagged_attempt = _tag_region_timings(result.attempt, candidate.unit.region_id)
+            if result.attempt.success:
                 attempts.extend(
-                    (
-                        _recovered_mypyc_attempt(tagged_attempt, fallback.unit.region_id),
-                        fallback_attempt,
-                    )
+                    _recovered_backend_attempt(attempt, candidate.unit.region_id)
+                    for attempt in rejected_attempts
                 )
-                successful.append(fallback)
-                artifacts.extend(fallback_result.artifacts)
-                cache_statuses.append(
-                    (fallback.unit.region_id, fallback_result.attempt.cache_status)
-                )
+                attempts.append(tagged_attempt)
+                successful.append(candidate)
+                artifacts.extend(result.artifacts)
+                cache_statuses.append((candidate.unit.region_id, result.attempt.cache_status))
                 successful_promises.add(item.unit.region_id)
                 _progress(
                     context.progress,
-                    f"compiled Cython fallback variant {fallback.unit.region_id}",
+                    (
+                        f"compiled typed region variant {candidate.unit.region_id} "
+                        f"as {candidate.lowering_mode}"
+                    ),
                 )
+                break
+            fallback = candidate.fallback
+            if fallback is not None and _should_retry_with_fallback(candidate, result):
+                rejected_attempts.append(tagged_attempt)
+                _progress(
+                    context.progress,
+                    (
+                        f"retrying deterministic {candidate.generation.backend} failure with "
+                        f"{fallback.generation.backend} {fallback.lowering_mode}: "
+                        f"{fallback.unit.region_id}"
+                    ),
+                )
+                candidate = fallback
                 continue
-            attempts.extend((tagged_attempt, fallback_attempt))
-            failure_item = fallback
-            failure_result = fallback_result
-        else:
+            attempts.extend(rejected_attempts)
             attempts.append(tagged_attempt)
-        skipped.append(
-            PackageRegionBuildFailure(
-                region=failure_item.generation.region,
-                variant_id=failure_item.unit.region_id,
-                backend=failure_item.generation.backend,
-                assessment=failure_item.assessment,
-                build=failure_result.attempt,
+            skipped.append(
+                PackageRegionBuildFailure(
+                    region=candidate.generation.region,
+                    variant_id=candidate.unit.region_id,
+                    backend=candidate.generation.backend,
+                    assessment=candidate.assessment,
+                    build=result.attempt,
+                )
             )
-        )
-        _progress(
-            context.progress,
-            f"kept typed region variant {failure_item.unit.region_id} as fallback",
-        )
+            _progress(
+                context.progress,
+                f"kept typed region variant {candidate.unit.region_id} as fallback",
+            )
+            break
     return _TypedRegionBuildOutcome(
         successful=tuple(successful),
         build=_aggregate_region_attempts(tuple(attempts), bool(successful)),
@@ -1273,27 +1431,28 @@ def _compile_typed_variant(
     )
 
 
-def _should_retry_with_cython(
+def _should_retry_with_fallback(
     item: _PreparedTypedRegion,
     result: BackendCompileResult,
 ) -> bool:
-    """Return whether a deterministic mypyc rejection permits Cython retry.
+    """Return whether deterministic diagnostics permit the prepared fallback.
 
     Args:
         item: Object being formatted for deterministic diagnostics.
         result: Operation result being normalized or rendered.
 
     Returns:
-        bool: Whether a failed preferred variant qualifies for Cython fallback.
+        bool: Whether the failed variant qualifies for its next prepared fallback.
     """
-    return (
-        item.generation.backend == "mypyc"
-        and not result.attempt.success
-        and result.attempt.stderr.startswith("MYPYC_TYPE_ERROR:")
+    if result.attempt.success:
+        return False
+    diagnostic_prefix = (
+        "MYPYC_TYPE_ERROR:" if item.generation.backend == "mypyc" else "CYTHON_COMPILE_ERROR:"
     )
+    return result.attempt.stderr.startswith(diagnostic_prefix)
 
 
-def _recovered_mypyc_attempt(
+def _recovered_backend_attempt(
     attempt: CompileAttempt,
     fallback_variant_id: str,
 ) -> CompileAttempt:
@@ -1304,8 +1463,16 @@ def _recovered_mypyc_attempt(
         fallback_variant_id: Variant ID used when no preferred backend succeeds.
 
     Returns:
-        CompileAttempt: Mypyc attempt augmented with successful Cython fallback evidence.
+        CompileAttempt: Rejection augmented with successful fallback evidence.
     """
+    recovery = (
+        f"mypyc rejected this variant; compiled {fallback_variant_id} with Cython"
+        if attempt.stderr.startswith("MYPYC_TYPE_ERROR:")
+        else (
+            "whole-callable Cython rejected this variant; compiled "
+            f"{fallback_variant_id} with outlined Cython"
+        )
+    )
     return replace(
         attempt,
         success=True,
@@ -1313,7 +1480,7 @@ def _recovered_mypyc_attempt(
             part
             for part in (
                 attempt.stdout,
-                f"mypyc rejected this variant; compiled {fallback_variant_id} with Cython",
+                recovery,
                 attempt.stderr,
             )
             if part

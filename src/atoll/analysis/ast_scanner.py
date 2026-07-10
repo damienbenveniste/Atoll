@@ -568,9 +568,7 @@ def _binding_kind(
 
 
 def _decorator_name(decorator: ast.expr) -> str | None:
-    target = decorator.func if isinstance(decorator, ast.Call) else decorator
-    path = _attribute_path(target)
-    return path[-1] if path is not None else None
+    return decorator.id if isinstance(decorator, ast.Name) else None
 
 
 def _execution_kind(node: ast.FunctionDef | ast.AsyncFunctionDef) -> ExecutionKind:

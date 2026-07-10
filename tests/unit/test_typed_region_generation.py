@@ -662,7 +662,7 @@ def test_generation_rejects_unknown_decorators_and_missing_receivers(tmp_path: P
     region = next(region for region in scan.typed_regions if region.atomic_class)
     scale = next(member for member in region.members if member.id.qualname == "Worker.scale")
     adjust = next(member for member in region.members if member.id.qualname == "Worker.adjust")
-    decorated = replace(scale, source_text="@custom\n" + dedent(scale.source_text))
+    decorated = replace(scale, source_text="@custom.staticmethod\n" + dedent(scale.source_text))
     no_self = replace(
         scale,
         source_text="def scale(*, value: int) -> int:\n    return value\n",

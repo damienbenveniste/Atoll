@@ -279,6 +279,27 @@ def test_scan_populates_extended_function_class_and_method_facts(tmp_path: Path)
     ]
 
 
+def test_qualified_descriptor_decorator_is_not_treated_as_builtin(
+    tmp_path: Path,
+) -> None:
+    """A custom attribute named staticmethod remains an unknown instance decorator."""
+    module_path = tmp_path / "qualified_decorator.py"
+    module_path.write_text(
+        """class Worker:
+    @custom.staticmethod
+    async def score(values: list[int]) -> int:
+        return len(values)
+""",
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="qualified_decorator", path=module_path))
+    method = next(symbol for symbol in scan.symbols if symbol.id.qualname == "Worker.score")
+
+    assert method.binding_kind == "instance_method"
+    assert method.decorators == ("custom.staticmethod",)
+
+
 def test_scan_detects_execution_kinds_without_nested_symbol_bodies(tmp_path: Path) -> None:
     """Generator and coroutine shape belongs only to the scanned symbol body."""
     module_path = tmp_path / "execution.py"

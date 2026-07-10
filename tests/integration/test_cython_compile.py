@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import sys
 from pathlib import Path
 
@@ -12,6 +13,11 @@ import pytest
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.backends.cython import CythonBackend
+from atoll.generation.outlined_region import generate_outlined_region
+from atoll.generation.region_shim import (
+    RegionShimConfig,
+    insert_or_replace_region_shim,
+)
 from atoll.generation.typed_region import (
     TypedRegionGenerationOptions,
     generate_typed_method_region,
@@ -20,6 +26,103 @@ from atoll.models import BackendCompileContext, BackendLoweringRequest, ModuleId
 
 SENT_VALUE = 3
 LARGE_INTEGER = 10**40
+
+
+def test_cython_outlined_coroutine_routes_through_native_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged Python coroutine shell owns await while native code owns its hot block."""
+    module_name = "cython_outlined_runtime"
+    source_path = tmp_path / f"{module_name}.py"
+    source = """import asyncio
+
+DEFAULT = (1, 2)
+
+
+async def checkpoint() -> None:
+    await asyncio.sleep(0)
+
+
+async def workload(
+    values: list[int], token: object = DEFAULT
+) -> tuple[int, object]:
+    start = len(values) + 1
+    doubled = start * 2
+    total = doubled + 3
+    await checkpoint()
+    return total, token
+"""
+    source_path.write_text(source, encoding="utf-8")
+    scan = enrich_island_analysis(scan_module(ModuleId(name=module_name, path=source_path)))
+    region = next(
+        item
+        for item in scan.typed_regions
+        if any(member.id.qualname == "workload" for member in item.members)
+    )
+    member = next(member for member in region.members if member.id.qualname == "workload")
+    binding = next(binding for binding in region.bindings if binding.source == member.id)
+    logical_module = "_atoll_cython_outlined_runtime"
+    variant_id = f"{region.id}@cython-outline"
+    generation = generate_outlined_region(
+        region,
+        member.id,
+        binding,
+        output_path=tmp_path / f"{logical_module}.py",
+    )
+    backend = CythonBackend()
+    unit = backend.lower(
+        BackendLoweringRequest(
+            region=region,
+            source_path=generation.source_path,
+            logical_module=logical_module,
+            install_relative_dir="compiled",
+            members=(member.id,),
+            variant_id=variant_id,
+        )
+    )
+    result = backend.compile(
+        (unit,),
+        BackendCompileContext(
+            project_root=tmp_path,
+            build_dir=tmp_path / ".atoll" / "build",
+            source_roots=(tmp_path,),
+        ),
+    )
+
+    assert result.attempt.success is True, result.attempt.stderr
+    assert result.attempt.artifact_paths
+    config = RegionShimConfig(
+        source_module=module_name,
+        source_path=source_path,
+        region_id=variant_id,
+        backend="cython",
+        compiled_module=logical_module,
+        artifact_dir=tmp_path / ".atoll" / "artifacts",
+        bindings=(binding,),
+        outlined_shell=generation.shell,
+    )
+    source_path.write_text(
+        insert_or_replace_region_shim(source, (config,)).new_text,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "path", [str(tmp_path), *sys.path])
+    monkeypatch.setenv("ATOLL_DISABLE", "1")
+    sys.modules.pop(module_name, None)
+    disabled = importlib.import_module(module_name)
+    assert not hasattr(disabled.workload, "__atoll_compiled_target__")
+
+    monkeypatch.delenv("ATOLL_DISABLE")
+    sys.modules.pop(module_name, None)
+    enabled = importlib.import_module(module_name)
+    compiled_target = enabled.workload.__atoll_compiled_target__
+
+    assert inspect.iscoroutinefunction(enabled.workload)
+    assert inspect.iscoroutinefunction(compiled_target)
+    assert inspect.signature(enabled.workload).parameters["token"].default is enabled.DEFAULT
+    assert asyncio.run(enabled.workload([1, 2])) == (9, enabled.DEFAULT)
+    assert len(compiled_target.__atoll_native_helpers__) == 1
+    assert enabled.__atoll_status__["regions"][variant_id]["active"] is True
 
 
 def test_cython_compiles_and_imports_async_generator(

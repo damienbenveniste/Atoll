@@ -48,15 +48,29 @@ installs the project's declared build requirements automatically. This preserves
 entry points, and backend-generated metadata. The final platform tag and `RECORD` are regenerated,
 then staged and wheel routing are verified in fresh interpreters before temporary trees are removed.
 For typed regions, `compiled_regions` records each backend variant, class and descriptor-aware
-bindings, runtime guards, concrete target owners, and native artifact paths. Typed-region entries
-preserve the original generic declaration and list specialization origins, substitutions, and
-concrete type bindings separately.
+bindings, runtime guards, concrete target owners, and native artifact paths. It also records
+`lowering_mode`; `outlined-block` variants list the private synchronous `native_helpers` called by
+their staged Python suspension shell. Typed-region entries preserve the original generic
+declaration and list specialization origins, substitutions, and concrete type bindings separately.
 Compile report schema v3 includes profile coverage, candidate decisions, backend decisions,
 suspension plans, candidate trials, and accepted or rejected variants. It retains the v2
 compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
 are legacy views and normally remain empty with zero counts. Region members expose ordered call
 sites, runtime imports, and suspension points, while dependency records identify invocation mode
-and whether a dependency must share a native compilation unit.
+and whether a dependency must share a native compilation unit. Suspension plans include source
+coordinates, live-ins, live-outs, runtime dependencies, work signals, eligibility, and rejection
+evidence for every considered synchronous block.
+
+For one precise coroutine, generator, or async-generator binding, a deterministic whole-callable
+Cython rejection can fall back to planner-approved synchronous blocks. The staged Python shell
+continues to own `await`, `yield`, cancellation, exception handlers, and cleanup while native
+helpers receive explicit live-ins and return live-outs. Unsafe control flow, cells, nonlocals,
+nested definitions, comprehensions, deletion, global declarations, and exception/context
+boundaries stay interpreted. Native helper failures propagate without retrying the same block in
+Python.
+Global and builtin names are resolved against the source module at every native read, preserving
+rebinding performed by earlier calls in the same block. Only bare `@staticmethod` and
+`@classmethod` descriptors are recognized; qualified and custom decorators stay interpreted.
 
 Source-clean compile no longer generates Python sidecars or performs generated-AST
 native-readiness scoring before backend compilation. Ordinary functions, methods, classes, sync

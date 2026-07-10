@@ -20,9 +20,13 @@ from atoll.models import (
     CompilePhaseTiming,
     EnabledIslandConfig,
     IslandRisk,
+    LoweringMode,
     ModuleId,
     PytestRunResult,
+    RegionMember,
+    SuspensionPoint,
     SymbolId,
+    TypedRegion,
     VerifyResult,
 )
 from atoll.report import (
@@ -647,6 +651,8 @@ def third(value: int) -> int:
             "source_module": "report_regions",
             "backend": "mypyc",
             "cache_status": "disabled",
+            "lowering_mode": "whole-callable",
+            "native_helpers": [],
             "symbols": [binding.source.stable_id for binding in first.bindings],
             "artifacts": [],
         },
@@ -656,6 +662,8 @@ def third(value: int) -> int:
             "source_module": "report_regions",
             "backend": "cython",
             "cache_status": "disabled",
+            "lowering_mode": "whole-callable",
+            "native_helpers": [],
             "symbols": [binding.source.stable_id for binding in second.bindings],
             "artifacts": [".atoll/artifacts/_atoll_second.so"],
         },
@@ -665,6 +673,8 @@ def third(value: int) -> int:
             "source_module": "report_regions",
             "backend": None,
             "cache_status": "disabled",
+            "lowering_mode": "whole-callable",
+            "native_helpers": [],
             "symbols": [binding.source.stable_id for binding in third.bindings],
             "artifacts": [],
         },
@@ -682,7 +692,11 @@ def test_compilation_report_serializes_async_region_planning_evidence(tmp_path: 
 
 async def hot(value: int) -> int:
     import math
-    return await helper(value) + math.floor(0.5)
+    start = value + 1
+    doubled = start * 2
+    total = doubled + math.floor(0.5)
+    result = await helper(total)
+    return result
 """,
         encoding="utf-8",
     )
@@ -705,6 +719,14 @@ async def hot(value: int) -> int:
     )
     region = build_directed_region_slice(region, hot_id)
     hot_binding = next(binding for binding in region.bindings if binding.source == hot_id)
+    outlined_variant = CompiledRegionVariant(
+        id=f"{region.id}@cython-outline",
+        region=region,
+        backend="cython",
+        bindings=(hot_binding,),
+        lowering_mode="outlined-block",
+        native_helpers=("_hot__outlined_0_fixture",),
+    )
 
     report = build_compilation_report(
         CompilationReportInput(
@@ -721,8 +743,7 @@ async def hot(value: int) -> int:
                 duration_seconds=0.1,
             ),
             typed_regions=(region,),
-            compiled_regions=(region,),
-            compiled_bindings=(hot_binding,),
+            compiled_variants=(outlined_variant,),
         )
     )
     markdown = render_compilation_markdown_report(report)
@@ -742,10 +763,13 @@ async def hot(value: int) -> int:
     assert helper_dependency["invocation_mode"] == "awaited"
     assert helper_dependency["requires_same_unit"] is True
     plans = {plan["member"]: plan for plan in report["suspension_plans"]}
-    assert plans["async_regions::hot"]["lowering_mode"] == "whole-callable"
-    assert plans["async_regions::helper"]["lowering_mode"] == "whole-callable"
+    assert plans["async_regions::hot"]["lowering_mode"] == "outlined-block"
+    assert plans["async_regions::hot"]["native_helpers"] == ["_hot__outlined_0_fixture"]
+    assert plans["async_regions::hot"]["blocks"][0]["eligible"] is True
+    assert plans["async_regions::hot"]["blocks"][0]["live_outs"] == ["total"]
+    assert plans["async_regions::helper"]["lowering_mode"] == "interpreted"
     assert "## Suspension Handling" in markdown
-    assert "`async_regions::hot`: whole-callable" in markdown
+    assert "`async_regions::hot`: outlined-block via `_hot__outlined_0_fixture`" in markdown
 
 
 def test_compilation_report_accepts_explicit_compiled_variants(tmp_path: Path) -> None:
@@ -805,6 +829,8 @@ def test_compilation_report_accepts_explicit_compiled_variants(tmp_path: Path) -
             "source_module": "variant_regions",
             "backend": "mypyc",
             "cache_status": "hit",
+            "lowering_mode": "whole-callable",
+            "native_helpers": [],
             "bindings": [
                 {
                     "source": binding.source.stable_id,
@@ -828,7 +854,113 @@ def test_compilation_report_accepts_explicit_compiled_variants(tmp_path: Path) -
             "source_module": "variant_regions",
             "backend": "mypyc",
             "cache_status": "hit",
+            "lowering_mode": "whole-callable",
+            "native_helpers": [],
             "symbols": [binding.source.stable_id for binding in region.bindings],
             "artifacts": [".atoll/artifacts/_atoll_variant_score.so"],
         }
     ]
+
+
+def test_suspension_report_applies_member_rejections_to_block_eligibility(
+    tmp_path: Path,
+) -> None:
+    """Member-level scope rejection overrides an otherwise eligible local block."""
+    member = RegionMember(
+        id=SymbolId("blocked_async", "blocked"),
+        kind="function",
+        owner_class=None,
+        binding_kind="module",
+        execution_kind="coroutine",
+        source_text="""async def blocked(values):
+    callback = lambda value: value
+    start = len(values) + 1
+    doubled = start * 2
+    total = callback(doubled)
+    await checkpoint()
+    return total
+""",
+        type_parameters=(),
+        type_parameter_records=(),
+        scope_type_parameters=(),
+        scope_type_parameter_records=(),
+        parameters=(),
+        return_annotation=None,
+        suspension_points=(
+            SuspensionPoint(
+                kind="await",
+                lineno=6,
+                end_lineno=6,
+                col_offset=4,
+                end_col_offset=22,
+            ),
+        ),
+    )
+    region = TypedRegion(
+        id="blocked_async::blocked:fixture",
+        source_module=ModuleId("blocked_async", tmp_path / "blocked_async.py"),
+        members=(member,),
+        dependencies=(),
+        type_bindings=(),
+        bindings=(),
+        decisions=(),
+        source_hash="a" * 64,
+    )
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter="blocked_async",
+            islands=(),
+            build=CompileAttempt(
+                success=False,
+                command=("atoll", "typed-region-build"),
+                stdout="",
+                stderr="interpreted",
+                artifact_paths=(),
+                duration_seconds=0.0,
+            ),
+            typed_regions=(region,),
+        )
+    )
+    plan = report["suspension_plans"][0]
+
+    assert {rejection["code"] for rejection in plan["rejections"]} == {"nested_scope"}
+    assert plan["blocks"][0]["eligible"] is False
+    assert "0/1 synchronous blocks eligible" in render_compilation_markdown_report(report)
+
+
+@pytest.mark.parametrize(
+    ("mode", "helpers", "message"),
+    [
+        ("outlined-block", (), "require native helpers"),
+        ("whole-callable", ("helper",), "cannot declare"),
+        ("outlined-block", ("helper", "helper"), "must be unique"),
+    ],
+)
+def test_compiled_variant_rejects_contradictory_lowering_metadata(
+    tmp_path: Path,
+    mode: LoweringMode,
+    helpers: tuple[str, ...],
+    message: str,
+) -> None:
+    """Compiled variant mode and helper metadata remain internally consistent."""
+    source_path = tmp_path / "variant_validation.py"
+    source_path.write_text(
+        "def score(value: int) -> int:\n    return value + 1\n",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(
+        scan_module(ModuleId(name="variant_validation", path=source_path))
+    )
+    region = scan.typed_regions[0]
+
+    with pytest.raises(ValueError, match=message):
+        CompiledRegionVariant(
+            id=f"{region.id}:fixture",
+            region=region,
+            backend="cython",
+            bindings=region.bindings,
+            lowering_mode=mode,
+            native_helpers=helpers,
+        )

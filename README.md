@@ -76,14 +76,29 @@ the platform tag and `RECORD`, verifies both the staged payload and final wheel 
 interpreters, and removes the copied project and install payload after a successful default run.
 For typed regions, the report's `compiled_regions` section names each backend variant, every class
 or descriptor-aware binding, its runtime guards and concrete target owner, and the artifact paths
-associated with that variant. Typed-region entries retain the original generic declaration plus the
-specialization origin, substitutions, and concrete type bindings.
+associated with that variant. Each variant also reports `lowering_mode`; an `outlined-block`
+variant lists the private synchronous `native_helpers` called by its staged Python suspension
+shell. Typed-region entries retain the original generic declaration plus the specialization origin,
+substitutions, and concrete type bindings.
 Compile report schema v3 includes profile coverage, candidate decisions, backend decisions,
 suspension plans, candidate trials, and accepted or rejected variants. It retains the v2
 compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
 are legacy views and normally remain empty with zero counts. Region members also expose ordered
 call sites, runtime imports, and suspension points; dependency records state the invocation mode
-and whether a dependency must share a native compilation unit.
+and whether a dependency must share a native compilation unit. Suspension plans include each
+block's source coordinates, live-ins, live-outs, runtime dependencies, work signal, eligibility,
+and conservative rejection evidence.
+
+For a precise coroutine, generator, or async-generator binding, Atoll can fall back from a
+deterministically rejected whole-callable Cython variant to planner-approved synchronous blocks.
+The staged Python shell retains `await`, `yield`, cancellation, exception handlers, and cleanup;
+the Cython extension receives explicit live-ins and returns live-outs. Blocks involving unsafe
+control flow, cells, nonlocals, nested definitions, comprehensions, deletion, global declarations,
+or exception/context boundaries remain interpreted. A native helper failure is surfaced directly;
+Atoll never retries the interpreted block after native execution starts. Global and builtin names
+are resolved against the source module at each native read, so a call that rebinds a global remains
+observable later in the same block. Only bare `@staticmethod` and `@classmethod` descriptors are
+accepted; qualified and custom decorators remain interpreted.
 
 Source-clean compile no longer generates Python sidecars or performs generated-AST
 native-readiness scoring before backend compilation. Ordinary functions, methods, classes, sync

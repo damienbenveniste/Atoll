@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 from atoll.analysis.native_readiness import NativeReadiness
+from atoll.analysis.suspension_planner import (
+    RejectionEvidence,
+    SuspensionBlock,
+    plan_suspension_blocks,
+)
 from atoll.models import (
     ArtifactRecord,
     Backend,
@@ -37,6 +42,7 @@ from atoll.models import (
     InvocationMode,
     IslandRisk,
     LossAction,
+    LoweringMode,
     ModuleScan,
     MypyDiagnostic,
     ParameterKind,
@@ -912,6 +918,8 @@ class CompilationAcceptedVariantReport(TypedDict):
         source_module: Importable source module name.
         backend: Native compiler backend selected for this record.
         cache_status: Whether compilation used, missed, or restored cache state.
+        lowering_mode: Whether compilation owns the whole callable or native blocks.
+        native_helpers: Private native helper names used by an outlined shell.
         symbols: Source bindings promised by the compiled variant.
         artifacts: Install-relative native artifact paths owned by the variant.
     """
@@ -921,6 +929,8 @@ class CompilationAcceptedVariantReport(TypedDict):
     source_module: str
     backend: Backend | None
     cache_status: CompileCacheStatus
+    lowering_mode: LoweringMode
+    native_helpers: list[str]
     symbols: list[str]
     artifacts: list[str]
 
@@ -968,7 +978,10 @@ class CompilationSuspensionPlanReport(TypedDict):
         member: Stable source callable identity.
         execution_kind: Coroutine, generator, or async-generator shape.
         lowering_mode: Whole-callable or interpreted mode used by this compile.
+        native_helpers: Private native helper names for outlined-block lowering.
         points: Ordered syntax-level suspension boundaries.
+        blocks: Synchronous block plans with liveness and rejection evidence.
+        rejections: Member-level reasons preventing safe block extraction.
         reason: Evidence supporting the selected lowering mode.
     """
 
@@ -977,8 +990,59 @@ class CompilationSuspensionPlanReport(TypedDict):
     member: str
     execution_kind: ExecutionKind
     lowering_mode: str
+    native_helpers: list[str]
     points: list[SuspensionPointReport]
+    blocks: list[CompilationSuspensionBlockReport]
+    rejections: list[CompilationSuspensionRejectionReport]
     reason: str
+
+
+class CompilationSuspensionRejectionReport(TypedDict):
+    """One stable reason a callable or synchronous block remains interpreted.
+
+    Attributes:
+        code: Stable machine-readable rejection category.
+        message: Human-readable conservative planning explanation.
+        lineno: One-based source line for local evidence, when available.
+    """
+
+    code: str
+    message: str
+    lineno: int | None
+
+
+class CompilationSuspensionBlockReport(TypedDict):
+    """One synchronous block considered between suspension boundaries.
+
+    Attributes:
+        id: Stable content-derived block identifier.
+        start_lineno: One-based first source line.
+        start_col_offset: Zero-based first source byte offset.
+        end_lineno: One-based final source line.
+        end_col_offset: Zero-based final source byte offset.
+        live_ins: Values passed explicitly from the Python shell.
+        live_outs: Values restored into the Python shell.
+        late_bound_globals: Runtime global dependencies passed explicitly.
+        receiver_dependencies: Receiver attributes read by the block.
+        loop_count: Synchronous loops retained in the block.
+        operation_count: Conservative native-work signal.
+        eligible: Whether the block passed every extraction gate.
+        rejections: Block-local reasons for retaining interpreted execution.
+    """
+
+    id: str
+    start_lineno: int
+    start_col_offset: int
+    end_lineno: int
+    end_col_offset: int
+    live_ins: list[str]
+    live_outs: list[str]
+    late_bound_globals: list[str]
+    receiver_dependencies: list[str]
+    loop_count: int
+    operation_count: int
+    eligible: bool
+    rejections: list[CompilationSuspensionRejectionReport]
 
 
 class CompilationBuildReport(TypedDict):
@@ -1160,6 +1224,8 @@ class CompilationCompiledRegionReport(TypedDict):
         source_module: Importable source module name.
         backend: Native compiler backend selected for this record.
         cache_status: Whether compilation used, missed, or partially restored cache state.
+        lowering_mode: Whether compilation owns the whole callable or native blocks.
+        native_helpers: Private native helper names used by an outlined shell.
         bindings: Source bindings promised by the compiled region or variant.
         artifacts: Install-relative native artifact paths owned by the variant.
     """
@@ -1169,6 +1235,8 @@ class CompilationCompiledRegionReport(TypedDict):
     source_module: str
     backend: Backend | None
     cache_status: CompileCacheStatus
+    lowering_mode: LoweringMode
+    native_helpers: list[str]
     bindings: list[CompilationCompiledBindingReport]
     artifacts: list[str]
 
@@ -1351,6 +1419,8 @@ class _CompiledVariantReportInput:
     region: TypedRegion
     backend: Backend | None
     cache_status: CompileCacheStatus
+    lowering_mode: LoweringMode = "whole-callable"
+    native_helpers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1718,6 +1788,8 @@ def _compiled_region_reports(
                     region=variant.region,
                     backend=variant.backend,
                     cache_status=variant.cache_status,
+                    lowering_mode=variant.lowering_mode,
+                    native_helpers=variant.native_helpers,
                 ),
                 bindings=variant.bindings,
                 artifact_records=report_input.artifact_records,
@@ -1774,6 +1846,8 @@ def _compiled_region_variant_report(
         "source_module": identity.region.source_module.name,
         "backend": identity.backend,
         "cache_status": identity.cache_status,
+        "lowering_mode": identity.lowering_mode,
+        "native_helpers": list(identity.native_helpers),
         "bindings": [
             {
                 "source": binding.source.stable_id,
@@ -2034,9 +2108,14 @@ def _compiled_region_markdown(region: CompilationCompiledRegionReport) -> str:
     backend = region["backend"] or "unknown backend"
     bindings = ", ".join(_compiled_binding_markdown(binding) for binding in region["bindings"])
     artifacts = ", ".join(region["artifacts"]) or "no recorded artifacts"
+    helpers = ", ".join(f"`{name}`" for name in region["native_helpers"])
+    lowering = region["lowering_mode"]
+    lowering_text = f"; lowering: {lowering}"
+    if helpers:
+        lowering_text += f" via {helpers}"
     return (
         f"- `{region['variant_id']}` [{backend}] for region `{region['id']}`: "
-        f"{bindings}; cache: {region['cache_status']}; artifacts: {artifacts}"
+        f"{bindings}; cache: {region['cache_status']}{lowering_text}; artifacts: {artifacts}"
     )
 
 
@@ -2049,7 +2128,14 @@ def _append_suspension_plans_markdown(
     lines.extend(["## Suspension Handling", ""])
     for plan in plans:
         points = ", ".join(f"{point['kind']} at line {point['lineno']}" for point in plan["points"])
-        lines.append(f"- `{plan['member']}`: {plan['lowering_mode']} ({points}); {plan['reason']}")
+        helpers = ", ".join(f"`{name}`" for name in plan["native_helpers"])
+        helper_text = f" via {helpers}" if helpers else ""
+        eligible_blocks = sum(block["eligible"] for block in plan["blocks"])
+        block_text = f"{eligible_blocks}/{len(plan['blocks'])} synchronous blocks eligible"
+        lines.append(
+            f"- `{plan['member']}`: {plan['lowering_mode']}{helper_text} "
+            f"({points}); {block_text}; {plan['reason']}"
+        )
     lines.append("")
 
 
@@ -2752,36 +2838,101 @@ def _suspension_plan_reports(
     compiled_variants: tuple[CompiledRegionVariant, ...],
     compiled_bindings: tuple[BindingTarget, ...],
 ) -> list[CompilationSuspensionPlanReport]:
-    compiled_sources = {member.id for region in compiled_regions for member in region.members}
-    compiled_sources.update(
-        member.id for variant in compiled_variants for member in variant.region.members
+    compiled_by_source = {
+        binding.source: variant
+        for variant in sorted(compiled_variants, key=lambda item: item.id)
+        for binding in variant.bindings
+    }
+    legacy_compiled_sources: set[SymbolId] = (
+        {member.id for region in compiled_regions for member in region.members}
+        if not compiled_variants
+        else set()
     )
-    compiled_sources.update(binding.source for binding in compiled_bindings)
+    legacy_compiled_sources.update(binding.source for binding in compiled_bindings)
     reports: list[CompilationSuspensionPlanReport] = []
     for region in sorted(regions, key=lambda item: item.id):
         for member in region.members:
             if not member.suspension_points:
                 continue
-            compiled = member.id in compiled_sources
+            variant = compiled_by_source.get(member.id)
+            compiled = variant is not None or member.id in legacy_compiled_sources
+            lowering_mode = (
+                variant.lowering_mode
+                if variant is not None
+                else "whole-callable"
+                if compiled
+                else "interpreted"
+            )
+            native_helpers = list(variant.native_helpers) if variant is not None else []
+            suspension_plan = plan_suspension_blocks(member)
             reports.append(
                 {
                     "id": f"{region.id}:{member.id.stable_id}",
                     "region_id": region.id,
                     "member": member.id.stable_id,
                     "execution_kind": member.execution_kind,
-                    "lowering_mode": "whole-callable" if compiled else "interpreted",
+                    "lowering_mode": lowering_mode,
+                    "native_helpers": native_helpers,
                     "points": [
                         _suspension_point_report(point) for point in member.suspension_points
                     ],
+                    "blocks": [
+                        _suspension_block_report(
+                            block,
+                            effective_eligible=block.id in suspension_plan.eligible_block_ids,
+                        )
+                        for block in suspension_plan.blocks
+                    ],
+                    "rejections": [
+                        _suspension_rejection_report(rejection)
+                        for rejection in suspension_plan.rejections
+                    ],
                     "reason": (
-                        "the selected backend compiled the complete callable while preserving "
-                        "its suspension protocol"
-                        if compiled
-                        else "no accepted compiled binding replaced this callable"
+                        "the Python shell retains suspension and delegates synchronous blocks "
+                        "to verified native helpers"
+                        if lowering_mode == "outlined-block"
+                        else (
+                            "the selected backend compiled the complete callable while "
+                            "preserving its suspension protocol"
+                            if compiled
+                            else "no accepted compiled binding replaced this callable"
+                        )
                     ),
                 }
             )
     return reports
+
+
+def _suspension_block_report(
+    block: SuspensionBlock,
+    *,
+    effective_eligible: bool,
+) -> CompilationSuspensionBlockReport:
+    return {
+        "id": block.id,
+        "start_lineno": block.start_lineno,
+        "start_col_offset": block.start_col_offset,
+        "end_lineno": block.end_lineno,
+        "end_col_offset": block.end_col_offset,
+        "live_ins": list(block.live_ins),
+        "live_outs": list(block.live_outs),
+        "late_bound_globals": list(block.late_bound_globals),
+        "receiver_dependencies": list(block.receiver_dependencies),
+        "loop_count": block.loop_count,
+        "operation_count": block.operation_count,
+        "eligible": effective_eligible,
+        "rejections": [_suspension_rejection_report(rejection) for rejection in block.rejections],
+    }
+
+
+def _suspension_rejection_report(
+    rejection: RejectionEvidence,
+) -> CompilationSuspensionRejectionReport:
+    return {
+        "code": rejection.code,
+        "message": rejection.message,
+        "lineno": rejection.lineno,
+    }
 
 
 def _accepted_variant_reports(
@@ -2794,6 +2945,8 @@ def _accepted_variant_reports(
             "source_module": region["source_module"],
             "backend": region["backend"],
             "cache_status": region["cache_status"],
+            "lowering_mode": region["lowering_mode"],
+            "native_helpers": list(region["native_helpers"]),
             "symbols": sorted(binding["source"] for binding in region["bindings"]),
             "artifacts": list(region["artifacts"]),
         }

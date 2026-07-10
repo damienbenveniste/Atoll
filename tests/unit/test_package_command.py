@@ -29,6 +29,7 @@ from atoll.models import (
     CompilePhaseTiming,
     EnabledIslandConfig,
     LoweringDecision,
+    LoweringMode,
     ModuleId,
     ModuleScan,
     RegionSpecialization,
@@ -57,6 +58,7 @@ TYPED_FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
 EXPECTED_ATOMIC_SELECTION_COUNT = 2
 TEST_FAILURE_RETURN_CODE = 9
 RANKING_BINDING_COUNT = 3
+OUTLINED_COMPILE_CALL_COUNT = 2
 
 
 @pytest.fixture(autouse=True)
@@ -141,6 +143,8 @@ class _PreparedTypedRegion(Protocol):
     unit: CompilationUnit
     fallback: _PreparedTypedRegion | None
     conditional_on_failure_of: str | None
+    lowering_mode: LoweringMode
+    native_helpers: tuple[str, ...]
 
 
 class _TypedRegionOutcome(Protocol):
@@ -182,6 +186,43 @@ class _FakeCompileBackend:
         _ = context
         self.calls.append(units)
         return self.result
+
+
+class _SequencedCompileBackend:
+    """Backend stub returning one configured result per distinct fallback attempt."""
+
+    def __init__(
+        self,
+        name: Backend,
+        results: tuple[BackendCompileResult, ...],
+    ) -> None:
+        self.name = name
+        self.results = results
+        self.calls: list[tuple[CompilationUnit, ...]] = []
+
+    def fingerprint(
+        self,
+        unit: CompilationUnit,
+        context: BackendCompileContext,
+    ) -> str:
+        """Return a stable key that distinguishes whole and outlined units."""
+        _ = context
+        return hashlib.sha256(
+            f"{self.name}:{unit.region_id}:{unit.source_hash}".encode()
+        ).hexdigest()
+
+    def compile(
+        self,
+        units: tuple[CompilationUnit, ...],
+        context: BackendCompileContext,
+    ) -> BackendCompileResult:
+        """Return the next result and reject unexpected additional invocations."""
+        _ = context
+        index = len(self.calls)
+        if index >= len(self.results):
+            raise AssertionError("native backend received an unexpected compile invocation")
+        self.calls.append(units)
+        return self.results[index]
 
 
 def _package_attr(name: str) -> object:
@@ -822,6 +863,232 @@ def test_package_preserves_payload_for_subprocess_verification_failure(
     assert result.verification_steps[-1].stage == failed_stage
     if failed_stage == "wheel":
         assert result.verification_steps[-1].target.parent == output_dir / "build" / "diagnostics"
+
+
+def _prepare_outlined_coroutine_fixture(
+    tmp_path: Path,
+) -> tuple[_PreparedTypedRegion, Path, tuple[Path, ...]]:
+    project_root = tmp_path / "typed_region_project"
+    build_root = tmp_path / "build"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    module_path = project_root / "src" / "typed_region_project" / "outline_worker.py"
+    module_path.write_text(
+        """async def checkpoint() -> None:
+    return None
+
+
+async def hot(values: list[int]) -> int:
+    start = len(values) + 1
+    doubled = start * 2
+    total = doubled + 3
+    await checkpoint()
+    return total
+""",
+        encoding="utf-8",
+    )
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "typed_region_project.outline_worker")
+    hot = SymbolId("typed_region_project.outline_worker", "hot")
+    selections = _selected_typed_regions(
+        scans,
+        ("mypyc", "cython"),
+        (hot,),
+        hot_members=(hot,),
+    )
+    assert len(selections) == 1
+    staged_source_roots = _copy_source_roots(project, build_root)
+    prepared = _prepare_typed_region(
+        project=project,
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        selection=selections[0],
+    )
+    return prepared, build_root, staged_source_roots
+
+
+def test_prepare_typed_region_appends_outlined_cython_fallback(tmp_path: Path) -> None:
+    """A precise async root prepares whole-callable and outlined backend variants."""
+    prepared, _build_root, _staged_source_roots = _prepare_outlined_coroutine_fixture(tmp_path)
+
+    assert prepared.generation.backend == "mypyc"
+    assert prepared.fallback is not None
+    assert prepared.fallback.lowering_mode == "whole-callable"
+    assert prepared.fallback.fallback is not None
+    outlined = prepared.fallback.fallback
+    assert outlined.generation.backend == "cython"
+    assert outlined.lowering_mode == "outlined-block"
+    assert outlined.native_helpers
+    assert outlined.unit.region_id.endswith("@cython-outline")
+
+
+def test_typed_region_build_retries_whole_callable_failure_with_outline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deterministic backend failures continue through the outlined Cython variant."""
+    prepared, build_root, staged_source_roots = _prepare_outlined_coroutine_fixture(tmp_path)
+    mypyc = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=False,
+                command=("mypyc",),
+                stdout="",
+                stderr="MYPYC_TYPE_ERROR: fixture",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    cython = _SequencedCompileBackend(
+        "cython",
+        (
+            BackendCompileResult(
+                attempt=CompileAttempt(
+                    success=False,
+                    command=("cython",),
+                    stdout="",
+                    stderr="CYTHON_COMPILE_ERROR: whole callable fixture",
+                    artifact_paths=(),
+                    duration_seconds=0.2,
+                ),
+                artifacts=(),
+            ),
+            BackendCompileResult(
+                attempt=CompileAttempt(
+                    success=True,
+                    command=("cython",),
+                    stdout="",
+                    stderr="",
+                    artifact_paths=(),
+                    duration_seconds=0.2,
+                ),
+                artifacts=(),
+            ),
+        ),
+    )
+    monkeypatch.setitem(_compiler_backends, "mypyc", mypyc)
+    monkeypatch.setitem(_compiler_backends, "cython", cython)
+
+    outcome = _build_typed_regions(
+        prepared=(prepared,),
+        context=_TypedRegionBuildContext(
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            mypy_cache_dir=tmp_path / "mypy-cache",
+            compile_cache_dir=tmp_path / "compile-cache",
+            progress=None,
+        ),
+        initial_failures=(),
+    )
+
+    assert outcome.build.success is True
+    assert outcome.skipped == ()
+    assert len(mypyc.calls) == 1
+    assert len(cython.calls) == OUTLINED_COMPILE_CALL_COUNT
+    assert len(outcome.successful) == 1
+    assert outcome.successful[0].lowering_mode == "outlined-block"
+    assert outcome.successful[0].native_helpers
+    assert "outlined Cython" in outcome.build.stdout
+
+
+def test_outlined_fallback_chain_restores_all_warm_cache_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warm outline build invokes neither backend and restores its native artifact."""
+    prepared, build_root, staged_source_roots = _prepare_outlined_coroutine_fixture(tmp_path)
+    assert prepared.fallback is not None
+    assert prepared.fallback.fallback is not None
+    outlined = prepared.fallback.fallback
+    artifact = (
+        build_root / ".atoll" / "artifacts" / outlined.unit.install_relative_dir / "native.so"
+    )
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"outlined-native-artifact")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    mypyc = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=False,
+                command=("mypyc",),
+                stdout="",
+                stderr="MYPYC_TYPE_ERROR: deterministic fixture rejection",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    cython = _SequencedCompileBackend(
+        "cython",
+        (
+            BackendCompileResult(
+                attempt=CompileAttempt(
+                    success=False,
+                    command=("cython",),
+                    stdout="",
+                    stderr="CYTHON_COMPILE_ERROR: deterministic whole-callable rejection",
+                    artifact_paths=(),
+                    duration_seconds=0.2,
+                ),
+                artifacts=(),
+            ),
+            BackendCompileResult(
+                attempt=CompileAttempt(
+                    success=True,
+                    command=("cython",),
+                    stdout="",
+                    stderr="",
+                    artifact_paths=(artifact,),
+                    duration_seconds=0.2,
+                ),
+                artifacts=(
+                    ArtifactRecord(
+                        region_id=outlined.unit.region_id,
+                        backend="cython",
+                        logical_module=outlined.unit.logical_module,
+                        role="primary",
+                        install_relative_path=(f"{outlined.unit.install_relative_dir}/native.so"),
+                        digest=digest,
+                        abi="cp312",
+                        platform_tag="test-platform",
+                    ),
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setitem(_compiler_backends, "mypyc", mypyc)
+    monkeypatch.setitem(_compiler_backends, "cython", cython)
+    context = _TypedRegionBuildContext(
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        mypy_cache_dir=tmp_path / "mypy-cache",
+        compile_cache_dir=tmp_path / "compile-cache",
+        progress=None,
+    )
+
+    first = _build_typed_regions(
+        prepared=(prepared,),
+        context=context,
+        initial_failures=(),
+    )
+    artifact.unlink()
+    second = _build_typed_regions(
+        prepared=(prepared,),
+        context=context,
+        initial_failures=(),
+    )
+
+    assert first.build.success is True
+    assert second.build.success is True
+    assert len(mypyc.calls) == 1
+    assert len(cython.calls) == OUTLINED_COMPILE_CALL_COUNT
+    assert second.successful[0].lowering_mode == "outlined-block"
+    assert second.build.artifact_paths[0].read_bytes() == b"outlined-native-artifact"
+    timing_names = {timing.name for timing in second.build.phase_timings}
+    assert "backend_decision_cache" in timing_names
+    assert "cache_restore" in timing_names
 
 
 def test_typed_region_build_retries_deterministic_mypyc_failure_with_cython(

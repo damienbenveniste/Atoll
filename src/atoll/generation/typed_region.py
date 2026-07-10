@@ -1003,6 +1003,4 @@ def _facade_name(owner: str) -> str:
 def _decorator_name(decorator: ast.expr) -> str:
     if isinstance(decorator, ast.Name):
         return decorator.id
-    if isinstance(decorator, ast.Attribute):
-        return decorator.attr
     return ast.unparse(decorator)

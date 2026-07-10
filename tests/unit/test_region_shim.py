@@ -16,6 +16,7 @@ from typing import Protocol, cast
 import pytest
 
 from atoll.generation.region_shim import (
+    OutlinedShellConfig,
     RegionShimConfig,
     insert_or_replace_region_shim,
     remove_region_shim,
@@ -398,6 +399,180 @@ async def Worker__stream(self, token=object()):
     assert events == [("asend", "async-sent"), ("athrow", "boom"), ("aclose", None)]
 
 
+def test_region_shim_binds_outlined_coroutine_shell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An outlined coroutine keeps its Python shell and exact source defaults."""
+    source_path = tmp_path / "pkg" / "worker.py"
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=source_path,
+        region_id="pkg.worker::Worker.score:outline",
+        backend="cython",
+        compiled_module="_atoll_pkg_worker_score_outline",
+        artifact_dir=source_path.parent / "artifacts",
+        bindings=(_binding("score", "instance_method", "coroutine"),),
+        outlined_shell=OutlinedShellConfig(
+            factory_name="_atoll_make_shell",
+            factory_source="""def _atoll_make_shell(_atoll_native):
+    async def Worker__score(self, token=None):
+        return _atoll_native.Worker__score__block_0(self, token)
+    return Worker__score
+""",
+            helper_names=("Worker__score__block_0",),
+        ),
+    )
+    source = """DEFAULT = object()
+
+class Worker:
+    async def score(self, token: object = DEFAULT) -> object:
+        return ("source", token)
+"""
+    compiled = """def Worker__score__block_0(self, token):
+    return ("compiled", token)
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+    worker = module.Worker()
+
+    assert inspect.iscoroutinefunction(worker.score)
+    assert inspect.signature(worker.score).parameters["token"].default is module.DEFAULT
+    assert asyncio.run(worker.score()) == ("compiled", module.DEFAULT)
+    compiled_target = worker.score.__atoll_compiled_target__
+    assert inspect.iscoroutinefunction(compiled_target)
+    assert len(compiled_target.__atoll_native_helpers__) == 1
+    region_status = module.__atoll_status__["regions"][config.region_id]
+    assert region_status["active"] is True
+    assert region_status["compiled"] is True
+
+
+def test_region_shim_rejects_invalid_outlined_helper_transactionally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-synchronous native helper leaves the source binding untouched."""
+    source_path = tmp_path / "pkg" / "worker.py"
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=source_path,
+        region_id="pkg.worker::Worker.score:outline",
+        backend="cython",
+        compiled_module="_atoll_pkg_worker_score_outline",
+        artifact_dir=source_path.parent / "artifacts",
+        bindings=(_binding("score", "instance_method", "coroutine"),),
+        outlined_shell=OutlinedShellConfig(
+            factory_name="_atoll_make_shell",
+            factory_source="""def _atoll_make_shell(_atoll_native):
+    async def Worker__score(self):
+        return _atoll_native.Worker__score__block_0(self)
+    return Worker__score
+""",
+            helper_names=("Worker__score__block_0",),
+        ),
+    )
+    source = """class Worker:
+    async def score(self) -> str:
+        return "source"
+"""
+    compiled = """async def Worker__score__block_0(self):
+    return "invalid"
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+
+    assert asyncio.run(module.Worker().score()) == "source"
+    region_status = module.__atoll_status__["regions"][config.region_id]
+    assert region_status["active"] is False
+    assert region_status["compiled"] is False
+    error = region_status["bindings"]["Worker.score"]["error"]
+    assert "expected sync execution" in str(error)
+
+
+def test_region_shim_reapplies_outlined_staticmethod_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An outlined private shell is installed with its original static descriptor."""
+    source_path = tmp_path / "pkg" / "worker.py"
+    binding = _binding("score", "staticmethod", "coroutine")
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=source_path,
+        region_id="pkg.worker::Worker.score:outline-static",
+        backend="cython",
+        compiled_module="_atoll_pkg_worker_score_outline_static",
+        artifact_dir=source_path.parent / "artifacts",
+        bindings=(binding,),
+        outlined_shell=OutlinedShellConfig(
+            factory_name="_atoll_make_shell",
+            factory_source="""def _atoll_make_shell(_atoll_native):
+    class Worker:
+        async def score(values):
+            return _atoll_native.Worker__score__block_0(values)
+    return Worker.__dict__["score"]
+""",
+            helper_names=("Worker__score__block_0",),
+        ),
+    )
+    source = """class Worker:
+    @staticmethod
+    async def score(values: list[int]) -> int:
+        return -1
+"""
+    compiled = """def Worker__score__block_0(values):
+    return sum(values)
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+
+    assert isinstance(vars(module.Worker)["score"], staticmethod)
+    expected_result = 3
+    assert asyncio.run(module.Worker.score([1, 2])) == expected_result
+
+
+def test_region_shim_reapplies_outlined_classmethod_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An outlined classmethod receives the original source owner class."""
+    source_path = tmp_path / "pkg" / "worker.py"
+    binding = _binding("score", "classmethod", "coroutine")
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=source_path,
+        region_id="pkg.worker::Worker.score:outline-class",
+        backend="cython",
+        compiled_module="_atoll_pkg_worker_score_outline_class",
+        artifact_dir=source_path.parent / "artifacts",
+        bindings=(binding,),
+        outlined_shell=OutlinedShellConfig(
+            factory_name="_atoll_make_shell",
+            factory_source="""def _atoll_make_shell(_atoll_native):
+    class Worker:
+        async def score(cls, values):
+            return _atoll_native.Worker__score__block_0(cls, values)
+    return Worker.__dict__["score"]
+""",
+            helper_names=("Worker__score__block_0",),
+        ),
+    )
+    source = """class Worker:
+    @classmethod
+    async def score(cls, values: list[int]) -> tuple[str, int]:
+        return "source", -1
+"""
+    compiled = """def Worker__score__block_0(cls, values):
+    return cls.__name__, sum(values)
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+
+    assert isinstance(vars(module.Worker)["score"], classmethod)
+    expected_result = ("Worker", 3)
+    assert asyncio.run(module.Worker.score([1, 2])) == expected_result
+
+
 def test_region_shim_preflight_rejects_execution_kind_without_partial_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -555,6 +730,21 @@ def test_region_shim_config_rejects_invalid_promises(tmp_path: Path) -> None:
         replace(config, source_module="")
     with pytest.raises(ValueError, match="at least one"):
         replace(config, bindings=())
+    with pytest.raises(ValueError, match="factory and native helpers"):
+        OutlinedShellConfig(factory_name="", factory_source="", helper_names=())
+    with pytest.raises(ValueError, match="must be unique"):
+        OutlinedShellConfig(
+            factory_name="factory",
+            factory_source="def factory(native):\n    return native\n",
+            helper_names=("helper", "helper"),
+        )
+    shell = OutlinedShellConfig(
+        factory_name="factory",
+        factory_source="def factory(native):\n    return native\n",
+        helper_names=("helper",),
+    )
+    with pytest.raises(ValueError, match="exactly one public binding"):
+        replace(config, outlined_shell=shell)
     with pytest.raises(ValueError, match="another source module"):
         replace(
             config,

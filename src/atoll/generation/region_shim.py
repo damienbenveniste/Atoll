@@ -20,6 +20,36 @@ _MARKER_LABEL = "ATOLL TYPED REGIONS"
 
 
 @dataclass(frozen=True, slots=True)
+class OutlinedShellConfig:
+    """Private Python shell factory backed by synchronous native helpers.
+
+    The factory source is inserted only into the staged wheel shim. Calling the
+    factory with the loaded native module returns a coroutine, generator, or
+    async-generator shell whose suspension protocol remains Python-owned.
+
+    Attributes:
+        factory_name: Private factory function defined by `factory_source`.
+        factory_source: Deterministic source defining the private shell factory.
+        helper_names: Synchronous native helper attributes required by the shell.
+    """
+
+    factory_name: str
+    factory_source: str
+    helper_names: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Reject incomplete shell contracts before rendering executable code.
+
+        Raises:
+            ValueError: If the factory identity, source, or helper set is empty.
+        """
+        if not self.factory_name or not self.factory_source.strip() or not self.helper_names:
+            raise ValueError("outlined shell requires a factory and native helpers")
+        if len(set(self.helper_names)) != len(self.helper_names):
+            raise ValueError("outlined shell helper names must be unique")
+
+
+@dataclass(frozen=True, slots=True)
 class RegionShimConfig:
     """Runtime loading and binding contract for one compiled typed region.
 
@@ -31,6 +61,7 @@ class RegionShimConfig:
         compiled_module: Importable native module loaded by the managed region shim.
         artifact_dir: Directory from which the runtime shim loads native artifacts.
         bindings: Source bindings promised by the compiled region or variant.
+        outlined_shell: Optional Python suspension shell backed by this region's helpers.
     """
 
     source_module: str
@@ -40,6 +71,7 @@ class RegionShimConfig:
     compiled_module: str
     artifact_dir: Path
     bindings: tuple[BindingTarget, ...]
+    outlined_shell: OutlinedShellConfig | None = None
 
     def __post_init__(self) -> None:
         """Reject configs the current runtime binder cannot preserve.
@@ -52,6 +84,8 @@ class RegionShimConfig:
             raise ValueError("region shim identifiers must be non-empty")
         if not self.bindings:
             raise ValueError("region shim requires at least one promised binding")
+        if self.outlined_shell is not None and len(self.bindings) != 1:
+            raise ValueError("outlined region shim requires exactly one public binding")
         for binding in self.bindings:
             if binding.source.module != self.source_module:
                 raise ValueError("region shim binding belongs to another source module")
@@ -635,18 +669,60 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "                                _atoll_source = _atoll_descriptor.__func__",
             "                            else:",
             "                                _atoll_source = _atoll_descriptor",
-            "                        _atoll_target = getattr(",
-            '                            _atoll_mod, _atoll_binding["compiled_name"]',
-            "                        )",
             "                        _atoll_verify_execution_kind(",
             '                            _atoll_source, _atoll_binding["execution_kind"]',
             "                        )",
-            "                        _atoll_verify_compiled_execution_kind(",
-            "                            _atoll_mod,",
-            '                            _atoll_binding["compiled_name"],',
-            "                            _atoll_target,",
-            '                            _atoll_binding["execution_kind"],',
-            "                        )",
+            '                        _atoll_shell = _atoll_region["outlined_shell"]',
+            "                        if _atoll_shell is None:",
+            "                            _atoll_target = getattr(",
+            '                                _atoll_mod, _atoll_binding["compiled_name"]',
+            "                            )",
+            "                            _atoll_verify_compiled_execution_kind(",
+            "                                _atoll_mod,",
+            '                                _atoll_binding["compiled_name"],',
+            "                                _atoll_target,",
+            '                                _atoll_binding["execution_kind"],',
+            "                            )",
+            "                        else:",
+            "                            _atoll_helpers = tuple(",
+            "                                getattr(_atoll_mod, _atoll_helper_name)",
+            (
+                "                                for _atoll_helper_name in "
+                '_atoll_shell["helper_names"]'
+            ),
+            "                            )",
+            "                            for _atoll_helper_name, _atoll_helper in zip(",
+            '                                _atoll_shell["helper_names"],',
+            "                                _atoll_helpers,",
+            "                                strict=True,",
+            "                            ):",
+            "                                _atoll_verify_compiled_execution_kind(",
+            "                                    _atoll_mod,",
+            "                                    _atoll_helper_name,",
+            "                                    _atoll_helper,",
+            "                                    'sync',",
+            "                                )",
+            "                            _atoll_shell_namespace = {}",
+            "                            exec(",
+            '                                _atoll_shell["factory_source"],',
+            "                                globals(),",
+            "                                _atoll_shell_namespace,",
+            "                            )",
+            "                            _atoll_factory = _atoll_shell_namespace.get(",
+            '                                _atoll_shell["factory_name"]',
+            "                            )",
+            "                            if not callable(_atoll_factory):",
+            "                                raise TypeError(",
+            "                                    'Atoll outlined shell factory is not callable'",
+            "                                )",
+            "                            _atoll_target = _atoll_factory(_atoll_mod)",
+            "                            _atoll_verify_execution_kind(",
+            "                                _atoll_target,",
+            '                                _atoll_binding["execution_kind"],',
+            "                            )",
+            "                            _atoll_target.__atoll_native_helpers__ = (",
+            "                                _atoll_helpers",
+            "                            )",
             '                        if _atoll_binding["kind"] == "class":',
             "                            _atoll_plan.append(",
             "                                {",
@@ -773,6 +849,15 @@ def _runtime_region(config: RegionShimConfig) -> dict[str, object]:
         "backend": config.backend,
         "compiled_module": config.compiled_module,
         "artifact_relative": _relative_path_text(config.source_path.parent, config.artifact_dir),
+        "outlined_shell": (
+            {
+                "factory_name": config.outlined_shell.factory_name,
+                "factory_source": config.outlined_shell.factory_source,
+                "helper_names": config.outlined_shell.helper_names,
+            }
+            if config.outlined_shell is not None
+            else None
+        ),
         "bindings": tuple(
             {
                 "qualname": _binding_runtime_qualname(binding),

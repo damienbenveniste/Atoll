@@ -52,6 +52,7 @@ ExecutionKind = Literal["sync", "generator", "coroutine", "async_generator", "cl
 InvocationMode = Literal["ordinary", "awaited", "async_iteration"]
 IslandRisk = Literal["low", "medium", "high"]
 LossAction = Literal["preserve", "specialize", "box", "fallback", "reject"]
+LoweringMode = Literal["whole-callable", "outlined-block"]
 ParameterKind = Literal[
     "positional_only",
     "positional",
@@ -970,6 +971,8 @@ class CompiledRegionVariant:
         backend: Native compiler backend selected for this record.
         bindings: Source bindings promised by the compiled region or variant.
         cache_status: Whether compilation used, missed, or partially restored cache state.
+        lowering_mode: Whether the backend owns the complete callable or synchronous blocks.
+        native_helpers: Private native helper names used by an outlined Python shell.
     """
 
     id: str
@@ -977,6 +980,8 @@ class CompiledRegionVariant:
     backend: Backend
     bindings: tuple[BindingTarget, ...]
     cache_status: CompileCacheStatus = "disabled"
+    lowering_mode: LoweringMode = "whole-callable"
+    native_helpers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Require a non-empty variant ID and bindings owned by the region.
@@ -989,6 +994,12 @@ class CompiledRegionVariant:
         member_ids = {member.id for member in self.region.members}
         if not self.bindings or any(binding.source not in member_ids for binding in self.bindings):
             raise ValueError("compiled region variant bindings must belong to the region")
+        if self.lowering_mode == "outlined-block" and not self.native_helpers:
+            raise ValueError("outlined compiled region variants require native helpers")
+        if self.lowering_mode == "whole-callable" and self.native_helpers:
+            raise ValueError("whole-callable variants cannot declare outlined native helpers")
+        if len(set(self.native_helpers)) != len(self.native_helpers):
+            raise ValueError("compiled region variant native helpers must be unique")
 
 
 @dataclass(frozen=True, slots=True)
