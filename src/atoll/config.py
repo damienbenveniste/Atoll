@@ -22,7 +22,17 @@ class CompileConfigError(ValueError):
 
 
 def load_compile_config(root: Path) -> CompileConfig:
-    """Load and validate optional `[tool.atoll.compile]` source-clean policy."""
+    """Load and validate optional `[tool.atoll.compile]` source-clean policy.
+
+    Args:
+        root: Root directory of the target Python project.
+
+    Returns:
+        CompileConfig: Normalized compile, test, and benchmark configuration.
+
+    Raises:
+        CompileConfigError: If TOML syntax, field types, backend names, or gate policy are invalid.
+    """
     try:
         return _load_compile_config(root)
     except (tomllib.TOMLDecodeError, TypeError, ValueError) as error:
@@ -30,7 +40,14 @@ def load_compile_config(root: Path) -> CompileConfig:
 
 
 def _load_compile_config(root: Path) -> CompileConfig:
-    """Parse compile policy before the public loader normalizes configuration errors."""
+    """Parse compile policy before the public loader normalizes configuration errors.
+
+    Args:
+        root: Root directory of the target Python project.
+
+    Returns:
+        CompileConfig: Parsed compile policy before public error normalization.
+    """
     pyproject = root / "pyproject.toml"
     if not pyproject.exists():
         return CompileConfig()
@@ -64,7 +81,15 @@ def _load_compile_config(root: Path) -> CompileConfig:
 
 
 def load_enabled_islands(root: Path) -> tuple[EnabledIslandConfig, ...]:
-    """Load enabled islands from `.atoll.toml` and `pyproject.toml` if present."""
+    """Load enabled islands from `.atoll.toml` and `pyproject.toml` if present.
+
+    Args:
+        root: Root directory of the target Python project.
+
+    Returns:
+        tuple[EnabledIslandConfig, ...]: Configured islands in persisted order, or an empty tuple
+            when absent.
+    """
     islands: list[EnabledIslandConfig] = []
     atoll_config = root / CONFIG_PATH
     if atoll_config.exists():
@@ -81,6 +106,13 @@ def write_atoll_config(root: Path, islands: tuple[EnabledIslandConfig, ...]) -> 
     The file is fully rewritten from the supplied island tuple, so callers must
     preserve entries they do not intend to remove. Paths are emitted relative to
     the project root when possible.
+
+    Args:
+        root: Root directory of the target Python project.
+        islands: Enabled island configurations to serialize.
+
+    Returns:
+        Path: Path to the atomically rewritten Atoll configuration file.
     """
     path = root / CONFIG_PATH
     lines = [
@@ -115,7 +147,16 @@ def upsert_enabled_island(
     root: Path,
     island: EnabledIslandConfig,
 ) -> tuple[EnabledIslandConfig, ...]:
-    """Insert or replace one enabled island in project configuration."""
+    """Insert or replace one enabled island in project configuration.
+
+    Args:
+        root: Root directory of the target Python project.
+        island: Enabled island configuration to insert or update.
+
+    Returns:
+        tuple[EnabledIslandConfig, ...]: Complete island configuration after inserting or replacing
+            the module.
+    """
     islands = [
         existing
         for existing in load_enabled_islands(root)
@@ -132,6 +173,14 @@ def disable_island(root: Path, source_module: str) -> tuple[EnabledIslandConfig,
 
     Non-matching islands are preserved exactly. If the module is not configured,
     the resulting config is unchanged apart from normal rewrite formatting.
+
+    Args:
+        root: Root directory of the target Python project.
+        source_module: Importable source module name.
+
+    Returns:
+        tuple[EnabledIslandConfig, ...]: Complete island configuration with the selected module
+            disabled.
     """
     islands = tuple(
         EnabledIslandConfig(

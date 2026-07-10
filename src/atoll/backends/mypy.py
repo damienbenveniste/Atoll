@@ -29,6 +29,13 @@ class MypyRun:
     The return code and captured streams are preserved for diagnostics, while
     `diagnostics` contains only lines that match mypy's expected diagnostic
     format.
+
+    Attributes:
+        command: Normalized command argument vector.
+        returncode: Child process return code.
+        stdout: Captured child process standard output.
+        stderr: Captured child process standard error.
+        diagnostics: Parsed type-checker diagnostics.
     """
 
     command: tuple[str, ...]
@@ -44,6 +51,12 @@ def run_mypy(config: ProjectConfig) -> MypyRun:
     If the project root contains `pyproject.toml`, that file is passed as the
     mypy config. The working directory is temporarily changed to the project root
     so relative diagnostic paths can be resolved consistently.
+
+    Args:
+        config: Resolved configuration governing the requested operation.
+
+    Returns:
+        MypyRun: Captured mypy process evidence and parsed diagnostics.
     """
     args = (
         *(str(path) for path in config.source_roots),
@@ -74,6 +87,13 @@ def parse_mypy_output(output: str, *, cwd: Path) -> tuple[MypyDiagnostic, ...]:
     Non-diagnostic lines are ignored so callers can pass full stdout safely.
     Returned paths are absolute and columns are optional because mypy may omit
     column numbers for some messages.
+
+    Args:
+        output: Raw mypy standard output to parse.
+        cwd: Directory against which relative diagnostic paths are resolved.
+
+    Returns:
+        tuple[MypyDiagnostic, ...]: Diagnostics parsed from mypy's text output in source order.
     """
     diagnostics: list[MypyDiagnostic] = []
     for line in output.splitlines():

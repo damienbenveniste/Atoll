@@ -48,6 +48,16 @@ class CommandRunEvidence:
     while `payload_root` is prepended to the child `PYTHONPATH`. The parent
     process environment is never mutated; runtime mode flags are applied only to
     the child environment represented by this run.
+
+    Attributes:
+        command: Normalized command argument vector.
+        project_root: Root directory of the target Python project.
+        payload_root: Unpacked wheel payload used for the command.
+        mode: Compilation or runtime mode represented by this record.
+        returncode: Child process return code.
+        stdout: Captured child process standard output.
+        stderr: Captured child process standard error.
+        duration_seconds: Elapsed wall-clock duration in seconds.
     """
 
     command: tuple[str, ...]
@@ -61,7 +71,11 @@ class CommandRunEvidence:
 
     @property
     def succeeded(self) -> bool:
-        """Return whether the benchmark process exited successfully."""
+        """Return whether the benchmark process exited successfully.
+
+        Returns:
+            bool: Whether the child process exited successfully.
+        """
         return self.returncode == 0
 
 
@@ -73,6 +87,13 @@ class BenchmarkProgress:
     `sample_index` is `None` for warmups and equals `pair_index` for measured
     samples, so callbacks can present human-oriented sample progress without
     inferring it from runtime mode.
+
+    Attributes:
+        phase: Warmup or measured benchmark phase.
+        pair_index: One-based benchmark pair number.
+        sample_index: One-based sample number, or `None` for unnumbered phases.
+        mode: Compilation or runtime mode represented by this record.
+        duration_seconds: Elapsed wall-clock duration in seconds.
     """
 
     phase: BenchmarkPhase
@@ -89,6 +110,12 @@ class BenchmarkGateConfig:
     `command` is an argv tuple or `None` when the caller has no benchmark to
     run. Warmup pairs are excluded from medians, sample pairs are measured, and
     `minimum_speedup` is the required baseline-median / compiled-median ratio.
+
+    Attributes:
+        command: Normalized command argument vector.
+        warmups: Number of unmeasured baseline/compiled pairs.
+        samples: Number of measured baseline/compiled pairs.
+        minimum_speedup: Smallest acceptable compiled-to-baseline speedup ratio.
     """
 
     command: tuple[str, ...] | None
@@ -97,7 +124,12 @@ class BenchmarkGateConfig:
     minimum_speedup: float
 
     def __post_init__(self) -> None:
-        """Reject invalid benchmark policy before launching subprocesses."""
+        """Reject invalid benchmark policy before launching subprocesses.
+
+        Raises:
+            ValueError: If the command is empty, counts are invalid, or the speedup threshold is
+                not positive.
+        """
         if self.command is not None and (
             not self.command or any(not part.strip() for part in self.command)
         ):
@@ -119,6 +151,16 @@ class BenchmarkGateResult:
     but too small, `invalid` when execution failed or timings are too noisy, and
     `unbenchmarked` when no command was configured. Medians and speedup are
     omitted when no reliable measured sample set exists.
+
+    Attributes:
+        status: Passed, not-profitable, invalid, or unbenchmarked gate status.
+        reason: Concrete measurement or execution evidence supporting the status.
+        minimum_speedup: Smallest acceptable compiled-to-baseline speedup ratio.
+        baseline_median_seconds: Median elapsed time for baseline samples, when measured.
+        compiled_median_seconds: Median elapsed time for compiled samples, when measured.
+        speedup: Baseline-to-compiled median ratio, when measured.
+        warmups: Unmeasured benchmark warmup command evidence.
+        samples: Measured benchmark command evidence.
     """
 
     status: BenchmarkStatus
@@ -132,7 +174,11 @@ class BenchmarkGateResult:
 
     @property
     def succeeded(self) -> bool:
-        """Return whether the benchmark gate accepted the compiled payload."""
+        """Return whether the benchmark gate accepted the compiled payload.
+
+        Returns:
+            bool: Whether the benchmark gate status is exactly `passed`.
+        """
         return self.status == "passed"
 
 
@@ -162,8 +208,16 @@ def run_performance_command(
     to `PYTHONPATH`. Baseline mode sets `ATOLL_DISABLE=1`; compiled mode sets
     `ATOLL_REQUIRE_COMPILED=1` and clears any inherited disable flag so the
     compiled routing path is exercised.
-    """
 
+    Args:
+        command: Command to validate, execute, or benchmark.
+        project_root: Root directory of the target Python project.
+        payload_root: Wheel payload root placed first on the child process import path.
+        mode: Runtime mode selecting interpreted or compiled import behavior.
+
+    Returns:
+        CommandRunEvidence: Captured process output, status, mode, and elapsed duration.
+    """
     resolved_project_root = project_root.resolve()
     resolved_payload_root = payload_root.resolve()
     child_env = _runtime_environment(payload_root=resolved_payload_root, mode=mode)
@@ -207,8 +261,17 @@ def run_benchmark_gate(
     sample durations contribute to medians. Any non-zero subprocess exit makes
     the gate invalid. Very short medians are rejected as noisy because Atoll
     cannot make a credible performance decision from sub-quarter-second samples.
-    """
 
+    Args:
+        config: Resolved configuration governing the requested operation.
+        project_root: Root directory of the target Python project.
+        baseline_payload_root: Unpacked baseline wheel payload used for interpreted measurements.
+        compiled_payload_root: Unpacked compiled wheel payload used for native measurements.
+        progress: Optional callback notified after each benchmark phase.
+
+    Returns:
+        BenchmarkGateResult: Paired baseline and compiled samples plus the derived speedup decision.
+    """
     if config.command is None:
         return BenchmarkGateResult(
             status="unbenchmarked",

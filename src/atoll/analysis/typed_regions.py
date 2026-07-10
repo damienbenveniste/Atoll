@@ -41,7 +41,17 @@ _GETATTR_REQUIRED_ARGS = 2
 
 @dataclass(frozen=True, slots=True)
 class _RegionBuildContext:
-    """Immutable module evidence shared while materializing components."""
+    """Immutable module evidence shared while materializing components.
+
+    Attributes:
+        module: Module identity or syntax module associated with the state.
+        eligible: Members accepted for this region or backend.
+        edges: Dependency edges available to region construction.
+        source_lines: Original source lines used for precise extraction.
+        tree: Parsed syntax tree represented by the state.
+        downgraded_classes: Classes excluded from stronger atomic lowering.
+        forbidden_type_paths: Runtime types that cannot satisfy specialization guards.
+    """
 
     module: ModuleScan
     eligible: dict[SymbolId, SymbolRecord]
@@ -54,7 +64,16 @@ class _RegionBuildContext:
 
 @dataclass(frozen=True, slots=True)
 class _SpecializationEvidence:
-    """Normalized content used to create and hash specialization records."""
+    """Normalized content used to create and hash specialization records.
+
+    Attributes:
+        symbol: Stable source symbol identity.
+        origin: Evidence source for a specialization or generated name.
+        target_owner_class: Concrete runtime class receiving a specialized binding.
+        substitutions: Concrete generic type substitutions.
+        guards: Runtime checks required before selecting the specialization.
+        bindings: Runtime source bindings promised by the compiled variant.
+    """
 
     symbol: SymbolRecord
     origin: SpecializationOrigin
@@ -66,7 +85,16 @@ class _SpecializationEvidence:
 
 @dataclass(frozen=True, slots=True)
 class _MemberSpecializationInputs:
-    """All proof inputs required to specialize one source member."""
+    """All proof inputs required to specialize one source member.
+
+    Attributes:
+        symbol: Stable source symbol identity.
+        scope_type_parameter_records: Structured type parameters inherited from enclosing scopes.
+        substitutions: Concrete generic type substitutions.
+        origin: Evidence source for a specialization or generated name.
+        target_owner_class: Concrete runtime class receiving a specialized binding.
+        forbidden_type_paths: Runtime types that cannot satisfy specialization guards.
+    """
 
     symbol: SymbolRecord
     scope_type_parameter_records: tuple[TypeParameterRecord, ...]
@@ -78,7 +106,15 @@ class _MemberSpecializationInputs:
 
 @dataclass(frozen=True, slots=True)
 class _SubclassSpecializationInputs:
-    """Shared lookup tables for direct concrete subclass analysis."""
+    """Shared lookup tables for direct concrete subclass analysis.
+
+    Attributes:
+        context: Prepared state shared by the operation.
+        scopes: Nested type-parameter scopes visible at this location.
+        by_class: Declarations grouped by owning class name.
+        methods_by_owner: Method declarations grouped by owner class.
+        symbol_ids: Stable IDs of symbols included in the state.
+    """
 
     context: _RegionBuildContext
     scopes: dict[SymbolId, tuple[TypeParameterRecord, ...]]
@@ -89,7 +125,13 @@ class _SubclassSpecializationInputs:
 
 @dataclass(frozen=True, slots=True)
 class _ConcreteBaseTarget:
-    """One resolved generic ancestor plus method names shadowed below it."""
+    """One resolved generic ancestor plus method names shadowed below it.
+
+    Attributes:
+        base: Base-class expression being specialized.
+        substitutions: Concrete generic type substitutions.
+        shadowed_method_names: Base methods replaced by a subclass declaration.
+    """
 
     base: SymbolRecord
     substitutions: tuple[tuple[str, str], ...]
@@ -106,6 +148,13 @@ def build_typed_regions(
     are excluded. A class is included atomically only when every directly
     declared method is eligible; otherwise its eligible methods remain
     independent callable members on the original source class.
+
+    Args:
+        module: Module scan or module identity being analyzed.
+        edges: Dependency edges available when constructing typed regions.
+
+    Returns:
+        tuple[TypedRegion, ...]: Deterministically ordered backend-neutral typed regions.
     """
     source = module.module.path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(module.module.path), type_comments=True)
@@ -226,7 +275,13 @@ def _connect_interpreted_owner_methods(
     eligible: dict[SymbolId, SymbolRecord],
     adjacency: dict[SymbolId, set[SymbolId]],
 ) -> None:
-    """Keep one owner-level method region after whole-class replacement is rejected."""
+    """Keep one owner-level method region after whole-class replacement is rejected.
+
+    Args:
+        methods: Method declarations considered for class-region safety.
+        eligible: Members accepted by backend and specialization checks.
+        adjacency: Dependency adjacency keyed by stable symbol identity.
+    """
     method_ids = tuple(method.id for method in methods if method.id in eligible)
     if not method_ids:
         return
@@ -244,6 +299,13 @@ def _atomic_class_unsafe_reason(class_symbol: SymbolRecord, tree: ast.Module) ->
     or replace the class, duplicate module bindings obscure the public identity,
     and any later module-level reference may create an instance, subclass, default,
     annotation, or registry entry before the staged shim runs.
+
+    Args:
+        class_symbol: Scanned class declaration that owns the candidate methods.
+        tree: Parsed syntax tree being traversed or rewritten.
+
+    Returns:
+        str | None: Concrete rejection reason, or `None` when atomic lowering is safe.
     """
     declaration_issue = _atomic_class_declaration_issue(class_symbol, tree)
     if declaration_issue is not None:
@@ -290,7 +352,14 @@ def _atomic_class_identity_issue(
 
 
 def _atomic_class_definition_issue(node: ast.ClassDef) -> str | None:
-    """Return a reason when evaluating a copied class could change behavior."""
+    """Return a reason when evaluating a copied class could change behavior.
+
+    Args:
+        node: Syntax node being visited without executing target code.
+
+    Returns:
+        str | None: Unsupported class-definition reason, or `None` when safe.
+    """
     if node.bases or node.keywords:
         return "source inheritance is outside the closed atomic-class subset"
     for statement in node.body:
@@ -801,7 +870,17 @@ def _region_specializations(
     symbols: tuple[SymbolRecord, ...],
     scopes: dict[SymbolId, tuple[TypeParameterRecord, ...]],
 ) -> tuple[RegionSpecialization, ...]:
-    """Find concrete same-module specializations without mutating source facts."""
+    """Find concrete same-module specializations without mutating source facts.
+
+    Args:
+        context: Prepared state shared by this operation.
+        symbols: Source symbols processed in deterministic order.
+        scopes: Nested type-parameter scopes visible at this location.
+
+    Returns:
+        tuple[RegionSpecialization, ...]: Deterministically ordered guarded specializations for
+            the region.
+    """
     symbol_ids = {symbol.id for symbol in symbols}
     by_class = {
         symbol.id.qualname: symbol for symbol in context.module.symbols if symbol.kind == "class"
@@ -979,7 +1058,15 @@ def _concrete_base_targets(
 
 
 def _generic_base_is_safe(base: SymbolRecord, context: _RegionBuildContext) -> bool:
-    """Allow a legacy generic base blocked only by its own TypeVar assignment."""
+    """Allow a legacy generic base blocked only by its own TypeVar assignment.
+
+    Args:
+        base: Base-class expression being resolved.
+        context: Prepared state shared by this operation.
+
+    Returns:
+        bool: Whether the generic base can be retained without unsafe erasure.
+    """
     if _class_supports_member_binding(base, context):
         return True
     hard_blockers = tuple(blocker for blocker in base.blockers if blocker.severity == "hard")
@@ -1100,7 +1187,15 @@ def _class_supports_member_binding(
     class_symbol: SymbolRecord,
     context: _RegionBuildContext,
 ) -> bool:
-    """Keep method evidence when only whole-class replacement was downgraded."""
+    """Keep method evidence when only whole-class replacement was downgraded.
+
+    Args:
+        class_symbol: Scanned class declaration that owns the candidate methods.
+        context: Prepared state shared by this operation.
+
+    Returns:
+        bool: Whether runtime binding can preserve the selected class member.
+    """
     if class_symbol.id in context.eligible:
         return True
     decision = context.downgraded_classes.get(class_symbol.id.qualname)
@@ -1119,7 +1214,13 @@ def _class_supports_member_binding(
 
 @dataclass(frozen=True, slots=True)
 class _CallSite:
-    """A direct same-module function call plus concrete enclosing annotations."""
+    """A direct same-module function call plus concrete enclosing annotations.
+
+    Attributes:
+        node: Syntax node represented by the state.
+        enclosing_annotations: Annotations inherited from enclosing declarations.
+        receiver_kind: Binding shape of the method receiver.
+    """
 
     node: ast.Call
     enclosing_annotations: dict[str, str]
@@ -1668,7 +1769,14 @@ def _union_items(expression: ast.expr) -> tuple[ast.expr, ...] | None:
 
 
 def _annotation_expression(annotation: str) -> ast.expr | None:
-    """Parse one annotation and unwrap forward-reference string literals."""
+    """Parse one annotation and unwrap forward-reference string literals.
+
+    Args:
+        annotation: Source annotation expression being inspected or rewritten.
+
+    Returns:
+        ast.expr | None: Parsed annotation expression, or `None` when syntax is invalid.
+    """
     try:
         expression = ast.parse(annotation, mode="eval").body
     except SyntaxError:
@@ -1701,7 +1809,14 @@ def _type_path_is_forbidden(path: str, forbidden_type_paths: frozenset[str]) -> 
 
 
 def _semantic_any_paths(module: ModuleScan) -> frozenset[str]:
-    """Return direct and aliased typing.Any paths visible in one source module."""
+    """Return direct and aliased typing.Any paths visible in one source module.
+
+    Args:
+        module: Scanned module or syntax module being processed.
+
+    Returns:
+        frozenset[str]: Stable paths through which `Any` enters the annotation.
+    """
     paths = set(_DEFAULT_ANY_PATHS)
     for record in module.imports:
         try:

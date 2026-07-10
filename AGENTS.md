@@ -50,6 +50,10 @@ These rules apply to every code, documentation, and configuration change in this
 ## Documentation Rules
 
 - Update `README.md`, docs, examples, and tests when public behavior changes.
+- Use Google-style docstrings throughout Python source. Public and cross-module
+  APIs must use `Args`, `Returns`, `Yields`, `Raises`, and `Attributes` sections
+  whenever those sections apply; document each parameter, yielded or returned
+  value, raised exception, and structured field by name.
 - Treat docstrings as part of the public contract for the package. When adding or
   changing behavior, document the operational promise the code makes, the
   boundaries it relies on, and the failure modes a caller or maintainer must

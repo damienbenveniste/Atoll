@@ -42,6 +42,19 @@ class NativeReadiness:
     where ordering is not already determined by source order. ``score`` is a
     bounded 0-100 heuristic: hard blockers reduce it, while eligibility requires
     no blockers and a repeated/native work signal.
+
+    Attributes:
+        source_module: Importable source module name.
+        symbol: Exported source symbol represented by the generated sidecar.
+        eligible: Whether generated code passes the native-readiness gate.
+        score: Scan-only extraction-safety or native-readiness score.
+        function_count: Number of generated functions inspected.
+        any_typed_functions: Generated functions whose annotations contain `Any`.
+        boxed_typed_functions: Generated functions whose useful values remain boxed Python objects.
+        dynamic_dependencies: Generated dependencies requiring dynamic runtime lookup.
+        loop_count: Number of loops found in generated functions.
+        native_operation_count: Count of operations likely to benefit from native lowering.
+        reasons: Deterministically ordered evidence supporting the decision.
     """
 
     source_module: str
@@ -59,7 +72,18 @@ class NativeReadiness:
 
 @dataclass(frozen=True, slots=True)
 class _ReasonFacts:
-    """Internal rejection facts used to build stable, concise reason strings."""
+    """Internal rejection facts used to build stable, concise reason strings.
+
+    Attributes:
+        exported_symbol: Public source symbol represented by generated code.
+        function_names: Generated function names in source order.
+        missing_annotations: Generated functions with incomplete annotations.
+        any_typed: Generated functions whose annotations contain `Any`.
+        boxed_typed: Generated functions whose useful values remain boxed.
+        dynamic_dependencies: Generated dependencies requiring runtime lookup.
+        loop_count: Number of loops found in generated source.
+        native_operation_count: Operations likely to benefit from native lowering.
+    """
 
     exported_symbol: str
     function_names: tuple[str, ...]
@@ -83,6 +107,14 @@ def analyze_native_readiness(
     ``Any`` annotations, non-builtin boxed annotations, dynamic ``getattr``
     aliases used at runtime, and trivial bodies without repeated/native work are
     reported as concise rejection reasons.
+
+    Args:
+        source_module: Importable source module name.
+        exported_symbol: Public source symbol represented by the generated code.
+        generated_source: Generated Python source evaluated for native readiness.
+
+    Returns:
+        NativeReadiness: Scored native-readiness evidence for the generated symbol.
     """
     module = ast.parse(generated_source)
     functions = tuple(
@@ -304,23 +336,43 @@ class _RuntimeNameCollector(ast.NodeVisitor):
         self.names: set[str] = set()
 
     def visit_function_body(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        """Visit executable statements for one generated function."""
+        """Visit executable statements for one generated function.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         for statement in node.body:
             self.visit(statement)
 
     def visit_Name(self, node: ast.Name) -> None:
-        """Record loaded names that may bind to top-level dynamic aliases."""
+        """Record loaded names that may bind to top-level dynamic aliases.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         if isinstance(node.ctx, ast.Load):
             self.names.add(node.id)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """Skip nested function scopes when collecting parent dependencies."""
+        """Skip nested function scopes when collecting parent dependencies.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Skip nested async function scopes when collecting parent dependencies."""
+        """Skip nested async function scopes when collecting parent dependencies.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        """Skip nested class scopes when collecting parent dependencies."""
+        """Skip nested class scopes when collecting parent dependencies.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
 
 
 class _WorkCounter(ast.NodeVisitor):
@@ -331,64 +383,120 @@ class _WorkCounter(ast.NodeVisitor):
         self.native_operation_count = 0
 
     def visit_function_body(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        """Visit executable statements for one generated function."""
+        """Visit executable statements for one generated function.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         for statement in node.body:
             self.visit(statement)
 
     def visit_For(self, node: ast.For) -> None:
-        """Count explicit loops as repeated work."""
+        """Count explicit loops as repeated work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.loop_count += 1
         self.generic_visit(node)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-        """Count async loops as repeated work."""
+        """Count async loops as repeated work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.loop_count += 1
         self.generic_visit(node)
 
     def visit_While(self, node: ast.While) -> None:
-        """Count while loops as repeated work."""
+        """Count while loops as repeated work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.loop_count += 1
         self.generic_visit(node)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
-        """Count comprehensions as repeated work."""
+        """Count comprehensions as repeated work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self._visit_comprehension(node)
 
     def visit_SetComp(self, node: ast.SetComp) -> None:
-        """Count comprehensions as repeated work."""
+        """Count comprehensions as repeated work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self._visit_comprehension(node)
 
     def visit_DictComp(self, node: ast.DictComp) -> None:
-        """Count comprehensions as repeated work."""
+        """Count comprehensions as repeated work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self._visit_comprehension(node)
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-        """Count generator expressions as repeated work."""
+        """Count generator expressions as repeated work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self._visit_comprehension(node)
 
     def visit_BinOp(self, node: ast.BinOp) -> None:
-        """Count arithmetic operations as native work signal."""
+        """Count arithmetic operations as native work signal.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.native_operation_count += 1
         self.generic_visit(node)
 
     def visit_Compare(self, node: ast.Compare) -> None:
-        """Count each comparison operator as native work signal."""
+        """Count each comparison operator as native work signal.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.native_operation_count += len(node.ops)
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
-        """Count indexed access as native work signal."""
+        """Count indexed access as native work signal.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.native_operation_count += 1
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """Skip nested function scopes when counting parent work."""
+        """Skip nested function scopes when counting parent work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Skip nested async function scopes when counting parent work."""
+        """Skip nested async function scopes when counting parent work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        """Skip nested class scopes when counting parent work."""
+        """Skip nested class scopes when counting parent work.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
 
     def _visit_comprehension(
         self,

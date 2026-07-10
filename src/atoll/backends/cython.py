@@ -74,13 +74,35 @@ class _CythonizeFunction(Protocol):
         quiet: bool,
         build_dir: str,
     ) -> list[Extension]:
-        """Return setuptools extension modules generated from Cython inputs."""
+        """Return setuptools extension modules generated from Cython inputs.
+
+        Args:
+            module_list: Mutable output list receiving discovered modules.
+            compiler_directives: Cython compiler directives applied to the build.
+            quiet: Whether progress output should be suppressed.
+            build_dir: Directory containing disposable native build inputs.
+
+        Returns:
+            list[Extension]: Filtered compiler output with duplicate path noise removed.
+        """
         ...
 
 
 @dataclass(slots=True)
 class _FailureState:
-    """Mutable build state needed to normalize an interrupted compiler attempt."""
+    """Mutable build state needed to normalize an interrupted compiler attempt.
+
+    Attributes:
+        backend: Compiler backend selected for this state.
+        build_dir: Directory containing disposable native build inputs.
+        command: Normalized command argument vector.
+        stdout: Captured child process standard output.
+        stderr: Captured child process standard error.
+        native_stderr: Native compiler standard error retained for reporting.
+        phase_timings: Measured compiler subphase timings.
+        active_phase: Compiler phase currently contributing captured output.
+        started: Monotonic start time used for elapsed-duration reporting.
+    """
 
     backend: CythonBackend
     build_dir: Path
@@ -104,11 +126,22 @@ class CythonBackend:
 
     @property
     def name(self) -> Backend:
-        """Return the stable backend name used by reports and cache keys."""
+        """Return the stable backend name used by reports and cache keys.
+
+        Returns:
+            Backend: The `cython` backend identifier.
+        """
         return "cython"
 
     def assess(self, region: TypedRegion) -> BackendAssessment:
-        """Assess typed functions, methods, async generators, and closed classes."""
+        """Assess typed functions, methods, async generators, and closed classes.
+
+        Args:
+            region: Backend-neutral typed region being assessed or generated.
+
+        Returns:
+            BackendAssessment: Cython capability assessment for each region member.
+        """
         decisions = {decision.target: decision for decision in region.decisions}
         supported: list[SymbolId] = []
         unsupported: list[SymbolId] = []
@@ -141,7 +174,18 @@ class CythonBackend:
         )
 
     def lower(self, request: BackendLoweringRequest) -> CompilationUnit:
-        """Validate a supported member subset and record the prepared source file."""
+        """Validate a supported member subset and record the prepared source file.
+
+        Args:
+            request: Prepared source and member selection offered to the backend.
+
+        Returns:
+            CompilationUnit: Cython compilation unit for the selected region members.
+
+        Raises:
+            UnsupportedBackendRegionError: If selected members violate the backend assessment
+                contract.
+        """
         assessment = self.assess(request.region)
         selected = request.members or assessment.supported_members
         unsupported = set(selected) - set(assessment.supported_members)
@@ -175,7 +219,15 @@ class CythonBackend:
         units: tuple[CompilationUnit, ...],
         context: BackendCompileContext,
     ) -> BackendCompileResult:
-        """Compile pure-Python units and attach install-facing artifact records."""
+        """Compile pure-Python units and attach install-facing artifact records.
+
+        Args:
+            units: Backend compilation units submitted as one build request.
+            context: Filesystem, cache, and artifact-recording boundaries for compilation.
+
+        Returns:
+            BackendCompileResult: Cython build evidence and validated artifact records.
+        """
         _validate_units(units, expected_backend="cython")
         attempt = _build_units(units, context=context, backend=self)
         artifact_dir = context.build_dir.parent / "artifacts"
@@ -191,7 +243,15 @@ class CythonBackend:
         unit: CompilationUnit,
         context: BackendCompileContext,
     ) -> str:
-        """Hash unit content together with Cython, ABI, platform, and options."""
+        """Hash unit content together with Cython, ABI, platform, and options.
+
+        Args:
+            unit: Content-addressable backend compilation unit.
+            context: Filesystem, cache, and artifact-recording boundaries for compilation.
+
+        Returns:
+            str: Stable Cython cache fingerprint for the unit and context.
+        """
         _validate_units((unit,), expected_backend="cython")
         payload = {
             "adapter_version": _CYTHON_ADAPTER_VERSION,
@@ -226,7 +286,16 @@ class CythonBackend:
         diagnostics: str,
         log_path: Path | None,
     ) -> BackendDiagnostic:
-        """Normalize Cython, import-path, native toolchain, and unknown failures."""
+        """Normalize Cython, import-path, native toolchain, and unknown failures.
+
+        Args:
+            error: Backend exception that caused compilation to fail.
+            diagnostics: Captured backend diagnostic text to normalize.
+            log_path: Optional path to the complete backend build log.
+
+        Returns:
+            BackendDiagnostic: Normalized Cython or build-environment diagnostic.
+        """
         message = repr(error)
         lowered = f"{message}\n{diagnostics}".lower()
         code = _diagnostic_code(lowered)
@@ -492,7 +561,12 @@ def _project_path(path: Path, project_root: Path) -> str:
 
 
 def _prepare_build_temp_source_dir(build_temp: Path, source_dir: str) -> None:
-    """Create the object-file parent mirrored by setuptools for generated C sources."""
+    """Create the object-file parent mirrored by setuptools for generated C sources.
+
+    Args:
+        build_temp: Temporary build directory whose output should be filtered.
+        source_dir: Directory copied into source-clean staging.
+    """
     source_path = Path(source_dir)
     relative_parts = source_path.parts[1:] if source_path.anchor else source_path.parts
     build_temp.joinpath(*relative_parts).mkdir(parents=True, exist_ok=True)
@@ -513,7 +587,11 @@ class _NativeStderrCapture:
         self._captured = ""
 
     def __enter__(self) -> _NativeStderrCapture:
-        """Redirect native stderr to a temporary file for the build duration."""
+        """Redirect native stderr to a temporary file for the build duration.
+
+        Returns:
+            _NativeStderrCapture: Active context manager instance.
+        """
         sys.stderr.flush()
         self._file = tempfile.TemporaryFile(mode="w+b")
         self._saved_fd = os.dup(2)
@@ -526,7 +604,13 @@ class _NativeStderrCapture:
         exc: object,
         traceback: object,
     ) -> None:
-        """Restore native stderr and load captured bytes as replacement text."""
+        """Restore native stderr and load captured bytes as replacement text.
+
+        Args:
+            exc_type: Active exception type, when context exit follows a failure.
+            exc: Active exception instance, when context exit follows a failure.
+            traceback: Active traceback, when context exit follows a failure.
+        """
         _ = (exc_type, exc, traceback)
         sys.stderr.flush()
         if self._saved_fd is not None:
@@ -541,7 +625,11 @@ class _NativeStderrCapture:
             self._file = None
 
     def output(self) -> str:
-        """Return captured native stderr after the context has exited."""
+        """Return captured native stderr after the context has exited.
+
+        Returns:
+            str: Captured and normalized compiler output.
+        """
         return self._captured
 
 

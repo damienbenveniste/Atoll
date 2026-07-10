@@ -28,6 +28,18 @@ def run_pytest_command(
 
     The parent process receives only the normalized command and exit code; pytest
     output remains attached to the child process streams.
+
+    Args:
+        command: Command to validate, execute, or benchmark.
+        root: Root directory of the target Python project.
+        source_roots: Import roots made visible to analysis or child processes.
+        require_compiled: Whether interpreted fallback must be treated as verification failure.
+
+    Returns:
+        PytestRunResult: Normalized pytest command and child process exit status.
+
+    Raises:
+        ValueError: If `command` is not a supported pytest invocation.
     """
     command_parts = parse_pytest_command(command)
     context = get_context("spawn")
@@ -55,6 +67,15 @@ def parse_pytest_command(command: str) -> tuple[str, ...]:
 
     Only `pytest ...` and `python -m pytest ...` forms are accepted so trial mode
     does not execute arbitrary shell commands.
+
+    Args:
+        command: Command to validate, execute, or benchmark.
+
+    Returns:
+        tuple[str, ...]: Validated pytest argument vector suitable for subprocess execution.
+
+    Raises:
+        ValueError: If shell parsing fails or the command is not `pytest` or `python -m pytest`.
     """
     command_parts = tuple(shlex.split(command))
     _pytest_args(command_parts)

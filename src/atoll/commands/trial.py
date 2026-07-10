@@ -36,7 +36,18 @@ from atoll.runtime.test_runner import run_pytest_command
 
 @dataclass(frozen=True, slots=True)
 class TrialOptions:
-    """User-facing options for selecting and validating compiled regions."""
+    """User-facing options for selecting and validating compiled regions.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        candidate: Explicit candidate selector supplied by the user.
+        top: Maximum number of highest-scoring candidates to select.
+        test_command: Optional target-project semantic test command.
+        benchmark_command: Optional command used for paired performance measurements.
+        keep_temp: Whether trial artifacts remain after completion.
+        require_compiled: Whether interpreted fallback fails verification.
+        progress: Optional progress callback used by long-running packaging work.
+    """
 
     root: Path
     candidate: str | None = None
@@ -55,6 +66,20 @@ class TrialCommandResult:
     ``artifact_root`` contains the temporary wheel and install payload only when
     ``keep_temp`` is enabled. ``overlay_root`` and ``enabled`` remain read-only
     compatibility views for callers written against the legacy overlay trial.
+
+    Attributes:
+        success: Whether the represented operation completed successfully.
+        artifact_root: Retained trial directory containing generated artifacts and reports.
+        selected: Stable symbol identities selected for the trial.
+        compiled_bindings: Source bindings successfully provided by compiled regions.
+        wheel_path: Source-clean wheel path, when produced.
+        test_exit_code: Compatibility semantic-test exit code, when run.
+        benchmark_exit_code: Compatibility benchmark process exit code, when run.
+        error: User-facing failure text, or `None` on success.
+        selections: Module and symbol selections made by the trial.
+        package_result: Underlying source-clean package result, when compilation was attempted.
+        test_result: Compatibility semantic-test result, when run.
+        benchmark_result: Compatibility benchmark process result, when run.
     """
 
     success: bool
@@ -72,12 +97,21 @@ class TrialCommandResult:
 
     @property
     def overlay_root(self) -> Path:
-        """Return the temporary artifact root under the legacy property name."""
+        """Return the temporary artifact root under the legacy property name.
+
+        Returns:
+            Path: Compatibility alias for the trial artifact root.
+        """
         return self.artifact_root
 
     @property
     def enabled(self) -> tuple[EnabledIslandConfig, ...]:
-        """Return an empty legacy sidecar view; trial no longer enables islands."""
+        """Return an empty legacy sidecar view; trial no longer enables islands.
+
+        Returns:
+            tuple[EnabledIslandConfig, ...]: Always empty; source-clean trials no longer enable
+                persistent islands.
+        """
         return ()
 
 
@@ -87,6 +121,13 @@ def execute_trial(options: TrialOptions) -> TrialCommandResult:
     All compilation and routing verification is delegated to
     :func:`atoll.commands.package.execute_package`. Errors are normalized into a
     result so the CLI can report the temporary artifact location when retained.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        TrialCommandResult: Compilation, test, benchmark, and retained-artifact evidence for the
+            trial.
     """
     try:
         project = discover_project(options.root)
@@ -180,7 +221,12 @@ def execute_trial(options: TrialOptions) -> TrialCommandResult:
 
 @dataclass(frozen=True, slots=True)
 class TrialSelection:
-    """One scan candidate retained as a typed-region trial selection."""
+    """One scan candidate retained as a typed-region trial selection.
+
+    Attributes:
+        module: Discovered module containing the selected candidate symbols.
+        symbols: Qualified symbol names selected from that module.
+    """
 
     module: ModuleId
     symbols: tuple[str, ...]
@@ -211,7 +257,14 @@ def _select_islands(
 
 
 def _selected_member_ids(selections: tuple[TrialSelection, ...]) -> tuple[SymbolId, ...]:
-    """Return stable, de-duplicated member identities in candidate order."""
+    """Return stable, de-duplicated member identities in candidate order.
+
+    Args:
+        selections: Selected regions and backend assessments.
+
+    Returns:
+        tuple[SymbolId, ...]: Stable IDs selected across all trial candidates.
+    """
     members = (
         SymbolId(module=selection.module.name, qualname=symbol)
         for selection in selections
@@ -276,7 +329,15 @@ def _parse_candidate(value: str) -> tuple[str, tuple[str, ...]]:
 
 
 def _validate_explicit_symbols(module: ModuleId, symbols: tuple[str, ...]) -> None:
-    """Keep the legacy candidate contract limited to top-level functions."""
+    """Keep the legacy candidate contract limited to top-level functions.
+
+    Args:
+        module: Scanned module or syntax module being processed.
+        symbols: Source symbols processed in deterministic order.
+
+    Raises:
+        ValueError: If a requested symbol is not a top-level function in the selected module.
+    """
     scan = _scan_candidate_module(module)
     functions = frozenset(
         symbol.id.qualname

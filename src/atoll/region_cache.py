@@ -51,6 +51,15 @@ def compile_with_region_cache(
     Corrupt, stale, or unreadable entries are ordinary misses. Cache writes are
     atomic at the entry-directory level and never replace the backend result if
     storage itself fails.
+
+    Args:
+        backend: Compiler backend used to assess, lower, or compile the region.
+        unit: Content-addressable backend compilation unit.
+        context: Filesystem, cache, and artifact-recording boundaries for compilation.
+        cache_root: Root directory for content-addressed typed-region cache entries.
+
+    Returns:
+        BackendCompileResult: Cached or newly compiled result with an accurate cache status.
     """
     lookup_started = time.perf_counter()
     key = backend.fingerprint(unit, context)

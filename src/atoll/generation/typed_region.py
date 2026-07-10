@@ -38,6 +38,17 @@ class TypedRegionGeneration:
     The file is temporary build input. ``bindings`` is the public runtime
     promise consumed by the staged-wheel shim; generated source paths must not
     be copied into the final install payload.
+
+    Attributes:
+        region: Backend-neutral typed region represented by this record.
+        logical_module: Importable module name represented by the compilation unit.
+        source_path: Filesystem path of the source module or prepared source.
+        source_text: Exact source text retained for analysis or generation.
+        source_hash: Deterministic digest of generated or retained source.
+        selected_members: Region members emitted by generated source.
+        bindings: Source bindings promised by the compiled region or variant.
+        backend: Native compiler backend selected for this record.
+        specialization: Optional concrete specialization applied during generation.
     """
 
     region: TypedRegion
@@ -53,7 +64,12 @@ class TypedRegionGeneration:
 
 @dataclass(frozen=True, slots=True)
 class TypedRegionGenerationOptions:
-    """Backend and optional analysis-proven specialization for one generated unit."""
+    """Backend and optional analysis-proven specialization for one generated unit.
+
+    Attributes:
+        backend: Native compiler backend selected for this record.
+        specialization: Optional concrete specialization applied during generation.
+    """
 
     backend: Backend = "mypyc"
     specialization: RegionSpecialization | None = None
@@ -79,6 +95,16 @@ def generate_typed_method_region(
     selection must provide analysis-produced specialization evidence; this
     function never infers substitutions or erases unresolved types. Unsafe
     decorators and unresolved member identifiers fail before a file is written.
+
+    Args:
+        scan: Module scan containing source facts for typed-region generation.
+        region: Backend-neutral typed region being assessed or generated.
+        selected_members: Region members selected for this generated variant.
+        output_path: Path where generated source should be written.
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        TypedRegionGeneration: Generated source, bindings, hash, and specialization metadata.
     """
     members = _selected_region_members(
         region,
@@ -293,7 +319,15 @@ def _generated_sections(
 
 
 def _lowered_atomic_class(member: RegionMember, backend: Backend) -> str:
-    """Preserve one class declaration and add semantics-preserving backend flags."""
+    """Preserve one class declaration and add semantics-preserving backend flags.
+
+    Args:
+        member: Typed-region member being assessed or generated.
+        backend: Compiler backend selected for this operation.
+
+    Returns:
+        str: Generated atomic class source and promised bindings.
+    """
     node = _class_node(member)
     if backend == "mypyc":
         node.decorator_list.insert(
@@ -316,6 +350,16 @@ def _preserved_import(scan: ModuleScan, record: ImportRecord) -> str:
     Relative imports retain their import targets and aliases but are resolved to
     an absolute package name because temporary compilation units are not members
     of the target package.
+
+    Args:
+        scan: Module scan containing retained source facts.
+        record: Cached or report record being converted.
+
+    Returns:
+        str: Import source required to preserve generated annotations.
+
+    Raises:
+        ValueError: If a relative import ascends beyond the source package.
     """
     if record.level == 0:
         return record.source_text
@@ -345,7 +389,17 @@ def _owner_facade(
     source_owner: str | None = None,
     substitutions: tuple[tuple[str, str], ...] = (),
 ) -> str:
-    """Render a structural receiver facade, including safe inherited evidence."""
+    """Render a structural receiver facade, including safe inherited evidence.
+
+    Args:
+        scan: Module scan containing retained source facts.
+        owner: Owner class or symbol for the current operation.
+        source_owner: Source owner class declared for the method.
+        substitutions: Concrete generic type substitutions.
+
+    Returns:
+        str: Generated source facade for the selected owner class.
+    """
     owner_order = tuple(dict.fromkeys(item for item in (source_owner, owner) if item is not None))
     class_symbols = tuple(
         symbol
@@ -510,7 +564,15 @@ def _specialize_annotations(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     substitutions: tuple[tuple[str, str], ...],
 ) -> None:
-    """Apply complete TypeVar substitutions only inside annotation positions."""
+    """Apply complete TypeVar substitutions only inside annotation positions.
+
+    Args:
+        node: Syntax node being visited without executing target code.
+        substitutions: Concrete generic type substitutions.
+
+    Raises:
+        ValueError: If specialization is requested without any concrete substitutions.
+    """
     if not substitutions:
         raise ValueError("generic specialization requires at least one type substitution")
     parsed = _parsed_substitutions(substitutions)
@@ -574,7 +636,14 @@ class _TypeParameterAnnotationRewriter(ast.NodeTransformer):
         self.substitutions = substitutions
 
     def visit_Name(self, node: ast.Name) -> ast.expr:
-        """Return a fresh parsed replacement for a specialized TypeVar name."""
+        """Return a fresh parsed replacement for a specialized TypeVar name.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+
+        Returns:
+            ast.expr: Rewritten name expression or visitor-specific result.
+        """
         replacement = self.substitutions.get(node.id)
         if replacement is None:
             return node
@@ -591,7 +660,12 @@ def _rewrite_signature_owner_types(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     owner: str,
 ) -> None:
-    """Specialize method-scoped owner types for a top-level generated callable."""
+    """Specialize method-scoped owner types for a top-level generated callable.
+
+    Args:
+        node: Syntax node being visited without executing target code.
+        owner: Owner class or symbol for the current operation.
+    """
     rewriter = _OwnerAnnotationRewriter(owner)
     parameters = (
         *node.args.posonlyargs,
@@ -614,7 +688,17 @@ class _OwnerAnnotationRewriter(ast.NodeTransformer):
         self.owner = owner
 
     def rewrite(self, annotation: ast.expr) -> ast.expr:
-        """Return one type expression with owner references specialized."""
+        """Return one type expression with owner references specialized.
+
+        Args:
+            annotation: Source annotation expression being inspected or rewritten.
+
+        Returns:
+            ast.expr: Rewritten annotation or expression text.
+
+        Raises:
+            TypeError: If annotation rewriting produces a non-expression syntax node.
+        """
         expression = _unquoted_annotation(annotation)
         rewritten = self.visit(expression)
         if not isinstance(rewritten, ast.expr):
@@ -622,7 +706,14 @@ class _OwnerAnnotationRewriter(ast.NodeTransformer):
         return rewritten
 
     def visit_Name(self, node: ast.Name) -> ast.expr:
-        """Specialize direct owner and Self names without changing other types."""
+        """Specialize direct owner and Self names without changing other types.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+
+        Returns:
+            ast.expr: Rewritten name expression or visitor-specific result.
+        """
         if node.id in {self.owner, "Self"}:
             return ast.copy_location(
                 ast.Name(id=_facade_name(self.owner), ctx=ast.Load()),
@@ -631,7 +722,17 @@ class _OwnerAnnotationRewriter(ast.NodeTransformer):
         return node
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
-        """Specialize qualified typing.Self references."""
+        """Specialize qualified typing.Self references.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+
+        Returns:
+            ast.expr: Rewritten attribute expression or visitor-specific result.
+
+        Raises:
+            TypeError: If recursive attribute rewriting produces a non-expression syntax node.
+        """
         if node.attr == "Self":
             return ast.copy_location(
                 ast.Name(id=_facade_name(self.owner), ctx=ast.Load()),

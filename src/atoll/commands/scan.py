@@ -21,7 +21,16 @@ from atoll.report import ScanReport, build_scan_report, write_json_report, write
 
 @dataclass(frozen=True, slots=True)
 class ScanOptions:
-    """User-facing options controlling project discovery and report paths."""
+    """User-facing options controlling project discovery and report paths.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        source_roots: Optional source-root overrides resolved relative to the project root.
+        json_path: Path receiving the JSON scan report.
+        markdown_path: Path receiving the Markdown scan report.
+        max_files: Optional discovery limit for Python source files.
+        mypy_enabled: Whether the command runs mypy diagnostic mapping.
+    """
 
     root: Path
     source_roots: tuple[Path, ...] = ()
@@ -33,7 +42,15 @@ class ScanOptions:
 
 @dataclass(frozen=True, slots=True)
 class ScanCommandResult:
-    """Analysis result, report payload, written paths, and cache stats."""
+    """Analysis result, report payload, written paths, and cache stats.
+
+    Attributes:
+        result: Enriched project scan returned by the command.
+        report: Stable scan report emitted by the command.
+        json_path: Path receiving the JSON scan report.
+        markdown_path: Path receiving the Markdown scan report.
+        cache: Scan cache statistics or cleanup selection.
+    """
 
     result: ScanResult
     report: ScanReport
@@ -48,6 +65,12 @@ def execute_scan(options: ScanOptions) -> ScanCommandResult:
     `source_roots` and `max_files` constrain discovery. Mypy can be disabled for
     faster scans, but candidate readiness will then exclude type-checker
     diagnostics from blocker decisions.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        ScanCommandResult: Enriched scan state, stable reports, output paths, and cache statistics.
     """
     discovered = discover_project(
         options.root,

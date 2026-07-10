@@ -19,7 +19,13 @@ from atoll.project import discover_project
 
 @dataclass(frozen=True, slots=True)
 class GenerateOptions:
-    """User-facing options for sidecar generation or stale checks."""
+    """User-facing options for sidecar generation or stale checks.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        module_name: Importable module name used to restrict the command.
+        check: Whether generation should report drift without writing files.
+    """
 
     root: Path
     module_name: str | None = None
@@ -28,7 +34,12 @@ class GenerateOptions:
 
 @dataclass(frozen=True, slots=True)
 class GenerateCommandResult:
-    """Generated sidecars plus stale or missing paths found in check mode."""
+    """Generated sidecars plus stale or missing paths found in check mode.
+
+    Attributes:
+        generated: Sidecars generated for the selected islands.
+        stale_paths: Generated sidecar paths whose current content differs.
+    """
 
     generated: tuple[SidecarGeneration, ...]
     stale_paths: tuple[Path, ...]
@@ -40,6 +51,12 @@ def execute_generate(options: GenerateOptions) -> GenerateCommandResult:
     `module_name` narrows work to one configured source module. When `check` is
     false, generated source is written to disk and `stale_paths` is empty because
     the command has already reconciled the files.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        GenerateCommandResult: Generated sidecars and paths that differ from expected output.
     """
     project = discover_project(options.root)
     generations = tuple(

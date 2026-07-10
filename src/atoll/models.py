@@ -82,6 +82,14 @@ class CompileConfig:
     Commands remain argv tuples and are never interpreted by a shell. A
     benchmark requires a semantic test command because Atoll must prove both
     baseline and compiled behavior before measuring profitability.
+
+    Attributes:
+        backends: Native backends attempted in configured preference order.
+        test_command: Optional target-project semantic test command.
+        benchmark_command: Optional command used for paired performance measurements.
+        benchmark_warmups: Number of unmeasured warmup pairs run before sampling.
+        benchmark_samples: Number of measured baseline/compiled sample pairs.
+        minimum_speedup: Smallest acceptable compiled-to-baseline speedup ratio.
     """
 
     backends: tuple[Backend, ...] = ("mypyc", "cython")
@@ -92,7 +100,12 @@ class CompileConfig:
     minimum_speedup: float = 1.10
 
     def __post_init__(self) -> None:
-        """Reject incomplete or ambiguous compile policy at discovery time."""
+        """Reject incomplete or ambiguous compile policy at discovery time.
+
+        Raises:
+            ValueError: If backends are empty or duplicated, commands are malformed, benchmark
+                policy is incomplete, counts are invalid, or the speedup threshold is not positive.
+        """
         if not self.backends or len(set(self.backends)) != len(self.backends):
             raise ValueError("tool.atoll.compile.backends must be a non-empty unique list")
         if any(backend not in {"mypyc", "cython"} for backend in self.backends):
@@ -121,6 +134,15 @@ class ProjectConfig:
     discovery, while `cache_dir` and `report_dir` are Atoll-owned output
     locations under the project root unless configuration explicitly overrides
     them.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        source_roots: Absolute import roots discovered for the target project.
+        backend: Compatibility default backend used by legacy in-place workflows.
+        cache_dir: Directory containing reusable Atoll cache entries.
+        report_dir: Directory containing Atoll JSON and Markdown reports.
+        islands: Persisted managed islands used by legacy in-place workflows.
+        compile: Compile and quality-gate configuration for the project.
     """
 
     root: Path
@@ -140,6 +162,14 @@ class EnabledIslandConfig:
     symbols, and `symbols` names the exported top-level functions that should be
     rebound at runtime. Disabled islands remain in configuration for auditability
     but are skipped by generation, build, and verification commands.
+
+    Attributes:
+        source_module: Importable source module name.
+        source_path: Filesystem path of the source module or prepared source.
+        sidecar_module: Importable generated sidecar module name.
+        sidecar_path: Filesystem path of the generated sidecar.
+        symbols: Exported top-level symbols rebound through the managed sidecar.
+        enabled: Whether this island participates in generation, build, and verification.
     """
 
     source_module: str
@@ -156,6 +186,10 @@ class ModuleId:
 
     The `name` is the importable dotted module name relative to a configured
     source root. The `path` points at the source file scanned for AST facts.
+
+    Attributes:
+        name: Importable dotted module name relative to its source root.
+        path: Absolute path to the Python source file.
     """
 
     name: str
@@ -170,6 +204,10 @@ class SymbolId:
     `Class.method` names because Atoll V1 does not extract nested symbols. The
     `stable_id` property is the report-facing identifier used across JSON and
     Markdown output.
+
+    Attributes:
+        module: Importable dotted module containing the symbol.
+        qualname: Module-local qualified symbol name.
     """
 
     module: str
@@ -177,7 +215,11 @@ class SymbolId:
 
     @property
     def stable_id(self) -> str:
-        """Return the stable report-facing `module::qualname` identifier text used in reports."""
+        """Return the stable report-facing `module::qualname` identifier text used in reports.
+
+        Returns:
+            str: Stable `module::qualname` identifier used in reports and cache records.
+        """
         return f"{self.module}::{self.qualname}"
 
 
@@ -188,6 +230,13 @@ class Blocker:
     Hard blockers prevent candidate extraction, while soft and info blockers
     explain risk that may still be useful in reports. `symbol` is absent only for
     module-level conditions that cannot be tied to a specific symbol.
+
+    Attributes:
+        severity: Diagnostic severity used for filtering and reporting.
+        code: Stable machine-readable diagnostic or blocker code.
+        message: Human-readable diagnostic or blocker explanation.
+        lineno: One-based first source line covered by the record.
+        symbol: Stable symbol identifier associated with this record.
     """
 
     severity: BlockerSeverity
@@ -204,6 +253,15 @@ class MypyDiagnostic:
     Paths are resolved before storage so diagnostics can be grouped without
     depending on the current working directory. A mapped error also becomes a
     hard blocker on the owning symbol during type-readiness enrichment.
+
+    Attributes:
+        path: Absolute path to the source file reported by mypy.
+        line: One-based diagnostic line.
+        column: One-based diagnostic column, when mypy reports one.
+        severity: Diagnostic severity used for filtering and reporting.
+        code: Optional mypy error code, excluding brackets.
+        message: Diagnostic message with location and code removed.
+        symbol: Scanned symbol owning the diagnostic, when range mapping succeeds.
     """
 
     path: Path
@@ -222,6 +280,14 @@ class ImportRecord:
     `source_text` preserves the original statement for generated sidecars, while
     `imported_names` records the names made available in the module namespace for
     dependency analysis.
+
+    Attributes:
+        source_text: Exact source text retained for analysis or generation.
+        imported_names: Names introduced into the module namespace by the import.
+        module: Imported module path, or `None` for imports without one.
+        level: Relative import level; zero denotes an absolute import.
+        lineno: One-based first source line covered by the record.
+        end_lineno: One-based final source line covered by the record.
     """
 
     source_text: str
@@ -239,6 +305,13 @@ class ConstantRecord:
     Literal constants can be copied into sidecars. Dynamic or unknown constants
     remain visible to analysis so users can see why a global dependency blocked
     or raised the risk of extraction.
+
+    Attributes:
+        name: Top-level assignment name.
+        kind: Literal, runtime-dynamic, or unknown safety classification.
+        source_text: Exact source text retained for analysis or generation.
+        lineno: One-based first source line covered by the record.
+        end_lineno: One-based final source line covered by the record.
     """
 
     name: str
@@ -255,6 +328,12 @@ class ParameterRecord:
     Annotation and default text are preserved rather than interpreted so a
     backend can make its own semantic decision without inheriting an earlier
     lossy rewrite. `default_source` is absent for required parameters.
+
+    Attributes:
+        name: Source parameter name without `*` or `**` prefixes.
+        kind: Positional, variadic, keyword-only, or keyword variadic kind.
+        annotation: Exact source annotation text.
+        default_source: Exact default-value source text, or `None` when required.
     """
 
     name: str
@@ -265,7 +344,14 @@ class ParameterRecord:
 
 @dataclass(frozen=True, slots=True)
 class FieldRecord:
-    """Typed class field declaration retained for class-region planning."""
+    """Typed class field declaration retained for class-region planning.
+
+    Attributes:
+        name: Class field name.
+        annotation: Exact source annotation text.
+        default_source: Exact default-value source text, or `None` when required.
+        class_variable: Whether the field is declared as a class variable.
+    """
 
     name: str
     annotation: str
@@ -280,6 +366,11 @@ class TypeParameterRecord:
     `declaration` retains the complete source expression, including bounds,
     constraints, variance keywords, and defaults. `name` and `kind` provide the
     structured identity needed for scope and specialization decisions.
+
+    Attributes:
+        name: Type parameter name visible in source.
+        kind: `TypeVar`, `ParamSpec`, or `TypeVarTuple` classification.
+        declaration: Exact source declaration for the type parameter.
     """
 
     name: str
@@ -295,6 +386,41 @@ class SymbolRecord:
     names, and local blockers without executing project code. Later phases attach
     mypy diagnostics, dependency edges, and candidate decisions by replacing this
     immutable record.
+
+    Attributes:
+        id: Module and qualified-name identity for the declaration.
+        kind: Function, class, or method declaration kind.
+        visibility: Public or private source visibility.
+        lineno: One-based first source line covered by the record.
+        end_lineno: One-based final source line covered by the record.
+        col_offset: Zero-based source column where the declaration starts.
+        end_col_offset: Zero-based source column where the declaration ends, when available.
+        decorators: Source text for decorators applied to the symbol.
+        arg_count: Total caller-visible parameter count.
+        annotated_arg_count: Number of parameters with explicit annotations.
+        has_return_annotation: Whether the callable declares a return annotation.
+        has_any_annotation: Whether any visible annotation contains `Any`.
+        called_names: Simple names observed in call position.
+        uses_globals: Module globals read by the symbol body.
+        local_names: Names bound locally within the symbol body.
+        referenced_names: All names read by the symbol body or annotations.
+        blockers: Conservative blockers attached to this module or symbol.
+        mypy_diagnostics: Mypy diagnostics mapped to this module or symbol.
+        owner_class: Source owner class for a method binding, when applicable.
+        binding_kind: Runtime descriptor or module binding classification.
+        execution_kind: Synchronous, generator, coroutine, async-generator, or class shape.
+        type_parameters: Type parameter names declared directly by the symbol.
+        parameters: Exact source parameter declarations in call order.
+        return_annotation: Exact source return annotation, when present.
+        annotation_names: Names referenced by source annotations.
+        called_paths: Dotted call targets recovered from source syntax.
+        base_names: Base-class expressions referenced by the declaration.
+        fields: Typed class fields retained for region planning.
+        declaration_start_lineno: First line of decorators or declaration syntax.
+        scope_type_parameters: Type parameter names inherited from enclosing scopes.
+        type_parameter_records: Structured type parameters declared directly by the symbol.
+        scope_type_parameter_records: Structured type parameters inherited from enclosing scopes.
+        any_annotation_sources: Locations where `Any` enters the symbol's type surface.
     """
 
     id: SymbolId
@@ -342,6 +468,13 @@ class RuntimeTypeGuard:
     parameters use `None` because there is no stable positional slot. The
     nominal paths are syntactic type names such as `int` or `models.Payload`,
     and `allow_none` records a separate `None` acceptance branch.
+
+    Attributes:
+        parameter_name: Source parameter guarded at runtime.
+        positional_index: Zero-based positional argument index, when applicable.
+        annotation: Exact source annotation text.
+        nominal_type_paths: Importable runtime types accepted by the guard.
+        allow_none: Whether `None` satisfies this runtime type guard.
     """
 
     parameter_name: str
@@ -351,7 +484,12 @@ class RuntimeTypeGuard:
     allow_none: bool
 
     def __post_init__(self) -> None:
-        """Reject guards that cannot describe a constant-time nominal check."""
+        """Reject guards that cannot describe a constant-time nominal check.
+
+        Raises:
+            ValueError: If the parameter identity, positional index, annotation, or nominal type
+                paths cannot define a constant-time guard.
+        """
         if not self.parameter_name.strip():
             raise ValueError("runtime type guard parameter_name must be non-empty")
         if self.positional_index is not None and self.positional_index < 0:
@@ -373,6 +511,16 @@ class RegionSpecialization:
     proves a concrete binding, the substitutions that made all emitted
     `type_bindings` concrete, and runtime guards required to dispatch to the
     specialized binding in constant time.
+
+    Attributes:
+        id: Deterministic specialization ID included in cache and report identities.
+        source_member: Generic source member from which a specialization was derived.
+        source_owner_class: Owner class declared by the generic source member.
+        target_owner_class: Concrete runtime owner class for a specialized binding.
+        origin: Resolved module origin or specialization evidence source.
+        substitutions: Concrete type substitutions applied to generic parameters.
+        guards: Runtime type guards required before selecting this binding or specialization.
+        type_bindings: Preserved or concretized type evidence for the region.
     """
 
     id: str
@@ -385,7 +533,12 @@ class RegionSpecialization:
     type_bindings: tuple[TypeBinding, ...]
 
     def __post_init__(self) -> None:
-        """Validate that specialization evidence is concrete and self-contained."""
+        """Validate that specialization evidence is concrete and self-contained.
+
+        Raises:
+            ValueError: If the ID, substitutions, guards, bindings, or owner relationship is
+                incomplete or contradictory.
+        """
         if not self.id.strip():
             raise ValueError("region specialization id must be non-empty")
         if not self.substitutions:
@@ -418,6 +571,16 @@ class BindingTarget:
     backend output and may differ for lowered methods or specializations.
     `target_owner_class` and `guards` are empty for ordinary bindings and are
     reserved for bindings that install a concrete specialization.
+
+    Attributes:
+        source: Public source symbol promised by the binding.
+        compiled_name: Backend-generated attribute name containing the compiled callable.
+        kind: Module, class, or descriptor-aware binding kind.
+        owner_class: Source owner class for a method binding, when applicable.
+        execution_kind: Synchronous, generator, coroutine, async-generator, or class shape.
+        required: Whether absence of the compiled binding is a verification failure.
+        target_owner_class: Concrete runtime owner class for a specialized binding.
+        guards: Runtime type guards required before selecting this binding or specialization.
     """
 
     source: SymbolId
@@ -432,7 +595,15 @@ class BindingTarget:
 
 @dataclass(frozen=True, slots=True)
 class TypeBinding:
-    """Preserved or concretized type evidence used by a typed region."""
+    """Preserved or concretized type evidence used by a typed region.
+
+    Attributes:
+        name: Parameter, return, field, base, type-parameter, or import name.
+        annotation: Exact source annotation text.
+        source: Category from which the type evidence was obtained.
+        concrete: Whether the type evidence is fully concrete for lowering.
+        substitutions: Concrete type substitutions applied to generic parameters.
+    """
 
     name: str
     annotation: str
@@ -443,7 +614,14 @@ class TypeBinding:
 
 @dataclass(frozen=True, slots=True)
 class LoweringDecision:
-    """Auditable decision about how one typed-region fact will be lowered."""
+    """Auditable decision about how one typed-region fact will be lowered.
+
+    Attributes:
+        target: Stable symbol or region fact affected by the decision.
+        action: Lowering action chosen for the target.
+        reason: Concrete evidence requiring preservation, specialization, boxing, fallback, or
+            rejection.
+    """
 
     target: str
     action: LossAction
@@ -452,7 +630,23 @@ class LoweringDecision:
 
 @dataclass(frozen=True, slots=True)
 class RegionMember:
-    """Unlowered source declaration owned by a backend-neutral typed region."""
+    """Unlowered source declaration owned by a backend-neutral typed region.
+
+    Attributes:
+        id: Module and qualified-name identity for the retained declaration.
+        kind: Function, class, or method declaration kind.
+        owner_class: Source owner class for a method binding, when applicable.
+        binding_kind: Runtime descriptor or module binding classification.
+        execution_kind: Synchronous, generator, coroutine, async-generator, or class shape.
+        source_text: Exact source text retained for analysis or generation.
+        type_parameters: Type parameter names declared directly by the symbol.
+        type_parameter_records: Structured type parameters declared directly by the symbol.
+        scope_type_parameters: Type parameter names inherited from enclosing scopes.
+        scope_type_parameter_records: Structured type parameters inherited from enclosing scopes.
+        parameters: Exact source parameter declarations in call order.
+        return_annotation: Exact source return annotation, when present.
+        fields: Typed class fields retained for region planning.
+    """
 
     id: SymbolId
     kind: SymbolKind
@@ -471,7 +665,16 @@ class RegionMember:
 
 @dataclass(frozen=True, slots=True)
 class RegionDependency:
-    """Typed-region dependency retaining runtime versus annotation intent."""
+    """Typed-region dependency retaining runtime versus annotation intent.
+
+    Attributes:
+        src: Source symbol for the dependency edge.
+        dst: Dependency destination symbol or external boundary.
+        kind: Calls, global use, inheritance, decoration, import, or annotation edge kind.
+        confidence: Confidence assigned to the dependency evidence.
+        role: Whether the dependency is required at runtime, for typing, or by the facade.
+        type_only: Whether the dependency is used exclusively for typing.
+    """
 
     src: SymbolId
     dst: SymbolId | str
@@ -488,6 +691,18 @@ class TypedRegion:
     Region IDs and hashes are deterministic for the retained source and
     dependency evidence. Instances are safe to cache, compare, and pass to
     backend assessment without reading or importing target-project code.
+
+    Attributes:
+        id: Deterministic region ID derived from retained members and dependencies.
+        source_module: Importable source module name.
+        members: Source declarations owned by the typed region or compilation unit.
+        dependencies: Runtime and typing dependencies retained by the region.
+        type_bindings: Preserved or concretized type evidence for the region.
+        bindings: Source bindings promised by the compiled region or variant.
+        decisions: Auditable preservation, specialization, boxing, fallback, or rejection decisions.
+        source_hash: Deterministic digest of generated or retained source.
+        atomic_class: Whether the owner class must be lowered as one indivisible region.
+        specializations: Guarded concrete variants available for the typed region.
     """
 
     id: str
@@ -511,6 +726,16 @@ class BackendAssessment:
     means the backend can compile a correctly prepared member unit; it does not
     promise that runtime binding for that member has been implemented. Reasons
     are stable diagnostic text suitable for reports and backend selection.
+
+    Attributes:
+        region_id: Stable typed-region identifier owning the artifact or unit.
+        backend: Native compiler backend selected for this record.
+        status: Supported, partial, unsupported, or quality-gate status.
+        supported_members: Region members accepted by the backend.
+        unsupported_members: Region members rejected by the backend.
+        capabilities: Backend capabilities exercised by supported members.
+        reasons: Deterministically ordered evidence supporting the decision.
+        deterministic: Whether identical inputs must produce this assessment.
     """
 
     region_id: str
@@ -532,6 +757,14 @@ class BackendLoweringRequest:
     supported; explicit members must be a subset of that assessment.
     `variant_id` distinguishes backend-specific subsets of the same region and
     defaults to the semantic region ID for compatibility.
+
+    Attributes:
+        region: Backend-neutral typed region represented by this record.
+        source_path: Filesystem path of the source module or prepared source.
+        logical_module: Importable module name represented by the compilation unit.
+        install_relative_dir: POSIX directory below the staged wheel payload root.
+        members: Source declarations owned by the typed region or compilation unit.
+        variant_id: Stable backend/specialization variant identifier.
     """
 
     region: TypedRegion
@@ -544,7 +777,17 @@ class BackendLoweringRequest:
 
 @dataclass(frozen=True, slots=True)
 class CompilationUnit:
-    """Backend-specific, content-addressable source unit ready to compile."""
+    """Backend-specific, content-addressable source unit ready to compile.
+
+    Attributes:
+        region_id: Stable typed-region identifier owning the artifact or unit.
+        backend: Native compiler backend selected for this record.
+        logical_module: Importable module name represented by the compilation unit.
+        source_paths: Prepared source files compiled as one unit.
+        source_hash: Deterministic digest of generated or retained source.
+        members: Source declarations owned by the typed region or compilation unit.
+        install_relative_dir: POSIX directory below the staged wheel payload root.
+    """
 
     region_id: str
     backend: Backend
@@ -563,6 +806,14 @@ class BackendCompileContext:
     whose callers consume only `CompileAttempt`. Typed-region compilation keeps
     the default strict artifact recording and validation. `backend_options` is
     normalized key/value evidence included in backend fingerprints.
+
+    Attributes:
+        project_root: Root directory of the target Python project.
+        build_dir: Directory containing disposable native build inputs.
+        source_roots: Absolute import roots discovered for the target project.
+        cache_dir: Directory containing reusable Atoll cache entries.
+        record_artifacts: Whether compilation must emit and validate artifact records.
+        backend_options: Normalized backend options included in cache fingerprints.
     """
 
     project_root: Path
@@ -580,6 +831,16 @@ class ArtifactRecord:
     `install_relative_path` is always POSIX-style and relative to the staged
     payload root. Support artifacts shared by multiple regions use the reserved
     region ID `__shared__` instead of being assigned to an arbitrary member.
+
+    Attributes:
+        region_id: Stable typed-region identifier owning the artifact or unit.
+        backend: Native compiler backend selected for this record.
+        logical_module: Importable module name represented by the compilation unit.
+        role: Runtime, typing, facade, primary, or support role.
+        install_relative_path: POSIX artifact path relative to the staged payload root.
+        digest: Lowercase SHA-256 digest of artifact content.
+        abi: Native ABI tag recorded for the artifact.
+        platform_tag: Wheel platform tag for the native artifact.
     """
 
     region_id: str
@@ -592,7 +853,12 @@ class ArtifactRecord:
     platform_tag: str
 
     def __post_init__(self) -> None:
-        """Reject absolute, parent-traversing, or non-POSIX install paths."""
+        """Reject absolute, parent-traversing, or non-POSIX install paths.
+
+        Raises:
+            ValueError: If install paths, digests, identifiers, ABI, or platform metadata are
+                empty or unsafe.
+        """
         path = PurePosixPath(self.install_relative_path)
         if (
             not self.install_relative_path
@@ -618,6 +884,13 @@ class CompiledRegionVariant:
     A region can produce multiple variants when different members require
     different backends. ``id`` is unique across those variants and is the
     artifact/runtime status key; ``region.id`` remains the scanner identity.
+
+    Attributes:
+        id: Deterministic backend and specialization variant ID.
+        region: Backend-neutral typed region represented by this record.
+        backend: Native compiler backend selected for this record.
+        bindings: Source bindings promised by the compiled region or variant.
+        cache_status: Whether compilation used, missed, or partially restored cache state.
     """
 
     id: str
@@ -627,7 +900,11 @@ class CompiledRegionVariant:
     cache_status: CompileCacheStatus = "disabled"
 
     def __post_init__(self) -> None:
-        """Require a non-empty variant ID and bindings owned by the region."""
+        """Require a non-empty variant ID and bindings owned by the region.
+
+        Raises:
+            ValueError: If the variant ID is empty or a promised binding is absent from the region.
+        """
         if not self.id.strip():
             raise ValueError("compiled region variant ID must be non-empty")
         member_ids = {member.id for member in self.region.members}
@@ -637,7 +914,15 @@ class CompiledRegionVariant:
 
 @dataclass(frozen=True, slots=True)
 class BackendDiagnostic:
-    """Normalized compiler failure independent of backend exception types."""
+    """Normalized compiler failure independent of backend exception types.
+
+    Attributes:
+        code: Stable machine-readable diagnostic or blocker code.
+        message: Human-readable diagnostic or blocker explanation.
+        details: Additional normalized diagnostic lines.
+        log_path: Path to complete backend diagnostics, when retained.
+        transient: Whether retrying in a corrected environment may succeed.
+    """
 
     code: BackendDiagnosticCode
     message: str
@@ -653,6 +938,13 @@ class DependencyEdge:
     Destinations are either another `SymbolId` in the same module or a string for
     imports, constants, and unresolved globals. `confidence` documents whether
     the edge is a direct AST fact or a lower-confidence boundary inference.
+
+    Attributes:
+        src: Source symbol for the dependency edge.
+        dst: Dependency destination symbol or external boundary.
+        kind: Calls, global use, inheritance, decoration, import, or annotation edge kind.
+        confidence: Confidence assigned to the dependency evidence.
+        lineno: One-based first source line covered by the record.
     """
 
     src: SymbolId
@@ -669,6 +961,17 @@ class IslandCandidate:
     Candidates are heuristic recommendations, not proof of native compatibility.
     Build, verification, and target tests are still required before treating a
     candidate as deployable.
+
+    Attributes:
+        source_module: Importable source module name.
+        symbols: Stable IDs of symbols recommended as one compilation candidate.
+        required_imports: Imports required by the candidate.
+        required_constants: Literal constants required by the candidate.
+        required_local_symbols: Local symbols required by dependency closure.
+        rejected_symbols: Symbols excluded from the candidate dependency closure.
+        score: Scan-only extraction-safety or native-readiness score.
+        risk: Conservative extraction risk classification.
+        reasons: Deterministically ordered evidence supporting the decision.
     """
 
     source_module: ModuleId
@@ -688,6 +991,11 @@ class PoisonRadius:
 
     The radius is report-only evidence: it helps users understand why a nearby
     candidate is risky, but it does not mutate the original blockers or scores.
+
+    Attributes:
+        poison: Rejected symbol whose dependencies affect nearby candidates.
+        impacted: Otherwise viable symbols affected by the rejected symbol.
+        reason: Concrete blocker or dependency evidence causing the impact.
     """
 
     poison: SymbolId
@@ -702,6 +1010,12 @@ class SidecarGeneration:
     The source text is deterministic for the current generator version and input
     scan. `source_hash` is embedded into the generated file so stale sidecars can
     be detected without importing project code.
+
+    Attributes:
+        config: Enabled island that owns the generated sidecar.
+        included_symbols: Public symbols copied into generated source.
+        source_hash: Deterministic digest of generated or retained source.
+        source_text: Exact source text retained for analysis or generation.
     """
 
     config: EnabledIslandConfig
@@ -712,7 +1026,13 @@ class SidecarGeneration:
 
 @dataclass(frozen=True, slots=True)
 class CompilePhaseTiming:
-    """One measured subphase from a native compilation attempt."""
+    """One measured subphase from a native compilation attempt.
+
+    Attributes:
+        name: Stable native compiler subphase name.
+        duration_seconds: Elapsed wall-clock duration in seconds.
+        detail: Optional human-readable timing context.
+    """
 
     name: str
     duration_seconds: float
@@ -727,6 +1047,16 @@ class CompileAttempt:
     and `artifact_paths` lists extension outputs that were newly produced or
     modified. A failed attempt keeps enough detail for report rendering and CLI
     error messages without raising through command handlers.
+
+    Attributes:
+        success: Whether the represented operation completed successfully.
+        command: Normalized command argument vector.
+        stdout: Captured child process standard output.
+        stderr: Captured child process standard error.
+        artifact_paths: Native artifacts produced or changed by the build.
+        duration_seconds: Elapsed wall-clock duration in seconds.
+        phase_timings: Measured native compiler subphases.
+        cache_status: Whether compilation used, missed, or partially restored cache state.
     """
 
     success: bool
@@ -741,7 +1071,12 @@ class CompileAttempt:
 
 @dataclass(frozen=True, slots=True)
 class BackendCompileResult:
-    """Structured backend output plus the legacy attempt compatibility view."""
+    """Structured backend output plus the legacy attempt compatibility view.
+
+    Attributes:
+        attempt: Compatibility build evidence for the backend invocation.
+        artifacts: Validated install-facing records for produced native files.
+    """
 
     attempt: CompileAttempt
     artifacts: tuple[ArtifactRecord, ...]
@@ -755,6 +1090,15 @@ class VerifyResult:
     records whether exported symbols were rebound to the sidecar. `error` is
     populated when the island is inactive, not compiled when required, or
     otherwise fails the routing contract.
+
+    Attributes:
+        source_module: Importable source module name.
+        sidecar_module: Importable generated sidecar module name.
+        active: Whether the managed runtime shim is active.
+        compiled: Whether routing resolved to a native extension.
+        origin: Resolved module origin or specialization evidence source.
+        symbols: Pairs of exported symbol name and successful-rebinding status.
+        error: User-facing failure text, or `None` on success.
     """
 
     source_module: str
@@ -773,6 +1117,11 @@ class PytestRunResult:
     The command is normalized before execution and the success flag is derived
     only from the child process exit code. Captured test output remains owned by
     pytest and is not stored in this lightweight result.
+
+    Attributes:
+        command: Normalized command argument vector.
+        exit_code: Child process exit code.
+        success: Whether the represented operation completed successfully.
     """
 
     command: tuple[str, ...]
@@ -787,6 +1136,19 @@ class ModuleScan:
     Initial scans contain AST facts and module blockers. Later enrichment adds
     type diagnostics, dependency edges, candidates, and poison-radius records
     while preserving the same immutable shape for reports and commands.
+
+    Attributes:
+        module: Stable import name and source path for the scanned module.
+        imports: Top-level imports retained for analysis or generation.
+        constants: Top-level constants retained for analysis or sidecar generation.
+        symbols: AST-derived declaration facts in source order.
+        blockers: Conservative blockers attached to this module or symbol.
+        top_level_statement_lines: Executable module-level statements that may affect extraction.
+        mypy_diagnostics: Mypy diagnostics mapped to this module or symbol.
+        dependency_edges: Conservative dependency edges derived from syntax.
+        island_candidates: Conservative compilation candidates for the module.
+        poison_radii: Report-only impact records for rejected symbols.
+        typed_regions: Backend-neutral typed regions discovered or reported.
     """
 
     module: ModuleId
@@ -809,6 +1171,10 @@ class ScanResult:
     The result binds the resolved configuration to the enriched module scans used
     for JSON and Markdown reports. It intentionally excludes generated sidecar or
     build artifacts, which are owned by separate command results.
+
+    Attributes:
+        config: Resolved absolute project paths and persisted Atoll policy.
+        modules: Discovered or reported modules in deterministic order.
     """
 
     config: ProjectConfig

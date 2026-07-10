@@ -65,11 +65,22 @@ class MypycBackend:
 
     @property
     def name(self) -> Backend:
-        """Return the stable backend name used by reports and cache keys."""
+        """Return the stable backend name used by reports and cache keys.
+
+        Returns:
+            Backend: The `mypyc` backend identifier.
+        """
         return "mypyc"
 
     def assess(self, region: TypedRegion) -> BackendAssessment:
-        """Assess typed functions, methods, classes, generators, and coroutines."""
+        """Assess typed functions, methods, classes, generators, and coroutines.
+
+        Args:
+            region: Backend-neutral typed region being assessed or generated.
+
+        Returns:
+            BackendAssessment: Mypyc capability assessment for each region member.
+        """
         decisions = {decision.target: decision for decision in region.decisions}
         supported: list[SymbolId] = []
         unsupported: list[SymbolId] = []
@@ -108,6 +119,16 @@ class MypycBackend:
         The adapter deliberately does not generate source. The typed-region
         lowerer supplies a preserved source file, and this method records the
         exact member selection and content hash consumed by mypyc.
+
+        Args:
+            request: Prepared source and member selection offered to the backend.
+
+        Returns:
+            CompilationUnit: Mypyc compilation unit for the selected region members.
+
+        Raises:
+            UnsupportedBackendRegionError: If selected members violate the backend assessment
+                contract.
         """
         assessment = self.assess(request.region)
         selected = request.members or assessment.supported_members
@@ -138,7 +159,15 @@ class MypycBackend:
         units: tuple[CompilationUnit, ...],
         context: BackendCompileContext,
     ) -> BackendCompileResult:
-        """Compile prepared units and attach install-facing artifact records."""
+        """Compile prepared units and attach install-facing artifact records.
+
+        Args:
+            units: Backend compilation units submitted as one build request.
+            context: Filesystem, cache, and artifact-recording boundaries for compilation.
+
+        Returns:
+            BackendCompileResult: Mypyc build evidence and validated artifact records.
+        """
         _validate_units(units, expected_backend="mypyc")
         paths = tuple(path for unit in units for path in unit.source_paths)
         attempt = _build_paths(paths, context=context, backend=self)
@@ -155,7 +184,15 @@ class MypycBackend:
         unit: CompilationUnit,
         context: BackendCompileContext,
     ) -> str:
-        """Hash unit content together with the active mypyc toolchain and ABI."""
+        """Hash unit content together with the active mypyc toolchain and ABI.
+
+        Args:
+            unit: Content-addressable backend compilation unit.
+            context: Filesystem, cache, and artifact-recording boundaries for compilation.
+
+        Returns:
+            str: Stable mypyc cache fingerprint for the unit and context.
+        """
         _validate_units((unit,), expected_backend="mypyc")
         payload = {
             "adapter_version": _MYPYC_ADAPTER_VERSION,
@@ -190,7 +227,16 @@ class MypycBackend:
         diagnostics: str,
         log_path: Path | None,
     ) -> BackendDiagnostic:
-        """Normalize mypyc, import-path, and native toolchain failures."""
+        """Normalize mypyc, import-path, and native toolchain failures.
+
+        Args:
+            error: Backend exception that caused compilation to fail.
+            diagnostics: Captured backend diagnostic text to normalize.
+            log_path: Optional path to the complete backend build log.
+
+        Returns:
+            BackendDiagnostic: Normalized mypyc or build-environment diagnostic.
+        """
         message = repr(error)
         lowered = f"{message}\n{diagnostics}".lower()
         code = _diagnostic_code(lowered)
@@ -394,6 +440,17 @@ def build_sidecars(
     Empty input is a successful no-op. Build failures are converted into
     `CompileAttempt` values with classified diagnostics instead of escaping as
     exceptions through CLI command handlers.
+
+    Args:
+        paths: Generated source paths submitted to the native compiler.
+        project_root: Root directory of the target Python project.
+        build_dir: Directory for disposable native compiler inputs and outputs.
+        source_roots: Import roots made visible to analysis or child processes.
+        cache_dir: Optional directory for reusable compiler cache entries.
+
+    Returns:
+        CompileAttempt: Compatibility build attempt containing command, diagnostics, timings, and
+            artifacts.
     """
     units = tuple(_legacy_unit(path) for path in paths)
     return MYPYC_BACKEND.compile(
@@ -414,7 +471,16 @@ def _build_paths(
     context: BackendCompileContext,
     backend: MypycBackend,
 ) -> CompileAttempt:
-    """Run the legacy mypyc build and preserve its CompileAttempt contract."""
+    """Run the legacy mypyc build and preserve its CompileAttempt contract.
+
+    Args:
+        paths: Filesystem paths processed in deterministic order.
+        context: Prepared state shared by this operation.
+        backend: Compiler backend selected for this operation.
+
+    Returns:
+        CompileAttempt: Normalized build and cache directories for the native compiler.
+    """
     project_root = context.project_root
     build_dir = context.build_dir
     source_roots = context.source_roots
@@ -545,7 +611,11 @@ class _NativeStderrCapture:
         self._captured = ""
 
     def __enter__(self) -> _NativeStderrCapture:
-        """Redirect native stderr to a temporary file for the build duration."""
+        """Redirect native stderr to a temporary file for the build duration.
+
+        Returns:
+            _NativeStderrCapture: Active context manager instance.
+        """
         sys.stderr.flush()
         self._file = tempfile.TemporaryFile(mode="w+b")
         self._saved_fd = os.dup(2)
@@ -558,7 +628,13 @@ class _NativeStderrCapture:
         exc: object,
         traceback: object,
     ) -> None:
-        """Restore native stderr and load captured bytes as replacement text."""
+        """Restore native stderr and load captured bytes as replacement text.
+
+        Args:
+            exc_type: Active exception type, when context exit follows a failure.
+            exc: Active exception instance, when context exit follows a failure.
+            traceback: Active traceback, when context exit follows a failure.
+        """
         _ = (exc_type, exc, traceback)
         sys.stderr.flush()
         if self._saved_fd is not None:
@@ -573,7 +649,11 @@ class _NativeStderrCapture:
             self._file = None
 
     def output(self) -> str:
-        """Return captured native stderr after the context has exited."""
+        """Return captured native stderr after the context has exited.
+
+        Returns:
+            str: Captured and normalized compiler output.
+        """
         return self._captured
 
 
@@ -608,7 +688,12 @@ def _source_arg(path: Path, project_root: Path) -> str:
 
 
 def _prepare_build_temp_source_dir(build_temp: Path, source_dir: str) -> None:
-    """Create the object-file parent mirrored by setuptools for generated C sources."""
+    """Create the object-file parent mirrored by setuptools for generated C sources.
+
+    Args:
+        build_temp: Temporary build directory whose output should be filtered.
+        source_dir: Directory copied into source-clean staging.
+    """
     source_path = Path(source_dir)
     relative_parts = source_path.parts[1:] if source_path.anchor else source_path.parts
     build_temp.joinpath(*relative_parts).mkdir(parents=True, exist_ok=True)

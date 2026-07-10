@@ -61,7 +61,15 @@ class _Subparsers(Protocol):
         *,
         help: str | None = None,
     ) -> argparse.ArgumentParser:
-        """Create and return an argparse parser for one subcommand."""
+        """Create and return an argparse parser for one subcommand.
+
+        Args:
+            name: Source or parser name being resolved.
+            help: Help text shown by the argument parser.
+
+        Returns:
+            argparse.ArgumentParser: Configured child argument parser.
+        """
         ...
 
 
@@ -70,6 +78,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     `argv` is accepted for tests and programmatic callers. When no subcommand is
     provided, help is printed and the command fails with exit code 1.
+
+    Args:
+        argv: Command-line arguments excluding the executable name; `None` reads `sys.argv`.
+
+    Returns:
+        int: Process exit code selected from command success or failure.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -597,7 +611,13 @@ def _print_source_clean_success(
     label: str,
     report_paths: tuple[Path, Path],
 ) -> None:
-    """Print the compiled scope, fallbacks, performance status, and artifact paths."""
+    """Print the compiled scope, fallbacks, performance status, and artifact paths.
+
+    Args:
+        result: Operation result being normalized or rendered.
+        label: Human-readable progress label for the operation.
+        report_paths: Report artifact paths to retain in the final result.
+    """
     compiled_modules = {
         *(island.source_module for island in result.islands),
         *(binding.source.module for binding in result.compiled_bindings),
@@ -645,7 +665,11 @@ def _source_clean_progress_reporter(*, operation: str = "compile") -> Callable[[
     started = time.perf_counter()
 
     def progress(message: str) -> None:
-        """Print elapsed source-clean compile progress messages to stderr."""
+        """Print elapsed source-clean compile progress messages to stderr.
+
+        Args:
+            message: Progress message emitted to the optional callback.
+        """
         elapsed = time.perf_counter() - started
         print(f"Atoll {operation} [{elapsed:6.2f}s] {message}", file=sys.stderr)
 

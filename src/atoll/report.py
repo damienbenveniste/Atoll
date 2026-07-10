@@ -60,7 +60,15 @@ _ATOLL_GENERATED_INPUT_DIR_INDEX = 1
 
 
 class BlockerReport(TypedDict):
-    """Serialized blocker shown in scan and symbol reports."""
+    """Serialized blocker shown in scan and symbol reports.
+
+    Attributes:
+        severity: Diagnostic severity used for filtering and reporting.
+        code: Stable machine-readable diagnostic or blocker code.
+        message: Human-readable diagnostic or blocker explanation.
+        lineno: One-based first source line covered by the record.
+        symbol: Stable symbol identifier associated with this record.
+    """
 
     severity: BlockerSeverity
     code: str
@@ -70,7 +78,16 @@ class BlockerReport(TypedDict):
 
 
 class ImportReport(TypedDict):
-    """Serialized top-level import with original source text preserved."""
+    """Serialized top-level import with original source text preserved.
+
+    Attributes:
+        source_text: Exact source text retained for analysis or generation.
+        imported_names: Names introduced into the module namespace by the import.
+        module: Imported module path, or `None` for imports without one.
+        level: Relative import level; zero denotes an absolute import.
+        lineno: One-based first source line covered by the record.
+        end_lineno: One-based final source line covered by the record.
+    """
 
     source_text: str
     imported_names: list[str]
@@ -81,7 +98,15 @@ class ImportReport(TypedDict):
 
 
 class ConstantReport(TypedDict):
-    """Serialized top-level assignment and its extraction safety classification."""
+    """Serialized top-level assignment and its extraction safety classification.
+
+    Attributes:
+        name: Top-level assignment name.
+        kind: Literal, runtime-dynamic, or unknown safety classification.
+        source_text: Exact source text retained for analysis or generation.
+        lineno: One-based first source line covered by the record.
+        end_lineno: One-based final source line covered by the record.
+    """
 
     name: str
     kind: ConstantKind
@@ -91,7 +116,42 @@ class ConstantReport(TypedDict):
 
 
 class SymbolReport(TypedDict):
-    """Serialized AST, blocker, and type-checker facts for one symbol."""
+    """Serialized AST, blocker, and type-checker facts for one symbol.
+
+    Attributes:
+        id: Stable `module::qualname` symbol identifier.
+        qualname: Module-local qualified symbol name.
+        kind: Function, class, or method declaration kind.
+        visibility: Public or private source visibility.
+        lineno: One-based first source line covered by the record.
+        end_lineno: One-based final source line covered by the record.
+        decorators: Source text for decorators applied to the symbol.
+        arg_count: Total caller-visible parameter count.
+        annotated_arg_count: Number of parameters with explicit annotations.
+        has_return_annotation: Whether the callable declares a return annotation.
+        has_any_annotation: Whether any visible annotation contains `Any`.
+        called_names: Simple names observed in call position.
+        uses_globals: Module globals read by the symbol body.
+        local_names: Names bound locally within the symbol body.
+        referenced_names: All names read by the symbol body or annotations.
+        owner_class: Source owner class for a method binding, when applicable.
+        binding_kind: Runtime descriptor or module binding classification.
+        execution_kind: Synchronous, generator, coroutine, async-generator, or class shape.
+        type_parameters: Type parameter names declared directly by the symbol.
+        parameters: Exact source parameter declarations in call order.
+        return_annotation: Exact source return annotation, when present.
+        annotation_names: Names referenced by source annotations.
+        called_paths: Dotted call targets recovered from source syntax.
+        base_names: Base-class expressions referenced by the declaration.
+        fields: Typed class fields retained for region planning.
+        declaration_start_lineno: First line of decorators or declaration syntax.
+        scope_type_parameters: Type parameter names inherited from enclosing scopes.
+        type_parameter_records: Structured type parameters declared directly by the symbol.
+        scope_type_parameter_records: Structured type parameters inherited from enclosing scopes.
+        any_annotation_sources: Locations where `Any` enters the symbol's type surface.
+        blockers: Conservative blockers attached to this module or symbol.
+        mypy_diagnostics: Mypy diagnostics mapped to this module or symbol.
+    """
 
     id: str
     qualname: str
@@ -128,7 +188,14 @@ class SymbolReport(TypedDict):
 
 
 class ParameterReport(TypedDict):
-    """Exact source parameter evidence retained by typed-region analysis."""
+    """Exact source parameter evidence retained by typed-region analysis.
+
+    Attributes:
+        name: Source parameter name without `*` or `**` prefixes.
+        kind: Positional, variadic, keyword-only, or keyword variadic kind.
+        annotation: Exact source annotation text.
+        default_source: Exact default-value source text, or `None` when required.
+    """
 
     name: str
     kind: ParameterKind
@@ -137,7 +204,14 @@ class ParameterReport(TypedDict):
 
 
 class FieldReport(TypedDict):
-    """Typed class field evidence retained for class-region planning."""
+    """Typed class field evidence retained for class-region planning.
+
+    Attributes:
+        name: Class field name.
+        annotation: Exact source annotation text.
+        default_source: Exact default-value source text, or `None` when required.
+        class_variable: Whether the field is declared as a class variable.
+    """
 
     name: str
     annotation: str
@@ -146,7 +220,13 @@ class FieldReport(TypedDict):
 
 
 class TypeParameterReport(TypedDict):
-    """Exact type-parameter declaration retained for backend assessment."""
+    """Exact type-parameter declaration retained for backend assessment.
+
+    Attributes:
+        name: Type parameter name visible in source.
+        kind: `TypeVar`, `ParamSpec`, or `TypeVarTuple` classification.
+        declaration: Exact source declaration for the type parameter.
+    """
 
     name: str
     kind: TypeParameterKind
@@ -154,7 +234,17 @@ class TypeParameterReport(TypedDict):
 
 
 class MypyDiagnosticReport(TypedDict):
-    """Serialized mypy diagnostic after optional symbol range mapping."""
+    """Serialized mypy diagnostic after optional symbol range mapping.
+
+    Attributes:
+        path: Absolute source path reported by mypy.
+        line: One-based diagnostic line.
+        column: One-based diagnostic column, when mypy reports one.
+        severity: Diagnostic severity used for filtering and reporting.
+        code: Stable machine-readable diagnostic or blocker code.
+        message: Human-readable diagnostic or blocker explanation.
+        symbol: Stable symbol identifier associated with this record.
+    """
 
     path: str
     line: int
@@ -166,7 +256,15 @@ class MypyDiagnosticReport(TypedDict):
 
 
 class DependencyEdgeReport(TypedDict):
-    """Serialized same-module dependency or external boundary edge evidence."""
+    """Serialized same-module dependency or external boundary edge evidence.
+
+    Attributes:
+        src: Source symbol for the dependency edge.
+        dst: Dependency destination symbol or external boundary.
+        kind: Calls, global use, inheritance, decoration, import, or annotation edge kind.
+        confidence: Confidence assigned to the dependency evidence.
+        lineno: One-based first source line covered by the record.
+    """
 
     src: str
     dst: str
@@ -176,7 +274,21 @@ class DependencyEdgeReport(TypedDict):
 
 
 class IslandCandidateReport(TypedDict):
-    """Serialized island recommendation with score, risk, and dependency context."""
+    """Serialized island recommendation with score, risk, and dependency context.
+
+    Attributes:
+        symbols: Stable IDs of symbols recommended as one compilation candidate.
+        required_imports: Imports required by the candidate.
+        required_constants: Literal constants required by the candidate.
+        required_local_symbols: Local symbols required by dependency closure.
+        rejected_symbols: Symbols excluded from the candidate dependency closure.
+        score: Scan-only extraction-safety or native-readiness score.
+        score_label: Short qualitative score label.
+        score_summary: User-facing explanation of the score.
+        risk: Conservative extraction risk classification.
+        risk_summary: User-facing explanation of extraction risk.
+        reasons: Deterministically ordered evidence supporting the decision.
+    """
 
     symbols: list[str]
     required_imports: list[str]
@@ -192,7 +304,13 @@ class IslandCandidateReport(TypedDict):
 
 
 class PoisonRadiusReport(TypedDict):
-    """Serialized explanation of a rejected symbol's impact on candidates."""
+    """Serialized explanation of a rejected symbol's impact on candidates.
+
+    Attributes:
+        poison: Rejected symbol whose dependencies affect nearby candidates.
+        impacted: Otherwise viable symbols affected by the rejected symbol.
+        reason: Concrete blocker or dependency evidence causing the impact.
+    """
 
     poison: str
     impacted: list[str]
@@ -200,7 +318,22 @@ class PoisonRadiusReport(TypedDict):
 
 
 class RegionMemberReport(TypedDict):
-    """One unlowered declaration included in a typed region."""
+    """One unlowered declaration included in a typed region.
+
+    Attributes:
+        id: Stable ID of the retained source declaration.
+        kind: Function, class, or method declaration kind.
+        owner_class: Source owner class for a method binding, when applicable.
+        binding_kind: Runtime descriptor or module binding classification.
+        execution_kind: Synchronous, generator, coroutine, async-generator, or class shape.
+        type_parameters: Type parameter names declared directly by the symbol.
+        scope_type_parameters: Type parameter names inherited from enclosing scopes.
+        type_parameter_records: Structured type parameters declared directly by the symbol.
+        scope_type_parameter_records: Structured type parameters inherited from enclosing scopes.
+        parameters: Exact source parameter declarations in call order.
+        return_annotation: Exact source return annotation, when present.
+        fields: Typed class fields retained for region planning.
+    """
 
     id: str
     kind: SymbolKind
@@ -217,7 +350,16 @@ class RegionMemberReport(TypedDict):
 
 
 class RegionDependencyReport(TypedDict):
-    """Dependency retained with runtime versus type-only intent."""
+    """Dependency retained with runtime versus type-only intent.
+
+    Attributes:
+        src: Source symbol for the dependency edge.
+        dst: Dependency destination symbol or external boundary.
+        kind: Calls, global use, inheritance, decoration, import, or annotation edge kind.
+        confidence: Confidence assigned to the dependency evidence.
+        role: Whether the dependency is required at runtime, for typing, or by the facade.
+        type_only: Whether the dependency is used exclusively for typing.
+    """
 
     src: str
     dst: str
@@ -228,7 +370,15 @@ class RegionDependencyReport(TypedDict):
 
 
 class TypeBindingReport(TypedDict):
-    """Source type evidence retained before backend lowering."""
+    """Source type evidence retained before backend lowering.
+
+    Attributes:
+        name: Parameter, return, field, base, type-parameter, or import name.
+        annotation: Exact source annotation text.
+        source: Category from which the type evidence was obtained.
+        concrete: Whether the type evidence is fully concrete for lowering.
+        substitutions: Concrete type substitutions applied to generic parameters.
+    """
 
     name: str
     annotation: str
@@ -238,7 +388,13 @@ class TypeBindingReport(TypedDict):
 
 
 class LoweringDecisionReport(TypedDict):
-    """Auditable region-level preservation or fallback decision."""
+    """Auditable region-level preservation or fallback decision.
+
+    Attributes:
+        target: Stable symbol or region fact affected by the decision.
+        action: Lowering action chosen for the target.
+        reason: Concrete evidence supporting the lowering action.
+    """
 
     target: str
     action: LossAction
@@ -246,7 +402,18 @@ class LoweringDecisionReport(TypedDict):
 
 
 class BindingTargetReport(TypedDict):
-    """Descriptor-aware source binding promised by a typed region."""
+    """Descriptor-aware source binding promised by a typed region.
+
+    Attributes:
+        source: Stable ID of the public source binding.
+        compiled_name: Backend-generated attribute name containing the compiled callable.
+        kind: Module, class, or descriptor-aware binding kind.
+        owner_class: Source owner class for a method binding, when applicable.
+        target_owner_class: Concrete runtime owner class for a specialized binding.
+        execution_kind: Synchronous, generator, coroutine, async-generator, or class shape.
+        required: Whether absence of the compiled binding is a verification failure.
+        guards: Runtime type guards required before selecting this binding or specialization.
+    """
 
     source: str
     compiled_name: str
@@ -259,7 +426,15 @@ class BindingTargetReport(TypedDict):
 
 
 class RuntimeTypeGuardReport(TypedDict):
-    """Constant-time input check required before specialized native routing."""
+    """Constant-time input check required before specialized native routing.
+
+    Attributes:
+        parameter_name: Source parameter guarded at runtime.
+        positional_index: Zero-based positional argument index, when applicable.
+        annotation: Exact source annotation text.
+        nominal_type_paths: Importable runtime types accepted by the guard.
+        allow_none: Whether `None` satisfies this runtime type guard.
+    """
 
     parameter_name: str
     positional_index: int | None
@@ -269,7 +444,18 @@ class RuntimeTypeGuardReport(TypedDict):
 
 
 class RegionSpecializationReport(TypedDict):
-    """Concrete TypeVar binding layered on an unchanged generic declaration."""
+    """Concrete TypeVar binding layered on an unchanged generic declaration.
+
+    Attributes:
+        id: Deterministic specialization ID.
+        source_member: Generic source member from which a specialization was derived.
+        source_owner_class: Owner class declared by the generic source member.
+        target_owner_class: Concrete runtime owner class for a specialized binding.
+        origin: Resolved module origin or specialization evidence source.
+        substitutions: Concrete type substitutions applied to generic parameters.
+        guards: Runtime type guards required before selecting this binding or specialization.
+        type_bindings: Preserved or concretized type evidence for the region.
+    """
 
     id: str
     source_member: str
@@ -282,7 +468,19 @@ class RegionSpecializationReport(TypedDict):
 
 
 class TypedRegionReport(TypedDict):
-    """Backend-neutral typed region serialized in scan reports."""
+    """Backend-neutral typed region serialized in scan reports.
+
+    Attributes:
+        id: Deterministic typed-region ID.
+        source_hash: Deterministic digest of generated or retained source.
+        atomic_class: Whether the owner class must be lowered as one indivisible region.
+        members: Source declarations owned by the typed region or compilation unit.
+        dependencies: Runtime and typing dependencies retained by the region.
+        type_bindings: Preserved or concretized type evidence for the region.
+        bindings: Source bindings promised by the compiled region or variant.
+        decisions: Auditable preservation, specialization, boxing, fallback, or rejection decisions.
+        specializations: Guarded concrete variants available for the typed region.
+    """
 
     id: str
     source_hash: str
@@ -296,7 +494,22 @@ class TypedRegionReport(TypedDict):
 
 
 class ModuleReport(TypedDict):
-    """Complete scan report section for one discovered Python module."""
+    """Complete scan report section for one discovered Python module.
+
+    Attributes:
+        module: Importable dotted name of the scanned module.
+        path: Absolute source path of the scanned module.
+        imports: Top-level imports retained for analysis or generation.
+        constants: Top-level constants retained for analysis or sidecar generation.
+        symbols: Serialized declarations discovered in the module.
+        blockers: Module-level blockers not owned by one declaration.
+        top_level_statement_lines: Executable module-level statements that may affect extraction.
+        mypy_diagnostics: Mypy diagnostics mapped to this module or symbol.
+        dependency_edges: Conservative dependency edges derived from syntax.
+        island_candidates: Conservative compilation candidates for the module.
+        poison_radii: Report-only impact records for rejected symbols.
+        typed_regions: Backend-neutral typed regions discovered or reported.
+    """
 
     module: str
     path: str
@@ -313,7 +526,16 @@ class ModuleReport(TypedDict):
 
 
 class SummaryReport(TypedDict):
-    """Aggregate scan counts used by JSON and Markdown summaries."""
+    """Aggregate scan counts used by JSON and Markdown summaries.
+
+    Attributes:
+        modules_scanned: Number of modules included in the scan.
+        symbols_scanned: Number of source symbols included in the scan.
+        island_candidates: Number of conservative compilation candidates discovered.
+        typed_regions: Number of backend-neutral typed regions discovered.
+        hard_blockers: Number of blockers that prevent extraction.
+        soft_blockers: Number of blockers that increase extraction risk.
+    """
 
     modules_scanned: int
     symbols_scanned: int
@@ -324,7 +546,16 @@ class SummaryReport(TypedDict):
 
 
 class ScanReport(TypedDict):
-    """Top-level stable JSON report emitted by `atoll scan`."""
+    """Top-level stable JSON report emitted by `atoll scan`.
+
+    Attributes:
+        version: Schema or cache format version.
+        tool: Tool identifier that produced the report.
+        project_root: Root directory of the target Python project.
+        source_roots: Absolute import roots discovered for the target project.
+        summary: Aggregate counts and status for the report.
+        modules: Discovered or reported modules in deterministic order.
+    """
 
     version: int
     tool: str
@@ -339,7 +570,21 @@ CompilationMode = Literal["in-place", "source-clean"]
 
 
 class CompilationNativeReadinessReport(TypedDict):
-    """Post-generation evidence that a selected symbol can benefit from mypyc."""
+    """Post-generation evidence that a selected symbol can benefit from mypyc.
+
+    Attributes:
+        source_module: Importable source module name.
+        symbol: Stable symbol identifier associated with this record.
+        eligible: Whether generated code passes the native-readiness gate.
+        score: Scan-only extraction-safety or native-readiness score.
+        function_count: Number of generated functions inspected.
+        any_typed_functions: Generated functions whose annotations contain `Any`.
+        boxed_typed_functions: Generated functions whose useful values remain boxed Python objects.
+        dynamic_dependencies: Generated dependencies requiring dynamic runtime lookup.
+        loop_count: Number of loops found in generated functions.
+        native_operation_count: Count of operations likely to benefit from native lowering.
+        reasons: Deterministically ordered evidence supporting the decision.
+    """
 
     source_module: str
     symbol: str
@@ -355,7 +600,28 @@ class CompilationNativeReadinessReport(TypedDict):
 
 
 class CompilationSummaryReport(TypedDict):
-    """Aggregate build, verification, test, and cleanup counts for compilation."""
+    """Aggregate build, verification, test, and cleanup counts for compilation.
+
+    Attributes:
+        islands: Number of legacy managed islands represented in the report.
+        typed_regions: Number of backend-neutral typed regions considered.
+        compiled_regions: Number of typed-region variants compiled successfully.
+        symbols: Number of source symbols represented by islands and compiled bindings.
+        native_ready_symbols: Number of symbols accepted by the native-readiness gate.
+        native_rejected_symbols: Number of symbols rejected by the native-readiness gate.
+        artifacts: Number of native artifact paths produced by the build.
+        support_artifacts: Number of native support files not owned by one region.
+        skipped_modules: Number of modules skipped after native compiler rejection.
+        preflight_blockers: Number of module blockers detected before compilation.
+        verified: Number of islands subjected to runtime routing verification.
+        verify_failures: Number of runtime routing verification failures.
+        semantic_tests_run: Whether target-project semantic tests were executed.
+        semantic_test_failures: Number of failed target-project test gates.
+        subprocess_verifications: Number of isolated package verification stages run.
+        subprocess_verification_failures: Number of failed isolated package verifications.
+        performance_status: Passed, failed, skipped, or unavailable benchmark status.
+        duration_seconds: Elapsed wall-clock duration in seconds.
+    """
 
     islands: int
     typed_regions: int
@@ -378,7 +644,19 @@ class CompilationSummaryReport(TypedDict):
 
 
 class CompilationBuildReport(TypedDict):
-    """Serialized mypyc build command, diagnostics, and produced artifacts."""
+    """Serialized mypyc build command, diagnostics, and produced artifacts.
+
+    Attributes:
+        success: Whether the represented operation completed successfully.
+        command: Normalized command argument vector.
+        duration_seconds: Elapsed wall-clock duration in seconds.
+        stdout: Captured child process standard output.
+        stderr: Captured child process standard error.
+        cache_status: Whether compilation used, missed, or partially restored cache state.
+        phase_timings: Measured native compiler subphases.
+        artifacts: Project-relative paths to primary native artifacts.
+        support_artifacts: Native support files not owned by one compiled region.
+    """
 
     success: bool
     command: list[str]
@@ -392,27 +670,53 @@ class CompilationBuildReport(TypedDict):
 
 
 class CompilationPhaseTimingReport(TypedDict):
+    """Serialized timing evidence for one native compilation phase.
+
+    Attributes:
+        name: Stable compiler phase name.
+        duration_seconds: Elapsed wall-clock duration in seconds.
+        detail: Optional human-readable context for the measured phase.
+    """
+
     name: str
     duration_seconds: float
     detail: str | None
 
 
 class CompilationCleanupReport(TypedDict):
-    """Paths removed or intentionally kept after a build or package operation."""
+    """Paths removed or intentionally kept after a build or package operation.
+
+    Attributes:
+        removed: Paths removed during cleanup.
+        kept: Paths intentionally retained after cleanup.
+    """
 
     removed: list[str]
     kept: list[str]
 
 
 class CompilationSkippedModuleReport(TypedDict):
-    """Source-clean module skipped because its island failed compilation."""
+    """Source-clean module skipped because its island failed compilation.
+
+    Attributes:
+        module: Importable source module skipped after native compilation.
+        reason: Representative native compiler diagnostic explaining the skip.
+    """
 
     module: str
     reason: str
 
 
 class CompilationPreflightBlockerReport(TypedDict):
-    """Module-level blocker that prevented a source-clean module build attempt."""
+    """Module-level blocker that prevented a source-clean module build attempt.
+
+    Attributes:
+        module: Importable source module blocked before native compilation.
+        path: Project-relative path of the blocked source module.
+        line: One-based diagnostic or blocker line.
+        code: Stable machine-readable diagnostic or blocker code.
+        message: Human-readable diagnostic or blocker explanation.
+    """
 
     module: str
     path: str
@@ -422,7 +726,13 @@ class CompilationPreflightBlockerReport(TypedDict):
 
 
 class CompilationTestReport(TypedDict):
-    """Target-project semantic test command and process exit status."""
+    """Target-project semantic test command and process exit status.
+
+    Attributes:
+        command: Normalized command argument vector.
+        exit_code: Child process exit code.
+        success: Whether the represented operation completed successfully.
+    """
 
     command: list[str]
     exit_code: int
@@ -430,14 +740,27 @@ class CompilationTestReport(TypedDict):
 
 
 class CompilationVerifySymbolReport(TypedDict):
-    """Runtime verification result for one exported symbol rebound by a shim."""
+    """Runtime verification result for one exported symbol rebound by a shim.
+
+    Attributes:
+        symbol: Stable symbol identifier associated with this record.
+        rebound: Whether the source symbol resolves to the promised compiled callable.
+    """
 
     symbol: str
     rebound: bool
 
 
 class CompilationVerifyReport(TypedDict):
-    """Runtime routing state for one compiled or pure-Python sidecar."""
+    """Runtime routing state for one compiled or pure-Python sidecar.
+
+    Attributes:
+        active: Whether the managed runtime shim is active.
+        compiled: Whether routing resolved to a native extension.
+        origin: Resolved module origin or specialization evidence source.
+        symbols: Per-symbol routing and rebinding results.
+        error: User-facing failure text, or `None` on success.
+    """
 
     active: bool
     compiled: bool
@@ -447,7 +770,16 @@ class CompilationVerifyReport(TypedDict):
 
 
 class CompilationIslandReport(TypedDict):
-    """Compilation report section for one enabled source island."""
+    """Compilation report section for one enabled source island.
+
+    Attributes:
+        source_module: Importable source module name.
+        source_path: Filesystem path of the source module or prepared source.
+        generated_module: Importable module containing generated code.
+        symbols: Exported symbol names promised by the legacy island.
+        artifacts: Project-relative native artifacts mapped to the island.
+        verification: Runtime routing result for the island, when run.
+    """
 
     source_module: str
     source_path: str
@@ -458,7 +790,18 @@ class CompilationIslandReport(TypedDict):
 
 
 class CompilationCompiledBindingReport(TypedDict):
-    """One guarded function or descriptor promised by a compiled region."""
+    """One guarded function or descriptor promised by a compiled region.
+
+    Attributes:
+        source: Stable ID of the public source binding.
+        compiled_name: Backend-generated attribute name containing the compiled callable.
+        kind: Module, class, or descriptor-aware binding kind.
+        owner_class: Source owner class for a method binding, when applicable.
+        target_owner_class: Concrete runtime owner class for a specialized binding.
+        execution_kind: Synchronous, generator, coroutine, async-generator, or class shape.
+        required: Whether absence of the compiled binding is a verification failure.
+        guards: Runtime type guards required before selecting this binding or specialization.
+    """
 
     source: str
     compiled_name: str
@@ -471,7 +814,17 @@ class CompilationCompiledBindingReport(TypedDict):
 
 
 class CompilationCompiledRegionReport(TypedDict):
-    """Backend, binding, and artifact evidence for one successful region."""
+    """Backend, binding, and artifact evidence for one successful region.
+
+    Attributes:
+        id: Stable source typed-region ID.
+        variant_id: Stable backend/specialization variant identifier.
+        source_module: Importable source module name.
+        backend: Native compiler backend selected for this record.
+        cache_status: Whether compilation used, missed, or partially restored cache state.
+        bindings: Source bindings promised by the compiled region or variant.
+        artifacts: Install-relative native artifact paths owned by the variant.
+    """
 
     id: str
     variant_id: str
@@ -483,7 +836,18 @@ class CompilationCompiledRegionReport(TypedDict):
 
 
 class CompilationVerificationStepReport(TypedDict):
-    """Fresh-interpreter verification evidence for a payload or final wheel."""
+    """Fresh-interpreter verification evidence for a payload or final wheel.
+
+    Attributes:
+        stage: Package verification stage represented by the result.
+        target: Lowering target or package verification target.
+        command: Normalized command argument vector.
+        success: Whether the represented operation completed successfully.
+        exit_code: Child process exit code.
+        duration_seconds: Elapsed wall-clock duration in seconds.
+        stdout: Captured child process standard output.
+        stderr: Captured child process standard error.
+    """
 
     stage: str
     target: str
@@ -496,7 +860,18 @@ class CompilationVerificationStepReport(TypedDict):
 
 
 class CompilationCommandRunReport(TypedDict):
-    """One baseline or compiled semantic-test or benchmark subprocess run."""
+    """One baseline or compiled semantic-test or benchmark subprocess run.
+
+    Attributes:
+        command: Normalized command argument vector.
+        mode: Compilation or runtime mode represented by this record.
+        payload_root: Unpacked wheel payload used for the command.
+        returncode: Child process return code.
+        success: Whether the represented operation completed successfully.
+        duration_seconds: Elapsed wall-clock duration in seconds.
+        stdout: Captured child process standard output.
+        stderr: Captured child process standard error.
+    """
 
     command: list[str]
     mode: str
@@ -509,7 +884,18 @@ class CompilationCommandRunReport(TypedDict):
 
 
 class CompilationPerformanceReport(TypedDict):
-    """Measured profitability evidence or an explicit unbenchmarked status."""
+    """Measured profitability evidence or an explicit unbenchmarked status.
+
+    Attributes:
+        status: Supported, partial, unsupported, or quality-gate status.
+        reason: Concrete measurement or execution evidence supporting the status.
+        minimum_speedup: Smallest acceptable compiled-to-baseline speedup ratio.
+        baseline_median_seconds: Median elapsed time for baseline samples, when measured.
+        compiled_median_seconds: Median elapsed time for compiled samples, when measured.
+        speedup: Baseline-to-compiled median ratio, when measured.
+        warmups: Unmeasured benchmark warmup command evidence.
+        samples: Measured benchmark command evidence.
+    """
 
     status: str
     reason: str
@@ -522,7 +908,31 @@ class CompilationPerformanceReport(TypedDict):
 
 
 class CompilationReport(TypedDict):
-    """Top-level stable JSON report for build and source-clean compile commands."""
+    """Top-level stable JSON report for build and source-clean compile commands.
+
+    Attributes:
+        version: Schema or cache format version.
+        tool: Tool identifier that produced the report.
+        operation: Build or compile operation represented by the report.
+        mode: Compilation or runtime mode represented by this record.
+        project_root: Root directory of the target Python project.
+        module_filter: Optional module restriction applied to compilation.
+        success: Whether the represented operation completed successfully.
+        wheel_path: Source-clean wheel path, when produced.
+        summary: Aggregate counts and status for the report.
+        build: Captured native build evidence.
+        tests: Optional target-project semantic test result.
+        test_results: Target-project command evidence used by quality gates.
+        verification_steps: Isolated wheel and payload verification evidence.
+        performance: Paired performance-gate evidence.
+        cleanup: Paths removed or retained after compilation.
+        skipped_modules: Source modules skipped after native compiler rejection.
+        preflight_blockers: Module blockers detected before native compilation.
+        native_readiness: Post-generation native-readiness evidence.
+        typed_regions: Backend-neutral typed regions discovered or reported.
+        compiled_regions: Typed regions successfully compiled into the wheel.
+        islands: Enabled islands included in the operation or report.
+    """
 
     version: int
     tool: str
@@ -553,6 +963,10 @@ class CompilationSkippedModuleInput:
 
     This keeps source-clean packaging failures separate from preflight blockers:
     the module reached compilation, but no usable artifact was produced.
+
+    Attributes:
+        module: Importable source module skipped after mypyc rejection.
+        reason: Representative mypyc diagnostic explaining the skip.
     """
 
     module: str
@@ -565,6 +979,13 @@ class CompilationPreflightBlockerInput:
 
     Preflight blockers are emitted before running mypyc so the report can explain
     why a module was not attempted at all.
+
+    Attributes:
+        module: Importable source module blocked before mypyc invocation.
+        path: Absolute path of the blocked source module before report normalization.
+        line: One-based diagnostic or blocker line.
+        code: Stable machine-readable diagnostic or blocker code.
+        message: Human-readable diagnostic or blocker explanation.
     """
 
     module: str
@@ -589,6 +1010,31 @@ class CompilationReportInput:
     The renderer derives success from build, verification, and optional semantic
     test evidence instead of trusting a caller-supplied status. Paths are kept as
     `Path` objects until rendering so they can be normalized relative to `root`.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        operation: Build or compile operation represented by the report.
+        module_filter: Optional module restriction applied to compilation.
+        islands: Enabled islands included in the operation or report.
+        build: Captured native build evidence.
+        mode: Compilation or runtime mode represented by this record.
+        wheel_path: Source-clean wheel path, when produced.
+        verification: Runtime routing result for the island, when run.
+        tests: Optional target-project semantic test result.
+        cleanup_removed: Generated paths removed after the operation.
+        cleanup_kept: Generated paths intentionally retained for diagnostics.
+        skipped_modules: Source modules skipped after native compiler rejection.
+        preflight_blockers: Module blockers detected before native compilation.
+        native_readiness: Post-generation native-readiness evidence.
+        typed_regions: Backend-neutral typed regions discovered or reported.
+        compiled_regions: Typed regions successfully compiled into the wheel.
+        compiled_bindings: Source bindings successfully provided by compiled regions.
+        compiled_variants: Backend and specialization variants successfully compiled.
+        backend_assessments: Capability assessments produced before lowering.
+        artifact_records: Validated install metadata for produced native artifacts.
+        verification_steps: Isolated wheel and payload verification evidence.
+        test_results: Target-project command evidence used by quality gates.
+        performance: Paired performance-gate evidence.
     """
 
     root: Path
@@ -617,7 +1063,14 @@ class CompilationReportInput:
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
-    """Convert enriched scan dataclasses into the stable scan JSON shape."""
+    """Convert enriched scan dataclasses into the stable scan JSON shape.
+
+    Args:
+        result: Enriched project scan to convert into a stable report.
+
+    Returns:
+        ScanReport: Versioned JSON-compatible scan report.
+    """
     module_reports = [_module_report(module) for module in result.modules]
     all_blockers = [
         blocker
@@ -651,19 +1104,35 @@ def write_json_report(path: Path, report: ScanReport) -> None:
 
     Parent directories are created automatically. The function performs no schema
     validation beyond the `ScanReport` type shape used by callers.
+
+    Args:
+        path: Filesystem path consumed or produced by the operation.
+        report: Stable report mapping to serialize or render.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{json.dumps(report, indent=2, sort_keys=True)}\n", encoding="utf-8")
 
 
 def write_markdown_report(path: Path, report: ScanReport) -> None:
-    """Write the human-readable scan report next to JSON artifacts."""
+    """Write the human-readable scan report next to JSON artifacts.
+
+    Args:
+        path: Filesystem path consumed or produced by the operation.
+        report: Stable report mapping to serialize or render.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_markdown_report(report), encoding="utf-8")
 
 
 def render_markdown_report(report: ScanReport) -> str:
-    """Render a concise Markdown scan report for users reviewing candidates."""
+    """Render a concise Markdown scan report for users reviewing candidates.
+
+    Args:
+        report: Stable report mapping to serialize or render.
+
+    Returns:
+        str: Human-readable Markdown scan report ending with one newline.
+    """
     lines = [
         "# Atoll Scan Report",
         "",
@@ -692,7 +1161,14 @@ def render_markdown_report(report: ScanReport) -> str:
 
 
 def build_compilation_report(report_input: CompilationReportInput) -> CompilationReport:
-    """Convert build, verification, and cleanup evidence into a stable report."""
+    """Convert build, verification, and cleanup evidence into a stable report.
+
+    Args:
+        report_input: Build, verification, test, and cleanup evidence for one report.
+
+    Returns:
+        CompilationReport: Versioned compilation report with derived overall success.
+    """
     compiled_regions = _compiled_region_reports(report_input)
     verify_by_module = {result.source_module: result for result in report_input.verification}
     artifact_paths = tuple(report_input.build.artifact_paths)
@@ -945,19 +1421,36 @@ def _compiled_region_variant_report(
 
 
 def write_compilation_json_report(path: Path, report: CompilationReport) -> None:
-    """Write a machine-readable compilation report as sorted JSON."""
+    """Write a machine-readable compilation report as sorted JSON.
+
+    Args:
+        path: Filesystem path consumed or produced by the operation.
+        report: Stable report mapping to serialize or render.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{json.dumps(report, indent=2, sort_keys=True)}\n", encoding="utf-8")
 
 
 def write_compilation_markdown_report(path: Path, report: CompilationReport) -> None:
-    """Write the human-readable compilation report for CLI workflows."""
+    """Write the human-readable compilation report for CLI workflows.
+
+    Args:
+        path: Filesystem path consumed or produced by the operation.
+        report: Stable report mapping to serialize or render.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_compilation_markdown_report(report), encoding="utf-8")
 
 
 def render_compilation_markdown_report(report: CompilationReport) -> str:
-    """Render a concise Markdown report for a build or compile attempt."""
+    """Render a concise Markdown report for a build or compile attempt.
+
+    Args:
+        report: Stable report mapping to serialize or render.
+
+    Returns:
+        str: Human-readable Markdown compilation report ending with one newline.
+    """
     status = "success" if report["success"] else "failed"
     module_filter = report["module_filter"] or "all discovered modules"
     lines = [
@@ -1402,7 +1895,14 @@ def _typed_region_report(region: TypedRegion) -> TypedRegionReport:
 
 
 def _runtime_guard_report(guard: RuntimeTypeGuard) -> RuntimeTypeGuardReport:
-    """Serialize one runtime guard without exposing target code objects."""
+    """Serialize one runtime guard without exposing target code objects.
+
+    Args:
+        guard: Runtime type guard being rendered or evaluated.
+
+    Returns:
+        RuntimeTypeGuardReport: Serialized runtime type guard.
+    """
     return {
         "parameter_name": guard.parameter_name,
         "positional_index": guard.positional_index,
@@ -1449,7 +1949,14 @@ def _edge_dst_text(dst: SymbolId | str) -> str:
 
 
 def score_label(score: int) -> str:
-    """Return a short label for a candidate score."""
+    """Return a short label for a candidate score.
+
+    Args:
+        score: Scan-only candidate score in the inclusive 0-100 range.
+
+    Returns:
+        str: Short qualitative label for the candidate score.
+    """
     if score >= _STRONG_SCORE:
         return "strong"
     if score >= _GOOD_SCORE:
@@ -1460,7 +1967,14 @@ def score_label(score: int) -> str:
 
 
 def score_summary(score: int) -> str:
-    """Explain a scan-only candidate score in user-facing language."""
+    """Explain a scan-only candidate score in user-facing language.
+
+    Args:
+        score: Scan-only candidate score in the inclusive 0-100 range.
+
+    Returns:
+        str: User-facing score text that does not imply measured performance.
+    """
     label = score_label(score)
     if label == "strong":
         detail = "very promising scan-only candidate"
@@ -1474,7 +1988,14 @@ def score_summary(score: int) -> str:
 
 
 def risk_summary(risk: IslandRisk) -> str:
-    """Explain candidate extraction risk in user-facing scan report language."""
+    """Explain candidate extraction risk in user-facing scan report language.
+
+    Args:
+        risk: Candidate extraction risk classification to explain.
+
+    Returns:
+        str: User-facing explanation of the extraction risk classification.
+    """
     if risk == "low":
         return "low extraction risk; only high-confidence internal dependencies were seen"
     if risk == "medium":

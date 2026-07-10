@@ -63,6 +63,13 @@ def detect_function_blockers(
     The visitor checks executable body statements for dynamic behavior, then
     separately adds annotation, decorator, and async-function blockers. Nested
     definitions are reported as unsupported instead of traversed as candidates.
+
+    Args:
+        node: Syntax node inspected without executing target-project code.
+        symbol: Stable symbol identity associated with detected blockers.
+
+    Returns:
+        tuple[Blocker, ...]: Conservative blockers attached to the function symbol.
     """
     visitor = _BlockerVisitor(symbol)
     for child in node.body:
@@ -89,6 +96,13 @@ def detect_class_blockers(node: ast.ClassDef, symbol: SymbolId) -> tuple[Blocker
     Atoll V1 records classes for dependency analysis, but extraction focuses on
     functions. Dynamic class construction such as metaclasses or custom
     attribute hooks is therefore reported early as a hard boundary.
+
+    Args:
+        node: Syntax node inspected without executing target-project code.
+        symbol: Stable symbol identity associated with detected blockers.
+
+    Returns:
+        tuple[Blocker, ...]: Conservative blockers attached to the class symbol.
     """
     return (
         *_decorator_blockers(node.decorator_list, symbol),
@@ -103,6 +117,13 @@ def module_level_blockers(nodes: Iterable[ast.stmt], module: str) -> tuple[Block
     The detector flags top-level attribute assignment as monkey-patching and
     records mypyc-incompatible `TypeVar` keyword usage before compilation. It
     intentionally avoids executing imports or evaluating constants.
+
+    Args:
+        nodes: Top-level syntax statements inspected for module blockers.
+        module: Module scan or module identity being analyzed.
+
+    Returns:
+        tuple[Blocker, ...]: Module blockers that cannot be assigned to one symbol.
     """
     node_tuple = tuple(nodes)
     monkey_patch_blockers = tuple(
@@ -153,17 +174,29 @@ class _BlockerVisitor(ast.NodeVisitor):
     """Collect body-level blockers for one function-like symbol."""
 
     def __init__(self, symbol: SymbolId) -> None:
-        """Bind all emitted blockers to the source symbol being inspected."""
+        """Bind all emitted blockers to the source symbol being inspected.
+
+        Args:
+            symbol: Stable source symbol identity.
+        """
         self.symbol = symbol
         self.blockers: list[Blocker] = []
 
     def visit_Call(self, node: ast.Call) -> None:
-        """Record blockers caused by dynamic calls before visiting arguments."""
+        """Record blockers caused by dynamic calls before visiting arguments.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self._record_call_blocker(node)
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        """Flag direct access to frame attributes under compiled execution."""
+        """Flag direct access to frame attributes under compiled execution.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         if node.attr in _FRAME_ATTRIBUTE_BLOCKERS:
             self._append(
                 "hard",
@@ -174,15 +207,27 @@ class _BlockerVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """Report nested functions without descending into their bodies."""
+        """Report nested functions without descending into their bodies.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self._record_nested_symbol(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Report nested async functions as unsupported extraction boundaries."""
+        """Report nested async functions as unsupported extraction boundaries.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self._record_nested_symbol(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        """Report nested classes without scanning their class bodies."""
+        """Report nested classes without scanning their class bodies.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self._record_nested_symbol(node)
 
     def _record_call_blocker(self, node: ast.Call) -> None:
@@ -335,13 +380,22 @@ class _ModuleTypeVarVisitor(ast.NodeVisitor):
     """
 
     def __init__(self, module: str, aliases: _TypingAliases) -> None:
-        """Initialize a module-scoped visitor with known typing aliases."""
+        """Initialize a module-scoped visitor with known typing aliases.
+
+        Args:
+            module: Scanned module or syntax module being processed.
+            aliases: Typing aliases visible in the current module.
+        """
         self.module = module
         self.aliases = aliases
         self.blockers: list[Blocker] = []
 
     def visit_Call(self, node: ast.Call) -> None:
-        """Record unsupported TypeVar keyword arguments at module scope."""
+        """Record unsupported TypeVar keyword arguments at module scope.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         unsupported = _unsupported_typevar_keywords(node, self.aliases)
         if unsupported:
             keywords = ", ".join(unsupported)
@@ -357,11 +411,19 @@ class _ModuleTypeVarVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """Skip function bodies while scanning module-level TypeVar declarations."""
+        """Skip function bodies while scanning module-level TypeVar declarations.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         _ = node
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Skip async function bodies while scanning module-level declarations."""
+        """Skip async function bodies while scanning module-level declarations.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         _ = node
 
 

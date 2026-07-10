@@ -43,6 +43,16 @@ class WheelBuildEvidence:
     rather than raised as exceptions, so callers can include the evidence in a
     larger package report. `wheel_paths` lists wheels produced in `outdir` after
     the command completes; it can be empty when the backend failed.
+
+    Attributes:
+        command: Normalized command argument vector.
+        project_root: Root directory of the target Python project.
+        outdir: Directory receiving wheel archives.
+        returncode: Child process return code.
+        stdout: Captured child process standard output.
+        stderr: Captured child process standard error.
+        duration_seconds: Elapsed wall-clock duration in seconds.
+        wheel_paths: Wheel archives produced by the build command.
     """
 
     command: tuple[str, ...]
@@ -56,7 +66,11 @@ class WheelBuildEvidence:
 
     @property
     def succeeded(self) -> bool:
-        """Return whether the backend process exited successfully."""
+        """Return whether the backend process exited successfully.
+
+        Returns:
+            bool: Whether the wheel-build process exited with status zero.
+        """
         return self.returncode == 0
 
 
@@ -77,8 +91,14 @@ def build_baseline_wheel(project_root: Path, outdir: Path) -> WheelBuildEvidence
     `python -m build --wheel --no-isolation --outdir <outdir>`.
     `shell=False` is used through argv form. Non-zero backend exits are returned
     as structured evidence and are not raised.
-    """
 
+    Args:
+        project_root: Root directory of the target Python project.
+        outdir: Directory that receives built wheel archives.
+
+    Returns:
+        WheelBuildEvidence: Captured build evidence and wheel paths produced by `python -m build`.
+    """
     resolved_project_root = project_root.resolve()
     resolved_outdir = outdir.resolve()
     resolved_outdir.mkdir(parents=True, exist_ok=True)
@@ -117,8 +137,18 @@ def unpack_wheel_payload(wheel_path: Path, payload_dir: Path) -> Path:
     traversal, backslash-separated names, duplicate members, and symlinks are
     rejected so a malicious wheel cannot write outside the reset payload
     directory or create ambiguous payload state.
-    """
 
+    Args:
+        wheel_path: Wheel archive to inspect or unpack.
+        payload_dir: Directory that receives an unpacked wheel payload.
+
+    Returns:
+        Path: The sole `.dist-info` directory in the unpacked payload.
+
+    Raises:
+        WheelOverlayError: If archive paths, symlinks, RECORD data, or metadata are unsafe.
+        zipfile.BadZipFile: If `wheel_path` is not a readable ZIP archive.
+    """
     resolved_payload_dir = payload_dir.resolve()
     _reset_dir(resolved_payload_dir)
     with zipfile.ZipFile(wheel_path) as wheel:
@@ -134,8 +164,18 @@ def unpack_single_wheel_payload(wheel_dir: Path, payload_dir: Path) -> Path:
     PEP 517 build output is ambiguous if zero or multiple wheels are present.
     This helper enforces the single-artifact contract before delegating to the
     same safe archive extraction path used for explicit wheel files.
-    """
 
+    Args:
+        wheel_dir: Directory expected to contain exactly one wheel archive.
+        payload_dir: Directory that receives an unpacked wheel payload.
+
+    Returns:
+        Path: The sole `.dist-info` directory in the unpacked payload.
+
+    Raises:
+        WheelOverlayError: If the directory does not contain exactly one safe wheel.
+        zipfile.BadZipFile: If the selected wheel is not a readable ZIP archive.
+    """
     wheel_paths = tuple(sorted(wheel_dir.glob(f"*{_WHEEL_FILENAME_SUFFIX}")))
     if len(wheel_paths) != 1:
         raise WheelOverlayError(f"expected exactly one wheel, found {len(wheel_paths)}")
@@ -158,8 +198,19 @@ def repack_overlaid_wheel(
     all `Tag` headers with `platform_tag`, names the output by replacing the
     baseline filename's final three tag components, and recomputes every RECORD
     hash and size from bytes written into the archive.
-    """
 
+    Args:
+        baseline_wheel_path: Baseline wheel whose payload and metadata should be preserved.
+        payload_dir: Directory that receives an unpacked wheel payload.
+        output_dir: Directory that receives the resulting artifact.
+        platform_tag: Platform tag written into the rebuilt wheel metadata and filename.
+
+    Returns:
+        Path: Path to the rebuilt platform wheel.
+
+    Raises:
+        WheelOverlayError: If the payload, metadata, output name, or rebuilt archive is invalid.
+    """
     payload_root = payload_dir.resolve()
     dist_info_dir = validate_dist_info_dir(payload_root)
     for signature_name in ("RECORD.jws", "RECORD.p7s"):
@@ -196,7 +247,16 @@ def repack_overlaid_wheel(
 
 
 def validate_wheel_archive(wheel_path: Path, *, expected_tag: str | None = None) -> None:
-    """Read and validate every final wheel member, RECORD entry, and optional tag."""
+    """Read and validate every final wheel member, RECORD entry, and optional tag.
+
+    Args:
+        wheel_path: Wheel archive to inspect or unpack.
+        expected_tag: Optional wheel tag that every archive tag must match.
+
+    Raises:
+        WheelOverlayError: If archive members, RECORD evidence, or tags are invalid.
+        zipfile.BadZipFile: If `wheel_path` is not a readable ZIP archive.
+    """
     with zipfile.ZipFile(wheel_path) as wheel:
         _validate_zip_members(wheel.infolist())
         _validate_record(wheel)
@@ -231,8 +291,16 @@ def validate_dist_info_dir(payload_root: Path) -> Path:
     Wheel metadata belongs to a single distribution. Missing or multiple
     dist-info directories make WHEEL and RECORD updates ambiguous, so callers
     should treat this exception as invalid payload input.
-    """
 
+    Args:
+        payload_root: Wheel payload root placed first on the child process import path.
+
+    Returns:
+        Path: The sole valid `.dist-info` directory in the payload.
+
+    Raises:
+        WheelOverlayError: If the payload has zero or multiple `.dist-info` directories.
+    """
     return _single_dist_info_dir(payload_root.resolve())
 
 

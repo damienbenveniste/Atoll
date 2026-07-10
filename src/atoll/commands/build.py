@@ -20,7 +20,13 @@ from atoll.project import discover_project
 
 @dataclass(frozen=True, slots=True)
 class BuildOptions:
-    """User-facing options for building enabled sidecars in place."""
+    """User-facing options for building enabled sidecars in place.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        module_name: Importable module name used to restrict the command.
+        clean_first: Whether stale native outputs are removed before building.
+    """
 
     root: Path
     module_name: str | None = None
@@ -33,6 +39,12 @@ def execute_build(options: BuildOptions) -> CompileAttempt:
     `module_name` narrows the build to one configured source module. When
     `clean_first` is set, only Atoll's build directory is removed before
     compilation; source files and configuration are left intact.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        CompileAttempt: Native compilation attempt for all selected generated sidecars.
     """
     project = discover_project(options.root)
     build_dir = project.config.root / ".atoll" / "build"

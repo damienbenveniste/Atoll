@@ -23,6 +23,14 @@ def attach_mypy_diagnostics(
     The mapping is intentionally line-based and conservative. It does not try to
     interpret mypy context notes beyond the scanner's symbol spans, so unmapped
     diagnostics remain module-level evidence.
+
+    Args:
+        modules: Discovered or scanned modules processed in deterministic order.
+        diagnostics: Parsed mypy diagnostics to map by resolved path and source range.
+
+    Returns:
+        tuple[ModuleScan, ...]: Replacement module scans enriched with mapped diagnostics and
+            blockers.
     """
     diagnostics_by_path = _group_diagnostics_by_path(diagnostics)
     return tuple(

@@ -70,7 +70,12 @@ if temporary is not None:
 
 @dataclass(frozen=True, slots=True)
 class VerificationArtifact:
-    """One install-relative native artifact and its expected SHA-256 digest."""
+    """One install-relative native artifact and its expected SHA-256 digest.
+
+    Attributes:
+        path: POSIX artifact path relative to the staged package payload.
+        digest: Lowercase SHA-256 digest of artifact content.
+    """
 
     path: str
     digest: str
@@ -78,7 +83,13 @@ class VerificationArtifact:
 
 @dataclass(frozen=True, slots=True)
 class PackageVerificationPlan:
-    """Modules, region promises, and artifacts checked in a child interpreter."""
+    """Modules, region promises, and artifacts checked in a child interpreter.
+
+    Attributes:
+        modules: Importable source modules that must report compiled routing.
+        regions: Expected compiled region IDs grouped by source module.
+        artifacts: Install-relative native files and digests that must be present.
+    """
 
     modules: tuple[str, ...]
     regions: tuple[tuple[str, tuple[str, ...]], ...]
@@ -87,7 +98,18 @@ class PackageVerificationPlan:
 
 @dataclass(frozen=True, slots=True)
 class PackageVerificationResult:
-    """Captured subprocess evidence for one payload or wheel verification stage."""
+    """Captured subprocess evidence for one payload or wheel verification stage.
+
+    Attributes:
+        stage: Package verification stage represented by the result.
+        target: Unpacked payload directory or final wheel archive under test.
+        command: Normalized command argument vector.
+        success: Whether the represented operation completed successfully.
+        exit_code: Child process exit code.
+        stdout: Captured child process standard output.
+        stderr: Captured child process standard error.
+        duration_seconds: Elapsed wall-clock duration in seconds.
+    """
 
     stage: VerificationStage
     target: Path
@@ -106,7 +128,17 @@ def verify_package_subprocess(
     plan: PackageVerificationPlan,
     project_root: Path,
 ) -> PackageVerificationResult:
-    """Verify compiled routing from an unpacked payload or extracted final wheel."""
+    """Verify compiled routing from an unpacked payload or extracted final wheel.
+
+    Args:
+        stage: Verification stage that determines the target and failure context.
+        target: Wheel or payload path verified in an isolated child process.
+        plan: Expected modules, regions, and artifacts for package verification.
+        project_root: Root directory of the target Python project.
+
+    Returns:
+        PackageVerificationResult: Captured isolated verification evidence for the requested stage.
+    """
     payload = json.dumps(
         {
             "modules": list(plan.modules),

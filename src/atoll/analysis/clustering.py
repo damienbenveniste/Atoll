@@ -36,6 +36,12 @@ def enrich_island_analysis(module: ModuleScan) -> ModuleScan:
     Enrichment is pure: it returns a replacement `ModuleScan` and does not mutate
     the input scan. Candidate selection remains conservative so later build,
     verify, and target-test gates can provide stronger proof.
+
+    Args:
+        module: Module scan or module identity being analyzed.
+
+    Returns:
+        ModuleScan: A replacement module scan containing edges, candidates, and poison radii.
     """
     symbols = _attach_dynamic_global_blockers(module)
     module_with_blockers = replace(module, symbols=symbols)

@@ -23,6 +23,11 @@ class ShimEdit:
     Commands use this immutable object for dry-run output and file writes. The
     unified diff is derived from the old and new source text and is safe to show
     to users before any mutation occurs.
+
+    Attributes:
+        old_text: Source text before applying the managed edit.
+        new_text: Source text after applying the managed edit.
+        diff: Unified diff between original and transformed source.
     """
 
     old_text: str
@@ -36,6 +41,13 @@ def insert_or_replace_shim(source_text: str, config: EnabledIslandConfig) -> Shi
     Existing balanced markers are replaced in place; missing markers append a new
     managed block. Unbalanced or duplicate markers raise `ValueError` so commands
     do not overwrite ambiguous user code.
+
+    Args:
+        source_text: Original Python source text to transform.
+        config: Resolved configuration governing the requested operation.
+
+    Returns:
+        ShimEdit: Original text, transformed text, and unified diff for the island shim edit.
     """
     new_text = _replace_block(source_text, config, render_shim(config))
     return _edit(source_text, new_text, config.source_path.name)
@@ -46,6 +58,13 @@ def remove_shim(source_text: str, config: EnabledIslandConfig) -> ShimEdit:
 
     Missing markers are treated as a no-op. Marker imbalance still raises because
     it means Atoll cannot determine a safe deletion range.
+
+    Args:
+        source_text: Original Python source text to transform.
+        config: Resolved configuration governing the requested operation.
+
+    Returns:
+        ShimEdit: Original text, transformed text, and unified diff after shim removal.
     """
     new_text = _replace_block(source_text, config, "")
     return _edit(source_text, new_text, config.source_path.name)
@@ -60,6 +79,12 @@ def render_shim(config: EnabledIslandConfig) -> str:
     Python metadata so reflection APIs retain source signatures and callable
     kinds. Transient helper names are removed from the module namespace after
     import.
+
+    Args:
+        config: Resolved configuration governing the requested operation.
+
+    Returns:
+        str: Deterministic managed island-shim block.
     """
     status_symbols = tuple(config.symbols)
     assignments = "\n".join(

@@ -6,6 +6,12 @@ def greet(name: str = "World") -> str:
 
     This helper is intentionally simple; it gives generated-project smoke tests a
     stable public function without pulling in the CLI or analysis stack.
+
+    Args:
+        name: Name interpolated into the returned greeting.
+
+    Returns:
+        str: Greeting containing the supplied name.
     """
     clean_name = name.strip() or "World"
     return f"Hello, {clean_name}!"

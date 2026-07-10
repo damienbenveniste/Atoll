@@ -48,6 +48,16 @@ class SidecarPlan:
     Plans are deterministic products of an enriched module scan and the requested
     export list. They keep source fragments separate from rendering metadata so
     stale-file checks can hash the same evidence that is written to disk.
+
+    Attributes:
+        imports: Top-level imports retained for analysis or generation.
+        dynamic_imports: Import statements retained because static reconstruction is unsafe.
+        extra_typing_names: Typing names imported to preserve copied annotations.
+        type_checking_names: Names imported only under `TYPE_CHECKING` in generated source.
+        constants: Top-level constants retained for analysis or sidecar generation.
+        symbols: Scanned declarations copied after dependency closure.
+        included_symbol_names: All symbol names included after dependency closure.
+        copied_sources: Exact source fragments copied into the sidecar.
     """
 
     imports: tuple[ImportRecord, ...]
@@ -66,6 +76,13 @@ def generate_sidecar(module: ModuleScan, config: EnabledIslandConfig) -> Sidecar
     The source is not written here; callers decide whether they are checking,
     previewing, or applying changes. Unknown exported symbols raise `ValueError`
     during plan construction.
+
+    Args:
+        module: Module scan or module identity being analyzed.
+        config: Resolved configuration governing the requested operation.
+
+    Returns:
+        SidecarGeneration: Deterministic sidecar source and integrity metadata.
     """
     plan = build_sidecar_plan(module, config.symbols)
     source_hash = _source_hash(plan, config)
@@ -79,7 +96,11 @@ def generate_sidecar(module: ModuleScan, config: EnabledIslandConfig) -> Sidecar
 
 
 def write_sidecar(generation: SidecarGeneration) -> None:
-    """Write generated sidecar source, creating the sidecar directory if needed."""
+    """Write generated sidecar source, creating the sidecar directory if needed.
+
+    Args:
+        generation: Generated sidecar source and destination metadata to persist.
+    """
     generation.config.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
     generation.config.sidecar_path.write_text(generation.source_text, encoding="utf-8")
 
@@ -93,6 +114,13 @@ def build_sidecar_plan(
     The selected symbol set expands through direct same-module function calls so
     exported functions do not lose local helpers. Dynamic constants and erased
     annotation-only names are deliberately handled outside the runtime payload.
+
+    Args:
+        module: Module scan or module identity being analyzed.
+        exported_symbols: Public symbols that the generated sidecar must expose.
+
+    Returns:
+        SidecarPlan: Imports, constants, symbols, and source fragments needed by the sidecar.
     """
     top_level_functions = {
         symbol.id.qualname: symbol for symbol in module.symbols if symbol.kind == "function"
@@ -153,7 +181,14 @@ def build_sidecar_plan(
 
 
 def default_sidecar_module(source_module: str) -> str:
-    """Return Atoll's default unique sidecar module name for a source module."""
+    """Return Atoll's default unique sidecar module name for a source module.
+
+    Args:
+        source_module: Importable source module name.
+
+    Returns:
+        str: Default private sidecar module adjacent to the source module.
+    """
     normalized = "".join(character if character.isalnum() else "_" for character in source_module)
     sidecar_name = f"_atoll_{normalized}"
     package, _, _ = source_module.rpartition(".")
@@ -161,7 +196,15 @@ def default_sidecar_module(source_module: str) -> str:
 
 
 def expected_sidecar_path(root: Path, sidecar_module: str) -> Path:
-    """Return the generated sidecar source path under Atoll's private directory."""
+    """Return the generated sidecar source path under Atoll's private directory.
+
+    Args:
+        root: Root directory of the target Python project.
+        sidecar_module: Importable generated sidecar module name.
+
+    Returns:
+        Path: Filesystem path corresponding to the generated sidecar module.
+    """
     sidecar_name = sidecar_module.rsplit(".", maxsplit=1)[-1]
     return root.resolve() / ".atoll" / "sidecars" / f"{sidecar_name}.py"
 
@@ -324,6 +367,14 @@ def _split_runtime_imports(
     target package into mypyc and fail on typing constructs unrelated to the
     selected functions. Dynamic bindings preserve the runtime objects while
     making those names `Any` to the sidecar type checker.
+
+    Args:
+        imports: Imports available to generated source.
+        source_package: Top-level package name used to identify same-package imports.
+
+    Returns:
+        tuple[tuple[ImportRecord, ...], tuple[str, ...]]: Static import records and rendered dynamic
+            import assignments.
     """
     static_imports: list[ImportRecord] = []
     dynamic_imports: list[str] = []
@@ -528,25 +579,51 @@ class _MypycSidecarTransformer(ast.NodeTransformer):
         erased_type_arg_names: set[str],
         erased_annotation_names: set[str],
     ) -> None:
-        """Store erased names and collect extra typing imports needed later."""
+        """Store erased names and collect extra typing imports needed later.
+
+        Args:
+            erased_type_arg_names: Generic type arguments erased during lowering.
+            erased_annotation_names: Annotation names erased during lowering.
+        """
         self._erased_type_arg_names = erased_type_arg_names
         self._erased_annotation_names = erased_annotation_names
         self.extra_typing_names: set[str] = set()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        """Normalize a synchronous function after visiting its body."""
+        """Normalize a synchronous function after visiting its body.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+
+        Returns:
+            ast.FunctionDef: Rewritten function definition or visitor-specific result.
+        """
         self.generic_visit(node)
         self._normalize_function(node)
         return node
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
-        """Normalize an async function after visiting its body."""
+        """Normalize an async function after visiting its body.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+
+        Returns:
+            ast.AsyncFunctionDef: Rewritten async function definition or visitor-specific result.
+        """
         self.generic_visit(node)
         self._normalize_function(node)
         return node
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
-        """Erase subscripts for imported runtime types that are not in sidecars."""
+        """Erase subscripts for imported runtime types that are not in sidecars.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+
+        Returns:
+            ast.expr: Rewritten subscript annotation expression.
+        """
         self.generic_visit(node)
         if isinstance(node.value, ast.Name) and node.value.id in self._erased_type_arg_names:
             return node.value
@@ -602,12 +679,23 @@ class _TypeVarAnnotationSanitizer(ast.NodeTransformer):
     """Replace erased annotation-only names with `Any` in copied signatures."""
 
     def __init__(self, erased_annotation_names: set[str]) -> None:
-        """Track names that should not survive in generated annotations."""
+        """Track names that should not survive in generated annotations.
+
+        Args:
+            erased_annotation_names: Annotation names erased during lowering.
+        """
         self._erased_annotation_names = erased_annotation_names
         self.replaced = False
 
     def visit_Name(self, node: ast.Name) -> ast.expr:
-        """Return `Any` for erased annotation names while preserving location."""
+        """Return `Any` for erased annotation names while preserving location.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+
+        Returns:
+            ast.expr: Rewritten name expression or visitor-specific result.
+        """
         if node.id not in self._erased_annotation_names:
             return node
         self.replaced = True

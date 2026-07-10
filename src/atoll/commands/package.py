@@ -123,6 +123,16 @@ class PackageOptions:
     ``cache_dir`` can isolate reusable state for a temporary caller, and
     ``run_quality_gates=False`` delegates semantic and benchmark commands to
     that caller without weakening wheel routing verification.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        module_name: Importable module name used to restrict the command.
+        output_dir: Directory receiving source-clean wheel artifacts.
+        keep_install_tree: Whether source-clean staging is retained after completion.
+        progress: Optional progress callback used by long-running packaging work.
+        selected_members: Explicit members to compile; empty selects every supported region.
+        cache_dir: Optional cache override used by isolated callers such as trial mode.
+        run_quality_gates: Whether package verification, tests, and benchmarks should run.
     """
 
     root: Path
@@ -137,7 +147,35 @@ class PackageOptions:
 
 @dataclass(frozen=True, slots=True)
 class PackageCommandResult:
-    """Result from building a source-clean Atoll package artifact."""
+    """Result from building a source-clean Atoll package artifact.
+
+    Attributes:
+        success: Whether the represented operation completed successfully.
+        project_root: Root directory of the target Python project.
+        output_dir: Directory receiving source-clean wheel artifacts.
+        install_root: Temporary source-clean installation tree.
+        wheel_path: Source-clean wheel path, when produced.
+        islands: Enabled islands included in the operation or report.
+        build: Captured native build evidence.
+        install_tree_kept: Whether the temporary installation tree remains for inspection.
+        cleanup_removed: Generated paths removed after the operation.
+        cleanup_kept: Generated paths intentionally retained for diagnostics.
+        report_artifact_paths: Artifact paths exposed in user-facing reports.
+        error: User-facing failure text, or `None` on success.
+        skipped: Island builds that failed without producing usable artifacts.
+        preflight_skipped: Modules skipped before compilation because of known blockers.
+        native_readiness: Post-generation native-readiness evidence.
+        typed_regions: Backend-neutral typed regions discovered or reported.
+        compiled_regions: Typed regions successfully compiled into the wheel.
+        compiled_bindings: Source bindings successfully provided by compiled regions.
+        compiled_variants: Backend and specialization variants successfully compiled.
+        backend_assessments: Capability assessments produced before lowering.
+        artifact_records: Validated install metadata for produced native artifacts.
+        region_skipped: Typed-region variants rejected or failed during compilation.
+        verification_steps: Isolated wheel and payload verification evidence.
+        test_results: Target-project command evidence used by quality gates.
+        performance: Paired performance-gate evidence.
+    """
 
     success: bool
     project_root: Path
@@ -168,7 +206,12 @@ class PackageCommandResult:
 
 @dataclass(frozen=True, slots=True)
 class PackageBuildFailure:
-    """A selected island that could not be compiled into the artifact package."""
+    """A selected island that could not be compiled into the artifact package.
+
+    Attributes:
+        island: Enabled island affected by the command.
+        build: Captured native build evidence.
+    """
 
     island: EnabledIslandConfig
     build: CompileAttempt
@@ -176,7 +219,12 @@ class PackageBuildFailure:
 
 @dataclass(frozen=True, slots=True)
 class PackagePreflightFailure:
-    """A selected module skipped before build because mypyc rejects module-level code."""
+    """A selected module skipped before build because mypyc rejects module-level code.
+
+    Attributes:
+        scan: Cached module scan payload.
+        blockers: Conservative blockers attached to this module or symbol.
+    """
 
     scan: ModuleScan
     blockers: tuple[Blocker, ...]
@@ -184,7 +232,15 @@ class PackagePreflightFailure:
 
 @dataclass(frozen=True, slots=True)
 class PackageRegionBuildFailure:
-    """One typed region retained as interpreted after backend failure."""
+    """One typed region retained as interpreted after backend failure.
+
+    Attributes:
+        region: Backend-neutral typed region represented by this record.
+        variant_id: Stable backend/specialization variant identifier.
+        backend: Native compiler backend selected for this record.
+        assessment: Backend capability assessment associated with the build failure.
+        build: Captured native build evidence.
+    """
 
     region: TypedRegion
     variant_id: str
@@ -203,7 +259,19 @@ class _ProjectMetadata:
 
 @dataclass(frozen=True, slots=True)
 class _SelectedTypedRegion:
-    """One typed region and member subset selected for a backend variant."""
+    """One typed region and member subset selected for a backend variant.
+
+    Attributes:
+        scan: Module scan containing retained source facts.
+        region: Backend-neutral typed region represented by the state.
+        variant_id: Stable backend and specialization variant ID.
+        backend: Compiler backend selected for this state.
+        assessment: Backend capability assessment for the selected region.
+        members: Typed-region members included in this state.
+        bound_members: Members already assigned to another region or specialization.
+        specialization: Concrete guarded specialization for the variant.
+        conditional_on_failure_of: Preferred variant that must fail before this fallback runs.
+    """
 
     scan: ModuleScan
     region: TypedRegion
@@ -218,7 +286,16 @@ class _SelectedTypedRegion:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedTypedRegion:
-    """Generated unit plus its staged runtime binding contract."""
+    """Generated unit plus its staged runtime binding contract.
+
+    Attributes:
+        generation: Generated typed-region source and binding metadata.
+        assessment: Backend capability assessment for the selected region.
+        unit: Prepared backend compilation unit.
+        shim: Managed region shim edit for the staged source.
+        fallback: Fallback variant attempted after the preferred backend fails.
+        conditional_on_failure_of: Preferred variant that must fail before this fallback runs.
+    """
 
     generation: TypedRegionGeneration
     assessment: BackendAssessment
@@ -230,7 +307,15 @@ class _PreparedTypedRegion:
 
 @dataclass(frozen=True, slots=True)
 class _TypedRegionBuildOutcome:
-    """Per-region backend results aggregated for source-clean packaging."""
+    """Per-region backend results aggregated for source-clean packaging.
+
+    Attributes:
+        successful: Successfully compiled typed-region variants.
+        build: Captured native compilation attempt.
+        artifacts: Validated native artifacts produced by successful variants.
+        skipped: Region variants rejected or failed during compilation.
+        cache_statuses: Cache outcomes collected across compiled variants.
+    """
 
     successful: tuple[_PreparedTypedRegion, ...]
     build: CompileAttempt
@@ -241,7 +326,15 @@ class _TypedRegionBuildOutcome:
 
 @dataclass(frozen=True, slots=True)
 class _TypedRegionBuildContext:
-    """Filesystem, cache, and progress boundaries shared by region builds."""
+    """Filesystem, cache, and progress boundaries shared by region builds.
+
+    Attributes:
+        build_root: Root of the temporary source-clean build tree.
+        staged_source_roots: All import roots inside source-clean staging.
+        mypy_cache_dir: Mypy cache directory used by the native build.
+        compile_cache_dir: Cache directory used for native region compilation.
+        progress: Optional progress callback.
+    """
 
     build_root: Path
     staged_source_roots: tuple[Path, ...]
@@ -252,7 +345,15 @@ class _TypedRegionBuildContext:
 
 @dataclass(frozen=True, slots=True)
 class _StagedTypedRegionContext:
-    """Copied source evidence shared by primary and fallback backend variants."""
+    """Copied source evidence shared by primary and fallback backend variants.
+
+    Attributes:
+        build_root: Root of the temporary source-clean build tree.
+        staged_source_root: Primary import root inside source-clean staging.
+        module: Module identity or syntax module associated with the state.
+        scan: Module scan containing retained source facts.
+        region: Backend-neutral typed region represented by the state.
+    """
 
     build_root: Path
     staged_source_root: Path
@@ -263,7 +364,14 @@ class _StagedTypedRegionContext:
 
 @dataclass(frozen=True, slots=True)
 class _TypedRegionPackageContext:
-    """Selected analysis evidence carried into source-clean region packaging."""
+    """Selected analysis evidence carried into source-clean region packaging.
+
+    Attributes:
+        selected: Backend-supported region selections.
+        typed_regions: Backend-neutral typed regions considered by packaging.
+        preflight_skipped: Modules rejected before native compilation.
+        native_readiness: Post-generation native-readiness evidence.
+    """
 
     selected: tuple[_SelectedTypedRegion, ...]
     typed_regions: tuple[TypedRegion, ...]
@@ -273,7 +381,14 @@ class _TypedRegionPackageContext:
 
 @dataclass(frozen=True, slots=True)
 class _BaselineWheelPayload:
-    """Normal target wheel unpacked as the immutable source-clean base layer."""
+    """Normal target wheel unpacked as the immutable source-clean base layer.
+
+    Attributes:
+        wheel_path: Final or intermediate wheel archive path.
+        build: Captured native compilation attempt.
+        baseline_install_root: Unpacked baseline payload used for interpreted quality gates.
+        quality_project_root: Project root used by quality-gate subprocesses.
+    """
 
     wheel_path: Path | None
     build: CompileAttempt
@@ -283,7 +398,14 @@ class _BaselineWheelPayload:
 
 @dataclass(frozen=True, slots=True)
 class _QualityGateOutcome:
-    """Configured semantic-test and benchmark evidence before wheel promotion."""
+    """Configured semantic-test and benchmark evidence before wheel promotion.
+
+    Attributes:
+        success: Whether this operation completed successfully.
+        tests: Optional semantic test result.
+        performance: Paired performance-gate result.
+        error: User-facing failure text, or `None` on success.
+    """
 
     success: bool
     tests: tuple[CommandRunEvidence, ...]
@@ -293,7 +415,18 @@ class _QualityGateOutcome:
 
 @dataclass(frozen=True, slots=True)
 class _SourceCleanPromotionContext:
-    """Shared inputs for verifying, gating, and promoting one staged payload."""
+    """Shared inputs for verifying, gating, and promoting one staged payload.
+
+    Attributes:
+        options: Validated command or generation options.
+        project: Discovered target project.
+        output_dir: Directory receiving wheel artifacts.
+        build_root: Root of the temporary source-clean build tree.
+        install_root: Temporary source-clean payload root.
+        baseline: Baseline wheel build evidence.
+        verification_plan: Expected modules, regions, and artifacts for isolated verification.
+        build: Captured native compilation attempt.
+    """
 
     options: PackageOptions
     project: DiscoveredProject
@@ -307,7 +440,19 @@ class _SourceCleanPromotionContext:
 
 @dataclass(frozen=True, slots=True)
 class _SourceCleanPromotionResult:
-    """Final wheel, gate evidence, and cleanup state for a staged payload."""
+    """Final wheel, gate evidence, and cleanup state for a staged payload.
+
+    Attributes:
+        success: Whether this operation completed successfully.
+        wheel_path: Final or intermediate wheel archive path.
+        build: Captured native compilation attempt.
+        verification_steps: Isolated payload and wheel verification evidence.
+        test_results: Target-project command evidence.
+        performance: Paired performance-gate result.
+        cleanup_removed: Generated paths removed after completion.
+        cleanup_kept: Generated paths retained for diagnostics.
+        error: User-facing failure text, or `None` on success.
+    """
 
     success: bool
     wheel_path: Path | None
@@ -322,7 +467,15 @@ class _SourceCleanPromotionResult:
 
 @dataclass(frozen=True, slots=True)
 class _SourceCleanPromotionFailure:
-    """Evidence needed to reject a staged source-clean wheel candidate."""
+    """Evidence needed to reject a staged source-clean wheel candidate.
+
+    Attributes:
+        build: Captured native compilation attempt.
+        verification_steps: Isolated payload and wheel verification evidence.
+        error: User-facing failure text, or `None` on success.
+        wheel_path: Final or intermediate wheel archive path.
+        quality_gate: Test and benchmark outcome for staged artifacts.
+    """
 
     build: CompileAttempt
     verification_steps: tuple[PackageVerificationResult, ...]
@@ -338,6 +491,13 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     deliberately excluded from this command. Explicit in-place workflows retain
     their sidecar implementation, while default compile uses scanner IR, backend
     assessments, and per-region fallback throughout.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        PackageCommandResult: Complete source-clean wheel build, verification, and quality-gate
+            evidence.
     """
     _progress(options.progress, f"discovering project at {options.root.resolve()}")
     project = discover_project(options.root)
@@ -409,6 +569,14 @@ def _execute_typed_region_package(
     Generation and shims live only in copied build roots. Regions compile
     independently so one backend rejection leaves successful regions available
     in the wheel while preserving the original implementation as fallback.
+
+    Args:
+        options: Validated command or generation options.
+        project: Discovered target project configuration and modules.
+        context: Prepared state shared by this operation.
+
+    Returns:
+        PackageCommandResult: Complete source-clean package result for selected regions.
     """
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
     build_root = output_dir / "build"
@@ -708,7 +876,15 @@ def _staged_typed_selection(
     staged_scan: ModuleScan,
     selection: _SelectedTypedRegion,
 ) -> _SelectedTypedRegion:
-    """Rebind a deterministic selection to equivalent evidence in the copied tree."""
+    """Rebind a deterministic selection to equivalent evidence in the copied tree.
+
+    Args:
+        staged_scan: Scan of the staged module copy.
+        selection: One selected region and backend assessment.
+
+    Returns:
+        _SelectedTypedRegion: Prepared staged source, generation metadata, and shim edit.
+    """
     if selection.specialization is None:
         staged_region = next(
             region for region in staged_scan.typed_regions if region.id == selection.region.id
@@ -743,7 +919,15 @@ def _prepare_backend_variant(
     staged: _StagedTypedRegionContext,
     selection: _SelectedTypedRegion,
 ) -> _PreparedTypedRegion:
-    """Lower one selected backend variant inside the copied build tree."""
+    """Lower one selected backend variant inside the copied build tree.
+
+    Args:
+        staged: Staged source-clean package and native build context.
+        selection: One selected region and backend assessment.
+
+    Returns:
+        _PreparedTypedRegion: Prepared backend variant, or a structured skip failure.
+    """
     logical_module = _typed_region_module_name(
         staged.region,
         selection.backend,
@@ -796,7 +980,14 @@ def _prepare_backend_variant(
 def _prepared_source_paths(
     prepared: tuple[_PreparedTypedRegion, ...],
 ) -> tuple[Path, ...]:
-    """Return primary and speculative fallback source paths for cleanup."""
+    """Return primary and speculative fallback source paths for cleanup.
+
+    Args:
+        prepared: Prepared typed-region variant and generated source.
+
+    Returns:
+        tuple[Path, ...]: Source paths consumed by the backend compilation unit.
+    """
     return tuple(
         path
         for item in prepared
@@ -935,7 +1126,16 @@ def _compile_typed_variant(
     *,
     cache_root: Path,
 ) -> BackendCompileResult:
-    """Restore or invoke the adapter selected for one prepared backend variant."""
+    """Restore or invoke the adapter selected for one prepared backend variant.
+
+    Args:
+        item: Object being formatted for deterministic diagnostics.
+        context: Prepared state shared by this operation.
+        cache_root: Root directory for content-addressed cache entries.
+
+    Returns:
+        BackendCompileResult: Successful compiled variant or normalized build failure.
+    """
     backend = _compiler_backend(item.generation.backend)
     return compile_with_region_cache(
         backend,
@@ -949,7 +1149,15 @@ def _should_retry_with_cython(
     item: _PreparedTypedRegion,
     result: BackendCompileResult,
 ) -> bool:
-    """Return whether a deterministic mypyc rejection permits Cython retry."""
+    """Return whether a deterministic mypyc rejection permits Cython retry.
+
+    Args:
+        item: Object being formatted for deterministic diagnostics.
+        result: Operation result being normalized or rendered.
+
+    Returns:
+        bool: Whether a failed preferred variant qualifies for Cython fallback.
+    """
     return (
         item.generation.backend == "mypyc"
         and not result.attempt.success
@@ -961,7 +1169,15 @@ def _recovered_mypyc_attempt(
     attempt: CompileAttempt,
     fallback_variant_id: str,
 ) -> CompileAttempt:
-    """Retain deterministic rejection evidence without failing the aggregate build."""
+    """Retain deterministic rejection evidence without failing the aggregate build.
+
+    Args:
+        attempt: Native compilation attempt being recovered or reported.
+        fallback_variant_id: Variant ID used when no preferred backend succeeds.
+
+    Returns:
+        CompileAttempt: Mypyc attempt augmented with successful Cython fallback evidence.
+    """
     return replace(
         attempt,
         success=True,
@@ -1084,7 +1300,15 @@ def _source_clean_region_report_artifact_paths(
     root: Path,
     artifact_records: tuple[ArtifactRecord, ...],
 ) -> tuple[Path, ...]:
-    """Map region-owned install paths to stable report paths under the target root."""
+    """Map region-owned install paths to stable report paths under the target root.
+
+    Args:
+        root: Root directory of the target Python project.
+        artifact_records: Validated native artifact metadata for successful variants.
+
+    Returns:
+        tuple[Path, ...]: Artifact paths exposed in source-clean reports.
+    """
     return tuple(
         root / PurePosixPath(path)
         for path in dict.fromkeys(record.install_relative_path for record in artifact_records)
@@ -1102,7 +1326,14 @@ def _typed_region_module_name(
 
 
 def _region_artifact_relative_dir(variant_id: str) -> str:
-    """Return a stable collision-resistant install directory for one variant."""
+    """Return a stable collision-resistant install directory for one variant.
+
+    Args:
+        variant_id: Stable backend and specialization variant identifier.
+
+    Returns:
+        str: Install-relative directory that owns region artifacts.
+    """
     readable = re.sub(r"[^A-Za-z0-9_.-]", "_", variant_id).strip("_.-")[:48]
     digest = hashlib.sha256(variant_id.encode()).hexdigest()[:12]
     label = readable or "region"
@@ -1110,7 +1341,14 @@ def _region_artifact_relative_dir(variant_id: str) -> str:
 
 
 def _compiler_backend(backend: Backend) -> CompilerBackend:
-    """Return the configured compiler adapter for one automatic selection."""
+    """Return the configured compiler adapter for one automatic selection.
+
+    Args:
+        backend: Compiler backend selected for this operation.
+
+    Returns:
+        CompilerBackend: Compiler backend registered for the requested identifier.
+    """
     return _COMPILER_BACKENDS[backend]
 
 
@@ -1189,7 +1427,18 @@ def _prepare_baseline_wheel_payload(
     progress: PackageProgress | None,
     run_quality_gates: bool,
 ) -> _BaselineWheelPayload:
-    """Build and unpack the target project's normal wheel from a clean copy."""
+    """Build and unpack the target project's normal wheel from a clean copy.
+
+    Args:
+        project: Discovered target project configuration and modules.
+        build_root: Root of the temporary source-clean build tree.
+        install_root: Temporary install payload receiving compiled artifacts.
+        progress: Optional progress callback for long-running work.
+        run_quality_gates: Whether verification, tests, and benchmarks should run.
+
+    Returns:
+        _BaselineWheelPayload: Baseline wheel and unpacked payload evidence.
+    """
     copied_project = build_root / "pep517-project"
     baseline_output = build_root / "pep517-dist"
     _progress(progress, "building target PEP 517 baseline wheel")
@@ -1311,7 +1560,15 @@ def _combine_baseline_and_native(
     baseline: CompileAttempt,
     native: CompileAttempt,
 ) -> CompileAttempt:
-    """Preserve normal-wheel and native-build evidence in one compatibility view."""
+    """Preserve normal-wheel and native-build evidence in one compatibility view.
+
+    Args:
+        baseline: Baseline wheel build evidence.
+        native: Compiled payload command evidence.
+
+    Returns:
+        CompileAttempt: Final wheel path after overlaying native artifacts.
+    """
     return CompileAttempt(
         success=baseline.success and native.success,
         command=("atoll", "source-clean-build"),
@@ -1579,7 +1836,15 @@ def _failed_promotion(
 
 
 def _retain_failed_wheel(build_root: Path, wheel_path: Path) -> Path | None:
-    """Move a rejected candidate under diagnostic scratch without exposing a wheel output."""
+    """Move a rejected candidate under diagnostic scratch without exposing a wheel output.
+
+    Args:
+        build_root: Root of the temporary source-clean build tree.
+        wheel_path: Wheel archive being retained, overlaid, or reported.
+
+    Returns:
+        Path | None: Retained diagnostic wheel path, when one can be preserved.
+    """
     if not wheel_path.exists():
         return None
     diagnostic_root = build_root / "diagnostics"
@@ -1695,7 +1960,14 @@ def _invalid_quality_gate(minimum_speedup: float, reason: str) -> _QualityGateOu
 
 
 def _skipped_quality_gate(minimum_speedup: float) -> _QualityGateOutcome:
-    """Record that a caller owns semantic and performance gates for this build."""
+    """Record that a caller owns semantic and performance gates for this build.
+
+    Args:
+        minimum_speedup: Configured profitability threshold for benchmark results.
+
+    Returns:
+        _QualityGateOutcome: Explicit skipped quality-gate result with its reason.
+    """
     return _QualityGateOutcome(
         success=True,
         tests=(),
@@ -1788,6 +2060,15 @@ def _selected_typed_regions(
     Explicit requests are expanded only along same-region runtime call edges.
     This keeps trial selection precise while ensuring copied callables retain
     every eligible helper required by their executable bodies.
+
+    Args:
+        scans: Selected module scans in deterministic order.
+        backends: Backends considered in configured preference order.
+        requested_members: Explicit source members requested by the caller.
+
+    Returns:
+        tuple[_SelectedTypedRegion, ...]: Backend-supported region selections in deterministic
+            order.
     """
     selected: list[_SelectedTypedRegion] = []
     requested = frozenset(requested_members)
@@ -1893,7 +2174,18 @@ def _selected_requested_callable_variant(
     requested: frozenset[SymbolId],
     backends: tuple[Backend, ...],
 ) -> tuple[_SelectedTypedRegion, ...]:
-    """Choose one backend that supports a requested callable closure in full."""
+    """Choose one backend that supports a requested callable closure in full.
+
+    Args:
+        scan: Module scan containing retained source facts.
+        region: Backend-neutral typed region being processed.
+        closure: Stable IDs in the selected runtime dependency closure.
+        requested: Explicit source members requested by the caller.
+        backends: Backends considered in configured preference order.
+
+    Returns:
+        tuple[_SelectedTypedRegion, ...]: Callable variant matching the explicit request, if any.
+    """
     if not closure:
         return ()
     closure_set = frozenset(closure)
@@ -1922,7 +2214,18 @@ def _backend_callable_members(
     *,
     excluded: tuple[SymbolId, ...],
 ) -> tuple[tuple[SymbolId, ...], tuple[SymbolId, ...]]:
-    """Return complete generated closure members and public backend bindings."""
+    """Return complete generated closure members and public backend bindings.
+
+    Args:
+        region: Backend-neutral typed region being processed.
+        eligible: Members accepted by backend and specialization checks.
+        assessment: Backend capability assessment for the selected region.
+        excluded: Paths or names that must not be copied.
+
+    Returns:
+        tuple[tuple[SymbolId, ...], tuple[SymbolId, ...]]: Generated callable members and
+            source-class bindings supported by the selected backend.
+    """
     if assessment is None:
         return (), ()
     supported = frozenset(assessment.supported_members)
@@ -1998,7 +2301,15 @@ def _eligible_atomic_class(
     region: TypedRegion,
     assessment: BackendAssessment,
 ) -> SymbolId | None:
-    """Return the class binding only when Cython supports its complete region."""
+    """Return the class binding only when Cython supports its complete region.
+
+    Args:
+        region: Backend-neutral typed region being processed.
+        assessment: Backend capability assessment for the selected region.
+
+    Returns:
+        SymbolId | None: Atomic class region when every safety condition passes.
+    """
     if not region.atomic_class or assessment.status != "supported":
         return None
     class_members = tuple(member for member in region.members if member.kind == "class")
@@ -2021,7 +2332,15 @@ def _specialized_region(
     source_region: TypedRegion,
     specialization: RegionSpecialization,
 ) -> TypedRegion:
-    """Materialize one backend-assessable view without changing generic source IR."""
+    """Materialize one backend-assessable view without changing generic source IR.
+
+    Args:
+        source_region: Unspecialized typed region used to derive the variant.
+        specialization: Concrete guarded specialization applied to the region.
+
+    Returns:
+        TypedRegion: Region variant with concrete substitutions and runtime guards.
+    """
     member = next(item for item in source_region.members if item.id == specialization.source_member)
     source_hash = hashlib.sha256(
         f"{source_region.source_hash}:{specialization.id}".encode()
@@ -2083,7 +2402,16 @@ def _runtime_member_closure(
     eligible: tuple[SymbolId, ...],
     requested: frozenset[SymbolId],
 ) -> tuple[SymbolId, ...]:
-    """Return a complete eligible callable closure, or empty when one edge is unsafe."""
+    """Return a complete eligible callable closure, or empty when one edge is unsafe.
+
+    Args:
+        region: Backend-neutral typed region being processed.
+        eligible: Members accepted by backend and specialization checks.
+        requested: Explicit source members requested by the caller.
+
+    Returns:
+        tuple[SymbolId, ...]: Stable IDs required by the selected members at runtime.
+    """
     eligible_set = frozenset(eligible)
     selected = set(requested.intersection(eligible_set))
     changed = True
@@ -2109,7 +2437,15 @@ def _missing_requested_members(
     requested: tuple[SymbolId, ...],
     selected: tuple[_SelectedTypedRegion, ...],
 ) -> tuple[SymbolId, ...]:
-    """Return explicit requests not covered by any selected backend variant."""
+    """Return explicit requests not covered by any selected backend variant.
+
+    Args:
+        requested: Explicit source members requested by the caller.
+        selected: Backend-supported region selections.
+
+    Returns:
+        tuple[SymbolId, ...]: Requested members absent from all selected backend variants.
+    """
     covered: set[SymbolId] = set()
     for selection in selected:
         covered.update(selection.bound_members or selection.members)
@@ -2140,7 +2476,14 @@ def _owner_disallows_method_binding(
 
 
 def _member_requires_source_class(source_text: str) -> bool:
-    """Reject method extraction when Python's class compilation supplies semantics."""
+    """Reject method extraction when Python's class compilation supplies semantics.
+
+    Args:
+        source_text: Original Python source text being analyzed or transformed.
+
+    Returns:
+        bool: Whether generated code must retain the source owner class.
+    """
     tree = ast.parse(textwrap.dedent(source_text))
     return any(
         (isinstance(node, ast.Name) and node.id == "__class__")
@@ -2186,7 +2529,16 @@ def _overlay_staged_sources(
     install_root: Path,
     source_paths: tuple[Path, ...],
 ) -> None:
-    """Overlay only shimmed modules that already exist in the backend wheel."""
+    """Overlay only shimmed modules that already exist in the backend wheel.
+
+    Args:
+        source_roots: Import roots visible to the target project.
+        install_root: Temporary install payload receiving compiled artifacts.
+        source_paths: Prepared source files included in the build.
+
+    Raises:
+        ValueError: If the baseline wheel omitted a source module that Atoll must shim.
+    """
     for source_path in dict.fromkeys(source_paths):
         relative = _source_relative_path(source_path, source_roots)
         destination = install_root / relative
@@ -2202,7 +2554,16 @@ def _overlay_install_payload(
     install_root: Path,
     source_paths: tuple[Path, ...],
 ) -> str | None:
-    """Overlay source modules and artifacts, normalizing backend omissions as failure text."""
+    """Overlay source modules and artifacts, normalizing backend omissions as failure text.
+
+    Args:
+        source_roots: Import roots visible to the target project.
+        install_root: Temporary install payload receiving compiled artifacts.
+        source_paths: Prepared source files included in the build.
+
+    Returns:
+        str | None: Paths installed into the staged wheel payload.
+    """
     try:
         _overlay_staged_sources(source_roots, install_root, source_paths)
         _copy_atoll_artifacts(source_roots, install_root)
@@ -2241,7 +2602,12 @@ def _wheel_output_path(output_dir: Path, metadata: _ProjectMetadata) -> Path:
 
 
 def _remove_failed_wheels(project: DiscoveredProject, output_dir: Path) -> None:
-    """Remove wheel artifacts that could be mistaken for the failed attempt."""
+    """Remove wheel artifacts that could be mistaken for the failed attempt.
+
+    Args:
+        project: Discovered target project configuration and modules.
+        output_dir: Directory receiving generated wheel artifacts.
+    """
     metadata = _project_metadata(project.config.root)
     default_output = project.config.root / ".atoll" / "dist"
     if output_dir.resolve() != default_output.resolve():
@@ -2324,7 +2690,13 @@ def _copy_pep517_project(
     *,
     excluded_output: Path,
 ) -> None:
-    """Copy complete build inputs while excluding Atoll state and native residue."""
+    """Copy complete build inputs while excluding Atoll state and native residue.
+
+    Args:
+        source: Source expression, declaration, or filesystem path being processed.
+        destination: Filesystem destination receiving copied or overlaid content.
+        excluded_output: Output directory excluded from the copied project tree.
+    """
     source_root = source.resolve()
     excluded_root = excluded_output.resolve()
 
@@ -2347,7 +2719,12 @@ def _copy_pep517_project(
 
 
 def _remove_quality_gate_sources(project: DiscoveredProject, copied_project: Path) -> None:
-    """Remove importable checkout modules while preserving tests and benchmark files."""
+    """Remove importable checkout modules while preserving tests and benchmark files.
+
+    Args:
+        project: Discovered target project configuration and modules.
+        copied_project: Temporary project copy used for a PEP 517 build.
+    """
     for module in project.modules:
         try:
             relative = module.path.relative_to(project.config.root)
@@ -2357,7 +2734,12 @@ def _remove_quality_gate_sources(project: DiscoveredProject, copied_project: Pat
 
 
 def _write_gitdir_pointer(source: Path, destination: Path) -> None:
-    """Expose read-only VCS metadata to dynamic-version PEP 517 backends."""
+    """Expose read-only VCS metadata to dynamic-version PEP 517 backends.
+
+    Args:
+        source: Source expression, declaration, or filesystem path being processed.
+        destination: Filesystem destination receiving copied or overlaid content.
+    """
     source_git = source / ".git"
     if source_git.is_dir():
         git_dir = source_git.resolve()

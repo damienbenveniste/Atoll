@@ -45,7 +45,13 @@ _QUALIFIED_TYPING_PATH_LENGTH = 2
 
 @dataclass(frozen=True, slots=True)
 class _TypingAliases:
-    """Imported typing aliases and legacy module-level type parameters."""
+    """Imported typing aliases and legacy module-level type parameters.
+
+    Attributes:
+        any_names: Names that resolve to `typing.Any` in the module.
+        typing_module_names: Aliases bound to the `typing` module.
+        module_type_parameters: Type parameters declared by the module scope.
+    """
 
     any_names: frozenset[str]
     typing_module_names: frozenset[str]
@@ -54,7 +60,15 @@ class _TypingAliases:
 
 @dataclass(frozen=True, slots=True)
 class _FunctionRecordContext:
-    """Source ownership and import context needed to build a function symbol."""
+    """Source ownership and import context needed to build a function symbol.
+
+    Attributes:
+        module_name: Importable source module name.
+        kind: Classified declaration, binding, or receiver kind.
+        qualname: Module-local qualified declaration name.
+        owner_class: Source class owning the selected member.
+        typing_aliases: Typing names and aliases visible in the module.
+    """
 
     module_name: str
     kind: SymbolKind
@@ -70,6 +84,12 @@ def scan_module(module: ModuleId) -> ModuleScan:
     classifications, functions/classes/simple methods, module blockers, and
     executable statement locations. It deliberately omits mypy diagnostics and
     candidate scoring because those depend on later enrichment phases.
+
+    Args:
+        module: Module scan or module identity being analyzed.
+
+    Returns:
+        ModuleScan: Immutable AST-derived scan facts for the module.
     """
     source = module.path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(module.path), type_comments=True)
@@ -266,7 +286,14 @@ def _global_names(
 def _declaration_start_lineno(
     node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
 ) -> int:
-    """Return the first decorator line or the declaration line when undecorated."""
+    """Return the first decorator line or the declaration line when undecorated.
+
+    Args:
+        node: Syntax node being visited without executing target code.
+
+    Returns:
+        int: First line occupied by decorators or declaration syntax.
+    """
     return min((decorator.lineno for decorator in node.decorator_list), default=node.lineno)
 
 
@@ -757,7 +784,11 @@ class _FunctionNameCollector(ast.NodeVisitor):
         self._in_annotation = False
 
     def collect(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        """Collect names from a function without visiting its decorator wrapper."""
+        """Collect names from a function without visiting its decorator wrapper.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self._collect_arguments(node)
         self._collect_defaults(node)
         self._collect_decorators(node)
@@ -793,12 +824,20 @@ class _FunctionNameCollector(ast.NodeVisitor):
             self._visit_annotation(node.returns)
 
     def visit_arg(self, node: ast.arg) -> None:
-        """Record argument names as local bindings while preserving annotations."""
+        """Record argument names as local bindings while preserving annotations.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.local_names.add(node.arg)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
-        """Classify loaded names as references and stored names as locals."""
+        """Classify loaded names as references and stored names as locals.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         if isinstance(node.ctx, ast.Load):
             self.referenced_names.add(node.id)
             if not self._in_annotation:
@@ -807,7 +846,11 @@ class _FunctionNameCollector(ast.NodeVisitor):
             self.local_names.add(node.id)
 
     def visit_Call(self, node: ast.Call) -> None:
-        """Record directly named calls for conservative same-module edges."""
+        """Record directly named calls for conservative same-module edges.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         if isinstance(node.func, ast.Name):
             self.called_names.add(node.func.id)
         path = _attribute_path(node.func)
@@ -816,15 +859,27 @@ class _FunctionNameCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """Treat nested functions as local bindings and do not traverse them."""
+        """Treat nested functions as local bindings and do not traverse them.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.local_names.add(node.name)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Treat nested async functions as local bindings and do not traverse them."""
+        """Treat nested async functions as local bindings and do not traverse them.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.local_names.add(node.name)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        """Treat nested classes as local bindings and do not traverse them."""
+        """Treat nested classes as local bindings and do not traverse them.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         self.local_names.add(node.name)
 
     def _visit_annotation(self, node: ast.expr) -> None:
@@ -862,23 +917,43 @@ class _YieldShapeVisitor(ast.NodeVisitor):
         self.contains_yield = False
 
     def visit_Yield(self, node: ast.Yield) -> None:
-        """Mark a sync or async generator yield expression."""
+        """Mark a sync or async generator yield expression.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         del node
         self.contains_yield = True
 
     def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
-        """Mark a generator delegation expression."""
+        """Mark a generator delegation expression.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         del node
         self.contains_yield = True
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """Skip nested functions when detecting the outer execution shape."""
+        """Skip nested functions when detecting the outer execution shape.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Skip nested async functions when detecting the outer execution shape."""
+        """Skip nested async functions when detecting the outer execution shape.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        """Skip nested class bodies when detecting the outer execution shape."""
+        """Skip nested class bodies when detecting the outer execution shape.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
 
 
 class _ClassNameCollector(ast.NodeVisitor):
@@ -895,7 +970,11 @@ class _ClassNameCollector(ast.NodeVisitor):
         self.referenced_names: set[str] = set()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        """Visit only the class header and decorator expressions."""
+        """Visit only the class header and decorator expressions.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         for decorator in node.decorator_list:
             self.visit(decorator)
         for base in node.bases:
@@ -904,6 +983,10 @@ class _ClassNameCollector(ast.NodeVisitor):
             self.visit(keyword.value)
 
     def visit_Name(self, node: ast.Name) -> None:
-        """Record names loaded by class headers as references."""
+        """Record names loaded by class headers as references.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
         if isinstance(node.ctx, ast.Load):
             self.referenced_names.add(node.id)

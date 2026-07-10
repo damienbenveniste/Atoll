@@ -29,6 +29,14 @@ def verify_islands(
     `module_name` narrows the check to one source module. When `require_compiled`
     is true, active pure-Python sidecars are reported as failures even if symbols
     are rebound correctly.
+
+    Args:
+        config: Resolved configuration governing the requested operation.
+        module_name: Optional importable module name used to limit the operation.
+        require_compiled: Whether interpreted fallback must be treated as verification failure.
+
+    Returns:
+        tuple[VerifyResult, ...]: Routing results for each matching enabled island.
     """
     enabled = tuple(
         island
@@ -115,6 +123,14 @@ def _is_sidecar_binding(value: object, sidecar_module: str, *, compiled: bool) -
     them with the original source function and expose the native callable through
     `__atoll_compiled_target__`; pure-Python fallback bindings remain direct. The
     marker is trusted only when the managed shim reports compiled routing.
+
+    Args:
+        value: Source value or annotation name being normalized.
+        sidecar_module: Importable generated sidecar module name.
+        compiled: Compiled payload command evidence.
+
+    Returns:
+        bool: Whether the runtime object originates from the expected sidecar.
     """
     target = getattr(value, "__atoll_compiled_target__", value) if compiled else value
     return getattr(target, "__module__", None) == sidecar_module

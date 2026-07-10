@@ -17,7 +17,14 @@ from atoll.config import load_enabled_islands
 
 @dataclass(frozen=True, slots=True)
 class CleanOptions:
-    """User-facing options for selecting which Atoll outputs to remove."""
+    """User-facing options for selecting which Atoll outputs to remove.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        cache: Whether scan and native build caches should be removed.
+        artifacts: Whether compiled extension artifacts should be removed.
+        all_outputs: Whether every Atoll-owned output category should be removed.
+    """
 
     root: Path
     cache: bool = False
@@ -27,7 +34,11 @@ class CleanOptions:
 
 @dataclass(frozen=True, slots=True)
 class CleanCommandResult:
-    """Paths that no longer exist after a clean operation completes."""
+    """Paths that no longer exist after a clean operation completes.
+
+    Attributes:
+        removed: Paths removed during cleanup.
+    """
 
     removed: tuple[Path, ...]
 
@@ -38,6 +49,12 @@ def execute_clean(options: CleanOptions) -> CleanCommandResult:
     With no specific flag, the default is to clear cache/build state. Artifact
     removal is opt-in through `artifacts` or `all_outputs` because compiled files
     may be useful for later inspection.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        CleanCommandResult: Paths removed by the requested cleanup scope.
     """
     root = options.root.resolve()
     remove_cache = options.cache or options.all_outputs or not options.artifacts

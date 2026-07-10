@@ -41,7 +41,12 @@ SCANNER_VERSION = "5"
 
 
 class CacheStats(TypedDict):
-    """Hit and miss counts returned with a cached scan run."""
+    """Hit and miss counts returned with a cached scan run.
+
+    Attributes:
+        hits: Number of module scans restored from cache.
+        misses: Number of module scans recomputed from source.
+    """
 
     hits: int
     misses: int
@@ -52,6 +57,14 @@ class BlockerCacheEntry(TypedDict):
 
     The symbol identity is split into nullable module and qualname fields because
     module-level blockers do not belong to a concrete symbol.
+
+    Attributes:
+        severity: Diagnostic severity used for filtering and reporting.
+        code: Stable machine-readable diagnostic or blocker code.
+        message: Human-readable diagnostic or blocker explanation.
+        lineno: One-based first source line covered by the record.
+        symbol_module: Module portion of an optional cached symbol identity.
+        symbol_qualname: Qualified-name portion of an optional cached symbol identity.
     """
 
     severity: BlockerSeverity
@@ -63,7 +76,16 @@ class BlockerCacheEntry(TypedDict):
 
 
 class ImportCacheEntry(TypedDict):
-    """Cached top-level import record used for dependency and sidecar analysis."""
+    """Cached top-level import record used for dependency and sidecar analysis.
+
+    Attributes:
+        source_text: Exact source text retained for analysis or generation.
+        imported_names: Names introduced into the module namespace by the import.
+        module: Imported module path, or `None` for imports without one.
+        level: Relative import level; zero denotes an absolute import.
+        lineno: One-based first source line covered by the record.
+        end_lineno: One-based final source line covered by the record.
+    """
 
     source_text: str
     imported_names: list[str]
@@ -74,7 +96,15 @@ class ImportCacheEntry(TypedDict):
 
 
 class ConstantCacheEntry(TypedDict):
-    """Cached top-level assignment record and its literal-safety classification."""
+    """Cached top-level assignment record and its literal-safety classification.
+
+    Attributes:
+        name: Top-level assignment name.
+        kind: Literal, runtime-dynamic, or unknown safety classification.
+        source_text: Exact source text retained for analysis or generation.
+        lineno: One-based first source line covered by the record.
+        end_lineno: One-based final source line covered by the record.
+    """
 
     name: str
     kind: ConstantKind
@@ -84,7 +114,14 @@ class ConstantCacheEntry(TypedDict):
 
 
 class ParameterCacheEntry(TypedDict):
-    """Cached exact source parameter facts for typed-region planning."""
+    """Cached exact source parameter facts for typed-region planning.
+
+    Attributes:
+        name: Source parameter name without `*` or `**` prefixes.
+        kind: Positional, variadic, keyword-only, or keyword variadic kind.
+        annotation: Exact source annotation text.
+        default_source: Exact default-value source text, or `None` when required.
+    """
 
     name: str
     kind: ParameterKind
@@ -93,7 +130,14 @@ class ParameterCacheEntry(TypedDict):
 
 
 class FieldCacheEntry(TypedDict):
-    """Cached typed class field facts for class-region planning."""
+    """Cached typed class field facts for class-region planning.
+
+    Attributes:
+        name: Class field name.
+        annotation: Exact source annotation text.
+        default_source: Exact default-value source text, or `None` when required.
+        class_variable: Whether the field is declared as a class variable.
+    """
 
     name: str
     annotation: str
@@ -102,7 +146,13 @@ class FieldCacheEntry(TypedDict):
 
 
 class TypeParameterCacheEntry(TypedDict):
-    """Cached exact type-parameter declaration and structured identity."""
+    """Cached exact type-parameter declaration and structured identity.
+
+    Attributes:
+        name: Type parameter name visible in source.
+        kind: `TypeVar`, `ParamSpec`, or `TypeVarTuple` classification.
+        declaration: Exact source declaration for the type parameter.
+    """
 
     name: str
     kind: TypeParameterKind
@@ -115,6 +165,41 @@ class SymbolCacheEntry(TypedDict):
     The payload intentionally excludes mypy diagnostics and candidate data
     because those are enrichment outputs that can change without the source file
     itself changing.
+
+    Attributes:
+        module: Importable module containing the cached declaration.
+        qualname: Module-local qualified symbol name.
+        kind: Function, class, or method declaration kind.
+        visibility: Public or private source visibility.
+        lineno: One-based first source line covered by the record.
+        end_lineno: One-based final source line covered by the record.
+        col_offset: Zero-based source column where the declaration starts.
+        end_col_offset: Zero-based source column where the declaration ends, when available.
+        decorators: Source text for decorators applied to the symbol.
+        arg_count: Total caller-visible parameter count.
+        annotated_arg_count: Number of parameters with explicit annotations.
+        has_return_annotation: Whether the callable declares a return annotation.
+        has_any_annotation: Whether any visible annotation contains `Any`.
+        called_names: Simple names observed in call position.
+        uses_globals: Module globals read by the symbol body.
+        local_names: Names bound locally within the symbol body.
+        referenced_names: All names read by the symbol body or annotations.
+        owner_class: Source owner class for a method binding, when applicable.
+        binding_kind: Runtime descriptor or module binding classification.
+        execution_kind: Synchronous, generator, coroutine, async-generator, or class shape.
+        type_parameters: Type parameter names declared directly by the symbol.
+        parameters: Exact source parameter declarations in call order.
+        return_annotation: Exact source return annotation, when present.
+        annotation_names: Names referenced by source annotations.
+        called_paths: Dotted call targets recovered from source syntax.
+        base_names: Base-class expressions referenced by the declaration.
+        fields: Typed class fields retained for region planning.
+        declaration_start_lineno: First line of decorators or declaration syntax.
+        scope_type_parameters: Type parameter names inherited from enclosing scopes.
+        type_parameter_records: Structured type parameters declared directly by the symbol.
+        scope_type_parameter_records: Structured type parameters inherited from enclosing scopes.
+        any_annotation_sources: Locations where `Any` enters the symbol's type surface.
+        blockers: Conservative blockers attached to this module or symbol.
     """
 
     module: str
@@ -153,7 +238,17 @@ class SymbolCacheEntry(TypedDict):
 
 
 class ModuleScanCacheEntry(TypedDict):
-    """Cached first-pass scan for one module before enrichment."""
+    """Cached first-pass scan for one module before enrichment.
+
+    Attributes:
+        module_name: Importable module name used to restrict the command.
+        path: Absolute source path serialized for cache reconstruction.
+        imports: Top-level imports retained for analysis or generation.
+        constants: Top-level constants retained for analysis or sidecar generation.
+        symbols: Cached declaration facts in source order.
+        blockers: Conservative blockers attached to this module or symbol.
+        top_level_statement_lines: Executable module-level statements that may affect extraction.
+    """
 
     module_name: str
     path: str
@@ -165,7 +260,16 @@ class ModuleScanCacheEntry(TypedDict):
 
 
 class FileCacheEntry(TypedDict):
-    """One indexed source file and the scanner inputs that validate its cache."""
+    """One indexed source file and the scanner inputs that validate its cache.
+
+    Attributes:
+        path: Normalized source path used as the cache-index key.
+        module_name: Importable module name used to restrict the command.
+        sha256: Source content digest used for cache invalidation.
+        python_version: Python version included in cache invalidation.
+        scanner_version: Scanner schema version included in cache invalidation.
+        scan: Cached module scan payload.
+    """
 
     path: str
     module_name: str
@@ -176,7 +280,12 @@ class FileCacheEntry(TypedDict):
 
 
 class CacheIndex(TypedDict):
-    """Root cache file mapping relative source paths to scan entries."""
+    """Root cache file mapping relative source paths to scan entries.
+
+    Attributes:
+        version: Schema or cache format version.
+        files: Cache entries keyed by normalized source path.
+    """
 
     version: Literal[1]
     files: dict[str, FileCacheEntry]
@@ -191,6 +300,14 @@ def scan_modules_with_cache(
     The function updates the cache index after scanning misses. It does not cache
     mypy diagnostics, dependency edges, candidate scores, or reports; callers
     must run those enrichment phases on the returned scans every time.
+
+    Args:
+        config: Resolved configuration governing the requested operation.
+        modules: Discovered or scanned modules processed in deterministic order.
+
+    Returns:
+        tuple[tuple[ModuleScan, ...], CacheStats]: Module scans in input order together with cache
+            hit and miss counts.
     """
     index = _read_index(config.cache_dir / "index.json")
     files = dict(index["files"])
@@ -219,6 +336,9 @@ def clear_scan_cache(root: Path) -> None:
 
     This is a best-effort cleanup helper used by commands that want a fresh AST
     scan. Missing cache files are treated as already clean.
+
+    Args:
+        root: Root directory of the target Python project.
     """
     index = root.resolve() / ".atoll" / "cache" / "index.json"
     if index.exists():

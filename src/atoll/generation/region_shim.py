@@ -21,7 +21,17 @@ _MARKER_LABEL = "ATOLL TYPED REGIONS"
 
 @dataclass(frozen=True, slots=True)
 class RegionShimConfig:
-    """Runtime loading and binding contract for one compiled typed region."""
+    """Runtime loading and binding contract for one compiled typed region.
+
+    Attributes:
+        source_module: Importable source module name.
+        source_path: Filesystem path of the source module or prepared source.
+        region_id: Stable typed-region identifier owning the artifact or unit.
+        backend: Native compiler backend selected for this record.
+        compiled_module: Importable native module loaded by the managed region shim.
+        artifact_dir: Directory from which the runtime shim loads native artifacts.
+        bindings: Source bindings promised by the compiled region or variant.
+    """
 
     source_module: str
     source_path: Path
@@ -32,7 +42,12 @@ class RegionShimConfig:
     bindings: tuple[BindingTarget, ...]
 
     def __post_init__(self) -> None:
-        """Reject configs the current runtime binder cannot preserve."""
+        """Reject configs the current runtime binder cannot preserve.
+
+        Raises:
+            ValueError: If identifiers are empty or bindings are absent, cross-module, or
+                unsupported by the runtime binder.
+        """
         if not self.source_module or not self.region_id or not self.compiled_module:
             raise ValueError("region shim identifiers must be non-empty")
         if not self.bindings:
@@ -60,7 +75,13 @@ class RegionShimConfig:
 
 @dataclass(frozen=True, slots=True)
 class RegionShimEdit:
-    """Original and updated staged source plus a reviewable unified diff."""
+    """Original and updated staged source plus a reviewable unified diff.
+
+    Attributes:
+        old_text: Source text before applying the managed edit.
+        new_text: Source text after applying the managed edit.
+        diff: Unified diff between original and transformed source.
+    """
 
     old_text: str
     new_text: str
@@ -71,7 +92,15 @@ def insert_or_replace_region_shim(
     source_text: str,
     configs: tuple[RegionShimConfig, ...],
 ) -> RegionShimEdit:
-    """Append or replace one module-level typed-region runtime block."""
+    """Append or replace one module-level typed-region runtime block.
+
+    Args:
+        source_text: Original Python source text to transform.
+        configs: Region shim configurations to render in deterministic order.
+
+    Returns:
+        RegionShimEdit: Original text, transformed text, and unified diff for the region shim edit.
+    """
     source_module = _validate_configs(configs)
     new_text = _replace_block(source_text, source_module, render_region_shim(configs))
     return _edit(source_text, new_text, configs[0].source_path.name)
@@ -83,13 +112,29 @@ def remove_region_shim(
     source_module: str,
     filename: str,
 ) -> RegionShimEdit:
-    """Remove a typed-region block while rejecting ambiguous markers."""
+    """Remove a typed-region block while rejecting ambiguous markers.
+
+    Args:
+        source_text: Original Python source text to transform.
+        source_module: Importable source module name.
+        filename: Filename used in unified diff headers.
+
+    Returns:
+        RegionShimEdit: Original text, transformed text, and unified diff after shim removal.
+    """
     new_text = _replace_block(source_text, source_module, "")
     return _edit(source_text, new_text, filename)
 
 
 def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
-    """Render a staged-wheel loader for guarded functions and descriptors."""
+    """Render a staged-wheel loader for guarded functions and descriptors.
+
+    Args:
+        configs: Region shim configurations to render in deterministic order.
+
+    Returns:
+        str: Deterministic managed region-shim block.
+    """
     source_module = _validate_configs(configs)
     regions = tuple(_runtime_region(config) for config in configs)
     promised_symbols = tuple(
@@ -539,7 +584,14 @@ def _runtime_region(config: RegionShimConfig) -> dict[str, object]:
 
 
 def _binding_runtime_qualname(binding: BindingTarget) -> str:
-    """Return the binding key users see, including concrete subclass targets."""
+    """Return the binding key users see, including concrete subclass targets.
+
+    Args:
+        binding: Source binding being rendered or verified.
+
+    Returns:
+        str: Runtime qualified name used to resolve the binding.
+    """
     member_name = binding.source.qualname.rsplit(".", maxsplit=1)[-1]
     if binding.target_owner_class is not None:
         return f"{binding.target_owner_class}.{member_name}"

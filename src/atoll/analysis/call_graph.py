@@ -39,6 +39,12 @@ def build_dependency_edges(module: ModuleScan) -> tuple[DependencyEdge, ...]:
     The graph uses scanner-provided name facts rather than AST re-traversal so
     dependency analysis stays aligned with cached scan output. Scanner-version
     invalidation ensures cached records always carry the typed-region fields.
+
+    Args:
+        module: Module scan or module identity being analyzed.
+
+    Returns:
+        tuple[DependencyEdge, ...]: Deterministically ordered dependency edges for the module.
     """
     symbol_by_name = _symbol_name_map(module.symbols)
     imported_names = _imported_name_map(module.imports)

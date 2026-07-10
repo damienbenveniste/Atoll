@@ -17,7 +17,14 @@ from atoll.models import EnabledIslandConfig
 
 @dataclass(frozen=True, slots=True)
 class DisableOptions:
-    """User-facing options for disabling one configured Atoll island."""
+    """User-facing options for disabling one configured Atoll island.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        module_name: Importable module name used to restrict the command.
+        delete_sidecar: Whether disabling also removes the generated sidecar file.
+        dry_run: Whether changes are planned and reported without filesystem writes.
+    """
 
     root: Path
     module_name: str
@@ -27,7 +34,13 @@ class DisableOptions:
 
 @dataclass(frozen=True, slots=True)
 class DisableCommandResult:
-    """Prepared or applied edits from disabling one island."""
+    """Prepared or applied edits from disabling one island.
+
+    Attributes:
+        island: Enabled island affected by the command.
+        shim_edit: Managed source transformation planned or applied by the command.
+        applied: Whether the planned filesystem changes were written.
+    """
 
     island: EnabledIslandConfig
     shim_edit: ShimEdit
@@ -39,6 +52,12 @@ def execute_disable(options: DisableOptions) -> DisableCommandResult:
 
     In dry-run mode the source text diff is prepared but no files or
     configuration are changed. A missing configured island raises `ValueError`.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        DisableCommandResult: Planned or applied island, shim, and configuration changes.
     """
     root = options.root.resolve()
     island = _find_island(load_enabled_islands(root), options.module_name)

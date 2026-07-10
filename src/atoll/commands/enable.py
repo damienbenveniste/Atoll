@@ -21,7 +21,16 @@ from atoll.project import DiscoveredProject, discover_project
 
 @dataclass(frozen=True, slots=True)
 class EnableOptions:
-    """User-facing options for enabling one explicit Atoll island."""
+    """User-facing options for enabling one explicit Atoll island.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        module_name: Importable module name used to restrict the command.
+        symbols: Exported source symbols to copy and rebind through the sidecar.
+        sidecar_module: Optional generated module override; `None` uses Atoll's default.
+        dry_run: Whether changes are planned and reported without filesystem writes.
+        yes: Whether interactive confirmation is pre-approved.
+    """
 
     root: Path
     module_name: str
@@ -33,7 +42,14 @@ class EnableOptions:
 
 @dataclass(frozen=True, slots=True)
 class EnableAllOptions:
-    """User-facing options for enabling all current scan candidates."""
+    """User-facing options for enabling all current scan candidates.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        module_name: Importable module name used to restrict the command.
+        dry_run: Whether changes are planned and reported without filesystem writes.
+        yes: Whether interactive confirmation is pre-approved.
+    """
 
     root: Path
     module_name: str | None = None
@@ -47,6 +63,13 @@ class EnableCommandResult:
 
     The result includes both generated sidecar source and the managed shim edit
     so dry-run callers can show exactly what would change before writing.
+
+    Attributes:
+        island: Enabled island affected by the command.
+        sidecar: Generated sidecar source and metadata.
+        shim_edit: Managed source transformation planned or applied by the command.
+        config_path: Path to the Atoll configuration file.
+        applied: Whether the planned filesystem changes were written.
     """
 
     island: EnabledIslandConfig
@@ -58,14 +81,23 @@ class EnableCommandResult:
 
 @dataclass(frozen=True, slots=True)
 class EnableAllCommandResult:
-    """Prepared or applied results from enabling all selected candidates."""
+    """Prepared or applied results from enabling all selected candidates.
+
+    Attributes:
+        enabled: Per-module enable results in deterministic module order.
+        applied: Whether the planned filesystem changes were written.
+    """
 
     enabled: tuple[EnableCommandResult, ...]
     applied: bool
 
     @property
     def symbol_count(self) -> int:
-        """Return the number of exported symbols enabled across all modules."""
+        """Return the number of exported symbols enabled across all modules.
+
+        Returns:
+            int: Total number of symbols selected across enabled islands.
+        """
         return sum(len(result.island.symbols) for result in self.enabled)
 
 
@@ -74,6 +106,12 @@ def execute_enable(options: EnableOptions) -> EnableCommandResult:
 
     Dry-run mode performs discovery, scanning, sidecar rendering, and shim diff
     generation without mutating the source module, sidecar path, or config file.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        EnableCommandResult: Generated sidecar and shim changes for the selected module.
     """
     project = discover_project(options.root)
     module = _find_module(project.modules, options.module_name)
@@ -96,6 +134,15 @@ def execute_enable_all(options: EnableAllOptions) -> EnableAllCommandResult:
 
     Existing islands for selected modules are replaced atomically in the written
     config, while islands for other modules are preserved.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        EnableAllCommandResult: Results for every selected candidate module.
+
+    Raises:
+        ValueError: If no scan candidates match the optional module filter.
     """
     project = discover_project(options.root)
     scans = _candidate_scans(project, options.module_name)

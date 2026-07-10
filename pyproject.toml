@@ -53,6 +53,7 @@ select = [
 
     "C90",
 
+    "D",
     "E",
     "F",
     "I",
@@ -85,12 +86,15 @@ max-branches = 12
 max-returns = 6
 max-statements = 60
 
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
 
 [tool.ruff.lint.per-file-ignores]
 "src/atoll/runtime/package_verify.py" = ["S603"]
 "src/atoll/runtime/performance.py" = ["S603"]
 "src/atoll/wheel_overlay.py" = ["S603"]
-"tests/**/*.py" = ["S101"]
+"tests/**/*.py" = ["D", "S101"]
 
 
 

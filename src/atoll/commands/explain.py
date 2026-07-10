@@ -21,7 +21,13 @@ from atoll.report import risk_summary, score_summary
 
 @dataclass(frozen=True, slots=True)
 class ExplainOptions:
-    """User-facing options for module or symbol explanation output."""
+    """User-facing options for module or symbol explanation output.
+
+    Attributes:
+        root: Root directory of the target Python project.
+        target: Lowering target or package verification target.
+        mypy_enabled: Whether the command runs mypy diagnostic mapping.
+    """
 
     root: Path
     target: str
@@ -33,6 +39,12 @@ def execute_explain(options: ExplainOptions) -> str:
 
     The target is `module` or `module::symbol`. When mypy is enabled, diagnostics
     are attached before scoring so the explanation matches scan behavior.
+
+    Args:
+        options: Validated command options supplied by the CLI layer.
+
+    Returns:
+        str: Human-readable explanation of the selected module or symbol.
     """
     module_name, symbol_name = _split_target(options.target)
     module = _analyze_module(options.root, module_name, mypy_enabled=options.mypy_enabled)
