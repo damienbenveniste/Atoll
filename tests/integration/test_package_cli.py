@@ -19,6 +19,9 @@ FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXIT_USAGE = 2
 RANKING_SYMBOL_COUNT = 3
 GATE_FAILURE_CODE = 7
+PROFILE_BENCHMARK_ITERATIONS = 100_000
+PROFILE_REPORT_SCHEMA_VERSION = 3
+MINIMUM_PROFILE_SAMPLES = 100
 
 
 def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
@@ -163,6 +166,74 @@ def test_compile_runs_semantic_gate_without_flat_checkout_shadowing(
     assert report["test_results"][0]["mode"] == "compiled"
     assert report["test_results"][0]["returncode"] == 0
     assert report["performance"]["status"] == "unbenchmarked"
+
+
+def test_compile_profiles_configured_benchmark_before_hot_region_selection(
+    tmp_path: Path,
+) -> None:
+    """A real configured workload profiles, selects, compiles, and reports hot symbols."""
+    project_root = tmp_path / "profiled_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    benchmark_path = project_root / "benchmark.py"
+    benchmark_path.write_text(
+        """from app.ranking import rank_candidates
+from app.types import Event, User
+
+users = [User(float(index)) for index in range(8)]
+events = [Event(str(index)) for index in range(4)]
+for _ in range(ITERATIONS):
+    rank_candidates(users, events)
+""".replace("ITERATIONS", str(PROFILE_BENCHMARK_ITERATIONS)),
+        encoding="utf-8",
+    )
+    pyproject = project_root / "pyproject.toml"
+    semantic_probe = "import app.ranking; assert callable(app.ranking.rank_candidates)"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + "\n".join(
+            (
+                "",
+                "[tool.atoll.compile]",
+                (
+                    f'test_command = [{json.dumps(sys.executable)}, "-c", '
+                    f"{json.dumps(semantic_probe)}]"
+                ),
+                (f'benchmark_command = [{json.dumps(sys.executable)}, "benchmark.py"]'),
+                "benchmark_warmups = 0",
+                "benchmark_samples = 1",
+                "minimum_speedup = 0.01",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
+
+    report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    profile = report["profile"]
+    selected = set(profile["selected_symbols"])
+    compiled = {
+        binding["source"] for region in report["compiled_regions"] for binding in region["bindings"]
+    }
+    assert exit_code == 0
+    assert report["version"] == PROFILE_REPORT_SCHEMA_VERSION
+    assert report["success"] is True
+    assert profile["status"] == "profiled"
+    assert profile["launch_kind"] == "script"
+    assert profile["total_samples"] >= MINIMUM_PROFILE_SAMPLES
+    assert profile["mapped_project_samples"] > 0
+    assert profile["selected_hot_coverage"] > 0
+    assert [run["pass_kind"] for run in profile["child_passes"]] == ["sampling", "types"]
+    assert selected
+    assert compiled == selected
+    assert report["summary"]["symbols"] == len(selected)
+    assert report["performance"]["status"] == "passed"
+    assert {timing["name"] for timing in report["build"]["phase_timings"]}.issuperset(
+        {"profile_sampling", "profile_types"}
+    )
+    assert not (project_root / ".atoll" / "dist" / "build").exists()
+    assert not (project_root / ".atoll" / "dist" / "install").exists()
 
 
 def test_compile_keeps_same_module_class_dependent_function_interpreted(

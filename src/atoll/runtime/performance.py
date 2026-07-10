@@ -414,11 +414,12 @@ def _run_phase(
             )
             runs.append(run)
             if context.progress is not None:
+                pair_number = pair_index + 1
                 context.progress(
                     BenchmarkProgress(
                         phase=phase,
-                        pair_index=pair_index,
-                        sample_index=pair_index if phase == "sample" else None,
+                        pair_index=pair_number,
+                        sample_index=pair_number if phase == "sample" else None,
                         mode=mode,
                         duration_seconds=run.duration_seconds,
                     )

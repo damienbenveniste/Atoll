@@ -7,6 +7,7 @@ import importlib.machinery
 import shutil
 import zipfile
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -43,6 +44,12 @@ from atoll.runtime.performance import (
     BenchmarkProgress,
     CommandRunEvidence,
     RuntimeMode,
+)
+from atoll.runtime.profiling import (
+    LifecycleCounts,
+    ProfiledMember,
+    ProfileResult,
+    unconfigured_profile,
 )
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
@@ -88,6 +95,7 @@ class _BaselinePayloadFactory(Protocol):
         build: CompileAttempt,
         baseline_install_root: Path | None = None,
         quality_project_root: Path | None = None,
+        semantic_test_result: CommandRunEvidence | None = None,
     ) -> object: ...
 
 
@@ -1063,6 +1071,92 @@ def test_quality_gate_rejects_missing_benchmark_baseline(tmp_path: Path) -> None
     assert outcome.error == "baseline payload is missing"
 
 
+def test_quality_gate_reuses_early_baseline_semantic_test(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Promotion runs only the compiled test after the baseline passed before profiling."""
+    project = _quality_gate_project(
+        tmp_path,
+        (
+            'test_command = ["python", "-c", "pass"]',
+            'benchmark_command = ["python", "bench.py"]',
+        ),
+    )
+    quality_root = tmp_path / "quality-project"
+    baseline_root = tmp_path / "baseline"
+    compiled_root = tmp_path / "compiled"
+    quality_root.mkdir()
+    baseline_root.mkdir()
+    compiled_root.mkdir()
+    baseline_result = CommandRunEvidence(
+        command=("python", "-c", "pass"),
+        project_root=quality_root,
+        payload_root=baseline_root,
+        mode="baseline",
+        returncode=0,
+        stdout="",
+        stderr="",
+        duration_seconds=0.2,
+    )
+    baseline = _BaselineWheelPayload(
+        wheel_path=tmp_path / "baseline.whl",
+        build=_successful_attempt(),
+        baseline_install_root=baseline_root,
+        quality_project_root=quality_root,
+        semantic_test_result=baseline_result,
+    )
+    executed_modes: list[RuntimeMode] = []
+
+    def run_test(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: RuntimeMode,
+    ) -> CommandRunEvidence:
+        executed_modes.append(mode)
+        return CommandRunEvidence(
+            command=command,
+            project_root=project_root,
+            payload_root=payload_root,
+            mode=mode,
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.2,
+        )
+
+    def pass_benchmark(*args: object, **kwargs: object) -> BenchmarkGateResult:
+        assert len(args) == 1
+        assert kwargs
+        return BenchmarkGateResult(
+            status="passed",
+            reason="fixture passed",
+            minimum_speedup=1.1,
+            baseline_median_seconds=1.1,
+            compiled_median_seconds=1.0,
+            speedup=1.1,
+            warmups=(),
+            samples=(),
+        )
+
+    monkeypatch.setattr(package_command, "run_performance_command", run_test)
+    monkeypatch.setattr(package_command, "run_benchmark_gate", pass_benchmark)
+
+    outcome = _run_configured_quality_gate(
+        project=project,
+        baseline=baseline,
+        compiled_payload_root=compiled_root,
+        progress=None,
+    )
+
+    assert outcome.success is True
+    assert outcome.tests[0] is baseline_result
+    assert [result.mode for result in outcome.tests] == ["baseline", "compiled"]
+    assert executed_modes == ["compiled"]
+
+
 def test_quality_gate_reports_semantic_test_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1292,8 +1386,30 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
             samples=(),
         )
 
+    def insufficient_profile(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        module_paths: tuple[tuple[str, str], ...],
+        scratch_dir: Path,
+    ) -> ProfileResult:
+        assert command == ("python", "bench.py")
+        assert project_root != target_project_root
+        assert payload_root.is_dir()
+        assert module_paths
+        assert scratch_dir.name == "profile"
+        return replace(
+            unconfigured_profile(),
+            status="static-fallback",
+            reason="insufficient baseline profile samples: observed 90, required 100",
+            launch_kind="script",
+            total_samples=90,
+        )
+
     monkeypatch.setattr(package_command, "build_sidecars", successful_build_sidecars, raising=False)
     monkeypatch.setattr(package_command, "run_performance_command", passing_test_command)
+    monkeypatch.setattr(package_command, "run_baseline_profile", insufficient_profile)
     monkeypatch.setattr(package_command, "run_benchmark_gate", rejecting_benchmark)
 
     result = package_command.execute_package(
@@ -1316,6 +1432,270 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
     diagnostic_wheels = tuple((output_dir / "build" / "diagnostics").glob("*.whl"))
     assert diagnostic_wheels
     assert result.verification_steps[-1].target == diagnostic_wheels[0]
+
+
+def test_package_profiles_before_backend_selection_and_scopes_hot_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured benchmark selects its hot member before backend assessment."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + """
+
+[tool.atoll.compile]
+test_command = ["python", "-c", "pass"]
+benchmark_command = ["python", "bench.py"]
+benchmark_warmups = 0
+benchmark_samples = 1
+minimum_speedup = 1.10
+""",
+        encoding="utf-8",
+    )
+    target_project_root = project_root
+    events: list[str] = []
+    progress_messages: list[str] = []
+    original_selection = _selected_typed_regions
+
+    def run_test(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: RuntimeMode,
+    ) -> CommandRunEvidence:
+        events.append(f"test:{mode}")
+        return CommandRunEvidence(
+            command=command,
+            project_root=project_root,
+            payload_root=payload_root,
+            mode=mode,
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.2,
+        )
+
+    def profile_baseline(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        module_paths: tuple[tuple[str, str], ...],
+        scratch_dir: Path,
+    ) -> ProfileResult:
+        events.append("profile")
+        assert command == ("python", "bench.py")
+        assert project_root != target_project_root
+        assert payload_root.is_dir()
+        assert ("app.ranking", "app/ranking.py") in module_paths
+        assert scratch_dir.name == "profile"
+        return replace(
+            unconfigured_profile(),
+            status="profiled",
+            reason="fixture profile",
+            launch_kind="script",
+            total_samples=200,
+            mapped_project_samples=180,
+            mapped_coverage=0.9,
+            lifecycle=LifecycleCounts(
+                start=10,
+                return_=10,
+                yield_=0,
+                resume=0,
+                unwind=0,
+                throw=0,
+            ),
+            members=(
+                ProfiledMember(
+                    module="app.ranking",
+                    qualname="rank_candidates",
+                    samples=180,
+                    coverage=0.9,
+                    call_count=10,
+                    lifecycle=LifecycleCounts(
+                        start=10,
+                        return_=10,
+                        yield_=0,
+                        resume=0,
+                        unwind=0,
+                        throw=0,
+                    ),
+                    signatures=(),
+                    polymorphic_overflow=False,
+                ),
+            ),
+        )
+
+    def record_selection(*args: object, **kwargs: object) -> tuple[_TypedSelection, ...]:
+        events.append("selection")
+        return original_selection(*args, **kwargs)
+
+    def pass_benchmark(*args: object, **kwargs: object) -> BenchmarkGateResult:
+        assert len(args) == 1
+        assert kwargs
+        progress = cast(Callable[[BenchmarkProgress], None], kwargs["progress"])
+        progress(
+            BenchmarkProgress(
+                phase="sample",
+                pair_index=1,
+                sample_index=1,
+                mode="baseline",
+                duration_seconds=0.125,
+            )
+        )
+        return BenchmarkGateResult(
+            status="passed",
+            reason="fixture passed",
+            minimum_speedup=1.1,
+            baseline_median_seconds=1.1,
+            compiled_median_seconds=1.0,
+            speedup=1.1,
+            warmups=(),
+            samples=(),
+        )
+
+    monkeypatch.setattr(package_command, "run_performance_command", run_test)
+    monkeypatch.setattr(package_command, "run_baseline_profile", profile_baseline)
+    monkeypatch.setattr(package_command, "_selected_typed_regions", record_selection)
+    monkeypatch.setattr(package_command, "run_benchmark_gate", pass_benchmark)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+            progress=progress_messages.append,
+        )
+    )
+
+    assert result.success is True
+    assert result.profile is not None
+    assert result.profile.selected_symbols == (SymbolId("app.ranking", "rank_candidates"),)
+    assert result.profile.selected_hot_coverage == 1.0
+    assert events == [
+        "selection",
+        "test:baseline",
+        "profile",
+        "selection",
+        "test:compiled",
+    ]
+    assert "benchmark sample pair 1 baseline completed in 0.12s" in progress_messages
+    assert {binding.source.qualname for binding in result.compiled_bindings} == {"rank_candidates"}
+
+
+def test_package_stops_before_profiling_when_baseline_semantics_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed interpreted baseline test prevents profile and native work."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + """
+
+[tool.atoll.compile]
+test_command = ["python", "-c", "raise SystemExit(9)"]
+benchmark_command = ["python", "bench.py"]
+""",
+        encoding="utf-8",
+    )
+
+    def fail_baseline(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: RuntimeMode,
+    ) -> CommandRunEvidence:
+        assert mode == "baseline"
+        return CommandRunEvidence(
+            command=command,
+            project_root=project_root,
+            payload_root=payload_root,
+            mode=mode,
+            returncode=9,
+            stdout="",
+            stderr="baseline fixture failed",
+            duration_seconds=0.2,
+        )
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("work continued after the baseline semantic failure")
+
+    monkeypatch.setattr(package_command, "run_performance_command", fail_baseline)
+    monkeypatch.setattr(package_command, "run_baseline_profile", forbidden)
+    monkeypatch.setattr(package_command, "_build_typed_regions", forbidden)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+        )
+    )
+
+    assert result.success is False
+    assert result.error == "baseline fixture failed"
+    assert result.profile is None
+    assert [run.mode for run in result.test_results] == ["baseline"]
+    assert result.performance is not None
+    assert result.performance.status == "invalid"
+    assert not tuple(output_dir.glob("*.whl"))
+
+
+def test_package_rejects_invalid_member_before_baseline_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Static request preflight prevents side effects for an invalid member."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + """
+
+[tool.atoll.compile]
+test_command = ["python", "-c", "pass"]
+benchmark_command = ["python", "bench.py"]
+""",
+        encoding="utf-8",
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("configured target command ran before request validation")
+
+    monkeypatch.setattr(package_command, "_prepare_baseline_wheel_payload", forbidden)
+    monkeypatch.setattr(package_command, "run_performance_command", forbidden)
+    monkeypatch.setattr(package_command, "run_baseline_profile", forbidden)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+            selected_members=(SymbolId("app.ranking", "missing_member"),),
+        )
+    )
+
+    assert result.success is False
+    assert result.error == (
+        "requested member(s) are not backend-supported typed regions: app.ranking::missing_member"
+    )
+    assert result.profile is None
+    assert result.test_results == ()
+    assert not output_dir.exists()
 
 
 def test_package_reuses_region_cache_for_unchanged_inputs(

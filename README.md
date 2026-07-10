@@ -78,8 +78,10 @@ For typed regions, the report's `compiled_regions` section names each backend va
 or descriptor-aware binding, its runtime guards and concrete target owner, and the artifact paths
 associated with that variant. Typed-region entries retain the original generic declaration plus the
 specialization origin, substitutions, and concrete type bindings.
-Report schema v2 still includes the compatibility fields `islands` and `native_readiness`; for
-source-clean typed-region compile they are legacy views and normally remain empty with zero counts.
+Compile report schema v3 includes profile coverage, candidate decisions, backend decisions,
+suspension plans, candidate trials, and accepted or rejected variants. It retains the v2
+compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
+are legacy views and normally remain empty with zero counts.
 
 Source-clean compile no longer generates Python sidecars or performs generated-AST
 native-readiness scoring before backend compilation. Ordinary functions, methods, classes, sync
@@ -139,15 +141,26 @@ benchmark_samples = 7
 minimum_speedup = 1.10
 ```
 
-Commands run directly with `shell=False`. When a benchmark is configured, Atoll tests both the
-baseline wheel payload and compiled payload, runs alternating baseline/compiled benchmark pairs,
-and compares median durations. A median below 0.25 seconds is rejected as too noisy. Failed tests,
-invalid measurements, or speedup below `minimum_speedup` remove the candidate wheel and are recorded
-in `.atoll/compile-report.*`; only a passing gate promotes the wheel. Commands run from a temporary
-copy that retains project tests and benchmark files but removes importable checkout modules, so a
-flat-layout checkout cannot shadow the baseline or compiled payload. On verification or gate
-failure, Atoll keeps `.atoll/dist/install` and moves the rejected wheel under
-`.atoll/dist/build/diagnostics/` for inspection; no candidate remains in `.atoll/dist/*.whl`.
+Commands run directly with `shell=False`. For `python script.py` and `python -m module` benchmark
+commands, Atoll first builds and tests the baseline wheel, then runs unmeasured profile passes before
+selecting regions. A 2 ms statistical leaf-frame sampler identifies project hot paths. A bounded
+Python 3.12 monitoring pass records lifecycle counts and canonical `module.qualname` argument type
+identities for those members. Reports never persist argument values or representations, retain at
+most eight signatures per member, and mark polymorphic or observation-capped evidence explicitly.
+Atoll requires 100 workload samples, then considers members with at least 20 samples and 2% of the
+workload. It selects at most four in descending order until they cover 80% of mapped project
+samples. Unsupported launchers or insufficient samples use static selection, but still run the
+final benchmark gate.
+
+Profiling durations are excluded from performance medians. Atoll tests the compiled payload, runs
+alternating baseline/compiled benchmark pairs, and compares median durations. A median below 0.25
+seconds is rejected as too noisy. Failed tests, invalid measurements, or speedup below
+`minimum_speedup` remove the candidate wheel and are recorded in `.atoll/compile-report.*`; only a
+passing gate promotes the wheel. Commands run from a temporary copy that retains project tests and
+benchmark files but removes importable checkout modules, so a flat-layout checkout cannot shadow
+the baseline or compiled payload. On verification or gate failure, Atoll keeps
+`.atoll/dist/install` and moves the rejected wheel under `.atoll/dist/build/diagnostics/` for
+inspection; no candidate remains in `.atoll/dist/*.whl`.
 
 Compiled functions and methods retain their source name, qualified name, documentation,
 annotations, signature, and sync, coroutine, generator, or async-generator shape. Async-generator

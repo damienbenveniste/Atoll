@@ -51,6 +51,7 @@ from atoll.models import (
 )
 from atoll.runtime.package_verify import PackageVerificationResult
 from atoll.runtime.performance import BenchmarkGateResult, CommandRunEvidence
+from atoll.runtime.profiling import LifecycleCounts, ProfileResult
 
 _STRONG_SCORE = 90
 _GOOD_SCORE = 80
@@ -620,6 +621,9 @@ class CompilationSummaryReport(TypedDict):
         subprocess_verifications: Number of isolated package verification stages run.
         subprocess_verification_failures: Number of failed isolated package verifications.
         performance_status: Passed, failed, skipped, or unavailable benchmark status.
+        profile_status: Whether profile evidence was collected or static fallback was used.
+        profile_mapped_coverage: Fraction of samples mapped to configured project modules.
+        profile_selected_hot_coverage: Fraction of mapped samples covered by selected candidates.
         duration_seconds: Elapsed wall-clock duration in seconds.
     """
 
@@ -640,7 +644,248 @@ class CompilationSummaryReport(TypedDict):
     subprocess_verifications: int
     subprocess_verification_failures: int
     performance_status: str
+    profile_status: str
+    profile_mapped_coverage: float
+    profile_selected_hot_coverage: float
     duration_seconds: float
+
+
+class CompilationProfileSamplingPolicyReport(TypedDict):
+    """Stable profile sampling policy included in compile reports.
+
+    Attributes:
+        interval_ms: Sampling interval used by the baseline profiler.
+        mode: Sampling mode described without target-project runtime values.
+    """
+
+    interval_ms: int
+    mode: str
+
+
+class CompilationProfilePassReport(TypedDict):
+    """Child profiling pass evidence without benchmark stdout or stderr.
+
+    Attributes:
+        pass_kind: Profiling pass represented by the child process.
+        command: Exact child argv used to launch the profiling bootstrap.
+        returncode: Child process exit status.
+        duration_seconds: Parent-observed elapsed duration.
+    """
+
+    pass_kind: str
+    command: list[str]
+    returncode: int
+    duration_seconds: float
+
+
+class CompilationProfileLifecycleReport(TypedDict):
+    """Python lifecycle event counts serialized for profile evidence.
+
+    Attributes:
+        start: Python frame start events.
+        return_: Python frame return events.
+        yield_: Python yield events.
+        resume: Python resume events.
+        unwind: Python unwind events.
+        throw: Python throw events.
+    """
+
+    start: int
+    return_: int
+    yield_: int
+    resume: int
+    unwind: int
+    throw: int
+
+
+class CompilationProfileTypeObservationReport(TypedDict):
+    """Canonical argument-type count for one observed parameter.
+
+    Attributes:
+        parameter_name: Source parameter name observed in frame locals.
+        type_path: Canonical runtime type identity as `module.qualname`.
+        count: Number of calls whose parameter had this canonical type.
+    """
+
+    parameter_name: str
+    type_path: str
+    count: int
+
+
+class CompilationProfileSignatureReport(TypedDict):
+    """Canonical observed signature evidence for a profiled member.
+
+    Attributes:
+        parameters: Canonical parameter type identities and counts.
+        count: Number of calls with this exact canonical signature.
+    """
+
+    parameters: list[CompilationProfileTypeObservationReport]
+    count: int
+
+
+class CompilationProfileMemberReport(TypedDict):
+    """Profiled member evidence safe for persisted reports.
+
+    Attributes:
+        module: Importable module name resolved from profiling path evidence.
+        qualname: Runtime qualified name observed in the profile.
+        symbol: Stable static symbol implied by the member.
+        samples: Statistical samples mapped to this member.
+        coverage: Fraction of total workload samples represented by this member.
+        call_count: Targeted type-observation calls observed for this member.
+        lifecycle: Python lifecycle event counts for this member.
+        signatures: Canonical argument-type signatures observed for this member.
+        polymorphic: Whether the member exceeded the retained signature budget.
+        observation_capped: Whether targeted observation reached its call budget.
+    """
+
+    module: str
+    qualname: str
+    symbol: str
+    samples: int
+    coverage: float
+    call_count: int
+    lifecycle: CompilationProfileLifecycleReport
+    signatures: list[CompilationProfileSignatureReport]
+    polymorphic: bool
+    observation_capped: bool
+
+
+class CompilationProfileCandidateDecisionReport(TypedDict):
+    """Profile-to-static mapping and candidate policy decision.
+
+    Attributes:
+        symbol: Stable static symbol when mapping succeeded.
+        module: Runtime module name observed in the profile.
+        qualname: Runtime qualified name observed in the profile.
+        samples: Statistical samples mapped to this member.
+        coverage: Fraction of total workload samples represented by this member.
+        selected: Whether the member passed the candidate policy.
+        reason: Deterministic selection or rejection reason.
+    """
+
+    symbol: str | None
+    module: str
+    qualname: str
+    samples: int
+    coverage: float
+    selected: bool
+    reason: str
+
+
+class CompilationProfileReport(TypedDict):
+    """Profile-guided selection evidence for compile report schema v3.
+
+    Attributes:
+        status: Profile status describing dynamic evidence or static fallback.
+        reason: Human-readable explanation for the current profile status.
+        launch_kind: Supported launch shape used for child execution.
+        sampling_policy: Stable sampling interval and sampling mode.
+        total_samples: Statistical samples collected across the benchmark.
+        mapped_project_samples: Samples mapped to configured project modules.
+        mapped_coverage: Fraction of samples mapped to configured project modules.
+        selected_hot_samples: Samples covered by selected candidates.
+        selected_hot_coverage: Fraction of mapped samples covered by selected candidates.
+        child_passes: Child-process profiling pass evidence.
+        lifecycle: Aggregate Python lifecycle event counts.
+        members: Profiled project members with sample and type evidence.
+        candidate_mapping_decisions: Static mapping and hotness policy decisions.
+        selected_symbols: Static symbols accepted by the profile candidate policy.
+    """
+
+    status: str
+    reason: str
+    launch_kind: str
+    sampling_policy: CompilationProfileSamplingPolicyReport
+    total_samples: int
+    mapped_project_samples: int
+    mapped_coverage: float
+    selected_hot_samples: int
+    selected_hot_coverage: float
+    child_passes: list[CompilationProfilePassReport]
+    lifecycle: CompilationProfileLifecycleReport
+    members: list[CompilationProfileMemberReport]
+    candidate_mapping_decisions: list[CompilationProfileCandidateDecisionReport]
+    selected_symbols: list[str]
+
+
+class CompilationBackendDecisionReport(TypedDict):
+    """Normalized backend capability assessment retained in schema v3.
+
+    Attributes:
+        region_id: Stable typed-region identifier assessed by the backend.
+        backend: Native compiler backend selected for this record.
+        status: Supported, partial, or unsupported capability status.
+        supported_members: Region members accepted by the backend.
+        unsupported_members: Region members rejected by the backend.
+        capabilities: Backend capabilities exercised by supported members.
+        reasons: Deterministically ordered evidence supporting the decision.
+        deterministic: Whether identical inputs must produce this assessment.
+    """
+
+    region_id: str
+    backend: Backend
+    status: str
+    supported_members: list[str]
+    unsupported_members: list[str]
+    capabilities: list[str]
+    reasons: list[str]
+    deterministic: bool
+
+
+class CompilationAcceptedVariantReport(TypedDict):
+    """Compatibility view of compiled variants and legacy compiled regions.
+
+    Attributes:
+        region_id: Stable typed-region identifier.
+        variant_id: Stable backend or specialization variant identifier.
+        source_module: Importable source module name.
+        backend: Native compiler backend selected for this record.
+        cache_status: Whether compilation used, missed, or restored cache state.
+        symbols: Source bindings promised by the compiled variant.
+        artifacts: Install-relative native artifact paths owned by the variant.
+    """
+
+    region_id: str
+    variant_id: str
+    source_module: str
+    backend: Backend | None
+    cache_status: CompileCacheStatus
+    symbols: list[str]
+    artifacts: list[str]
+
+
+class CompilationRejectedVariantReport(TypedDict):
+    """Compatibility view of rejected source-clean module variants.
+
+    Attributes:
+        module: Importable source module skipped after native compiler rejection.
+        reason: Representative native compiler diagnostic explaining the rejection.
+    """
+
+    module: str
+    reason: str
+
+
+class CompilationCandidateTrialReport(TypedDict):
+    """Reserved schema slot for future candidate trial evidence.
+
+    Attributes:
+        id: Reserved stable candidate trial identifier.
+    """
+
+    id: str
+
+
+class CompilationSuspensionPlanReport(TypedDict):
+    """Reserved schema slot for future suspension plan evidence.
+
+    Attributes:
+        id: Reserved stable suspension plan identifier.
+    """
+
+    id: str
 
 
 class CompilationBuildReport(TypedDict):
@@ -925,6 +1170,12 @@ class CompilationReport(TypedDict):
         test_results: Target-project command evidence used by quality gates.
         verification_steps: Isolated wheel and payload verification evidence.
         performance: Paired performance-gate evidence.
+        profile: Profile-guided selection evidence or explicit static fallback.
+        candidate_trials: Reserved list for future candidate trial evidence.
+        suspension_plans: Reserved list for future suspension plan evidence.
+        backend_decisions: Normalized backend capability assessments.
+        accepted_variants: Compatibility view of accepted compiled variants.
+        rejected_variants: Compatibility view of rejected source-clean module variants.
         cleanup: Paths removed or retained after compilation.
         skipped_modules: Source modules skipped after native compiler rejection.
         preflight_blockers: Module blockers detected before native compilation.
@@ -948,6 +1199,12 @@ class CompilationReport(TypedDict):
     test_results: list[CompilationCommandRunReport]
     verification_steps: list[CompilationVerificationStepReport]
     performance: CompilationPerformanceReport
+    profile: CompilationProfileReport
+    candidate_trials: list[CompilationCandidateTrialReport]
+    suspension_plans: list[CompilationSuspensionPlanReport]
+    backend_decisions: list[CompilationBackendDecisionReport]
+    accepted_variants: list[CompilationAcceptedVariantReport]
+    rejected_variants: list[CompilationRejectedVariantReport]
     cleanup: CompilationCleanupReport
     skipped_modules: list[CompilationSkippedModuleReport]
     preflight_blockers: list[CompilationPreflightBlockerReport]
@@ -1035,6 +1292,7 @@ class CompilationReportInput:
         verification_steps: Isolated wheel and payload verification evidence.
         test_results: Target-project command evidence used by quality gates.
         performance: Paired performance-gate evidence.
+        profile: Profile-guided candidate evidence, or `None` for explicit static fallback.
     """
 
     root: Path
@@ -1060,6 +1318,7 @@ class CompilationReportInput:
     verification_steps: tuple[PackageVerificationResult, ...] = ()
     test_results: tuple[CommandRunEvidence, ...] = ()
     performance: BenchmarkGateResult | None = None
+    profile: ProfileResult | None = None
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -1196,6 +1455,10 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         not result.succeeded for result in report_input.test_results
     )
     performance = _compilation_performance_report(report_input.root, report_input.performance)
+    profile = _compilation_profile_report(report_input.profile)
+    backend_decisions = _backend_decision_reports(report_input.backend_assessments)
+    accepted_variants = _accepted_variant_reports(compiled_regions)
+    rejected_variants = _rejected_variant_reports(report_input.skipped_modules)
     performance_failed = performance["status"] not in {"passed", "unbenchmarked"}
     wheel_missing = report_input.mode == "source-clean" and report_input.wheel_path is None
     success = (
@@ -1207,7 +1470,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         and not wheel_missing
     )
     return {
-        "version": 2,
+        "version": 3,
         "tool": "atoll",
         "operation": report_input.operation,
         "mode": report_input.mode,
@@ -1242,6 +1505,9 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             "subprocess_verifications": len(report_input.verification_steps),
             "subprocess_verification_failures": subprocess_verify_failures,
             "performance_status": performance["status"],
+            "profile_status": profile["status"],
+            "profile_mapped_coverage": profile["mapped_coverage"],
+            "profile_selected_hot_coverage": profile["selected_hot_coverage"],
             "duration_seconds": report_input.build.duration_seconds,
         },
         "build": {
@@ -1274,6 +1540,12 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             for result in report_input.verification_steps
         ],
         "performance": performance,
+        "profile": profile,
+        "candidate_trials": [],
+        "suspension_plans": [],
+        "backend_decisions": backend_decisions,
+        "accepted_variants": accepted_variants,
+        "rejected_variants": rejected_variants,
         "cleanup": {
             "removed": [
                 *_generated_input_cleanup_reports(report_input.root, report_input.cleanup_removed),
@@ -1487,6 +1759,7 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         _verification_scope_text(report["mode"]),
         "",
     ]
+    _append_profile_guided_selection_markdown(lines, report["profile"])
     if report["typed_regions"]:
         lines.extend(["## Planned Regions", ""])
         lines.extend(
@@ -1595,6 +1868,64 @@ def _append_performance_markdown(
             f"- Baseline median: {_optional_seconds(performance['baseline_median_seconds'])}",
             f"- Compiled median: {_optional_seconds(performance['compiled_median_seconds'])}",
             f"- Speedup: {performance['speedup']:.3f}x",
+        ]
+    )
+
+
+def _append_profile_guided_selection_markdown(
+    lines: list[str],
+    profile: CompilationProfileReport,
+) -> None:
+    lines.extend(
+        [
+            "## Profile-Guided Selection",
+            "",
+            f"- Status: {profile['status']}",
+            f"- Reason: {profile['reason']}",
+            (
+                "- Sample sufficiency: "
+                f"{profile['total_samples']} total sample(s), "
+                f"{profile['mapped_project_samples']} mapped to project code"
+            ),
+            f"- Mapped coverage: {profile['mapped_coverage']:.1%}",
+            f"- Selected hot coverage: {profile['selected_hot_coverage']:.1%}",
+        ]
+    )
+    if profile["launch_kind"] == "unsupported":
+        lines.append("- Unsupported launcher: using static fallback candidate evidence")
+    passes = profile["child_passes"]
+    if passes:
+        pass_text = ", ".join(
+            f"{child['pass_kind']} {child['duration_seconds']:.3f}s" for child in passes
+        )
+        lines.append(f"- Unmeasured profiling passes: {pass_text}")
+    selected = profile["selected_symbols"]
+    selected_text = ", ".join(f"`{symbol}`" for symbol in selected) if selected else "none"
+    rejected = [
+        candidate
+        for candidate in profile["candidate_mapping_decisions"]
+        if not candidate["selected"]
+    ]
+    rejected_text = (
+        ", ".join(
+            f"`{candidate['module']}::{candidate['qualname']}` ({candidate['reason']})"
+            for candidate in rejected
+        )
+        if rejected
+        else "none"
+    )
+    capped = [
+        f"{member['module']}::{member['qualname']}"
+        for member in profile["members"]
+        if member["observation_capped"]
+    ]
+    capped_text = ", ".join(f"`{symbol}`" for symbol in capped) if capped else "none"
+    lines.extend(
+        [
+            f"- Selected candidates: {selected_text}",
+            f"- Rejected candidates: {rejected_text}",
+            f"- Bounded type observation reached: {capped_text}",
+            "",
         ]
     )
 
@@ -2120,6 +2451,166 @@ def _compilation_performance_report(
         "warmups": [_compilation_command_run_report(root, run) for run in result.warmups],
         "samples": [_compilation_command_run_report(root, run) for run in result.samples],
     }
+
+
+def _compilation_profile_report(result: ProfileResult | None) -> CompilationProfileReport:
+    """Serialize profile evidence without retaining runtime values or object reprs.
+
+    Args:
+        result: Profile evidence collected by the runtime profiler, or `None` when
+            no benchmark command was configured for candidate selection.
+
+    Returns:
+        CompilationProfileReport: Stable profile-guided selection section.
+    """
+    if result is None:
+        return {
+            "status": "unconfigured",
+            "reason": "no benchmark command configured; static candidate evidence only",
+            "launch_kind": "unconfigured",
+            "sampling_policy": _profile_sampling_policy_report(),
+            "total_samples": 0,
+            "mapped_project_samples": 0,
+            "mapped_coverage": 0.0,
+            "selected_hot_samples": 0,
+            "selected_hot_coverage": 0.0,
+            "child_passes": [],
+            "lifecycle": _empty_profile_lifecycle_report(),
+            "members": [],
+            "candidate_mapping_decisions": [],
+            "selected_symbols": [],
+        }
+    return {
+        "status": result.status,
+        "reason": result.reason,
+        "launch_kind": result.launch_kind,
+        "sampling_policy": _profile_sampling_policy_report(),
+        "total_samples": result.total_samples,
+        "mapped_project_samples": result.mapped_project_samples,
+        "mapped_coverage": result.mapped_coverage,
+        "selected_hot_samples": result.selected_hot_samples,
+        "selected_hot_coverage": result.selected_hot_coverage,
+        "child_passes": [
+            {
+                "pass_kind": run.pass_kind,
+                "command": list(run.command),
+                "returncode": run.returncode,
+                "duration_seconds": run.duration_seconds,
+            }
+            for run in result.runs
+        ],
+        "lifecycle": _profile_lifecycle_report(result.lifecycle),
+        "members": [
+            {
+                "module": member.module,
+                "qualname": member.qualname,
+                "symbol": member.symbol.stable_id,
+                "samples": member.samples,
+                "coverage": member.coverage,
+                "call_count": member.call_count,
+                "lifecycle": _profile_lifecycle_report(member.lifecycle),
+                "signatures": [
+                    {
+                        "parameters": [
+                            {
+                                "parameter_name": parameter.parameter_name,
+                                "type_path": parameter.type_path,
+                                "count": parameter.count,
+                            }
+                            for parameter in signature.parameters
+                        ],
+                        "count": signature.count,
+                    }
+                    for signature in member.signatures
+                ],
+                "polymorphic": member.polymorphic_overflow,
+                "observation_capped": member.observation_capped,
+            }
+            for member in result.members
+        ],
+        "candidate_mapping_decisions": [
+            {
+                "symbol": candidate.symbol.stable_id if candidate.symbol is not None else None,
+                "module": candidate.module,
+                "qualname": candidate.qualname,
+                "samples": candidate.samples,
+                "coverage": candidate.coverage,
+                "selected": candidate.selected,
+                "reason": candidate.reason,
+            }
+            for candidate in result.candidates
+        ],
+        "selected_symbols": [symbol.stable_id for symbol in result.selected_symbols],
+    }
+
+
+def _profile_sampling_policy_report() -> CompilationProfileSamplingPolicyReport:
+    return {"interval_ms": 2, "mode": "statistical leaf-frame sampling"}
+
+
+def _empty_profile_lifecycle_report() -> CompilationProfileLifecycleReport:
+    return {"start": 0, "return_": 0, "yield_": 0, "resume": 0, "unwind": 0, "throw": 0}
+
+
+def _profile_lifecycle_report(lifecycle: LifecycleCounts) -> CompilationProfileLifecycleReport:
+    return {
+        "start": lifecycle.start,
+        "return_": lifecycle.return_,
+        "yield_": lifecycle.yield_,
+        "resume": lifecycle.resume,
+        "unwind": lifecycle.unwind,
+        "throw": lifecycle.throw,
+    }
+
+
+def _backend_decision_reports(
+    assessments: tuple[BackendAssessment, ...],
+) -> list[CompilationBackendDecisionReport]:
+    return [
+        {
+            "region_id": assessment.region_id,
+            "backend": assessment.backend,
+            "status": assessment.status,
+            "supported_members": [symbol.stable_id for symbol in assessment.supported_members],
+            "unsupported_members": [symbol.stable_id for symbol in assessment.unsupported_members],
+            "capabilities": list(assessment.capabilities),
+            "reasons": list(assessment.reasons),
+            "deterministic": assessment.deterministic,
+        }
+        for assessment in sorted(
+            assessments,
+            key=lambda item: (item.region_id, item.backend, item.status),
+        )
+    ]
+
+
+def _accepted_variant_reports(
+    compiled_regions: list[CompilationCompiledRegionReport],
+) -> list[CompilationAcceptedVariantReport]:
+    return [
+        {
+            "region_id": region["id"],
+            "variant_id": region["variant_id"],
+            "source_module": region["source_module"],
+            "backend": region["backend"],
+            "cache_status": region["cache_status"],
+            "symbols": sorted(binding["source"] for binding in region["bindings"]),
+            "artifacts": list(region["artifacts"]),
+        }
+        for region in sorted(
+            compiled_regions,
+            key=lambda item: (item["id"], item["variant_id"], item["source_module"]),
+        )
+    ]
+
+
+def _rejected_variant_reports(
+    skipped_modules: tuple[CompilationSkippedModuleInput, ...],
+) -> list[CompilationRejectedVariantReport]:
+    return [
+        {"module": skipped.module, "reason": skipped.reason}
+        for skipped in sorted(skipped_modules, key=lambda item: (item.module, item.reason))
+    ]
 
 
 def _semantic_test_summary(result: CompilationTestReport | None) -> str:

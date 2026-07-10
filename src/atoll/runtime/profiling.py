@@ -1,0 +1,739 @@
+"""Collect self-contained baseline profiling evidence for candidate selection.
+
+The parent API in this module never imports target project modules. It validates
+supported Python launch forms, runs a private bootstrap module in child
+processes, reads scratch JSON evidence, and removes those scratch files before
+returning. Candidate selection is deliberately recomputed from the supplied
+profile evidence on every invocation; no cache or profitability state is kept.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Literal, cast
+
+from atoll.models import SymbolId, SymbolRecord
+
+type SymbolFact = SymbolRecord
+
+ProfileStatus = Literal["profiled", "static-fallback", "invalid", "unconfigured"]
+LaunchKind = Literal["script", "module", "unsupported", "unconfigured"]
+ProfilePassKind = Literal["sampling", "types"]
+CandidateDecisionReason = Literal[
+    "selected",
+    "unmapped",
+    "below-threshold",
+    "coverage-reached",
+    "limit",
+]
+
+_MIN_TOTAL_SAMPLES = 100
+_MIN_CANDIDATE_SAMPLES = 20
+_MIN_CANDIDATE_SHARE = 0.02
+_TARGET_MAPPED_COVERAGE = 0.80
+_MAX_SELECTED_CANDIDATES = 4
+_BOOTSTRAP_PATH = Path(__file__).with_name("_profile_bootstrap.py")
+
+_SCRIPT_COMMAND_LENGTH = 2
+_MODULE_COMMAND_LENGTH = 3
+
+type JsonScalar = str | int | float | bool | None
+type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+type JsonObject = dict[str, JsonValue]
+type _RunSubprocess = Callable[..., subprocess.CompletedProcess[str]]
+
+_subprocess_run: _RunSubprocess = subprocess.run
+
+
+@dataclass(frozen=True, slots=True)
+class _SubprocessInvocation:
+    command: tuple[str, ...]
+    cwd: Path
+    env: dict[str, str]
+    check: bool
+    shell: bool
+    capture_output: bool
+    text: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _BootstrapRequest:
+    profile_stage: ProfilePassKind
+    launch_plan: _LaunchPlan
+    project_root: Path
+    payload_root: Path
+    module_paths: tuple[tuple[str, str], ...]
+    scratch_dir: Path
+    targets: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidatePolicyContext:
+    total_samples: int
+    mapped_project_samples: int
+    selected_samples: int
+    selected_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SubprocessPassEvidence:
+    """Captured evidence from one profiling child process.
+
+    Attributes:
+        pass_kind: Profiling pass represented by this child process.
+        command: Exact argv tuple used for the profiling bootstrap child.
+        returncode: Child process exit status.
+        stdout: Captured benchmark standard output from the child.
+        stderr: Captured benchmark standard error from the child.
+        duration_seconds: Parent-observed elapsed duration for evidence only.
+    """
+
+    pass_kind: ProfilePassKind
+    command: tuple[str, ...]
+    returncode: int
+    stdout: str
+    stderr: str
+    duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleCounts:
+    """Python lifecycle event counts observed through `sys.monitoring`.
+
+    Attributes:
+        start: Python frame start events.
+        return_: Python frame return events.
+        yield_: Python yield events.
+        resume: Python resume events.
+        unwind: Python unwind events.
+        throw: Python throw events.
+    """
+
+    start: int
+    return_: int
+    yield_: int
+    resume: int
+    unwind: int
+    throw: int
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalTypeObservation:
+    """Canonical parameter type count for a profiled callable.
+
+    Attributes:
+        parameter_name: Source parameter name observed in the frame locals.
+        type_path: Canonical runtime type identity as `module.qualname`.
+        count: Number of calls whose parameter had this canonical type.
+    """
+
+    parameter_name: str
+    type_path: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedSignature:
+    """Canonical argument-type signature observed for a profiled callable.
+
+    Attributes:
+        parameters: Parameter type observations in source argument order.
+        count: Number of calls with this exact canonical signature.
+    """
+
+    parameters: tuple[CanonicalTypeObservation, ...]
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProfiledMember:
+    """Profiled project member keyed by module and runtime qualified name.
+
+    Attributes:
+        module: Importable module name resolved from `module_paths`.
+        qualname: Runtime code qualified name.
+        samples: Statistical leaf-frame samples mapped to this member.
+        coverage: Fraction of total workload samples represented by this member.
+        call_count: Targeted type-observation calls observed for this member.
+        lifecycle: Python lifecycle event counts observed for this member.
+        signatures: Canonical argument-type signatures observed in the targeted pass.
+        polymorphic_overflow: Whether more than eight unique signatures were observed.
+        observation_capped: Whether type observation stopped at its per-member budget.
+    """
+
+    module: str
+    qualname: str
+    samples: int
+    coverage: float
+    call_count: int
+    lifecycle: LifecycleCounts
+    signatures: tuple[ObservedSignature, ...]
+    polymorphic_overflow: bool
+    observation_capped: bool = False
+
+    @property
+    def symbol(self) -> SymbolId:
+        """Return the static symbol identity implied by the profiled member.
+
+        Returns:
+            SymbolId: Stable symbol identity matching the module and qualified name.
+        """
+        return SymbolId(module=self.module, qualname=self.qualname)
+
+
+@dataclass(frozen=True, slots=True)
+class MappedCandidateDecision:
+    """Static mapping and hotness decision for one profiled member.
+
+    Attributes:
+        symbol: Static symbol when the profiled member maps to `symbols`.
+        module: Runtime module name observed in the profile.
+        qualname: Runtime qualified name observed in the profile.
+        samples: Statistical leaf-frame samples for this member.
+        coverage: Fraction of total workload samples represented by this member.
+        selected: Whether the member passed the candidate policy.
+        reason: Deterministic policy reason for selection or rejection.
+    """
+
+    symbol: SymbolId | None
+    module: str
+    qualname: str
+    samples: int
+    coverage: float
+    selected: bool
+    reason: CandidateDecisionReason
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileResult:
+    """Aggregate baseline profile and candidate-selection evidence.
+
+    Attributes:
+        status: Profile status describing whether dynamic evidence was collected.
+        reason: Human-readable explanation for the current status.
+        launch_kind: Supported launch shape used for child execution.
+        total_samples: Statistical samples collected across the benchmark.
+        mapped_project_samples: Samples mapped to configured project modules.
+        mapped_coverage: Fraction of samples mapped to configured project modules.
+        selected_hot_samples: Samples covered by selected candidates.
+        selected_hot_coverage: Fraction of samples covered by selected candidates.
+        runs: Child-process evidence for each profiling pass.
+        lifecycle: Python lifecycle event counts from the sampling pass.
+        members: Profiled project members with sample and type evidence.
+        candidates: Candidate mapping decisions derived from static symbols.
+        selected_symbols: Static symbols accepted by the candidate policy.
+    """
+
+    status: ProfileStatus
+    reason: str
+    launch_kind: LaunchKind
+    total_samples: int
+    mapped_project_samples: int
+    mapped_coverage: float
+    selected_hot_samples: int
+    selected_hot_coverage: float
+    runs: tuple[SubprocessPassEvidence, ...]
+    lifecycle: LifecycleCounts
+    members: tuple[ProfiledMember, ...]
+    candidates: tuple[MappedCandidateDecision, ...]
+    selected_symbols: tuple[SymbolId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _LaunchPlan:
+    launch_kind: Literal["script", "module"]
+    target: str
+    args: tuple[str, ...]
+
+
+def unconfigured_profile() -> ProfileResult:
+    """Return deterministic no-benchmark profile evidence.
+
+    Returns:
+        ProfileResult: Empty profile evidence suitable for report and command defaults.
+    """
+    return ProfileResult(
+        status="unconfigured",
+        reason="no benchmark command configured",
+        launch_kind="unconfigured",
+        total_samples=0,
+        mapped_project_samples=0,
+        mapped_coverage=0.0,
+        selected_hot_samples=0,
+        selected_hot_coverage=0.0,
+        runs=(),
+        lifecycle=LifecycleCounts(start=0, return_=0, yield_=0, resume=0, unwind=0, throw=0),
+        members=(),
+        candidates=(),
+        selected_symbols=(),
+    )
+
+
+def run_baseline_profile(
+    command: tuple[str, ...],
+    *,
+    project_root: Path,
+    payload_root: Path,
+    module_paths: tuple[tuple[str, str], ...],
+    scratch_dir: Path,
+) -> ProfileResult:
+    """Run the two-pass baseline profiler for a supported Python benchmark command.
+
+    Args:
+        command: Benchmark argv. Only Python script and `python -m module` forms are supported.
+        project_root: Target project working directory for child processes.
+        payload_root: Import root placed first on `PYTHONPATH` for child processes.
+        module_paths: `(module, install-relative .py suffix)` entries used for mapping frames.
+        scratch_dir: Directory for temporary JSON files removed before return.
+
+    Returns:
+        ProfileResult: Baseline profile evidence without candidate decisions.
+    """
+    launch_plan = _launch_plan(command)
+    if launch_plan is None:
+        return replace(
+            unconfigured_profile(),
+            status="static-fallback",
+            reason="unsupported benchmark launcher; static candidate fallback required",
+            launch_kind="unsupported",
+        )
+
+    resolved_project_root = project_root.resolve()
+    resolved_payload_root = payload_root.resolve()
+    resolved_scratch_dir = scratch_dir.resolve()
+    resolved_scratch_dir.mkdir(parents=True, exist_ok=True)
+    sampling_payload, sampling_run = _run_bootstrap_pass(
+        _BootstrapRequest(
+            profile_stage="sampling",
+            launch_plan=launch_plan,
+            project_root=resolved_project_root,
+            payload_root=resolved_payload_root,
+            module_paths=module_paths,
+            scratch_dir=resolved_scratch_dir,
+            targets=(),
+        )
+    )
+    runs: tuple[SubprocessPassEvidence, ...] = (sampling_run,)
+    if sampling_run.returncode != 0:
+        return _profile_from_payload(
+            sampling_payload,
+            status="invalid",
+            reason=f"sampling profile exited with status {sampling_run.returncode}",
+            launch_kind=launch_plan.launch_kind,
+            runs=runs,
+        )
+
+    hot_targets = tuple(member_key for member_key, _ in _hot_member_keys(sampling_payload))
+    type_payload, type_run = _run_bootstrap_pass(
+        _BootstrapRequest(
+            profile_stage="types",
+            launch_plan=launch_plan,
+            project_root=resolved_project_root,
+            payload_root=resolved_payload_root,
+            module_paths=module_paths,
+            scratch_dir=resolved_scratch_dir,
+            targets=hot_targets,
+        )
+    )
+    runs = (sampling_run, type_run)
+    combined = _merge_payloads(sampling_payload, type_payload)
+    if type_run.returncode != 0:
+        return _profile_from_payload(
+            combined,
+            status="invalid",
+            reason=f"type-observation profile exited with status {type_run.returncode}",
+            launch_kind=launch_plan.launch_kind,
+            runs=runs,
+        )
+    return _profile_from_payload(
+        combined,
+        status="profiled",
+        reason="baseline profile collected",
+        launch_kind=launch_plan.launch_kind,
+        runs=runs,
+    )
+
+
+def select_profile_candidates(
+    profile: ProfileResult,
+    symbols: tuple[SymbolFact, ...],
+) -> ProfileResult:
+    """Map profiled members to static symbols and select hot baseline candidates.
+
+    Args:
+        profile: Baseline profile evidence to map and filter.
+        symbols: Static symbol facts available for compilation planning.
+
+    Returns:
+        ProfileResult: The input profile with candidate decisions and selected symbols attached.
+    """
+    available = frozenset(symbol.id for symbol in symbols)
+    if profile.total_samples < _MIN_TOTAL_SAMPLES:
+        return replace(
+            profile,
+            status="static-fallback",
+            reason=(
+                "insufficient baseline profile samples: "
+                f"observed {profile.total_samples}, required {_MIN_TOTAL_SAMPLES}"
+            ),
+            selected_hot_samples=0,
+            selected_hot_coverage=0.0,
+            candidates=tuple(
+                MappedCandidateDecision(
+                    symbol=member.symbol if member.symbol in available else None,
+                    module=member.module,
+                    qualname=member.qualname,
+                    samples=member.samples,
+                    coverage=member.coverage,
+                    selected=False,
+                    reason=("below-threshold" if member.symbol in available else "unmapped"),
+                )
+                for member in sorted(
+                    profile.members,
+                    key=lambda item: (-item.samples, item.module, item.qualname),
+                )
+            ),
+            selected_symbols=(),
+        )
+    decisions: list[MappedCandidateDecision] = []
+    selected_symbols: list[SymbolId] = []
+    selected_samples = 0
+    for member in sorted(
+        profile.members,
+        key=lambda item: (-item.samples, item.module, item.qualname),
+    ):
+        symbol = member.symbol if member.symbol in available else None
+        reason = _candidate_reason(
+            member=member,
+            symbol=symbol,
+            context=_CandidatePolicyContext(
+                total_samples=profile.total_samples,
+                mapped_project_samples=profile.mapped_project_samples,
+                selected_samples=selected_samples,
+                selected_count=len(selected_symbols),
+            ),
+        )
+        selected = reason == "selected"
+        if selected:
+            selected_symbols.append(member.symbol)
+            selected_samples += member.samples
+        decisions.append(
+            MappedCandidateDecision(
+                symbol=symbol,
+                module=member.module,
+                qualname=member.qualname,
+                samples=member.samples,
+                coverage=member.coverage,
+                selected=selected,
+                reason=reason,
+            )
+        )
+    return replace(
+        profile,
+        selected_hot_samples=selected_samples,
+        selected_hot_coverage=_coverage(selected_samples, profile.mapped_project_samples),
+        candidates=tuple(decisions),
+        selected_symbols=tuple(selected_symbols),
+    )
+
+
+def _run_bootstrap_pass(request: _BootstrapRequest) -> tuple[JsonObject, SubprocessPassEvidence]:
+    stem = f"atoll-profile-{os.getpid()}-{time.monotonic_ns()}-{request.profile_stage}"
+    config_path = request.scratch_dir / f"{stem}.config.json"
+    result_path = request.scratch_dir / f"{stem}.result.json"
+    config = _bootstrap_config(
+        request=request,
+        result_path=result_path,
+    )
+    try:
+        config_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
+        command = (sys.executable, str(_BOOTSTRAP_PATH), str(config_path))
+        env = _profile_environment(payload_root=request.payload_root)
+        started = time.perf_counter()
+        completed = _run_subprocess(
+            _SubprocessInvocation(
+                command=command,
+                cwd=request.project_root,
+                env=env,
+                check=False,
+                shell=False,
+                capture_output=True,
+                text=True,
+            )
+        )
+        duration = time.perf_counter() - started
+        payload = _read_json_object(result_path) if result_path.exists() else _empty_payload()
+        return payload, SubprocessPassEvidence(
+            pass_kind=request.profile_stage,
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            duration_seconds=duration,
+        )
+    finally:
+        config_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
+
+
+def _run_subprocess(invocation: _SubprocessInvocation) -> subprocess.CompletedProcess[str]:
+    return _subprocess_run(
+        invocation.command,
+        cwd=invocation.cwd,
+        env=invocation.env,
+        check=invocation.check,
+        shell=invocation.shell,
+        capture_output=invocation.capture_output,
+        text=invocation.text,
+    )
+
+
+def _bootstrap_config(request: _BootstrapRequest, *, result_path: Path) -> JsonObject:
+    return {
+        "profile_stage": request.profile_stage,
+        "launch_kind": request.launch_plan.launch_kind,
+        "target": request.launch_plan.target,
+        "args": list(request.launch_plan.args),
+        "project_root": str(request.project_root),
+        "payload_root": str(request.payload_root),
+        "module_paths": [[module, suffix] for module, suffix in request.module_paths],
+        "result_path": str(result_path),
+        "targets": list(request.targets),
+    }
+
+
+def _profile_environment(*, payload_root: Path) -> dict[str, str]:
+    child_env = dict(os.environ)
+    existing_pythonpath = tuple(
+        path for path in child_env.get("PYTHONPATH", "").split(os.pathsep) if path
+    )
+    child_env["PYTHONPATH"] = os.pathsep.join((str(payload_root), *existing_pythonpath))
+    child_env["ATOLL_DISABLE"] = "1"
+    child_env.pop("ATOLL_REQUIRE_COMPILED", None)
+    return child_env
+
+
+def _launch_plan(command: tuple[str, ...]) -> _LaunchPlan | None:
+    if len(command) < _SCRIPT_COMMAND_LENGTH or not _is_python_launcher(command[0]):
+        return None
+    if command[1] == "-m":
+        if len(command) < _MODULE_COMMAND_LENGTH or not command[2]:
+            return None
+        return _LaunchPlan(launch_kind="module", target=command[2], args=command[3:])
+    script = command[1]
+    if script.endswith(".py"):
+        return _LaunchPlan(launch_kind="script", target=script, args=command[2:])
+    return None
+
+
+def _is_python_launcher(value: str) -> bool:
+    launcher = Path(value).name
+    if launcher == Path(sys.executable).name or Path(value) == Path(sys.executable):
+        return True
+    if launcher in {"python", "python3"}:
+        return True
+    return launcher.startswith("python3.") and launcher[8:].isdigit()
+
+
+def _profile_from_payload(
+    payload: JsonObject,
+    *,
+    status: ProfileStatus,
+    reason: str,
+    launch_kind: Literal["script", "module"],
+    runs: tuple[SubprocessPassEvidence, ...],
+) -> ProfileResult:
+    total_samples = _int_field(payload, "total_samples")
+    sample_counts = _object_field(payload, "sample_counts")
+    signature_payload = _object_field(payload, "signatures")
+    member_lifecycle_payload = _object_field(payload, "member_lifecycle")
+    mapped_project_samples = sum(_int_value(value) for value in sample_counts.values())
+    members = tuple(
+        _profiled_member(key, count, total_samples, signature_payload, member_lifecycle_payload)
+        for key, count in sorted(
+            ((_string_key(key), _int_value(value)) for key, value in sample_counts.items()),
+            key=lambda item: (-item[1], item[0]),
+        )
+    )
+    return ProfileResult(
+        status=status,
+        reason=reason,
+        launch_kind=launch_kind,
+        total_samples=total_samples,
+        mapped_project_samples=mapped_project_samples,
+        mapped_coverage=_coverage(mapped_project_samples, total_samples),
+        selected_hot_samples=0,
+        selected_hot_coverage=0.0,
+        runs=runs,
+        lifecycle=_lifecycle_counts(_object_field(payload, "lifecycle")),
+        members=members,
+        candidates=(),
+        selected_symbols=(),
+    )
+
+
+def _profiled_member(
+    key: str,
+    samples: int,
+    total_samples: int,
+    signature_payload: JsonObject,
+    member_lifecycle_payload: JsonObject,
+) -> ProfiledMember:
+    module, qualname = _split_member_key(key)
+    member_payload = _object_value(signature_payload.get(key, {}))
+    return ProfiledMember(
+        module=module,
+        qualname=qualname,
+        samples=samples,
+        coverage=_coverage(samples, total_samples),
+        call_count=_int_field(member_payload, "call_count"),
+        lifecycle=_lifecycle_counts(_object_value(member_lifecycle_payload.get(key, {}))),
+        signatures=_signatures(_list_value(member_payload.get("signatures", []))),
+        polymorphic_overflow=_bool_value(member_payload.get("polymorphic_overflow", False)),
+        observation_capped=_bool_value(member_payload.get("observation_capped", False)),
+    )
+
+
+def _signatures(items: list[JsonValue]) -> tuple[ObservedSignature, ...]:
+    signatures: list[ObservedSignature] = []
+    for item in items:
+        payload = _object_value(item)
+        parameters = tuple(
+            CanonicalTypeObservation(
+                parameter_name=_string_field(_object_value(parameter), "parameter_name"),
+                type_path=_string_field(_object_value(parameter), "type_path"),
+                count=_int_field(_object_value(parameter), "count"),
+            )
+            for parameter in _list_value(payload.get("parameters", []))
+        )
+        signatures.append(
+            ObservedSignature(
+                parameters=parameters,
+                count=_int_field(payload, "count"),
+            )
+        )
+    return tuple(signatures)
+
+
+def _lifecycle_counts(payload: JsonObject) -> LifecycleCounts:
+    return LifecycleCounts(
+        start=_int_field(payload, "start"),
+        return_=_int_field(payload, "return"),
+        yield_=_int_field(payload, "yield"),
+        resume=_int_field(payload, "resume"),
+        unwind=_int_field(payload, "unwind"),
+        throw=_int_field(payload, "throw"),
+    )
+
+
+def _candidate_reason(
+    *,
+    member: ProfiledMember,
+    symbol: SymbolId | None,
+    context: _CandidatePolicyContext,
+) -> CandidateDecisionReason:
+    if symbol is None:
+        return "unmapped"
+    if (
+        context.total_samples < _MIN_TOTAL_SAMPLES
+        or member.samples < _MIN_CANDIDATE_SAMPLES
+        or _coverage(member.samples, context.total_samples) < _MIN_CANDIDATE_SHARE
+    ):
+        return "below-threshold"
+    if context.selected_count >= _MAX_SELECTED_CANDIDATES:
+        return "limit"
+    if (
+        context.selected_count > 0
+        and context.selected_samples >= context.mapped_project_samples * _TARGET_MAPPED_COVERAGE
+    ):
+        return "coverage-reached"
+    return "selected"
+
+
+def _hot_member_keys(payload: JsonObject) -> tuple[tuple[str, int], ...]:
+    sample_counts = _object_field(payload, "sample_counts")
+    return tuple(
+        sorted(
+            ((_string_key(key), _int_value(value)) for key, value in sample_counts.items()),
+            key=lambda item: (-item[1], item[0]),
+        )[:_MAX_SELECTED_CANDIDATES]
+    )
+
+
+def _merge_payloads(sampling_payload: JsonObject, type_payload: JsonObject) -> JsonObject:
+    merged = dict(sampling_payload)
+    merged["signatures"] = type_payload.get("signatures", {})
+    merged["lifecycle"] = type_payload.get("lifecycle", {})
+    merged["member_lifecycle"] = type_payload.get("member_lifecycle", {})
+    return merged
+
+
+def _empty_payload() -> JsonObject:
+    return {
+        "total_samples": 0,
+        "sample_counts": {},
+        "lifecycle": {"start": 0, "return": 0, "yield": 0, "resume": 0, "unwind": 0, "throw": 0},
+        "member_lifecycle": {},
+        "signatures": {},
+    }
+
+
+def _read_json_object(path: Path) -> JsonObject:
+    return _object_value(cast(JsonValue, json.loads(path.read_text(encoding="utf-8"))))
+
+
+def _split_member_key(key: str) -> tuple[str, str]:
+    module, separator, qualname = key.partition("::")
+    if not separator:
+        return "", key
+    return module, qualname
+
+
+def _coverage(samples: int, total_samples: int) -> float:
+    if total_samples <= 0:
+        return 0.0
+    return samples / total_samples
+
+
+def _object_field(payload: JsonObject, key: str) -> JsonObject:
+    return _object_value(payload.get(key, {}))
+
+
+def _string_field(payload: JsonObject, key: str) -> str:
+    value = payload.get(key, "")
+    return value if isinstance(value, str) else ""
+
+
+def _int_field(payload: JsonObject, key: str) -> int:
+    return _int_value(payload.get(key, 0))
+
+
+def _int_value(value: JsonValue) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _bool_value(value: JsonValue) -> bool:
+    return value if isinstance(value, bool) else False
+
+
+def _object_value(value: JsonValue) -> JsonObject:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _list_value(value: JsonValue) -> list[JsonValue]:
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _string_key(value: object) -> str:
+    return value if isinstance(value, str) else ""

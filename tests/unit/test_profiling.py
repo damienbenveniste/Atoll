@@ -1,0 +1,933 @@
+"""Unit tests for baseline profiling evidence and candidate selection."""
+
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import subprocess
+import sys
+from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Protocol, cast
+
+import pytest
+
+from atoll.models import SymbolId, SymbolRecord
+from atoll.runtime import profiling
+from atoll.runtime.profiling import (
+    CanonicalTypeObservation,
+    LifecycleCounts,
+    MappedCandidateDecision,
+    ObservedSignature,
+    ProfiledMember,
+    ProfileResult,
+    run_baseline_profile,
+    select_profile_candidates,
+    unconfigured_profile,
+)
+
+MAX_SIGNATURES_PER_MEMBER = 8
+MAX_TYPE_OBSERVATIONS_PER_MEMBER = 256
+BOOTSTRAP_EXIT_CODE = 7
+BOOTSTRAP_USAGE_ERROR_CODE = 2
+BOOTSTRAP_STRING_EXIT_CODE = 1
+
+
+class SubprocessInvocationView(Protocol):
+    command: tuple[str, ...]
+
+
+class ProfileBootstrapModule(Protocol):
+    @staticmethod
+    def main(argv: tuple[str, ...] | None = None) -> int: ...
+
+
+class CallbackCaseModule(Protocol):
+    OBSERVER: Callable[[object, int], object]
+    hot: Callable[..., object]
+    nested_code: Callable[[], object]
+
+
+@dataclass(frozen=True, slots=True)
+class _TypeProfilerHarness:
+    wrapped: object
+
+    def start(self) -> None:
+        _callable_attribute(self.wrapped, "start")()
+
+    def stop(self) -> None:
+        _callable_attribute(self.wrapped, "stop")()
+
+    def payload(self) -> dict[str, object]:
+        return cast(dict[str, object], _callable_attribute(self.wrapped, "payload")())
+
+    @property
+    def observer(self) -> Callable[[object, int], object]:
+        return cast(
+            Callable[[object, int], object],
+            _callable_attribute(self.wrapped, "_on_start"),
+        )
+
+    def lifecycle_callback(self, name: str) -> Callable[..., object]:
+        factory = cast(
+            Callable[[str], Callable[..., object]],
+            _callable_attribute(self.wrapped, "_lifecycle_callback"),
+        )
+        return factory(name)
+
+
+@dataclass(frozen=True, slots=True)
+class _BootstrapConfigInput:
+    profile_stage: str
+    launch_kind: str
+    target: str
+    args: tuple[str, ...] = ()
+    module_paths: tuple[tuple[str, str], ...] = ()
+    targets: tuple[str, ...] = ()
+
+
+def test_unconfigured_profile_returns_deterministic_no_benchmark_evidence() -> None:
+    first = unconfigured_profile()
+    second = unconfigured_profile()
+
+    assert first == second
+    assert first.status == "unconfigured"
+    assert first.reason == "no benchmark command configured"
+    assert first.launch_kind == "unconfigured"
+    assert first.total_samples == 0
+    assert first.selected_symbols == ()
+
+
+def test_unsupported_launcher_returns_static_fallback_without_scratch_files(tmp_path: Path) -> None:
+    scratch_dir = tmp_path / "scratch"
+
+    result = run_baseline_profile(
+        ("pytest", "tests"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("workload", "workload.py"),),
+        scratch_dir=scratch_dir,
+    )
+
+    assert result.status == "static-fallback"
+    assert result.launch_kind == "unsupported"
+    assert result.runs == ()
+    assert not list(scratch_dir.glob("*.json")) if scratch_dir.exists() else True
+
+
+def test_script_launch_collects_lifecycle_types_and_cleans_scratch(tmp_path: Path) -> None:
+    _write_workload_project(tmp_path)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench_script.py", "9"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("workload", "workload.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    assert result.status == "profiled"
+    assert result.launch_kind == "script"
+    assert [run.pass_kind for run in result.runs] == ["sampling", "types"]
+    assert result.runs[0].stdout == "script-done\n"
+    assert result.runs[1].stdout == "script-done\n"
+    assert result.lifecycle.start > 0
+    assert result.lifecycle.return_ > 0
+    assert any(
+        member.module == "workload" and member.qualname == "hot" for member in result.members
+    )
+    hot = _member(result, "workload", "hot")
+    assert hot.lifecycle.start > 0
+    assert hot.lifecycle.return_ > 0
+    assert hot.call_count > 0
+    assert hot.signatures
+    assert not list((tmp_path / "scratch").glob("*.json"))
+
+
+def test_module_launch_collects_project_samples(tmp_path: Path) -> None:
+    _write_workload_project(tmp_path)
+
+    result = run_baseline_profile(
+        (sys.executable, "-m", "benchpkg.runner", "7"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("workload", "workload.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    assert result.status == "profiled"
+    assert result.launch_kind == "module"
+    assert result.runs[0].stdout == "module-done\n"
+    assert result.mapped_project_samples >= 0
+
+
+def test_type_observation_stores_canonical_types_without_values_or_repr(tmp_path: Path) -> None:
+    _write_privacy_project(tmp_path)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench_privacy.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("privacy", "privacy.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    observed = "\n".join(
+        type_observation.type_path
+        for signature in _member(result, "privacy", "accept").signatures
+        for type_observation in signature.parameters
+    )
+    assert "SecretPayload" in observed
+    assert "do-not-leak" not in observed
+    assert "repr" not in observed
+
+
+def test_polymorphic_overflow_is_reported_without_extra_signatures(tmp_path: Path) -> None:
+    _write_polymorphic_project(tmp_path)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench_poly.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("poly", "poly.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    member = _member(result, "poly", "accept")
+    assert member.polymorphic_overflow
+    assert len(member.signatures) == MAX_SIGNATURES_PER_MEMBER
+
+
+def test_type_observation_is_bounded_for_frequently_called_hot_member(tmp_path: Path) -> None:
+    _write_frequent_call_project(tmp_path)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench_frequent.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("frequent", "frequent.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    member = _member(result, "frequent", "hot")
+    assert member.call_count == MAX_TYPE_OBSERVATIONS_PER_MEMBER
+    assert member.observation_capped
+    assert sum(signature.count for signature in member.signatures) == member.call_count
+
+
+def test_select_profile_candidates_applies_threshold_coverage_and_limit_policy() -> None:
+    profile = _profile_with_members(
+        total_samples=200,
+        members=(
+            ("pkg.hot", "alpha", 80),
+            ("pkg.hot", "beta", 50),
+            ("pkg.hot", "gamma", 30),
+            ("pkg.hot", "delta", 20),
+            ("pkg.hot", "epsilon", 10),
+            ("pkg.hot", "zeta", 10),
+        ),
+    )
+
+    selected = select_profile_candidates(
+        profile,
+        tuple(_symbol(module, qualname) for module, qualname, _samples in _member_specs(profile)),
+    )
+
+    assert selected.selected_symbols == (
+        SymbolId("pkg.hot", "alpha"),
+        SymbolId("pkg.hot", "beta"),
+        SymbolId("pkg.hot", "gamma"),
+    )
+    assert selected.selected_hot_coverage == 160 / 200
+    assert [(candidate.qualname, candidate.reason) for candidate in selected.candidates] == [
+        ("alpha", "selected"),
+        ("beta", "selected"),
+        ("gamma", "selected"),
+        ("delta", "coverage-reached"),
+        ("epsilon", "below-threshold"),
+        ("zeta", "below-threshold"),
+    ]
+
+
+def test_select_profile_candidates_reports_unmapped_without_selecting_low_total_samples() -> None:
+    profile = _profile_with_members(
+        total_samples=90,
+        members=(("pkg.hot", "alpha", 80), ("pkg.hot", "missing", 10)),
+    )
+
+    selected = select_profile_candidates(profile, (_symbol("pkg.hot", "alpha"),))
+
+    assert selected.status == "static-fallback"
+    assert selected.reason == "insufficient baseline profile samples: observed 90, required 100"
+    assert [(candidate.qualname, candidate.reason) for candidate in selected.candidates] == [
+        ("alpha", "below-threshold"),
+        ("missing", "unmapped"),
+    ]
+    assert selected.selected_symbols == ()
+
+
+def test_select_profile_candidates_reports_limit_after_four_selected() -> None:
+    profile = _profile_with_members(
+        total_samples=300,
+        members=(
+            ("pkg.hot", "alpha", 40),
+            ("pkg.hot", "beta", 40),
+            ("pkg.hot", "gamma", 40),
+            ("pkg.hot", "delta", 40),
+            ("pkg.hot", "epsilon", 40),
+            ("pkg.hot", "zeta", 100),
+        ),
+    )
+
+    selected = select_profile_candidates(
+        profile,
+        tuple(_symbol(module, qualname) for module, qualname, _samples in _member_specs(profile)),
+    )
+
+    assert [symbol.qualname for symbol in selected.selected_symbols] == [
+        "zeta",
+        "alpha",
+        "beta",
+        "delta",
+    ]
+    assert _candidate(selected, "epsilon").reason == "limit"
+
+
+def test_scratch_files_are_removed_when_bootstrap_subprocess_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_workload_project(tmp_path)
+
+    def failing_run(_invocation: SubprocessInvocationView) -> subprocess.CompletedProcess[str]:
+        raise RuntimeError("subprocess unavailable")
+
+    monkeypatch.setattr(profiling, "_run_subprocess", failing_run)
+
+    with suppress(RuntimeError):
+        run_baseline_profile(
+            (sys.executable, "bench_script.py", "9"),
+            project_root=tmp_path,
+            payload_root=tmp_path,
+            module_paths=(("workload", "workload.py"),),
+            scratch_dir=tmp_path / "scratch",
+        )
+
+    assert not list((tmp_path / "scratch").glob("*.json"))
+
+
+def test_bootstrap_launch_uses_absolute_file_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_workload_project(tmp_path)
+    captured: list[tuple[str, ...]] = []
+
+    def fake_run(invocation: SubprocessInvocationView) -> subprocess.CompletedProcess[str]:
+        captured.append(invocation.command)
+        config_path = Path(invocation.command[-1])
+        payload = cast(dict[str, object], json.loads(config_path.read_text(encoding="utf-8")))
+        result_path = payload["result_path"]
+        assert isinstance(result_path, str)
+        Path(str(result_path)).write_text(
+            json.dumps(
+                {
+                    "total_samples": 0,
+                    "sample_counts": {},
+                    "lifecycle": {
+                        "start": 0,
+                        "return": 0,
+                        "yield": 0,
+                        "resume": 0,
+                        "unwind": 0,
+                        "throw": 0,
+                    },
+                    "member_lifecycle": {},
+                    "signatures": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(profiling, "_run_subprocess", fake_run)
+
+    run_baseline_profile(
+        (sys.executable, "bench_script.py", "9"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("workload", "workload.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    assert captured
+    assert captured[0][1].endswith("src/atoll/runtime/_profile_bootstrap.py")
+    assert Path(captured[0][1]).is_absolute()
+
+
+def test_signatures_observe_parameters_without_ordinary_locals(tmp_path: Path) -> None:
+    _write_signature_project(tmp_path)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench_signature.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("signature_case", "signature_case.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    member = _member(result, "signature_case", "target")
+    assert member.signatures
+    assert [item.parameter_name for item in member.signatures[0].parameters] == [
+        "first",
+        "second",
+        "flag",
+        "items",
+        "options",
+    ]
+
+
+def test_profile_bootstrap_sampling_entrypoint_runs_in_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_workload_project(tmp_path)
+    config_path, result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="script",
+            target="bench_script.py",
+            args=("9",),
+            module_paths=(("workload", "workload.py"),),
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path, "workload")
+
+    exit_code = _profile_bootstrap().main((str(config_path),))
+
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert payload["total_samples"] > 0
+    assert payload["sample_counts"]["workload::hot"] > 0
+
+
+def test_profile_bootstrap_type_entrypoint_bounds_hot_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_frequent_call_project(tmp_path)
+    config_path, result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="types",
+            launch_kind="script",
+            target="bench_frequent.py",
+            module_paths=(("frequent", "frequent.py"),),
+            targets=("frequent::hot",),
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path, "frequent")
+
+    exit_code = _profile_bootstrap().main((str(config_path),))
+
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    hot = payload["signatures"]["frequent::hot"]
+    assert exit_code == 0
+    assert hot["call_count"] == MAX_TYPE_OBSERVATIONS_PER_MEMBER
+    assert hot["observation_capped"] is True
+    assert payload["member_lifecycle"]["frequent::hot"]["start"] == (
+        MAX_TYPE_OBSERVATIONS_PER_MEMBER
+    )
+
+
+def test_profile_bootstrap_module_entrypoint_returns_system_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "bootstrap_exit_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "runner.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+    config_path, result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="module",
+            target="bootstrap_exit_pkg.runner",
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path, "bootstrap_exit_pkg")
+
+    exit_code = _profile_bootstrap().main((str(config_path),))
+
+    assert exit_code == BOOTSTRAP_EXIT_CODE
+    assert result_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("statement", "expected_exit_code", "add_root"),
+    [
+        ("raise SystemExit", 0, True),
+        ("raise SystemExit('message')", BOOTSTRAP_STRING_EXIT_CODE, False),
+    ],
+)
+def test_profile_bootstrap_normalizes_non_integer_system_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    statement: str,
+    expected_exit_code: int,
+    add_root: bool,
+) -> None:
+    script_path = tmp_path / f"bench_exit_{expected_exit_code}.py"
+    script_path.write_text(f"{statement}\n", encoding="utf-8")
+    config_path, result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="script",
+            target=str(script_path),
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path, add_root=add_root)
+
+    exit_code = _profile_bootstrap().main((str(config_path),))
+
+    assert exit_code == expected_exit_code
+    assert result_path.exists()
+
+
+def test_profile_bootstrap_persists_partial_evidence_before_target_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "bench_error.py").write_text(
+        "raise RuntimeError('expected profile target failure')\n",
+        encoding="utf-8",
+    )
+    config_path, result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="script",
+            target="bench_error.py",
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path)
+
+    with pytest.raises(RuntimeError, match="expected profile target failure"):
+        _profile_bootstrap().main((str(config_path),))
+
+    assert result_path.exists()
+    assert json.loads(result_path.read_text(encoding="utf-8"))["total_samples"] >= 0
+
+
+def test_profile_bootstrap_rejects_missing_config_argument() -> None:
+    assert _profile_bootstrap().main(()) == BOOTSTRAP_USAGE_ERROR_CODE
+
+
+def test_profile_bootstrap_config_rejects_non_structured_sequences(tmp_path: Path) -> None:
+    module = importlib.import_module("atoll.runtime._profile_bootstrap")
+    read_config = _callable_attribute(module, "_read_config")
+    list_payload = tmp_path / "list.json"
+    list_payload.write_text("[]", encoding="utf-8")
+    malformed_sequences = tmp_path / "malformed-sequences.json"
+    malformed_sequences.write_text(
+        json.dumps(
+            {
+                "profile_stage": "sampling",
+                "launch_kind": "script",
+                "target": "bench.py",
+                "args": "not-a-list",
+                "project_root": str(tmp_path),
+                "payload_root": str(tmp_path),
+                "module_paths": {},
+                "result_path": str(tmp_path / "result.json"),
+                "targets": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert read_config(list_payload) is not None
+    assert read_config(malformed_sequences) is not None
+
+
+def test_type_profiler_callbacks_are_bounded_and_ignore_non_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "callback_case.py").write_text(
+        "OBSERVER = None\n"
+        "def hot(value: object, *items: object, flag: bool = False, **options: object) -> object:\n"
+        "    return OBSERVER(hot.__code__, 0)\n"
+        "def nested_code() -> object:\n"
+        "    def inner() -> None:\n"
+        "        return None\n"
+        "    return inner.__code__\n",
+        encoding="utf-8",
+    )
+    config_path, _result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="types",
+            launch_kind="script",
+            target="unused.py",
+            module_paths=(("callback_case", "callback_case.py"),),
+            targets=("callback_case::hot",),
+        ),
+    )
+    _prepare_in_process_bootstrap(
+        monkeypatch,
+        tmp_path,
+        "callback_case",
+        add_root=True,
+    )
+    callback_case = cast(CallbackCaseModule, importlib.import_module("callback_case"))
+    profiler = _type_profiler(config_path)
+    callback_case.OBSERVER = profiler.observer
+
+    sys.monitoring.use_tool_id(5, "direct-callback-test")
+    try:
+        profiler.observer(callback_case.hot.__code__, 0)
+        assert profiler.observer(callback_case.nested_code(), 0) is sys.monitoring.DISABLE
+        distinct_values: tuple[object, ...] = (
+            0,
+            "text",
+            1.5,
+            (),
+            list[int](),
+            dict[str, int](),
+            set[int](),
+            frozenset[int](),
+            object(),
+        )
+        for value in distinct_values:
+            callback_case.hot(value, 1, flag=True, extra=None)
+        for value in range(MAX_TYPE_OBSERVATIONS_PER_MEMBER - len(distinct_values)):
+            callback_case.hot(value)
+        profiler.lifecycle_callback("throw")(callback_case.hot.__code__, 0)
+        profiler.lifecycle_callback("throw")((lambda: None).__code__, 0)
+    finally:
+        sys.monitoring.set_local_events(
+            5,
+            callback_case.hot.__code__,
+            sys.monitoring.events.NO_EVENTS,
+        )
+        sys.monitoring.free_tool_id(5)
+    profiler.stop()
+
+    payload = profiler.payload()
+    signatures = cast(dict[str, dict[str, object]], payload["signatures"])
+    hot_payload = signatures["callback_case::hot"]
+    assert hot_payload["call_count"] == MAX_TYPE_OBSERVATIONS_PER_MEMBER
+    assert hot_payload["observation_capped"] is True
+    assert hot_payload["polymorphic_overflow"] is True
+
+
+def test_type_profiler_reports_monitoring_tool_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, _result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="types",
+            launch_kind="script",
+            target="unused.py",
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path)
+    profiler = _type_profiler(config_path)
+    sys.monitoring.use_tool_id(5, "occupied-by-test")
+    try:
+        with pytest.raises(RuntimeError, match="unable to reserve"):
+            profiler.start()
+    finally:
+        sys.monitoring.free_tool_id(5)
+    profiler.stop()
+
+
+def _write_workload_project(root: Path) -> None:
+    (root / "workload.py").write_text(
+        "\n".join(
+            [
+                "def hot(value: int) -> int:",
+                "    total = 0",
+                "    for item in range(600000):",
+                "        total += (item % 7) * value",
+                "    return total",
+                "",
+                "def cold(value: int) -> int:",
+                "    return value + 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (root / "bench_script.py").write_text(
+        "\n".join(
+            [
+                "import sys",
+                "from workload import cold, hot",
+                "hot(int(sys.argv[1])); cold(1); print('script-done')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    package = root / "benchpkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "runner.py").write_text(
+        "import sys\nfrom workload import hot\nhot(int(sys.argv[1])); print('module-done')\n",
+        encoding="utf-8",
+    )
+
+
+def _write_privacy_project(root: Path) -> None:
+    (root / "privacy.py").write_text(
+        "\n".join(
+            [
+                "class SecretPayload:",
+                "    def __repr__(self) -> str:",
+                "        return 'do-not-leak-repr'",
+                "",
+                "def accept(payload: SecretPayload) -> int:",
+                "    total = 0",
+                "    for item in range(500000):",
+                "        total += item % 5",
+                "    return total",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (root / "bench_privacy.py").write_text(
+        "from privacy import SecretPayload, accept\naccept(SecretPayload())\n",
+        encoding="utf-8",
+    )
+
+
+def _write_polymorphic_project(root: Path) -> None:
+    class_names = tuple(f"Payload{index}" for index in range(9))
+    (root / "poly.py").write_text(
+        "\n".join(
+            [
+                *(f"class {name}: pass" for name in class_names),
+                "",
+                "def accept(payload: object) -> int:",
+                "    total = 0",
+                "    for item in range(80000):",
+                "        total += item % 3",
+                "    return total",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    calls = "\n".join(f"accept({name}())" for name in class_names)
+    (root / "bench_poly.py").write_text(
+        f"from poly import accept, {', '.join(class_names)}\n{calls}\n",
+        encoding="utf-8",
+    )
+
+
+def _write_frequent_call_project(root: Path) -> None:
+    (root / "frequent.py").write_text(
+        "def hot(value: int) -> int:\n    return (value * 3) % 11\n",
+        encoding="utf-8",
+    )
+    (root / "bench_frequent.py").write_text(
+        "from frequent import hot\nfor item in range(800000): hot(item)\n",
+        encoding="utf-8",
+    )
+
+
+def _write_signature_project(root: Path) -> None:
+    (root / "signature_case.py").write_text(
+        "\n".join(
+            [
+                "def target(",
+                "    first: int, /, second: str, *items: float, flag: bool, **options: object",
+                ") -> int:",
+                "    ordinary_local = object()",
+                "    total = first + len(second) + len(items) + int(flag) + len(options)",
+                "    for item in range(500000):",
+                "        total += item % 3",
+                "    return total + (ordinary_local is None)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (root / "bench_signature.py").write_text(
+        "\n".join(
+            [
+                "from signature_case import target",
+                "target(1, 'two', 3.0, flag=True, extra=object())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _profile_bootstrap() -> ProfileBootstrapModule:
+    return cast(
+        ProfileBootstrapModule,
+        importlib.import_module("atoll.runtime._profile_bootstrap"),
+    )
+
+
+def _type_profiler(config_path: Path) -> _TypeProfilerHarness:
+    module = importlib.import_module("atoll.runtime._profile_bootstrap")
+    read_config = cast(
+        Callable[[Path], object],
+        _callable_attribute(module, "_read_config"),
+    )
+    factory = cast(
+        Callable[[object], object],
+        _callable_attribute(module, "_TypeProfiler"),
+    )
+    return _TypeProfilerHarness(factory(read_config(config_path)))
+
+
+def _callable_attribute(value: object, name: str) -> Callable[..., object]:
+    return cast(Callable[..., object], getattr(value, name))
+
+
+def _write_bootstrap_config(
+    root: Path,
+    config: _BootstrapConfigInput,
+) -> tuple[Path, Path]:
+    config_path = root / f"{config.profile_stage}.config.json"
+    result_path = root / f"{config.profile_stage}.result.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "profile_stage": config.profile_stage,
+                "launch_kind": config.launch_kind,
+                "target": config.target,
+                "args": list(config.args),
+                "project_root": str(root),
+                "payload_root": str(root),
+                "module_paths": [list(item) for item in config.module_paths],
+                "result_path": str(result_path),
+                "targets": list(config.targets),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config_path, result_path
+
+
+def _prepare_in_process_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    *module_names: str,
+    add_root: bool = False,
+) -> None:
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    if add_root:
+        sys.path.insert(0, str(root))
+    monkeypatch.setenv("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
+    monkeypatch.setenv("ATOLL_DISABLE", os.environ.get("ATOLL_DISABLE", ""))
+    monkeypatch.setenv(
+        "ATOLL_REQUIRE_COMPILED",
+        os.environ.get("ATOLL_REQUIRE_COMPILED", ""),
+    )
+    for module_name in module_names:
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+
+def _profile_with_members(
+    *,
+    total_samples: int,
+    members: tuple[tuple[str, str, int], ...],
+) -> ProfileResult:
+    base = unconfigured_profile()
+    profiled_members = tuple(
+        ProfiledMember(
+            module=module,
+            qualname=qualname,
+            samples=samples,
+            coverage=samples / total_samples,
+            call_count=samples,
+            lifecycle=LifecycleCounts(
+                start=samples,
+                return_=samples,
+                yield_=0,
+                resume=0,
+                unwind=0,
+                throw=0,
+            ),
+            signatures=(
+                ObservedSignature(
+                    parameters=(
+                        CanonicalTypeObservation(
+                            parameter_name="value",
+                            type_path="builtins.int",
+                            count=samples,
+                        ),
+                    ),
+                    count=samples,
+                ),
+            ),
+            polymorphic_overflow=False,
+        )
+        for module, qualname, samples in members
+    )
+    return replace(
+        base,
+        status="profiled",
+        reason="synthetic profile",
+        launch_kind="script",
+        total_samples=total_samples,
+        mapped_project_samples=sum(samples for _module, _qualname, samples in members),
+        mapped_coverage=1.0,
+        lifecycle=LifecycleCounts(start=1, return_=1, yield_=0, resume=0, unwind=0, throw=0),
+        members=profiled_members,
+    )
+
+
+def _symbol(module: str, qualname: str) -> SymbolRecord:
+    return SymbolRecord(
+        id=SymbolId(module, qualname),
+        kind="function",
+        visibility="public",
+        lineno=1,
+        end_lineno=2,
+        col_offset=0,
+        end_col_offset=0,
+        decorators=(),
+        arg_count=1,
+        annotated_arg_count=1,
+        has_return_annotation=True,
+        has_any_annotation=False,
+        called_names=(),
+        uses_globals=(),
+        local_names=(),
+        referenced_names=(),
+        blockers=(),
+    )
+
+
+def _member(result: ProfileResult, module: str, qualname: str) -> ProfiledMember:
+    return next(
+        member
+        for member in result.members
+        if member.module == module and member.qualname == qualname
+    )
+
+
+def _candidate(result: ProfileResult, qualname: str) -> MappedCandidateDecision:
+    return next(candidate for candidate in result.candidates if candidate.qualname == qualname)
+
+
+def _member_specs(result: ProfileResult) -> tuple[tuple[str, str, int], ...]:
+    return tuple((member.module, member.qualname, member.samples) for member in result.members)

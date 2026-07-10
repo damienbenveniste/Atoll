@@ -70,6 +70,11 @@ from atoll.runtime.performance import (
     run_benchmark_gate,
     run_performance_command,
 )
+from atoll.runtime.profiling import (
+    ProfileResult,
+    run_baseline_profile,
+    select_profile_candidates,
+)
 from atoll.wheel_overlay import (
     WheelBuildEvidence,
     WheelOverlayError,
@@ -176,6 +181,7 @@ class PackageCommandResult:
         verification_steps: Isolated wheel and payload verification evidence.
         test_results: Target-project command evidence used by quality gates.
         performance: Paired performance-gate evidence.
+        profile: Unmeasured baseline profile and hot-candidate selection evidence.
     """
 
     success: bool
@@ -203,6 +209,7 @@ class PackageCommandResult:
     verification_steps: tuple[PackageVerificationResult, ...] = ()
     test_results: tuple[CommandRunEvidence, ...] = ()
     performance: BenchmarkGateResult | None = None
+    profile: ProfileResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,12 +396,14 @@ class _BaselineWheelPayload:
         build: Captured native compilation attempt.
         baseline_install_root: Unpacked baseline payload used for interpreted quality gates.
         quality_project_root: Project root used by quality-gate subprocesses.
+        semantic_test_result: Baseline semantic-test evidence collected before profiling.
     """
 
     wheel_path: Path | None
     build: CompileAttempt
     baseline_install_root: Path | None = None
     quality_project_root: Path | None = None
+    semantic_test_result: CommandRunEvidence | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,6 +494,21 @@ class _SourceCleanPromotionFailure:
     quality_gate: _QualityGateOutcome | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ProfilePreparation:
+    """Baseline and profile state prepared before static region selection.
+
+    Attributes:
+        baseline: Built baseline wheel payload, when profile-guided selection is configured.
+        profile: Unmeasured profile evidence, when profiling reached a supported launcher.
+        failure: Early failure that must stop region scanning and native compilation.
+    """
+
+    baseline: _BaselineWheelPayload | None = None
+    profile: ProfileResult | None = None
+    failure: PackageCommandResult | None = None
+
+
 def execute_package(options: PackageOptions) -> PackageCommandResult:
     """Build a source-clean wheel from backend-neutral typed regions.
 
@@ -510,41 +534,82 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     scans = _selected_scans(project, options.module_name, options.selected_members)
     typed_regions = tuple(region for scan in scans for region in scan.typed_regions)
     _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
-    selected_typed_regions = _selected_typed_regions(
+    preflight_selected = _selected_typed_regions(
         scans,
         project.config.compile.backends,
         options.selected_members,
     )
+    preflight_missing = _missing_requested_members(options.selected_members, preflight_selected)
+    preflight_error = _region_selection_error(
+        profile=None,
+        selection_members=options.selected_members,
+        profile_members=(),
+        selected=preflight_selected,
+        missing=preflight_missing,
+    )
+    if preflight_error is not None:
+        _remove_failed_wheels(
+            project,
+            _resolve_output_dir(project.config.root, options.output_dir),
+        )
+        return _failed_result(
+            project.config.root,
+            options.output_dir,
+            preflight_error,
+            typed_regions=typed_regions,
+        )
+    preparation = _prepare_profile_guided_selection(options, project)
+    if preparation.failure is not None:
+        return preparation.failure
+    baseline = preparation.baseline
+    profile = preparation.profile
+    if profile is not None:
+        profile = select_profile_candidates(
+            profile,
+            tuple(symbol for scan in scans for symbol in scan.symbols),
+        )
+        _progress(
+            options.progress,
+            (
+                f"profile selected {len(profile.selected_symbols)} hot member(s) covering "
+                f"{profile.selected_hot_coverage:.1%} of mapped project samples"
+            ),
+        )
+    profile_members = (
+        profile.selected_symbols if profile is not None and profile.status == "profiled" else ()
+    )
+    selection_members = options.selected_members or profile_members
+    selected_typed_regions = (
+        _selected_typed_regions(
+            scans,
+            project.config.compile.backends,
+            selection_members,
+        )
+        if profile_members and not options.selected_members
+        else preflight_selected
+    )
     _progress_compile_selection(
         options.progress,
         selected_typed_regions,
-        requested_members=options.selected_members,
+        requested_members=selection_members,
     )
     missing_members = _missing_requested_members(
         options.selected_members,
         selected_typed_regions,
     )
-    if missing_members:
-        missing_text = ", ".join(member.stable_id for member in missing_members)
-        _remove_failed_wheels(
-            project,
-            _resolve_output_dir(project.config.root, options.output_dir),
-        )
-        return _failed_result(
-            project.config.root,
-            options.output_dir,
-            f"requested member(s) are not backend-supported typed regions: {missing_text}",
-            typed_regions=typed_regions,
-        )
-    if not selected_typed_regions:
-        _remove_failed_wheels(
-            project,
-            _resolve_output_dir(project.config.root, options.output_dir),
-        )
-        return _failed_result(
-            project.config.root,
-            options.output_dir,
-            "scan found no backend-supported typed regions",
+    selection_error = _region_selection_error(
+        profile=profile,
+        selection_members=selection_members,
+        profile_members=profile_members,
+        selected=selected_typed_regions,
+        missing=missing_members,
+    )
+    if selection_error is not None:
+        return _failed_region_selection(
+            options=options,
+            project=project,
+            preparation=replace(preparation, profile=profile),
+            error=selection_error,
             typed_regions=typed_regions,
         )
     return _execute_typed_region_package(
@@ -556,6 +621,8 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             preflight_skipped=(),
             native_readiness=(),
         ),
+        prepared_baseline=baseline,
+        profile=profile,
     )
 
 
@@ -564,6 +631,8 @@ def _execute_typed_region_package(
     options: PackageOptions,
     project: DiscoveredProject,
     context: _TypedRegionPackageContext,
+    prepared_baseline: _BaselineWheelPayload | None = None,
+    profile: ProfileResult | None = None,
 ) -> PackageCommandResult:
     """Build source-clean class and callable region variants.
 
@@ -575,6 +644,8 @@ def _execute_typed_region_package(
         options: Validated command or generation options.
         project: Discovered target project configuration and modules.
         context: Prepared state shared by this operation.
+        prepared_baseline: Baseline wheel already tested and profiled before region selection.
+        profile: Unmeasured baseline profile and selected hot-candidate evidence.
 
     Returns:
         PackageCommandResult: Complete source-clean package result for selected regions.
@@ -582,17 +653,7 @@ def _execute_typed_region_package(
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
     build_root = output_dir / "build"
     install_root = output_dir / "install"
-    _progress(options.progress, f"resetting temporary build roots in {output_dir}")
-    _reset_dir(build_root)
-    _reset_dir(install_root)
-
-    baseline = _prepare_baseline_wheel_payload(
-        project=project,
-        build_root=build_root,
-        install_root=install_root,
-        progress=options.progress,
-        run_quality_gates=options.run_quality_gates,
-    )
+    baseline = _package_baseline(options, project, prepared_baseline)
     if baseline.wheel_path is None:
         _remove_failed_wheels(project, output_dir)
         cleanup_removed = _remove_tree(install_root)
@@ -611,6 +672,7 @@ def _execute_typed_region_package(
             native_readiness=context.native_readiness,
             typed_regions=context.typed_regions,
             backend_assessments=tuple(selection.assessment for selection in context.selected),
+            profile=profile,
         )
 
     copy_started = time.perf_counter()
@@ -668,6 +730,7 @@ def _execute_typed_region_package(
             typed_regions=context.typed_regions,
             backend_assessments=tuple(selection.assessment for selection in context.selected),
             region_skipped=tuple(preparation_failures),
+            profile=profile,
         )
 
     outcome = _build_typed_regions(
@@ -707,6 +770,7 @@ def _execute_typed_region_package(
             backend_assessments=tuple(selection.assessment for selection in context.selected),
             artifact_records=outcome.artifacts,
             region_skipped=outcome.skipped,
+            profile=profile,
         )
 
     successful_bindings = tuple(
@@ -745,6 +809,7 @@ def _execute_typed_region_package(
             backend_assessments=tuple(selection.assessment for selection in context.selected),
             artifact_records=outcome.artifacts,
             region_skipped=outcome.skipped,
+            profile=profile,
         )
 
     payload_started = time.perf_counter()
@@ -829,6 +894,7 @@ def _execute_typed_region_package(
         verification_steps=promotion.verification_steps,
         test_results=promotion.test_results,
         performance=promotion.performance,
+        profile=profile,
     )
 
 
@@ -1383,6 +1449,278 @@ def _failed_result(
     )
 
 
+def _prepare_profile_guided_selection(
+    options: PackageOptions,
+    project: DiscoveredProject,
+) -> _ProfilePreparation:
+    """Build, test, and profile the baseline before static region selection.
+
+    Args:
+        options: Validated command or generation options.
+        project: Discovered target project configuration and modules.
+
+    Returns:
+        _ProfilePreparation: Prepared baseline/profile evidence or an early failure.
+    """
+    benchmark = project.config.compile.benchmark_command
+    if not options.run_quality_gates or benchmark is None:
+        return _ProfilePreparation()
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    build_root = output_dir / "build"
+    install_root = output_dir / "install"
+    _progress(options.progress, f"resetting temporary build roots in {output_dir}")
+    _reset_dir(build_root)
+    _reset_dir(install_root)
+    baseline = _prepare_baseline_wheel_payload(
+        project=project,
+        build_root=build_root,
+        install_root=install_root,
+        progress=options.progress,
+        run_quality_gates=options.run_quality_gates,
+    )
+    preparation = _ProfilePreparation(baseline=baseline)
+    if baseline.wheel_path is None:
+        return _profile_preparation_failure(options, project, preparation, baseline.build.stderr)
+    baseline = _run_baseline_semantic_test(
+        project=project,
+        baseline=baseline,
+        progress=options.progress,
+    )
+    preparation = replace(preparation, baseline=baseline)
+    semantic_test = baseline.semantic_test_result
+    if semantic_test is None or not semantic_test.succeeded:
+        error = (
+            semantic_test.stderr
+            if semantic_test is not None and semantic_test.stderr
+            else "baseline semantic test command failed before profiling"
+        )
+        return _profile_preparation_failure(options, project, preparation, error)
+    if baseline.baseline_install_root is None or baseline.quality_project_root is None:
+        return _profile_preparation_failure(
+            options,
+            project,
+            preparation,
+            "baseline profiling payload is unavailable",
+        )
+    _progress(options.progress, "profiling baseline benchmark before region selection")
+    profile = run_baseline_profile(
+        benchmark,
+        project_root=baseline.quality_project_root,
+        payload_root=baseline.baseline_install_root,
+        module_paths=_profile_module_paths(project),
+        scratch_dir=build_root / "profile",
+    )
+    baseline = _append_profile_timings(baseline, profile)
+    preparation = replace(preparation, baseline=baseline, profile=profile)
+    _profile_progress(options.progress, profile)
+    if profile.status == "invalid":
+        return _profile_preparation_failure(options, project, preparation, profile.reason)
+    return preparation
+
+
+def _profile_preparation_failure(
+    options: PackageOptions,
+    project: DiscoveredProject,
+    preparation: _ProfilePreparation,
+    error: str,
+) -> _ProfilePreparation:
+    failure = _failed_before_region_selection(
+        options=options,
+        project=project,
+        preparation=preparation,
+        error=error,
+    )
+    return replace(preparation, failure=failure)
+
+
+def _profile_progress(progress: PackageProgress | None, profile: ProfileResult) -> None:
+    for run in profile.runs:
+        _progress(
+            progress,
+            (
+                f"profile {run.pass_kind} pass exited {run.returncode} "
+                f"in {run.duration_seconds:.2f}s"
+            ),
+        )
+    _progress(
+        progress,
+        (
+            f"profile status {profile.status}: {profile.total_samples} sample(s), "
+            f"{profile.mapped_project_samples} mapped to project code"
+        ),
+    )
+
+
+def _region_selection_error(
+    *,
+    profile: ProfileResult | None,
+    selection_members: tuple[SymbolId, ...],
+    profile_members: tuple[SymbolId, ...],
+    selected: tuple[_SelectedTypedRegion, ...],
+    missing: tuple[SymbolId, ...],
+) -> str | None:
+    if profile is not None and profile.status == "profiled" and not selection_members:
+        return "baseline profile found no credible hot project members in the compile scope"
+    if missing:
+        names = ", ".join(member.stable_id for member in missing)
+        return f"requested member(s) are not backend-supported typed regions: {names}"
+    if selected:
+        return None
+    if profile_members:
+        return "profile-selected hot members are not supported by the configured compiler backends"
+    return "scan found no backend-supported typed regions"
+
+
+def _failed_region_selection(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    preparation: _ProfilePreparation,
+    error: str,
+    typed_regions: tuple[TypedRegion, ...],
+) -> PackageCommandResult:
+    _remove_failed_wheels(
+        project,
+        _resolve_output_dir(project.config.root, options.output_dir),
+    )
+    if preparation.baseline is not None:
+        return _failed_before_region_selection(
+            options=options,
+            project=project,
+            preparation=preparation,
+            error=error,
+            typed_regions=typed_regions,
+        )
+    return _failed_result(
+        project.config.root,
+        options.output_dir,
+        error,
+        typed_regions=typed_regions,
+    )
+
+
+def _failed_before_region_selection(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    preparation: _ProfilePreparation,
+    error: str,
+    typed_regions: tuple[TypedRegion, ...] = (),
+) -> PackageCommandResult:
+    """Return pre-compilation baseline, semantic, or profiling failure evidence.
+
+    A successfully unpacked baseline is retained with its source-clean build
+    tree because it contains the exact payload and profiling diagnostics that
+    caused compilation to stop. A failed baseline build removes an empty install
+    root while preserving backend diagnostics.
+
+    Args:
+        options: Validated command or generation options.
+        project: Discovered target project configuration and modules.
+        preparation: Baseline wheel and any early profile evidence.
+        error: User-facing reason region compilation was not attempted.
+        typed_regions: Backend-neutral regions scanned before a selection failure.
+
+    Returns:
+        PackageCommandResult: Failed result with no promoted wheel or native artifacts.
+
+    Raises:
+        ValueError: Baseline preparation evidence is absent despite this failure path.
+    """
+    baseline = preparation.baseline
+    if baseline is None:
+        raise ValueError("pre-selection failure requires baseline evidence")
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    build_root = output_dir / "build"
+    install_root = output_dir / "install"
+    _remove_failed_wheels(project, output_dir)
+    cleanup_removed = _remove_tree(install_root) if baseline.wheel_path is None else ()
+    cleanup_kept = tuple(
+        path for path in (build_root, install_root) if path.exists() and path not in cleanup_removed
+    )
+    semantic_test = baseline.semantic_test_result
+    test_results = (semantic_test,) if semantic_test is not None else ()
+    return PackageCommandResult(
+        success=False,
+        project_root=project.config.root,
+        output_dir=output_dir,
+        install_root=install_root,
+        wheel_path=None,
+        islands=(),
+        build=replace(baseline.build, success=False, stderr=error),
+        cleanup_removed=cleanup_removed,
+        cleanup_kept=cleanup_kept,
+        error=error,
+        typed_regions=typed_regions,
+        test_results=test_results,
+        performance=BenchmarkGateResult(
+            status="invalid",
+            reason=error,
+            minimum_speedup=project.config.compile.minimum_speedup,
+            baseline_median_seconds=None,
+            compiled_median_seconds=None,
+            speedup=None,
+            warmups=(),
+            samples=(),
+        ),
+        profile=preparation.profile,
+    )
+
+
+def _append_profile_timings(
+    baseline: _BaselineWheelPayload,
+    profile: ProfileResult,
+) -> _BaselineWheelPayload:
+    """Attach unmeasured profiling duration to baseline phase evidence.
+
+    Args:
+        baseline: Built baseline wheel payload used by the profiling passes.
+        profile: Captured baseline profiling evidence.
+
+    Returns:
+        _BaselineWheelPayload: Baseline payload with profiling phase timings appended.
+    """
+    timings = tuple(
+        CompilePhaseTiming(
+            name=f"profile_{run.pass_kind}",
+            duration_seconds=run.duration_seconds,
+            detail=f"exit {run.returncode}",
+        )
+        for run in profile.runs
+    )
+    if not timings:
+        return baseline
+    duration = sum(timing.duration_seconds for timing in timings)
+    return replace(
+        baseline,
+        build=replace(
+            baseline.build,
+            duration_seconds=baseline.build.duration_seconds + duration,
+            phase_timings=(*baseline.build.phase_timings, *timings),
+        ),
+    )
+
+
+def _profile_module_paths(project: DiscoveredProject) -> tuple[tuple[str, str], ...]:
+    """Map discovered modules to install-relative source suffixes for profiling.
+
+    Args:
+        project: Discovered target project configuration and modules.
+
+    Returns:
+        tuple[tuple[str, str], ...]: Module names and deterministic wheel payload paths.
+    """
+    return tuple(
+        sorted(
+            (
+                module.name,
+                _source_relative_path(module.path, project.config.source_roots).as_posix(),
+            )
+            for module in project.modules
+        )
+    )
+
+
 def _remove_tree(path: Path) -> tuple[Path, ...]:
     if not path.exists():
         return ()
@@ -1418,6 +1756,38 @@ def _progress_compile_selection(
 
 def _duration(started: float) -> str:
     return f"{time.perf_counter() - started:.2f}s"
+
+
+def _package_baseline(
+    options: PackageOptions,
+    project: DiscoveredProject,
+    prepared: _BaselineWheelPayload | None,
+) -> _BaselineWheelPayload:
+    """Return an early profiled baseline or prepare the ordinary static baseline.
+
+    Args:
+        options: Validated command or generation options.
+        project: Discovered target project configuration and modules.
+        prepared: Baseline already built before profile-guided selection.
+
+    Returns:
+        _BaselineWheelPayload: Built and unpacked normal target wheel evidence.
+    """
+    if prepared is not None:
+        return prepared
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    build_root = output_dir / "build"
+    install_root = output_dir / "install"
+    _progress(options.progress, f"resetting temporary build roots in {output_dir}")
+    _reset_dir(build_root)
+    _reset_dir(install_root)
+    return _prepare_baseline_wheel_payload(
+        project=project,
+        build_root=build_root,
+        install_root=install_root,
+        progress=options.progress,
+        run_quality_gates=options.run_quality_gates,
+    )
 
 
 def _prepare_baseline_wheel_payload(
@@ -1899,11 +2269,14 @@ def _run_configured_quality_gate(
         return _invalid_quality_gate(config.minimum_speedup, "quality-gate project is missing")
     command_root = baseline.quality_project_root or project.config.root
     tests: list[CommandRunEvidence] = []
+    if baseline.semantic_test_result is not None:
+        tests.append(baseline.semantic_test_result)
     if config.test_command is not None:
-        if config.benchmark_command is not None:
+        pending_tests: list[CommandRunEvidence] = []
+        if config.benchmark_command is not None and baseline.semantic_test_result is None:
             if baseline.baseline_install_root is None:
                 return _invalid_quality_gate(config.minimum_speedup, "baseline payload is missing")
-            tests.append(
+            pending_tests.append(
                 run_performance_command(
                     config.test_command,
                     project_root=command_root,
@@ -1911,7 +2284,7 @@ def _run_configured_quality_gate(
                     mode="baseline",
                 )
             )
-        tests.append(
+        pending_tests.append(
             run_performance_command(
                 config.test_command,
                 project_root=command_root,
@@ -1919,7 +2292,8 @@ def _run_configured_quality_gate(
                 mode="compiled",
             )
         )
-        for result in tests:
+        tests.extend(pending_tests)
+        for result in pending_tests:
             status = "passed" if result.succeeded else f"failed with exit {result.returncode}"
             _progress(
                 progress,
@@ -1969,6 +2343,42 @@ def _run_configured_quality_gate(
     )
 
 
+def _run_baseline_semantic_test(
+    *,
+    project: DiscoveredProject,
+    baseline: _BaselineWheelPayload,
+    progress: PackageProgress | None,
+) -> _BaselineWheelPayload:
+    """Run the benchmark baseline's semantic test exactly once before profiling.
+
+    The early result is retained on the baseline payload and reused by the final
+    quality gate. This prevents an invalid baseline from consuming compiler time
+    and avoids running the same interpreted test twice.
+
+    Args:
+        project: Discovered target project configuration and modules.
+        baseline: Built and unpacked baseline wheel payload.
+        progress: Optional progress callback for long-running work.
+
+    Returns:
+        _BaselineWheelPayload: Baseline evidence with an optional semantic test result.
+    """
+    config = project.config.compile
+    if config.benchmark_command is None or config.test_command is None:
+        return baseline
+    if baseline.baseline_install_root is None or baseline.quality_project_root is None:
+        return baseline
+    result = run_performance_command(
+        config.test_command,
+        project_root=baseline.quality_project_root,
+        payload_root=baseline.baseline_install_root,
+        mode="baseline",
+    )
+    status = "passed" if result.succeeded else f"failed with exit {result.returncode}"
+    _progress(progress, f"baseline semantic tests {status} in {result.duration_seconds:.2f}s")
+    return replace(baseline, semantic_test_result=result)
+
+
 def _invalid_quality_gate(minimum_speedup: float, reason: str) -> _QualityGateOutcome:
     return _QualityGateOutcome(
         success=False,
@@ -2014,11 +2424,10 @@ def _skipped_quality_gate(minimum_speedup: float) -> _QualityGateOutcome:
 
 
 def _benchmark_progress(progress: PackageProgress | None, event: BenchmarkProgress) -> None:
-    sample = event.pair_index + 1
     _progress(
         progress,
         (
-            f"benchmark {event.phase} pair {sample} {event.mode} "
+            f"benchmark {event.phase} pair {event.pair_index} {event.mode} "
             f"completed in {event.duration_seconds:.2f}s"
         ),
     )

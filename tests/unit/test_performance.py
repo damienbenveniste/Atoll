@@ -185,12 +185,12 @@ def test_benchmark_gate_runs_warmups_then_alternating_sample_pairs_and_medians(
         "sample",
     ]
     assert [(event.sample_index, event.mode) for event in progress_events[2:]] == [
-        (0, "baseline"),
-        (0, "compiled"),
-        (1, "compiled"),
         (1, "baseline"),
-        (2, "baseline"),
+        (1, "compiled"),
         (2, "compiled"),
+        (2, "baseline"),
+        (3, "baseline"),
+        (3, "compiled"),
     ]
 
 
