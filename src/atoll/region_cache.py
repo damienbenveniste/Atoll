@@ -1,9 +1,10 @@
-"""Persistent success-only cache for source-clean typed-region artifacts.
+"""Persistent artifact and deterministic-rejection cache for typed regions.
 
 The cache delegates fingerprint construction to the selected compiler backend,
 then stores native files together with their install-facing `ArtifactRecord`
-evidence. Failed compilations are never written, so transient toolchain or
-environment failures cannot become permanent interpreted fallbacks.
+evidence. It also records normalized non-transient compiler rejections under a
+separate decision namespace. Toolchain and environment failures are never
+persisted as backend decisions.
 """
 
 from __future__ import annotations
@@ -29,6 +30,11 @@ from atoll.models import (
 )
 
 REGION_CACHE_VERSION = 1
+BACKEND_DECISION_CACHE_VERSION = 1
+_DETERMINISTIC_DIAGNOSTIC_CODES = (
+    "MYPYC_TYPE_ERROR",
+    "CYTHON_COMPILE_ERROR",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +108,15 @@ def compile_with_region_cache(
             artifacts=artifact_records,
         )
 
+    decision_path = _decision_path(cache_root, identity)
+    cached_rejection = _restore_rejection(
+        path=decision_path,
+        identity=identity,
+        duration_seconds=lookup_duration,
+    )
+    if cached_rejection is not None:
+        return cached_rejection
+
     result = backend.compile((unit,), context)
     miss_timing = CompilePhaseTiming(
         name="cache_lookup",
@@ -113,7 +128,30 @@ def compile_with_region_cache(
         cache_status="miss",
         phase_timings=(miss_timing, *result.attempt.phase_timings),
     )
-    if not result.attempt.success or not result.attempt.artifact_paths:
+    if not result.attempt.success:
+        code = _deterministic_diagnostic_code(result.attempt.stderr)
+        if code is None:
+            return replace(result, attempt=attempt)
+        store_started = time.perf_counter()
+        store_detail = _store_rejection(
+            path=decision_path,
+            identity=identity,
+            diagnostic_code=code,
+        )
+        store_timing = CompilePhaseTiming(
+            name="backend_decision_store",
+            duration_seconds=time.perf_counter() - store_started,
+            detail=f"{store_detail}; {unit.region_id}",
+        )
+        return replace(
+            result,
+            attempt=replace(
+                attempt,
+                duration_seconds=attempt.duration_seconds + store_timing.duration_seconds,
+                phase_timings=(*attempt.phase_timings, store_timing),
+            ),
+        )
+    if not result.attempt.artifact_paths:
         return replace(result, attempt=attempt)
 
     store_started = time.perf_counter()
@@ -134,6 +172,88 @@ def compile_with_region_cache(
             duration_seconds=attempt.duration_seconds + store_timing.duration_seconds,
             phase_timings=(*attempt.phase_timings, store_timing),
         ),
+    )
+
+
+def _decision_path(cache_root: Path, identity: _CacheIdentity) -> Path:
+    decision_root = (
+        cache_root.parent / "decisions"
+        if cache_root.name == "regions"
+        else cache_root / "decisions"
+    )
+    return decision_root / identity.backend / f"{identity.key}.json"
+
+
+def _restore_rejection(
+    *,
+    path: Path,
+    identity: _CacheIdentity,
+    duration_seconds: float,
+) -> BackendCompileResult | None:
+    manifest = _read_manifest(path)
+    if (
+        manifest is None
+        or manifest.get("version") != BACKEND_DECISION_CACHE_VERSION
+        or manifest.get("key") != identity.key
+        or manifest.get("backend") != identity.backend
+        or manifest.get("region_id") != identity.region_id
+    ):
+        return None
+    code = manifest.get("diagnostic_code")
+    if not isinstance(code, str) or code not in _DETERMINISTIC_DIAGNOSTIC_CODES:
+        return None
+    return BackendCompileResult(
+        attempt=CompileAttempt(
+            success=False,
+            command=("atoll", "cache", "reject", identity.backend, identity.region_id),
+            stdout="",
+            stderr=f"{code}: cached deterministic rejection for {identity.region_id}",
+            artifact_paths=(),
+            duration_seconds=duration_seconds,
+            phase_timings=(
+                CompilePhaseTiming(
+                    name="backend_decision_cache",
+                    duration_seconds=duration_seconds,
+                    detail=f"hit; {code}; {identity.region_id}",
+                ),
+            ),
+            cache_status="hit",
+        ),
+        artifacts=(),
+    )
+
+
+def _store_rejection(
+    *,
+    path: Path,
+    identity: _CacheIdentity,
+    diagnostic_code: str,
+) -> str:
+    temp_path = path.with_suffix(".tmp")
+    manifest = {
+        "version": BACKEND_DECISION_CACHE_VERSION,
+        "key": identity.key,
+        "backend": identity.backend,
+        "region_id": identity.region_id,
+        "diagnostic_code": diagnostic_code,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_text(
+            f"{json.dumps(manifest, indent=2, sort_keys=True)}\n",
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+    except OSError as error:
+        temp_path.unlink(missing_ok=True)
+        return f"decision store failed: {error}"
+    return f"stored deterministic {diagnostic_code} rejection"
+
+
+def _deterministic_diagnostic_code(stderr: str) -> str | None:
+    return next(
+        (code for code in _DETERMINISTIC_DIAGNOSTIC_CODES if stderr.startswith(f"{code}:")),
+        None,
     )
 
 

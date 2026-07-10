@@ -1,4 +1,4 @@
-"""Tests for success-only typed-region artifact caching."""
+"""Tests for typed-region artifacts and deterministic backend decisions."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ class _FakeBackend:
         self.key = key
         self.compile_count = 0
         self.fail = False
+        self.failure_stderr = "transient failure"
         self.write_outside_output_root = False
 
     def fingerprint(self, unit: CompilationUnit, context: BackendCompileContext) -> str:
@@ -50,7 +51,7 @@ class _FakeBackend:
                     success=False,
                     command=("fake",),
                     stdout="",
-                    stderr="transient failure",
+                    stderr=self.failure_stderr,
                     artifact_paths=(),
                     duration_seconds=0.1,
                 ),
@@ -171,6 +172,155 @@ def test_region_cache_never_stores_failures(tmp_path: Path) -> None:
     assert first.attempt.cache_status == "miss"
     assert second.attempt.cache_status == "miss"
     assert not (tmp_path / "cache" / "mypyc" / backend.key).exists()
+    assert not (tmp_path / "cache" / "decisions" / "mypyc" / f"{backend.key}.json").exists()
+
+
+def test_region_cache_restores_deterministic_backend_rejection(tmp_path: Path) -> None:
+    """A stable type rejection skips the unchanged backend on the next run."""
+    backend = _FakeBackend()
+    backend.fail = True
+    backend.failure_stderr = "MYPYC_TYPE_ERROR: generated unit is incompatible"
+    context = _context(tmp_path)
+    unit = _unit(tmp_path)
+
+    first = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    second = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    decision = tmp_path / "cache" / "decisions" / "mypyc" / f"{backend.key}.json"
+    assert backend.compile_count == 1
+    assert first.attempt.cache_status == "miss"
+    assert first.attempt.phase_timings[-1].name == "backend_decision_store"
+    assert second.attempt.cache_status == "hit"
+    assert second.attempt.command[:3] == ("atoll", "cache", "reject")
+    assert second.attempt.stderr.startswith("MYPYC_TYPE_ERROR:")
+    assert second.attempt.phase_timings[0].name == "backend_decision_cache"
+    assert decision.is_file()
+
+
+def test_region_cache_invalidates_rejection_when_backend_fingerprint_changes(
+    tmp_path: Path,
+) -> None:
+    """Generated source or toolchain fingerprint changes force a fresh attempt."""
+    backend = _FakeBackend(key="first")
+    backend.fail = True
+    backend.failure_stderr = "MYPYC_TYPE_ERROR: deterministic"
+    context = _context(tmp_path)
+    unit = _unit(tmp_path)
+    compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    backend.key = "second"
+
+    result = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert backend.compile_count == EXPECTED_DOUBLE_COMPILE_COUNT
+    assert result.attempt.cache_status == "miss"
+
+
+def test_region_cache_ignores_malformed_rejection_manifest(tmp_path: Path) -> None:
+    """Malformed decision evidence cannot suppress a backend invocation."""
+    backend = _FakeBackend()
+    backend.fail = True
+    backend.failure_stderr = "CYTHON_COMPILE_ERROR: deterministic"
+    context = _context(tmp_path)
+    unit = _unit(tmp_path)
+    compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    decision = tmp_path / "cache" / "decisions" / "mypyc" / f"{backend.key}.json"
+    decision.write_text('{"version": -1}', encoding="utf-8")
+
+    result = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert backend.compile_count == EXPECTED_DOUBLE_COMPILE_COUNT
+    assert result.attempt.cache_status == "miss"
+
+
+def test_region_cache_ignores_unknown_rejection_code(tmp_path: Path) -> None:
+    """Only normalized deterministic backend codes may suppress compilation."""
+    backend = _FakeBackend()
+    backend.fail = True
+    backend.failure_stderr = "MYPYC_TYPE_ERROR: deterministic"
+    context = _context(tmp_path)
+    unit = _unit(tmp_path)
+    compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    decision = tmp_path / "cache" / "decisions" / "mypyc" / f"{backend.key}.json"
+    manifest = cast(dict[str, object], json.loads(decision.read_text(encoding="utf-8")))
+    manifest["diagnostic_code"] = "UNKNOWN_BUILD_ERROR"
+    decision.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert backend.compile_count == EXPECTED_DOUBLE_COMPILE_COUNT
+    assert result.attempt.cache_status == "miss"
+
+
+def test_region_cache_reports_rejection_store_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache write error never replaces the actual backend rejection."""
+    backend = _FakeBackend()
+    backend.fail = True
+    backend.failure_stderr = "MYPYC_TYPE_ERROR: deterministic"
+    context = _context(tmp_path)
+    unit = _unit(tmp_path)
+    original_replace = Path.replace
+
+    def failing_replace(path: Path, target: Path) -> Path:
+        if path.suffix == ".tmp":
+            raise OSError("read-only cache")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+
+    result = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    detail = result.attempt.phase_timings[-1].detail
+    assert result.attempt.success is False
+    assert detail is not None
+    assert "decision store failed" in detail
 
 
 @pytest.mark.parametrize(
@@ -243,6 +393,35 @@ def test_region_cache_separates_backend_fingerprints(tmp_path: Path) -> None:
     assert mypyc.compile_count == 1
     assert cython.compile_count == 1
     assert result.attempt.cache_status == "miss"
+
+
+def test_region_cache_restores_support_artifact_role(tmp_path: Path) -> None:
+    """Support artifact metadata survives a strict cache round trip."""
+    backend = _FakeBackend()
+    context = _context(tmp_path)
+    unit = _unit(tmp_path)
+    first = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    manifest_path = tmp_path / "cache" / "mypyc" / backend.key / "manifest.json"
+    manifest = cast(dict[str, object], json.loads(manifest_path.read_text(encoding="utf-8")))
+    artifacts = cast(list[dict[str, object]], manifest["artifacts"])
+    artifacts[0]["role"] = "support"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    first.attempt.artifact_paths[0].unlink()
+
+    restored = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert restored.attempt.cache_status == "hit"
+    assert restored.artifacts[0].role == "support"
 
 
 def test_region_cache_does_not_store_artifacts_outside_backend_output(tmp_path: Path) -> None:

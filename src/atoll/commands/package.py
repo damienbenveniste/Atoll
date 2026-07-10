@@ -20,6 +20,7 @@ from packaging import tags
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.analysis.native_readiness import NativeReadiness
+from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
 from atoll.backends.mypyc import MYPYC_BACKEND
@@ -279,6 +280,8 @@ class _SelectedTypedRegion:
         bound_members: Members already assigned to another region or specialization.
         specialization: Concrete guarded specialization for the variant.
         conditional_on_failure_of: Preferred variant that must fail before this fallback runs.
+        source_region_id: Connected scan-region ID used to rebuild a directed staged slice.
+        slice_root: Hot or explicitly requested binding at the root of a directed slice.
     """
 
     scan: ModuleScan
@@ -290,6 +293,31 @@ class _SelectedTypedRegion:
     bound_members: tuple[SymbolId, ...] | None = None
     specialization: RegionSpecialization | None = None
     conditional_on_failure_of: str | None = None
+    source_region_id: str | None = None
+    slice_root: SymbolId | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestedCallableVariant:
+    """Inputs for selecting one backend for a directed callable slice.
+
+    Attributes:
+        scan: Module scan containing retained source facts.
+        region: Directed backend-neutral source slice.
+        closure: Members required in the generated compilation unit.
+        requested: Public bindings promised by this slice.
+        backends: Backends considered in configured preference order.
+        source_region_id: Connected scan-region ID owning the slice.
+        slice_root: Public root binding promised by the slice.
+    """
+
+    scan: ModuleScan
+    region: TypedRegion
+    closure: tuple[SymbolId, ...]
+    requested: frozenset[SymbolId]
+    backends: tuple[Backend, ...]
+    source_region_id: str
+    slice_root: SymbolId
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,6 +568,11 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         options.selected_members,
     )
     preflight_missing = _missing_requested_members(options.selected_members, preflight_selected)
+    profile_candidates = (
+        _profile_candidate_members(scans, project.config.compile.backends)
+        if project.config.compile.benchmark_command is not None and not options.selected_members
+        else ()
+    )
     preflight_error = _region_selection_error(
         profile=None,
         selection_members=options.selected_members,
@@ -547,7 +580,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         selected=preflight_selected,
         missing=preflight_missing,
     )
-    if preflight_error is not None:
+    if preflight_error is not None and not profile_candidates:
         _remove_failed_wheels(
             project,
             _resolve_output_dir(project.config.root, options.output_dir),
@@ -584,6 +617,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             scans,
             project.config.compile.backends,
             selection_members,
+            hot_members=profile_members,
         )
         if profile_members and not options.selected_members
         else preflight_selected
@@ -951,7 +985,34 @@ def _staged_typed_selection(
 
     Returns:
         _SelectedTypedRegion: Prepared staged source, generation metadata, and shim edit.
+
+    Raises:
+        ValueError: If staged scanning changes a directed slice or omits its root evidence.
     """
+    if selection.source_region_id is not None:
+        if selection.slice_root is None:
+            raise ValueError("directed staged selection requires a slice root")
+        staged_source_region = next(
+            region
+            for region in staged_scan.typed_regions
+            if region.id == selection.source_region_id
+        )
+        staged_region = build_directed_region_slice(
+            staged_source_region,
+            selection.slice_root,
+        )
+        if staged_region.id != selection.region.id:
+            raise ValueError(
+                "staged directed slice differs from checkout analysis: "
+                f"{selection.region.id} != {staged_region.id}"
+            )
+        backend = _compiler_backend(selection.backend)
+        return replace(
+            selection,
+            scan=staged_scan,
+            region=staged_region,
+            assessment=backend.assess(staged_region),
+        )
     if selection.specialization is None:
         staged_region = next(
             region for region in staged_scan.typed_regions if region.id == selection.region.id
@@ -2487,10 +2548,45 @@ def _selected_scans(
     return tuple(enrich_island_analysis(scan_module(module)) for module in modules)
 
 
+def _profile_candidate_members(
+    scans: tuple[ModuleScan, ...],
+    backends: tuple[Backend, ...],
+) -> tuple[SymbolId, ...]:
+    """Return callable roots a dynamic profile may select for some backend.
+
+    This preflight does not select or compile a member. It prevents Atoll from
+    rejecting a benchmark-configured project merely because all credible hot
+    members require boxed Cython lowering.
+
+    Args:
+        scans: Selected module scans in deterministic order.
+        backends: Backends considered in configured preference order.
+
+    Returns:
+        tuple[SymbolId, ...]: Potential profile roots in scan/source order.
+    """
+    candidates: list[SymbolId] = []
+    for scan in scans:
+        for region in scan.typed_regions:
+            decisions = {decision.target: decision for decision in region.decisions}
+            all_members = frozenset(member.id for member in region.members)
+            eligible = _eligible_typed_callables(region, decisions, hot=all_members)
+            for root in eligible:
+                sliced = build_directed_region_slice(region, root)
+                if any(
+                    root in _compiler_backend(backend).assess(sliced).supported_members
+                    for backend in backends
+                ):
+                    candidates.append(root)
+    return tuple(candidates)
+
+
 def _selected_typed_regions(
     scans: tuple[ModuleScan, ...],
     backends: tuple[Backend, ...] = ("mypyc", "cython"),
     requested_members: tuple[SymbolId, ...] = (),
+    *,
+    hot_members: tuple[SymbolId, ...] = (),
 ) -> tuple[_SelectedTypedRegion, ...]:
     """Select backend variants for typed callables and safe atomic classes.
 
@@ -2502,6 +2598,7 @@ def _selected_typed_regions(
         scans: Selected module scans in deterministic order.
         backends: Backends considered in configured preference order.
         requested_members: Explicit source members requested by the caller.
+        hot_members: Profile-selected members allowed to use boxed Cython lowering.
 
     Returns:
         tuple[_SelectedTypedRegion, ...]: Backend-supported region selections in deterministic
@@ -2509,9 +2606,18 @@ def _selected_typed_regions(
     """
     selected: list[_SelectedTypedRegion] = []
     requested = frozenset(requested_members)
+    hot = frozenset(hot_members)
     for scan in scans:
         for region in scan.typed_regions:
-            selected.extend(_selected_region_variants(scan, region, backends, requested))
+            selected.extend(
+                _selected_region_variants(
+                    scan,
+                    region,
+                    backends,
+                    requested,
+                    hot,
+                )
+            )
     return tuple(selected)
 
 
@@ -2520,6 +2626,7 @@ def _selected_region_variants(
     region: TypedRegion,
     backends: tuple[Backend, ...],
     requested: frozenset[SymbolId],
+    hot: frozenset[SymbolId],
 ) -> tuple[_SelectedTypedRegion, ...]:
     region_member_ids = frozenset(member.id for member in region.members)
     if requested and not requested.intersection(region_member_ids):
@@ -2527,28 +2634,15 @@ def _selected_region_variants(
     decisions = {decision.target: decision for decision in region.decisions}
     mypyc_assessment = MYPYC_BACKEND.assess(region) if "mypyc" in backends else None
     cython_assessment = CYTHON_BACKEND.assess(region) if "cython" in backends else None
-    eligible = _eligible_typed_callables(region, decisions)
     if requested:
-        closure = _runtime_member_closure(region, eligible, requested)
-        requested_variants = list(
-            _selected_requested_callable_variant(
-                scan,
-                region,
-                closure,
-                requested,
-                backends,
-            )
+        return _selected_requested_region_slices(
+            scan=scan,
+            source_region=region,
+            requested=requested,
+            hot=hot,
+            backends=backends,
         )
-        requested_variants.extend(
-            variant
-            for specialization in region.specializations
-            if specialization.source_member in requested
-            for variant in (
-                _selected_specialization_variant(scan, region, specialization, backends),
-            )
-            if variant is not None
-        )
-        return tuple(requested_variants)
+    eligible = _eligible_typed_callables(region, decisions, hot=frozenset())
     variants: list[_SelectedTypedRegion] = []
     atomic_variant_id = _append_atomic_class_variant(
         variants,
@@ -2604,41 +2698,91 @@ def _selected_region_variants(
     return tuple(variants)
 
 
-def _selected_requested_callable_variant(
+def _selected_requested_region_slices(
+    *,
     scan: ModuleScan,
-    region: TypedRegion,
-    closure: tuple[SymbolId, ...],
+    source_region: TypedRegion,
     requested: frozenset[SymbolId],
+    hot: frozenset[SymbolId],
     backends: tuple[Backend, ...],
+) -> tuple[_SelectedTypedRegion, ...]:
+    """Select one deterministic directed backend slice per requested binding.
+
+    Args:
+        scan: Module scan containing retained source facts.
+        source_region: Connected scan region that owns requested roots.
+        requested: Explicit or profile-derived public binding roots.
+        hot: Profile-selected roots allowed to use boxed Cython semantics.
+        backends: Backends considered in configured preference order.
+
+    Returns:
+        tuple[_SelectedTypedRegion, ...]: Independent root slices in source order.
+
+    Raises:
+        ValueError: If a required same-unit dependency is absent from the source region.
+    """
+    variants: list[_SelectedTypedRegion] = []
+    roots = tuple(member.id for member in source_region.members if member.id in requested)
+    for root in roots:
+        sliced = build_directed_region_slice(source_region, root)
+        decisions = {decision.target: decision for decision in sliced.decisions}
+        eligible = _eligible_typed_callables(sliced, decisions, hot=hot)
+        closure = _runtime_member_closure(sliced, eligible, frozenset({root}))
+        callable_variants = _selected_requested_callable_variant(
+            _RequestedCallableVariant(
+                scan=scan,
+                region=sliced,
+                closure=closure,
+                requested=frozenset({root}),
+                backends=backends,
+                source_region_id=source_region.id,
+                slice_root=root,
+            )
+        )
+        variants.extend(callable_variants)
+        if callable_variants:
+            continue
+        variants.extend(
+            variant
+            for specialization in source_region.specializations
+            if specialization.source_member == root
+            for variant in (
+                _selected_specialization_variant(scan, source_region, specialization, backends),
+            )
+            if variant is not None
+        )
+    return tuple(variants)
+
+
+def _selected_requested_callable_variant(
+    inputs: _RequestedCallableVariant,
 ) -> tuple[_SelectedTypedRegion, ...]:
     """Choose one backend that supports a requested callable closure in full.
 
     Args:
-        scan: Module scan containing retained source facts.
-        region: Backend-neutral typed region being processed.
-        closure: Stable IDs in the selected runtime dependency closure.
-        requested: Explicit source members requested by the caller.
-        backends: Backends considered in configured preference order.
+        inputs: Directed slice, closure, backend order, and public binding evidence.
 
     Returns:
         tuple[_SelectedTypedRegion, ...]: Callable variant matching the explicit request, if any.
     """
-    if not closure:
+    if not inputs.closure:
         return ()
-    closure_set = frozenset(closure)
-    bound_members = tuple(member for member in closure if member in requested)
-    for backend in backends:
-        assessment = _compiler_backend(backend).assess(region)
+    closure_set = frozenset(inputs.closure)
+    bound_members = tuple(member for member in inputs.closure if member in inputs.requested)
+    for backend in inputs.backends:
+        assessment = _compiler_backend(backend).assess(inputs.region)
         if closure_set <= frozenset(assessment.supported_members):
             return (
                 _SelectedTypedRegion(
-                    scan=scan,
-                    region=region,
-                    variant_id=f"{region.id}@{backend}",
+                    scan=inputs.scan,
+                    region=inputs.region,
+                    variant_id=f"{inputs.region.id}@{backend}",
                     backend=backend,
                     assessment=assessment,
-                    members=closure,
+                    members=inputs.closure,
                     bound_members=bound_members,
+                    source_region_id=inputs.source_region_id,
+                    slice_root=inputs.slice_root,
                 ),
             )
     return ()
@@ -2812,6 +2956,8 @@ def _specialized_region(
 def _eligible_typed_callables(
     region: TypedRegion,
     decisions: dict[str, LoweringDecision],
+    *,
+    hot: frozenset[SymbolId],
 ) -> tuple[SymbolId, ...]:
     return tuple(
         member.id
@@ -2830,7 +2976,10 @@ def _eligible_typed_callables(
                 and not _member_requires_source_class(member.source_text)
             )
         )
-        and decisions[member.id.stable_id].action == "preserve"
+        and (
+            decisions[member.id.stable_id].action == "preserve"
+            or (member.id in hot and decisions[member.id.stable_id].action in {"box", "fallback"})
+        )
     )
 
 
@@ -2855,7 +3004,11 @@ def _runtime_member_closure(
     while changed:
         changed = False
         for dependency in region.dependencies:
-            if dependency.src not in selected or dependency.role != "runtime":
+            if (
+                dependency.src not in selected
+                or dependency.role != "runtime"
+                or not dependency.requires_same_unit
+            ):
                 continue
             if not isinstance(dependency.dst, SymbolId):
                 continue

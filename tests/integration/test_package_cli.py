@@ -22,6 +22,7 @@ GATE_FAILURE_CODE = 7
 PROFILE_BENCHMARK_ITERATIONS = 100_000
 PROFILE_REPORT_SCHEMA_VERSION = 3
 MINIMUM_PROFILE_SAMPLES = 100
+CLASS_DEPENDENCY_COMPILED_SYMBOLS = 2
 
 
 def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
@@ -236,10 +237,10 @@ for _ in range(ITERATIONS):
     assert not (project_root / ".atoll" / "dist" / "install").exists()
 
 
-def test_compile_keeps_same_module_class_dependent_function_interpreted(
+def test_compile_keeps_same_module_class_dependency_as_runtime_boundary(
     tmp_path: Path,
 ) -> None:
-    """A missing class declaration cannot hide behind import-only wheel verification."""
+    """A compiled caller resolves its interpreted class dependency at runtime."""
     project_root = tmp_path / "class_dependency_project"
     shutil.copytree(FIXTURE_ROOT, project_root)
     module_path = project_root / "src" / "app" / "class_dependency.py"
@@ -278,7 +279,7 @@ def add_one(value: int) -> int:
                 "assert module.add_one(3) == 4; "
                 "assert hasattr(module.add_one, '__atoll_compiled_target__'); "
                 "assert module.make_payload(5).value == 5; "
-                "assert not hasattr(module.make_payload, '__atoll_compiled_target__')"
+                "assert hasattr(module.make_payload, '__atoll_compiled_target__')"
             ),
         ),
         project_root=project_root,
@@ -288,10 +289,14 @@ def add_one(value: int) -> int:
 
     assert exit_code == 0
     assert probe.succeeded is True
-    assert report["summary"]["symbols"] == 1
-    assert report["compiled_regions"][0]["bindings"][0]["source"] == (
-        "app.class_dependency::add_one"
-    )
+    assert report["summary"]["symbols"] == CLASS_DEPENDENCY_COMPILED_SYMBOLS
+    compiled = {
+        binding["source"] for region in report["compiled_regions"] for binding in region["bindings"]
+    }
+    assert compiled == {
+        "app.class_dependency::add_one",
+        "app.class_dependency::make_payload",
+    }
 
 
 def test_compile_rejects_wheel_after_real_semantic_gate_failure(tmp_path: Path) -> None:

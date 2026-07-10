@@ -11,6 +11,7 @@ import pytest
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
+from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.generation.typed_region import (
     TypedRegionGenerationOptions,
     generate_typed_method_region,
@@ -137,6 +138,270 @@ def test_generation_is_deterministic(tmp_path: Path) -> None:
 
     assert first.source_text == second.source_text
     assert first.source_hash == second.source_hash
+
+
+def test_directed_generation_routes_omitted_local_helper_through_source_module(
+    tmp_path: Path,
+) -> None:
+    """A sliced direct call retains live interpreted dispatch and source annotations."""
+    source_path = tmp_path / "runtime_boundary.py"
+    source_path.write_text(
+        """from __future__ import annotations
+
+def helper(value: int) -> int:
+    return value + 1
+
+def hot(value: int) -> int:
+    return helper(value)
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="runtime_boundary", path=source_path)))
+    source_region = next(
+        region
+        for region in scan.typed_regions
+        if {member.id.qualname for member in region.members} == {"helper", "hot"}
+    )
+    hot = next(member.id for member in source_region.members if member.id.qualname == "hot")
+    region = build_directed_region_slice(source_region, hot)
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (hot,),
+        output_path=tmp_path / "generated_boundary.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    assert "import runtime_boundary as _atoll_source" in generation.source_text
+    assert "return _atoll_source.helper(value)" in generation.source_text
+    assert "def hot(value: int) -> int:" in generation.source_text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    result = helper(value)\n"
+        "    helper = lambda item: item * 10\n"
+        "    return helper(result)",
+        "    from support import helper\n    return helper(value)",
+    ],
+)
+def test_directed_generation_preserves_lexically_shadowed_helper(
+    tmp_path: Path,
+    body: str,
+) -> None:
+    """A local assignment or import is never rewritten as a module boundary."""
+    source_path = tmp_path / "shadowed_boundary.py"
+    source_path.write_text(
+        "def helper(value: int) -> int:\n"
+        "    return value + 1\n\n"
+        "def hot(value: int) -> int:\n"
+        f"{body}\n",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="shadowed_boundary", path=source_path)))
+    hot_region = next(
+        region
+        for region in scan.typed_regions
+        if any(member.id.qualname == "hot" for member in region.members)
+    )
+    hot = next(member.id for member in hot_region.members if member.id.qualname == "hot")
+    region = build_directed_region_slice(hot_region, hot)
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (hot,),
+        output_path=tmp_path / "generated_shadowed.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    assert "_atoll_source.helper" not in generation.source_text
+    assert "helper(value)" in generation.source_text
+
+
+def test_directed_generation_rewrites_runtime_defaults_and_annotated_values(
+    tmp_path: Path,
+) -> None:
+    """Late-bound helpers are preserved in defaults and annotated assignments."""
+    source_path = tmp_path / "boundary_defaults.py"
+    source_path.write_text(
+        """def helper(value: int) -> int:
+    return value + 1
+
+def hot(
+    value: int = helper(1),
+    *,
+    other: int = helper(2),
+    empty: int | None = None,
+) -> int:
+    result: int = helper(value)
+    return result + other
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="boundary_defaults", path=source_path)))
+    source_region = next(
+        region
+        for region in scan.typed_regions
+        if {member.id.qualname for member in region.members} == {"helper", "hot"}
+    )
+    hot = next(member.id for member in source_region.members if member.id.qualname == "hot")
+    region = build_directed_region_slice(source_region, hot)
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (hot,),
+        output_path=tmp_path / "generated_defaults.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    assert "value: int=_atoll_source.helper(1)" in generation.source_text
+    assert "other: int=_atoll_source.helper(2)" in generation.source_text
+    assert "empty: int | None=None" in generation.source_text
+    assert "result: int = _atoll_source.helper(value)" in generation.source_text
+
+
+def test_cython_private_type_parameter_analysis_handles_nested_declarations(
+    tmp_path: Path,
+) -> None:
+    """Nested annotations stay typing-only while defaults and bodies are inspected."""
+    source_path = tmp_path / "nested_pep695.py"
+    source_path.write_text(
+        """def outer[T](value: T) -> T:
+    return value
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="nested_pep695", path=source_path)))
+    source_region = scan.typed_regions[0]
+    source_member = source_region.members[0]
+    nested_member = replace(
+        source_member,
+        source_text="""def outer[T](value: T, fallback: T | None = None) -> T:
+    selected: T = value
+
+    def inner(item: T = value) -> T:
+        return item
+
+    async def async_inner(item: T = value) -> T:
+        return item
+
+    if fallback is not None:
+        return fallback
+    return inner(selected)
+""",
+    )
+    region = replace(source_region, members=(nested_member,))
+    outer = nested_member.id
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (outer,),
+        output_path=tmp_path / "generated_nested_pep695.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    assert "def outer(value: T, fallback: T | None=None) -> T:" in generation.source_text
+    assert "def inner(item: T=value) -> T:" in generation.source_text
+    assert "async def async_inner(item: T=value) -> T:" in generation.source_text
+    assert "outer[T]" not in generation.source_text
+
+
+def test_directed_generation_keeps_receiver_method_dispatch(tmp_path: Path) -> None:
+    """A sliced method still resolves sibling methods through the original instance."""
+    source_path = tmp_path / "receiver_boundary.py"
+    source_path.write_text(
+        """class Worker:
+    def helper(self, value: int) -> int:
+        return value + 1
+
+    def hot(self, value: int) -> int:
+        return self.helper(value)
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="receiver_boundary", path=source_path)))
+    source_region = next(region for region in scan.typed_regions if region.atomic_class)
+    hot = next(member.id for member in source_region.members if member.id.qualname == "Worker.hot")
+    region = build_directed_region_slice(source_region, hot)
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (hot,),
+        output_path=tmp_path / "generated_receiver.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    assert "_atoll_source" not in generation.source_text
+    assert "return self.helper(value)" in generation.source_text
+
+
+def test_cython_private_lowering_preserves_pep695_annotations(tmp_path: Path) -> None:
+    """Cython-private source drops `[T]` syntax without inventing `Any`."""
+    source_path = tmp_path / "pep695_callable.py"
+    source_path.write_text(
+        """from __future__ import annotations
+
+def identity[T](value: T) -> T:
+    return value
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="pep695_callable", path=source_path)))
+    region = scan.typed_regions[0]
+    identity = region.members[0].id
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (identity,),
+        output_path=tmp_path / "generated_pep695.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    assert "def identity(value: T) -> T:" in generation.source_text
+    assert "identity[T]" not in generation.source_text
+    assert "Any" not in generation.source_text
+
+
+def test_cython_private_lowering_rejects_runtime_pep695_type_parameter(
+    tmp_path: Path,
+) -> None:
+    """A runtime TypeVar object cannot disappear from generated executable code."""
+    source_path = tmp_path / "runtime_type_parameter.py"
+    source_path.write_text(
+        """from __future__ import annotations
+
+def type_name[T](value: T) -> str:
+    return value.__class__.__name__
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(
+        scan_module(ModuleId(name="runtime_type_parameter", path=source_path))
+    )
+    source_region = scan.typed_regions[0]
+    source_member = source_region.members[0]
+    runtime_member = replace(
+        source_member,
+        source_text=("def type_name[T](value: T) -> str:\n    return T.__name__\n"),
+    )
+    region = replace(source_region, members=(runtime_member,))
+    member = runtime_member.id
+
+    with pytest.raises(ValueError, match=r"runtime type parameter.*T"):
+        generate_typed_method_region(
+            scan,
+            region,
+            (member,),
+            output_path=tmp_path / "generated_runtime_type.py",
+            options=TypedRegionGenerationOptions(backend="cython"),
+        )
 
 
 def test_atomic_class_generation_preserves_declaration_and_mypyc_contract(

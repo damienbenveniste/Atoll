@@ -19,16 +19,20 @@ from atoll.models import (
     BindingKind,
     Blocker,
     BlockerSeverity,
+    CallSiteFact,
     ConstantKind,
     ConstantRecord,
     ExecutionKind,
     FieldRecord,
     ImportRecord,
+    InvocationMode,
     ModuleId,
     ModuleScan,
     ParameterKind,
     ParameterRecord,
     ProjectConfig,
+    SuspensionKind,
+    SuspensionPoint,
     SymbolId,
     SymbolKind,
     SymbolRecord,
@@ -37,7 +41,7 @@ from atoll.models import (
     Visibility,
 )
 
-SCANNER_VERSION = "5"
+SCANNER_VERSION = "6"
 
 
 class CacheStats(TypedDict):
@@ -159,6 +163,48 @@ class TypeParameterCacheEntry(TypedDict):
     declaration: str
 
 
+class CallSiteCacheEntry(TypedDict):
+    """Cached ordered call-site evidence used by directed region planning.
+
+    Attributes:
+        target: Source-level call target expression.
+        root_name: First lexical name in the target expression.
+        invocation_mode: Ordinary, awaited, or async-iteration call mode.
+        lineno: One-based first source line covered by the call.
+        end_lineno: One-based final source line covered by the call.
+        col_offset: Zero-based first source column covered by the call.
+        end_col_offset: Zero-based final source column, when available.
+        requires_same_unit: Whether the call must share a native compilation unit.
+    """
+
+    target: str
+    root_name: str
+    invocation_mode: InvocationMode
+    lineno: int
+    end_lineno: int
+    col_offset: int
+    end_col_offset: int | None
+    requires_same_unit: bool
+
+
+class SuspensionPointCacheEntry(TypedDict):
+    """Cached source location for one coroutine or generator suspension.
+
+    Attributes:
+        kind: Await, yield, async-loop, or async-context suspension kind.
+        lineno: One-based first source line covered by the suspension.
+        end_lineno: One-based final source line covered by the suspension.
+        col_offset: Zero-based first source column covered by the suspension.
+        end_col_offset: Zero-based final source column, when available.
+    """
+
+    kind: SuspensionKind
+    lineno: int
+    end_lineno: int
+    col_offset: int
+    end_col_offset: int | None
+
+
 class SymbolCacheEntry(TypedDict):
     """Cached AST facts for a function, class, or simple method.
 
@@ -192,6 +238,9 @@ class SymbolCacheEntry(TypedDict):
         return_annotation: Exact source return annotation, when present.
         annotation_names: Names referenced by source annotations.
         called_paths: Dotted call targets recovered from source syntax.
+        call_sites: Ordered source call facts retained for directed slicing.
+        suspension_points: Ordered coroutine and generator suspension boundaries.
+        runtime_imports: Function-local imports executed by the declaration.
         base_names: Base-class expressions referenced by the declaration.
         fields: Typed class fields retained for region planning.
         declaration_start_lineno: First line of decorators or declaration syntax.
@@ -227,6 +276,9 @@ class SymbolCacheEntry(TypedDict):
     return_annotation: str | None
     annotation_names: list[str]
     called_paths: list[str]
+    call_sites: list[CallSiteCacheEntry]
+    suspension_points: list[SuspensionPointCacheEntry]
+    runtime_imports: list[ImportCacheEntry]
     base_names: list[str]
     fields: list[FieldCacheEntry]
     declaration_start_lineno: int | None
@@ -451,6 +503,40 @@ def _symbol_to_cache(symbol: SymbolRecord) -> SymbolCacheEntry:
         "return_annotation": symbol.return_annotation,
         "annotation_names": list(symbol.annotation_names),
         "called_paths": list(symbol.called_paths),
+        "call_sites": [
+            {
+                "target": call.target,
+                "root_name": call.root_name,
+                "invocation_mode": call.invocation_mode,
+                "lineno": call.lineno,
+                "end_lineno": call.end_lineno,
+                "col_offset": call.col_offset,
+                "end_col_offset": call.end_col_offset,
+                "requires_same_unit": call.requires_same_unit,
+            }
+            for call in symbol.call_sites
+        ],
+        "suspension_points": [
+            {
+                "kind": point.kind,
+                "lineno": point.lineno,
+                "end_lineno": point.end_lineno,
+                "col_offset": point.col_offset,
+                "end_col_offset": point.end_col_offset,
+            }
+            for point in symbol.suspension_points
+        ],
+        "runtime_imports": [
+            {
+                "source_text": record.source_text,
+                "imported_names": list(record.imported_names),
+                "module": record.module,
+                "level": record.level,
+                "lineno": record.lineno,
+                "end_lineno": record.end_lineno,
+            }
+            for record in symbol.runtime_imports
+        ],
         "base_names": list(symbol.base_names),
         "fields": [
             {
@@ -509,6 +595,30 @@ def _symbol_from_cache(entry: SymbolCacheEntry) -> SymbolRecord:
         return_annotation=entry["return_annotation"],
         annotation_names=tuple(entry["annotation_names"]),
         called_paths=tuple(entry["called_paths"]),
+        call_sites=tuple(
+            CallSiteFact(
+                target=call["target"],
+                root_name=call["root_name"],
+                invocation_mode=call["invocation_mode"],
+                lineno=call["lineno"],
+                end_lineno=call["end_lineno"],
+                col_offset=call["col_offset"],
+                end_col_offset=call["end_col_offset"],
+                requires_same_unit=call["requires_same_unit"],
+            )
+            for call in entry["call_sites"]
+        ),
+        suspension_points=tuple(
+            SuspensionPoint(
+                kind=point["kind"],
+                lineno=point["lineno"],
+                end_lineno=point["end_lineno"],
+                col_offset=point["col_offset"],
+                end_col_offset=point["end_col_offset"],
+            )
+            for point in entry["suspension_points"]
+        ),
+        runtime_imports=tuple(_import_from_cache(record) for record in entry["runtime_imports"]),
         base_names=tuple(entry["base_names"]),
         fields=tuple(
             FieldRecord(

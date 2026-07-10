@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.analysis.native_readiness import NativeReadiness
+from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.models import (
     ArtifactRecord,
     BackendAssessment,
@@ -668,6 +670,82 @@ def third(value: int) -> int:
         },
     ]
     assert report["rejected_variants"] == []
+
+
+def test_compilation_report_serializes_async_region_planning_evidence(tmp_path: Path) -> None:
+    """Schema v3 exposes ordered suspension, call, import, and boundary facts."""
+    source_path = tmp_path / "async_regions.py"
+    source_path.write_text(
+        """async def helper(value: int) -> int:
+    await value
+    return value + 1
+
+async def hot(value: int) -> int:
+    import math
+    return await helper(value) + math.floor(0.5)
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="async_regions", path=source_path)))
+    region = next(
+        item
+        for item in scan.typed_regions
+        if {member.id.qualname for member in item.members} == {"helper", "hot"}
+    )
+    hot_id = next(member.id for member in region.members if member.id.qualname == "hot")
+    helper_id = next(member.id for member in region.members if member.id.qualname == "helper")
+    region = replace(
+        region,
+        dependencies=tuple(
+            replace(dependency, requires_same_unit=True)
+            if dependency.src == hot_id and dependency.dst == helper_id
+            else dependency
+            for dependency in region.dependencies
+        ),
+    )
+    region = build_directed_region_slice(region, hot_id)
+    hot_binding = next(binding for binding in region.bindings if binding.source == hot_id)
+
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter="async_regions",
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "typed-region-build"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            typed_regions=(region,),
+            compiled_regions=(region,),
+            compiled_bindings=(hot_binding,),
+        )
+    )
+    markdown = render_compilation_markdown_report(report)
+    serialized_region = report["typed_regions"][0]
+    hot = next(member for member in serialized_region["members"] if member["id"].endswith("::hot"))
+    helper_call = next(call for call in hot["call_sites"] if call["target"] == "helper")
+    helper_dependency = next(
+        dependency
+        for dependency in serialized_region["dependencies"]
+        if dependency["dst"].endswith("::helper")
+    )
+
+    assert helper_call["invocation_mode"] == "awaited"
+    assert helper_call["requires_same_unit"] is False
+    assert hot["suspension_points"][0]["kind"] == "await"
+    assert hot["runtime_imports"][0]["imported_names"] == ["math"]
+    assert helper_dependency["invocation_mode"] == "awaited"
+    assert helper_dependency["requires_same_unit"] is True
+    plans = {plan["member"]: plan for plan in report["suspension_plans"]}
+    assert plans["async_regions::hot"]["lowering_mode"] == "whole-callable"
+    assert plans["async_regions::helper"]["lowering_mode"] == "whole-callable"
+    assert "## Suspension Handling" in markdown
+    assert "`async_regions::hot`: whole-callable" in markdown
 
 
 def test_compilation_report_accepts_explicit_compiled_variants(tmp_path: Path) -> None:

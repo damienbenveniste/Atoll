@@ -49,6 +49,7 @@ DependencyKind = Literal[
 DependencyRole = Literal["runtime", "typing", "facade"]
 DiagnosticSeverity = Literal["error", "note"]
 ExecutionKind = Literal["sync", "generator", "coroutine", "async_generator", "class"]
+InvocationMode = Literal["ordinary", "awaited", "async_iteration"]
 IslandRisk = Literal["low", "medium", "high"]
 LossAction = Literal["preserve", "specialize", "box", "fallback", "reject"]
 ParameterKind = Literal[
@@ -69,6 +70,7 @@ TypeBindingSource = Literal[
     "import",
 ]
 SpecializationOrigin = Literal["concrete_subclass", "closed_call"]
+SuspensionKind = Literal["await", "yield", "yield_from", "async_for", "async_with"]
 Visibility = Literal["public", "private"]
 
 _SHA256_HEX_LENGTH = 64
@@ -379,6 +381,64 @@ class TypeParameterRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class CallSiteFact:
+    """One syntactic call expression observed inside a scanned symbol body.
+
+    The scanner records the call target expression and source position without
+    evaluating arguments, receivers, descriptors, or runtime values.
+    `invocation_mode` separates ordinary calls from calls that are directly
+    awaited or used as an async-iteration source. `requires_same_unit` is
+    reserved for syntax that proves a call cannot be split across compilation
+    units; it defaults to `False` because most local calls can remain normal
+    runtime boundaries.
+
+    Attributes:
+        target: Source-level call target path, such as `helper` or `self.step`.
+        root_name: First lexical name in the target path used for boundary lookup.
+        invocation_mode: How the call expression participates in control flow.
+        lineno: One-based first source line covered by the call.
+        end_lineno: One-based final source line covered by the call.
+        col_offset: Zero-based first source column covered by the call.
+        end_col_offset: Zero-based final source column covered by the call, when available.
+        requires_same_unit: Whether syntax proves this call must share a compiled unit.
+    """
+
+    target: str
+    root_name: str
+    invocation_mode: InvocationMode
+    lineno: int
+    end_lineno: int
+    col_offset: int
+    end_col_offset: int | None
+    requires_same_unit: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SuspensionPoint:
+    """One syntax-level suspension boundary inside a scanned symbol body.
+
+    Suspension points describe control-flow shape, not the values yielded,
+    delegated to, or awaited through protocol methods. Source positions are
+    retained so later reports can explain why a function cannot be treated as a
+    purely synchronous body.
+
+    Attributes:
+        kind: Syntax form that can suspend execution.
+        lineno: One-based first source line covered by the suspension point.
+        end_lineno: One-based final source line covered by the suspension point.
+        col_offset: Zero-based first source column covered by the suspension point.
+        end_col_offset: Zero-based final source column covered by the suspension point, when
+            available.
+    """
+
+    kind: SuspensionKind
+    lineno: int
+    end_lineno: int
+    col_offset: int
+    end_col_offset: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class SymbolRecord:
     """AST-derived facts for one function, class, or simple method.
 
@@ -414,6 +474,9 @@ class SymbolRecord:
         return_annotation: Exact source return annotation, when present.
         annotation_names: Names referenced by source annotations.
         called_paths: Dotted call targets recovered from source syntax.
+        call_sites: Ordered source call facts observed in the symbol body.
+        suspension_points: Ordered syntax-level suspension boundaries in the symbol body.
+        runtime_imports: Ordered function-local imports executed at runtime.
         base_names: Base-class expressions referenced by the declaration.
         fields: Typed class fields retained for region planning.
         declaration_start_lineno: First line of decorators or declaration syntax.
@@ -449,6 +512,9 @@ class SymbolRecord:
     return_annotation: str | None = None
     annotation_names: tuple[str, ...] = ()
     called_paths: tuple[str, ...] = ()
+    call_sites: tuple[CallSiteFact, ...] = ()
+    suspension_points: tuple[SuspensionPoint, ...] = ()
+    runtime_imports: tuple[ImportRecord, ...] = ()
     base_names: tuple[str, ...] = ()
     fields: tuple[FieldRecord, ...] = ()
     declaration_start_lineno: int | None = None
@@ -645,6 +711,10 @@ class RegionMember:
         scope_type_parameter_records: Structured type parameters inherited from enclosing scopes.
         parameters: Exact source parameter declarations in call order.
         return_annotation: Exact source return annotation, when present.
+        call_sites: Ordered source call facts retained for region planning.
+        suspension_points: Ordered syntax-level suspension boundaries retained for backend
+            planning.
+        runtime_imports: Ordered function-local imports that execute at runtime.
         fields: Typed class fields retained for region planning.
     """
 
@@ -660,6 +730,9 @@ class RegionMember:
     scope_type_parameter_records: tuple[TypeParameterRecord, ...]
     parameters: tuple[ParameterRecord, ...]
     return_annotation: str | None
+    call_sites: tuple[CallSiteFact, ...] = ()
+    suspension_points: tuple[SuspensionPoint, ...] = ()
+    runtime_imports: tuple[ImportRecord, ...] = ()
     fields: tuple[FieldRecord, ...] = ()
 
 
@@ -674,6 +747,9 @@ class RegionDependency:
         confidence: Confidence assigned to the dependency evidence.
         role: Whether the dependency is required at runtime, for typing, or by the facade.
         type_only: Whether the dependency is used exclusively for typing.
+        lineno: One-based source line for the dependency evidence, when available.
+        invocation_mode: How the source call is invoked when this is a call edge.
+        requires_same_unit: Whether syntax proves the dependency must share a compiled unit.
     """
 
     src: SymbolId
@@ -682,6 +758,9 @@ class RegionDependency:
     confidence: Confidence
     role: DependencyRole
     type_only: bool
+    lineno: int | None = None
+    invocation_mode: InvocationMode | None = None
+    requires_same_unit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -945,6 +1024,8 @@ class DependencyEdge:
         kind: Calls, global use, inheritance, decoration, import, or annotation edge kind.
         confidence: Confidence assigned to the dependency evidence.
         lineno: One-based first source line covered by the record.
+        invocation_mode: How the source call is invoked when this is a call edge.
+        requires_same_unit: Whether syntax proves the dependency must share a compiled unit.
     """
 
     src: SymbolId
@@ -952,6 +1033,8 @@ class DependencyEdge:
     kind: DependencyKind
     confidence: Confidence
     lineno: int | None = None
+    invocation_mode: InvocationMode | None = None
+    requires_same_unit: bool = False
 
 
 @dataclass(frozen=True, slots=True)

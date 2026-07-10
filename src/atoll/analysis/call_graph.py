@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from atoll.models import (
+    CallSiteFact,
     ConstantRecord,
     DependencyEdge,
     DependencyKind,
@@ -109,9 +110,19 @@ def _symbol_name_map(symbols: tuple[SymbolRecord, ...]) -> dict[str, SymbolId]:
 
 def _dedupe_edges(edges: Iterable[DependencyEdge]) -> tuple[DependencyEdge, ...]:
     deduped: list[DependencyEdge] = []
-    seen: set[tuple[SymbolId, SymbolId | str, DependencyKind, str, int | None]] = set()
+    seen: set[
+        tuple[SymbolId, SymbolId | str, DependencyKind, str, int | None, str | None, bool]
+    ] = set()
     for edge in edges:
-        key = (edge.src, edge.dst, edge.kind, edge.confidence, edge.lineno)
+        key = (
+            edge.src,
+            edge.dst,
+            edge.kind,
+            edge.confidence,
+            edge.lineno,
+            edge.invocation_mode,
+            edge.requires_same_unit,
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -120,6 +131,100 @@ def _dedupe_edges(edges: Iterable[DependencyEdge]) -> tuple[DependencyEdge, ...]
 
 
 def _call_edges(
+    symbol: SymbolRecord,
+    symbol_by_name: dict[str, SymbolId],
+    imported_names: dict[str, str],
+) -> tuple[DependencyEdge, ...]:
+    if symbol.call_sites:
+        return _call_site_edges(symbol, symbol_by_name, imported_names)
+    return _legacy_call_edges(symbol, symbol_by_name, imported_names)
+
+
+def _call_site_edges(
+    symbol: SymbolRecord,
+    symbol_by_name: dict[str, SymbolId],
+    imported_names: dict[str, str],
+) -> tuple[DependencyEdge, ...]:
+    edges: list[DependencyEdge] = []
+    owner_class = _owner_class(symbol)
+    for call_site in symbol.call_sites:
+        receiver_dispatch = call_site.target.startswith(("self.", "cls."))
+        if call_site.root_name in symbol.local_names and not receiver_dispatch:
+            continue
+        if "." in call_site.target:
+            edges.extend(
+                _call_site_path_edges(
+                    symbol=symbol,
+                    call_site=call_site,
+                    owner_class=owner_class,
+                    symbol_by_name=symbol_by_name,
+                    imported_names=imported_names,
+                )
+            )
+        elif call_site.target in symbol_by_name:
+            edges.append(
+                DependencyEdge(
+                    src=symbol.id,
+                    dst=symbol_by_name[call_site.target],
+                    kind="calls",
+                    confidence="high",
+                    lineno=call_site.lineno,
+                    invocation_mode=call_site.invocation_mode,
+                    requires_same_unit=call_site.requires_same_unit,
+                )
+            )
+        elif call_site.target in imported_names:
+            edges.append(
+                DependencyEdge(
+                    src=symbol.id,
+                    dst=imported_names[call_site.target],
+                    kind="imports",
+                    confidence="medium",
+                    lineno=call_site.lineno,
+                    invocation_mode=call_site.invocation_mode,
+                    requires_same_unit=call_site.requires_same_unit,
+                )
+            )
+    return tuple(edges)
+
+
+def _call_site_path_edges(
+    symbol: SymbolRecord,
+    call_site: CallSiteFact,
+    owner_class: str | None,
+    symbol_by_name: dict[str, SymbolId],
+    imported_names: dict[str, str],
+) -> tuple[DependencyEdge, ...]:
+    target = _method_path_target(call_site.target, owner_class)
+    if target in symbol_by_name:
+        return (
+            DependencyEdge(
+                src=symbol.id,
+                dst=symbol_by_name[target],
+                kind="calls_method",
+                confidence="high",
+                lineno=call_site.lineno,
+                invocation_mode=call_site.invocation_mode,
+                requires_same_unit=call_site.requires_same_unit,
+            ),
+        )
+    root_name = target.split(".", maxsplit=1)[0]
+    if root_name in imported_names:
+        return (
+            DependencyEdge(
+                src=symbol.id,
+                dst=imported_names[root_name],
+                kind="imports",
+                confidence="medium",
+                lineno=call_site.lineno,
+                invocation_mode=call_site.invocation_mode,
+                requires_same_unit=call_site.requires_same_unit,
+            ),
+        )
+    return ()
+
+
+def _legacy_call_edges(
     symbol: SymbolRecord,
     symbol_by_name: dict[str, SymbolId],
     imported_names: dict[str, str],

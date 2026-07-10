@@ -20,15 +20,19 @@ from atoll.analysis.blockers import (
 )
 from atoll.models import (
     BindingKind,
+    CallSiteFact,
     ConstantKind,
     ConstantRecord,
     ExecutionKind,
     FieldRecord,
     ImportRecord,
+    InvocationMode,
     ModuleId,
     ModuleScan,
     ParameterKind,
     ParameterRecord,
+    SuspensionKind,
+    SuspensionPoint,
     SymbolId,
     SymbolKind,
     SymbolRecord,
@@ -64,6 +68,7 @@ class _FunctionRecordContext:
 
     Attributes:
         module_name: Importable source module name.
+        lines: Source lines for preserving exact local import text.
         kind: Classified declaration, binding, or receiver kind.
         qualname: Module-local qualified declaration name.
         owner_class: Source class owning the selected member.
@@ -71,6 +76,7 @@ class _FunctionRecordContext:
     """
 
     module_name: str
+    lines: list[str]
     kind: SymbolKind
     qualname: str
     owner_class: str | None
@@ -100,7 +106,7 @@ def scan_module(module: ModuleId) -> ModuleScan:
     symbols = tuple(
         record
         for node in tree.body
-        for record in _symbol_records(module.name, node, typing_aliases)
+        for record in _symbol_records(module.name, node, lines, typing_aliases)
     )
     module_blockers = module_level_blockers(tree.body, module.name)
     statement_lines = tuple(
@@ -119,6 +125,7 @@ def scan_module(module: ModuleId) -> ModuleScan:
 def _symbol_records(
     module_name: str,
     node: ast.stmt,
+    lines: list[str],
     typing_aliases: _TypingAliases,
 ) -> tuple[SymbolRecord, ...]:
     if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -127,6 +134,7 @@ def _symbol_records(
                 node,
                 _FunctionRecordContext(
                     module_name=module_name,
+                    lines=lines,
                     kind="function",
                     qualname=node.name,
                     owner_class=None,
@@ -141,6 +149,7 @@ def _symbol_records(
                 child,
                 _FunctionRecordContext(
                     module_name=module_name,
+                    lines=lines,
                     kind="method",
                     qualname=f"{node.name}.{child.name}",
                     owner_class=node.name,
@@ -159,7 +168,7 @@ def _function_record(
     context: _FunctionRecordContext,
 ) -> SymbolRecord:
     symbol = SymbolId(module=context.module_name, qualname=context.qualname)
-    collector = _FunctionNameCollector()
+    collector = _FunctionNameCollector(context.lines)
     collector.collect(node)
     annotations = _function_annotations(node)
     annotation_names = _annotation_names(annotations)
@@ -194,6 +203,9 @@ def _function_record(
         return_annotation=_annotation_source(node.returns),
         annotation_names=annotation_names,
         called_paths=tuple(sorted(collector.called_paths)),
+        call_sites=tuple(collector.call_sites),
+        suspension_points=tuple(collector.suspension_points),
+        runtime_imports=tuple(collector.runtime_imports),
         base_names=(),
         declaration_start_lineno=_declaration_start_lineno(node),
         any_annotation_sources=_any_annotation_sources(
@@ -739,6 +751,16 @@ def _source_text(node: ast.stmt, lines: list[str]) -> str:
     return "\n".join(lines[node.lineno - 1 : _end_lineno(node)])
 
 
+def _suspension_point(kind: SuspensionKind, node: ast.stmt | ast.expr) -> SuspensionPoint:
+    return SuspensionPoint(
+        kind=kind,
+        lineno=node.lineno,
+        end_lineno=_end_lineno(node),
+        col_offset=node.col_offset,
+        end_col_offset=node.end_col_offset,
+    )
+
+
 def _end_lineno(node: ast.stmt | ast.expr) -> int:
     return node.end_lineno if node.end_lineno is not None else node.lineno
 
@@ -774,10 +796,18 @@ class _FunctionNameCollector(ast.NodeVisitor):
     traversed bodies because Atoll V1 does not extract nested symbols.
     """
 
-    def __init__(self) -> None:
-        """Initialize independent name sets for one function definition."""
+    def __init__(self, lines: list[str]) -> None:
+        """Initialize independent name sets for one function definition.
+
+        Args:
+            lines: Original module source lines used to retain function-local imports.
+        """
+        self._lines = lines
         self.called_names: set[str] = set()
         self.called_paths: set[str] = set()
+        self.call_sites: list[CallSiteFact] = []
+        self.suspension_points: list[SuspensionPoint] = []
+        self.runtime_imports: list[ImportRecord] = []
         self.local_names: set[str] = set()
         self.referenced_names: set[str] = set()
         self.runtime_referenced_names: set[str] = set()
@@ -854,11 +884,62 @@ class _FunctionNameCollector(ast.NodeVisitor):
         Args:
             node: Syntax node being visited without executing target code.
         """
-        if isinstance(node.func, ast.Name) and not self._is_suppressed_load(node.func.id):
-            self.called_names.add(node.func.id)
-        path = _attribute_path(node.func)
-        if path is not None and not self._is_suppressed_load(path[0]):
-            self.called_paths.add(".".join(path))
+        self._visit_call(node, "ordinary")
+
+    def visit_Await(self, node: ast.Await) -> None:
+        """Record directly awaited calls without marking nested argument calls awaited.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self.suspension_points.append(_suspension_point("await", node))
+        if isinstance(node.value, ast.Call):
+            self._visit_call(node.value, "awaited")
+        else:
+            self.visit(node.value)
+
+    def visit_Yield(self, node: ast.Yield) -> None:
+        """Record a yield suspension point and visit the yielded expression.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self.suspension_points.append(_suspension_point("yield", node))
+        self.generic_visit(node)
+
+    def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
+        """Record a yield-from suspension point and visit its delegation expression.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self.suspension_points.append(_suspension_point("yield_from", node))
+        self.generic_visit(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        """Record async-iteration suspension and calls that create the async iterator.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self.suspension_points.append(_suspension_point("async_for", node))
+        self.visit(node.target)
+        if isinstance(node.iter, ast.Call):
+            self._visit_call(node.iter, "async_iteration")
+        else:
+            self.visit(node.iter)
+        for child in node.body:
+            self.visit(child)
+        for child in node.orelse:
+            self.visit(child)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        """Record async context-manager suspension and visit context expressions.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self.suspension_points.append(_suspension_point("async_with", node))
         self.generic_visit(node)
 
     def visit_Global(self, node: ast.Global) -> None:
@@ -889,6 +970,7 @@ class _FunctionNameCollector(ast.NodeVisitor):
             name = alias.asname or alias.name.split(".", maxsplit=1)[0]
             if not self._is_external_binding(name):
                 self.local_names.add(name)
+        self.runtime_imports.append(_import_record(node, self._lines))
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         """Treat imported symbols inside a function as lexical local bindings.
@@ -901,6 +983,7 @@ class _FunctionNameCollector(ast.NodeVisitor):
             for alias in node.names
             if not self._is_external_binding(name := alias.asname or alias.name)
         )
+        self.runtime_imports.append(_import_record(node, self._lines))
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
         """Collect exception targets that the AST stores outside `Name(Store)`.
@@ -1029,6 +1112,30 @@ class _FunctionNameCollector(ast.NodeVisitor):
         with self._suppressed_load_scope(bound_names):
             for result_node in result_nodes:
                 self.visit(result_node)
+
+    def _visit_call(self, node: ast.Call, invocation_mode: InvocationMode) -> None:
+        if isinstance(node.func, ast.Name) and not self._is_suppressed_load(node.func.id):
+            self.called_names.add(node.func.id)
+        path = _attribute_path(node.func)
+        if path is not None and not self._is_suppressed_load(path[0]):
+            target = ".".join(path)
+            self.called_paths.add(target)
+            self.call_sites.append(
+                CallSiteFact(
+                    target=target,
+                    root_name=path[0],
+                    invocation_mode=invocation_mode,
+                    lineno=node.lineno,
+                    end_lineno=_end_lineno(node),
+                    col_offset=node.col_offset,
+                    end_col_offset=node.end_col_offset,
+                )
+            )
+        self.visit(node.func)
+        for argument in node.args:
+            self.visit(argument)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
 
     def _suppressed_load_scope(self, names: Iterable[str]) -> _SuppressedLoadScope:
         return _SuppressedLoadScope(self._suppressed_load_names, frozenset(names))

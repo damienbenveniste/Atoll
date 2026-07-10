@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
 
@@ -125,8 +126,8 @@ def test_cython_assesses_typed_functions_methods_and_async_generators(tmp_path: 
     assert worker_assessment.reasons == ()
 
 
-def test_cython_rejects_any_generic_fallback_and_reject_decisions(tmp_path: Path) -> None:
-    """Any boxing, unresolved generics, and explicit rejects are unsupported."""
+def test_cython_supports_boxed_any_and_unresolved_generic_callables(tmp_path: Path) -> None:
+    """Whole-callable Cython retains Python semantics for dynamically typed inputs."""
     regions = _regions(
         tmp_path,
         "cython_fallbacks",
@@ -148,14 +149,49 @@ def test_cython_rejects_any_generic_fallback_and_reject_decisions(tmp_path: Path
     dynamic = backend.assess(_region_containing(regions, "dynamic"))
     identity = backend.assess(_region_containing(regions, "identity"))
 
-    assert dynamic.status == "unsupported"
-    assert dynamic.reasons == (
-        "cython_fallbacks::dynamic: cython preference requires concrete typing; source uses Any",
+    assert dynamic.status == "supported"
+    assert dynamic.supported_members == (SymbolId("cython_fallbacks", "dynamic"),)
+    assert dynamic.reasons == ()
+    assert identity.status == "supported"
+    assert identity.supported_members == (SymbolId("cython_fallbacks", "identity"),)
+    assert identity.reasons == ()
+
+
+def test_cython_rejects_boxed_member_from_atomic_class(tmp_path: Path) -> None:
+    """Boxed semantics require method rebinding on the original Python class."""
+    region = _region_containing(
+        _regions(
+            tmp_path,
+            "cython_atomic_box",
+            """
+            class Worker:
+                def scale(self, value: int) -> int:
+                    return value * 2
+            """,
+        ),
+        "Worker",
+        "Worker.scale",
     )
-    assert identity.status == "unsupported"
-    assert identity.reasons == (
-        "cython_fallbacks::identity: member requires interpreted fallback before specialization",
+    scale = _member(region, "Worker.scale")
+    boxed_region = replace(
+        region,
+        decisions=tuple(
+            replace(decision, action="box", reason="fixture boxed method")
+            if decision.target == scale.stable_id
+            else decision
+            for decision in region.decisions
+        ),
     )
+
+    assessment = CythonBackend().assess(boxed_region)
+
+    assert assessment.status == "unsupported"
+    assert set(assessment.unsupported_members) == {
+        _member(region, "Worker"),
+        scale,
+    }
+    assert any("requires concrete callable typing" in reason for reason in assessment.reasons)
+    assert any("requires every class member to pass" in reason for reason in assessment.reasons)
 
 
 def test_cython_lower_validates_requested_members_and_variant_id(tmp_path: Path) -> None:

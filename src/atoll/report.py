@@ -22,6 +22,7 @@ from atoll.models import (
     BindingTarget,
     Blocker,
     BlockerSeverity,
+    CallSiteFact,
     CompileAttempt,
     CompileCacheStatus,
     CompiledRegionVariant,
@@ -32,6 +33,8 @@ from atoll.models import (
     DiagnosticSeverity,
     EnabledIslandConfig,
     ExecutionKind,
+    ImportRecord,
+    InvocationMode,
     IslandRisk,
     LossAction,
     ModuleScan,
@@ -41,6 +44,8 @@ from atoll.models import (
     RuntimeTypeGuard,
     ScanResult,
     SpecializationOrigin,
+    SuspensionKind,
+    SuspensionPoint,
     SymbolId,
     SymbolKind,
     TypedRegion,
@@ -143,6 +148,9 @@ class SymbolReport(TypedDict):
         return_annotation: Exact source return annotation, when present.
         annotation_names: Names referenced by source annotations.
         called_paths: Dotted call targets recovered from source syntax.
+        call_sites: Ordered source call facts retained for region planning.
+        suspension_points: Ordered coroutine and generator suspension boundaries.
+        runtime_imports: Function-local imports executed by the declaration.
         base_names: Base-class expressions referenced by the declaration.
         fields: Typed class fields retained for region planning.
         declaration_start_lineno: First line of decorators or declaration syntax.
@@ -177,6 +185,9 @@ class SymbolReport(TypedDict):
     return_annotation: str | None
     annotation_names: list[str]
     called_paths: list[str]
+    call_sites: list[CallSiteReport]
+    suspension_points: list[SuspensionPointReport]
+    runtime_imports: list[ImportReport]
     base_names: list[str]
     fields: list[FieldReport]
     declaration_start_lineno: int | None
@@ -234,6 +245,48 @@ class TypeParameterReport(TypedDict):
     declaration: str
 
 
+class CallSiteReport(TypedDict):
+    """Ordered syntax evidence for one call inside a source declaration.
+
+    Attributes:
+        target: Source-level call target expression.
+        root_name: First lexical name in the target expression.
+        invocation_mode: Ordinary, awaited, or async-iteration call mode.
+        lineno: One-based first source line covered by the call.
+        end_lineno: One-based final source line covered by the call.
+        col_offset: Zero-based first source column covered by the call.
+        end_col_offset: Zero-based final source column, when available.
+        requires_same_unit: Whether the call must share a native compilation unit.
+    """
+
+    target: str
+    root_name: str
+    invocation_mode: InvocationMode
+    lineno: int
+    end_lineno: int
+    col_offset: int
+    end_col_offset: int | None
+    requires_same_unit: bool
+
+
+class SuspensionPointReport(TypedDict):
+    """Source location and syntax kind for one suspension boundary.
+
+    Attributes:
+        kind: Await, yield, async-loop, or async-context suspension kind.
+        lineno: One-based first source line covered by the suspension.
+        end_lineno: One-based final source line covered by the suspension.
+        col_offset: Zero-based first source column covered by the suspension.
+        end_col_offset: Zero-based final source column, when available.
+    """
+
+    kind: SuspensionKind
+    lineno: int
+    end_lineno: int
+    col_offset: int
+    end_col_offset: int | None
+
+
 class MypyDiagnosticReport(TypedDict):
     """Serialized mypy diagnostic after optional symbol range mapping.
 
@@ -265,6 +318,8 @@ class DependencyEdgeReport(TypedDict):
         kind: Calls, global use, inheritance, decoration, import, or annotation edge kind.
         confidence: Confidence assigned to the dependency evidence.
         lineno: One-based first source line covered by the record.
+        invocation_mode: Call execution mode when the edge comes from a call site.
+        requires_same_unit: Whether the dependency must share a compilation unit.
     """
 
     src: str
@@ -272,6 +327,8 @@ class DependencyEdgeReport(TypedDict):
     kind: DependencyKind
     confidence: Confidence
     lineno: int | None
+    invocation_mode: InvocationMode | None
+    requires_same_unit: bool
 
 
 class IslandCandidateReport(TypedDict):
@@ -334,6 +391,9 @@ class RegionMemberReport(TypedDict):
         parameters: Exact source parameter declarations in call order.
         return_annotation: Exact source return annotation, when present.
         fields: Typed class fields retained for region planning.
+        call_sites: Ordered source call facts retained for region planning.
+        suspension_points: Ordered coroutine and generator suspension boundaries.
+        runtime_imports: Function-local imports executed by the declaration.
     """
 
     id: str
@@ -347,6 +407,9 @@ class RegionMemberReport(TypedDict):
     scope_type_parameter_records: list[TypeParameterReport]
     parameters: list[ParameterReport]
     return_annotation: str | None
+    call_sites: list[CallSiteReport]
+    suspension_points: list[SuspensionPointReport]
+    runtime_imports: list[ImportReport]
     fields: list[FieldReport]
 
 
@@ -360,6 +423,9 @@ class RegionDependencyReport(TypedDict):
         confidence: Confidence assigned to the dependency evidence.
         role: Whether the dependency is required at runtime, for typing, or by the facade.
         type_only: Whether the dependency is used exclusively for typing.
+        lineno: One-based source line for the dependency evidence, when available.
+        invocation_mode: Call execution mode when the dependency comes from a call site.
+        requires_same_unit: Whether the dependency must share a compilation unit.
     """
 
     src: str
@@ -368,6 +434,9 @@ class RegionDependencyReport(TypedDict):
     confidence: Confidence
     role: DependencyRole
     type_only: bool
+    lineno: int | None
+    invocation_mode: InvocationMode | None
+    requires_same_unit: bool
 
 
 class TypeBindingReport(TypedDict):
@@ -869,23 +938,47 @@ class CompilationRejectedVariantReport(TypedDict):
 
 
 class CompilationCandidateTrialReport(TypedDict):
-    """Reserved schema slot for future candidate trial evidence.
+    """One measured candidate-variant decision made during profitability selection.
 
     Attributes:
-        id: Reserved stable candidate trial identifier.
+        id: Stable candidate trial identifier.
+        region_id: Region variant evaluated by the trial.
+        backend: Native backend used by the candidate.
+        lowering_mode: Whole-callable or outlined-block lowering mode.
+        status: Accepted, rejected, failed-semantics, or unavailable status.
+        reason: Evidence supporting the candidate decision.
+        marginal_speedup: Speedup over the previously accepted set, when measured.
     """
 
     id: str
+    region_id: str
+    backend: Backend
+    lowering_mode: str
+    status: str
+    reason: str
+    marginal_speedup: float | None
 
 
 class CompilationSuspensionPlanReport(TypedDict):
-    """Reserved schema slot for future suspension plan evidence.
+    """Suspension evidence and lowering mode selected for one callable.
 
     Attributes:
-        id: Reserved stable suspension plan identifier.
+        id: Stable plan identifier derived from region and member identities.
+        region_id: Source region containing the callable.
+        member: Stable source callable identity.
+        execution_kind: Coroutine, generator, or async-generator shape.
+        lowering_mode: Whole-callable or interpreted mode used by this compile.
+        points: Ordered syntax-level suspension boundaries.
+        reason: Evidence supporting the selected lowering mode.
     """
 
     id: str
+    region_id: str
+    member: str
+    execution_kind: ExecutionKind
+    lowering_mode: str
+    points: list[SuspensionPointReport]
+    reason: str
 
 
 class CompilationBuildReport(TypedDict):
@@ -1171,8 +1264,8 @@ class CompilationReport(TypedDict):
         verification_steps: Isolated wheel and payload verification evidence.
         performance: Paired performance-gate evidence.
         profile: Profile-guided selection evidence or explicit static fallback.
-        candidate_trials: Reserved list for future candidate trial evidence.
-        suspension_plans: Reserved list for future suspension plan evidence.
+        candidate_trials: Candidate variants evaluated by profitability selection.
+        suspension_plans: Per-callable suspension evidence and lowering decisions.
         backend_decisions: Normalized backend capability assessments.
         accepted_variants: Compatibility view of accepted compiled variants.
         rejected_variants: Compatibility view of rejected source-clean module variants.
@@ -1457,6 +1550,12 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     performance = _compilation_performance_report(report_input.root, report_input.performance)
     profile = _compilation_profile_report(report_input.profile)
     backend_decisions = _backend_decision_reports(report_input.backend_assessments)
+    suspension_plans = _suspension_plan_reports(
+        report_input.typed_regions,
+        report_input.compiled_regions,
+        report_input.compiled_variants,
+        report_input.compiled_bindings,
+    )
     accepted_variants = _accepted_variant_reports(compiled_regions)
     rejected_variants = _rejected_variant_reports(report_input.skipped_modules)
     performance_failed = performance["status"] not in {"passed", "unbenchmarked"}
@@ -1542,7 +1641,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         "performance": performance,
         "profile": profile,
         "candidate_trials": [],
-        "suspension_plans": [],
+        "suspension_plans": suspension_plans,
         "backend_decisions": backend_decisions,
         "accepted_variants": accepted_variants,
         "rejected_variants": rejected_variants,
@@ -1760,6 +1859,7 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         "",
     ]
     _append_profile_guided_selection_markdown(lines, report["profile"])
+    _append_suspension_plans_markdown(lines, report["suspension_plans"])
     if report["typed_regions"]:
         lines.extend(["## Planned Regions", ""])
         lines.extend(
@@ -1940,6 +2040,19 @@ def _compiled_region_markdown(region: CompilationCompiledRegionReport) -> str:
     )
 
 
+def _append_suspension_plans_markdown(
+    lines: list[str],
+    plans: list[CompilationSuspensionPlanReport],
+) -> None:
+    if not plans:
+        return
+    lines.extend(["## Suspension Handling", ""])
+    for plan in plans:
+        points = ", ".join(f"{point['kind']} at line {point['lineno']}" for point in plan["points"])
+        lines.append(f"- `{plan['member']}`: {plan['lowering_mode']} ({points}); {plan['reason']}")
+    lines.append("")
+
+
 def _compiled_binding_markdown(binding: CompilationCompiledBindingReport) -> str:
     target = binding["target_owner_class"]
     target_text = f" -> {target}" if target is not None else ""
@@ -2045,6 +2158,11 @@ def _module_report(module: ModuleScan) -> ModuleReport:
                 "return_annotation": symbol.return_annotation,
                 "annotation_names": list(symbol.annotation_names),
                 "called_paths": list(symbol.called_paths),
+                "call_sites": [_call_site_report(call) for call in symbol.call_sites],
+                "suspension_points": [
+                    _suspension_point_report(point) for point in symbol.suspension_points
+                ],
+                "runtime_imports": [_import_report(record) for record in symbol.runtime_imports],
                 "base_names": list(symbol.base_names),
                 "fields": [
                     {
@@ -2083,6 +2201,8 @@ def _module_report(module: ModuleScan) -> ModuleReport:
                 "kind": edge.kind,
                 "confidence": edge.confidence,
                 "lineno": edge.lineno,
+                "invocation_mode": edge.invocation_mode,
+                "requires_same_unit": edge.requires_same_unit,
             }
             for edge in module.dependency_edges
         ],
@@ -2146,6 +2266,11 @@ def _typed_region_report(region: TypedRegion) -> TypedRegionReport:
                     for parameter in member.parameters
                 ],
                 "return_annotation": member.return_annotation,
+                "call_sites": [_call_site_report(call) for call in member.call_sites],
+                "suspension_points": [
+                    _suspension_point_report(point) for point in member.suspension_points
+                ],
+                "runtime_imports": [_import_report(record) for record in member.runtime_imports],
                 "fields": [
                     {
                         "name": field.name,
@@ -2166,6 +2291,9 @@ def _typed_region_report(region: TypedRegion) -> TypedRegionReport:
                 "confidence": dependency.confidence,
                 "role": dependency.role,
                 "type_only": dependency.type_only,
+                "lineno": dependency.lineno,
+                "invocation_mode": dependency.invocation_mode,
+                "requires_same_unit": dependency.requires_same_unit,
             }
             for dependency in region.dependencies
         ],
@@ -2248,6 +2376,40 @@ def _type_parameter_report(record: TypeParameterRecord) -> TypeParameterReport:
         "name": record.name,
         "kind": record.kind,
         "declaration": record.declaration,
+    }
+
+
+def _call_site_report(call: CallSiteFact) -> CallSiteReport:
+    return {
+        "target": call.target,
+        "root_name": call.root_name,
+        "invocation_mode": call.invocation_mode,
+        "lineno": call.lineno,
+        "end_lineno": call.end_lineno,
+        "col_offset": call.col_offset,
+        "end_col_offset": call.end_col_offset,
+        "requires_same_unit": call.requires_same_unit,
+    }
+
+
+def _suspension_point_report(point: SuspensionPoint) -> SuspensionPointReport:
+    return {
+        "kind": point.kind,
+        "lineno": point.lineno,
+        "end_lineno": point.end_lineno,
+        "col_offset": point.col_offset,
+        "end_col_offset": point.end_col_offset,
+    }
+
+
+def _import_report(record: ImportRecord) -> ImportReport:
+    return {
+        "source_text": record.source_text,
+        "imported_names": list(record.imported_names),
+        "module": record.module,
+        "level": record.level,
+        "lineno": record.lineno,
+        "end_lineno": record.end_lineno,
     }
 
 
@@ -2582,6 +2744,44 @@ def _backend_decision_reports(
             key=lambda item: (item.region_id, item.backend, item.status),
         )
     ]
+
+
+def _suspension_plan_reports(
+    regions: tuple[TypedRegion, ...],
+    compiled_regions: tuple[TypedRegion, ...],
+    compiled_variants: tuple[CompiledRegionVariant, ...],
+    compiled_bindings: tuple[BindingTarget, ...],
+) -> list[CompilationSuspensionPlanReport]:
+    compiled_sources = {member.id for region in compiled_regions for member in region.members}
+    compiled_sources.update(
+        member.id for variant in compiled_variants for member in variant.region.members
+    )
+    compiled_sources.update(binding.source for binding in compiled_bindings)
+    reports: list[CompilationSuspensionPlanReport] = []
+    for region in sorted(regions, key=lambda item: item.id):
+        for member in region.members:
+            if not member.suspension_points:
+                continue
+            compiled = member.id in compiled_sources
+            reports.append(
+                {
+                    "id": f"{region.id}:{member.id.stable_id}",
+                    "region_id": region.id,
+                    "member": member.id.stable_id,
+                    "execution_kind": member.execution_kind,
+                    "lowering_mode": "whole-callable" if compiled else "interpreted",
+                    "points": [
+                        _suspension_point_report(point) for point in member.suspension_points
+                    ],
+                    "reason": (
+                        "the selected backend compiled the complete callable while preserving "
+                        "its suspension protocol"
+                        if compiled
+                        else "no accepted compiled binding replaced this callable"
+                    ),
+                }
+            )
+    return reports
 
 
 def _accepted_variant_reports(

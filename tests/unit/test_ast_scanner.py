@@ -342,6 +342,74 @@ def test_scan_treats_exception_targets_as_coroutine_locals(tmp_path: Path) -> No
     assert tracked_task.uses_globals == ("record_failure",)
 
 
+def test_scan_records_ordered_call_sites_suspensions_and_runtime_imports(
+    tmp_path: Path,
+) -> None:
+    """Scanner facts retain call and suspension syntax without runtime values."""
+    module_path = tmp_path / "scanner_facts.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "async def consume(worker, source):",
+                "    import json as json_lib",
+                "    from collections import deque",
+                "    start()",
+                "    await worker.fetch()",
+                "    await wrap(inner())",
+                "    async for item in source.stream():",
+                "        handle(item)",
+                "    async with worker.lock():",
+                "        yield item",
+                "    return",
+                "",
+                "def produce():",
+                "    yield from fallback()",
+                "    yield transform()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="scanner_facts", path=module_path))
+    symbols = {symbol.id.qualname: symbol for symbol in scan.symbols}
+
+    consume = symbols["consume"]
+    assert [
+        (call.target, call.invocation_mode, call.lineno, call.col_offset)
+        for call in consume.call_sites
+    ] == [
+        ("start", "ordinary", 4, 4),
+        ("worker.fetch", "awaited", 5, 10),
+        ("wrap", "awaited", 6, 10),
+        ("inner", "ordinary", 6, 15),
+        ("source.stream", "async_iteration", 7, 22),
+        ("handle", "ordinary", 8, 8),
+        ("worker.lock", "ordinary", 9, 15),
+    ]
+    assert [(record.imported_names, record.lineno) for record in consume.runtime_imports] == [
+        (("json_lib",), 2),
+        (("deque",), 3),
+    ]
+    assert [(point.kind, point.lineno) for point in consume.suspension_points] == [
+        ("await", 5),
+        ("await", 6),
+        ("async_for", 7),
+        ("async_with", 9),
+        ("yield", 10),
+    ]
+
+    produce = symbols["produce"]
+    assert [(call.target, call.invocation_mode, call.lineno) for call in produce.call_sites] == [
+        ("fallback", "ordinary", 14),
+        ("transform", "ordinary", 15),
+    ]
+    assert [(point.kind, point.lineno) for point in produce.suspension_points] == [
+        ("yield_from", 14),
+        ("yield", 15),
+    ]
+
+
 def test_scan_collects_non_name_store_lexical_bindings(tmp_path: Path) -> None:
     """Imports and structural pattern captures bind locals without false globals."""
     module_path = tmp_path / "binding_forms.py"

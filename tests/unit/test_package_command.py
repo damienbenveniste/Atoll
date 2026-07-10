@@ -106,7 +106,17 @@ class _QualityGateOutcomeView(Protocol):
     error: str | None
 
 
+class _SelectedScans(Protocol):
+    def __call__(
+        self,
+        project: DiscoveredProject,
+        module_name: str | None,
+        selected_members: tuple[SymbolId, ...] = (),
+    ) -> tuple[ModuleScan, ...]: ...
+
+
 class _TypedSelection(Protocol):
+    scan: ModuleScan
     backend: Backend
     variant_id: str
     region: TypedRegion
@@ -115,6 +125,8 @@ class _TypedSelection(Protocol):
     bound_members: tuple[SymbolId, ...] | None
     specialization: RegionSpecialization | None
     conditional_on_failure_of: str | None
+    source_region_id: str | None
+    slice_root: SymbolId | None
 
 
 class _TypedGeneration(Protocol):
@@ -215,7 +227,7 @@ _staged_module = cast(
 )
 _string = cast(Callable[[object], str | None], _package_attr("_string"))
 _selected_scans = cast(
-    Callable[[DiscoveredProject, str | None], tuple[ModuleScan, ...]],
+    _SelectedScans,
     _package_attr("_selected_scans"),
 )
 _selected_typed_regions = cast(
@@ -224,6 +236,24 @@ _selected_typed_regions = cast(
 )
 _prepare_typed_region = cast(
     Callable[..., _PreparedTypedRegion], _package_attr("_prepare_typed_region")
+)
+_SelectedTypedRegion = cast(Callable[..., _TypedSelection], _package_attr("_SelectedTypedRegion"))
+_RequestedCallableVariant = cast(Callable[..., object], _package_attr("_RequestedCallableVariant"))
+_staged_typed_selection = cast(
+    Callable[[ModuleScan, _TypedSelection], _TypedSelection],
+    _package_attr("_staged_typed_selection"),
+)
+_profile_candidate_members = cast(
+    Callable[[tuple[ModuleScan, ...], tuple[Backend, ...]], tuple[SymbolId, ...]],
+    _package_attr("_profile_candidate_members"),
+)
+_runtime_member_closure = cast(
+    Callable[[TypedRegion, tuple[SymbolId, ...], frozenset[SymbolId]], tuple[SymbolId, ...]],
+    _package_attr("_runtime_member_closure"),
+)
+_selected_requested_callable_variant = cast(
+    Callable[[object], tuple[_TypedSelection, ...]],
+    _package_attr("_selected_requested_callable_variant"),
 )
 _build_typed_regions = cast(
     Callable[..., _TypedRegionOutcome], _package_attr("_build_typed_regions")
@@ -285,7 +315,12 @@ def test_typed_region_selection_prefers_mypyc_for_safe_specializations(
         for selection in worker_selections
         if selection.specialization is not None
     )
-    assert len(function_selections) == 1
+    assert len(function_selections) == EXPECTED_ATOMIC_SELECTION_COUNT
+    ordinary = next(
+        selection for selection in function_selections if selection.specialization is None
+    )
+    assert ordinary.backend == "mypyc"
+    assert tuple(member.qualname for member in ordinary.members) == ("pair_int",)
     function_specialization = next(
         selection for selection in function_selections if selection.specialization is not None
     )
@@ -294,10 +329,10 @@ def test_typed_region_selection_prefers_mypyc_for_safe_specializations(
     assert function_specialization.specialization.origin == "closed_call"
 
 
-def test_explicit_function_selection_compiles_helpers_without_binding_them(
+def test_explicit_function_selection_creates_one_directed_slice_per_binding(
     tmp_path: Path,
 ) -> None:
-    """Runtime closure members support selected functions but stay private to the unit."""
+    """Independent requested roots do not inherit an oversized connected component."""
     project_root = tmp_path / "simple_project"
     shutil.copytree(FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
@@ -312,14 +347,158 @@ def test_explicit_function_selection_compiles_helpers_without_binding_them(
         requested,
     )
 
-    assert len(selections) == 1
-    assert selections[0].backend == "mypyc"
-    assert {member.qualname for member in selections[0].members} == {
-        "normalize_features",
-        "score_user",
-        "rank_candidates",
+    assert len(selections) == EXPECTED_ATOMIC_SELECTION_COUNT
+    assert all(selection.backend == "mypyc" for selection in selections)
+    assert {tuple(member.qualname for member in selection.members) for selection in selections} == {
+        ("score_user",),
+        ("rank_candidates",),
     }
-    assert set(selections[0].bound_members or ()) == set(requested)
+    assert {
+        member for selection in selections for member in (selection.bound_members or ())
+    } == set(requested)
+    assert all(selection.slice_root is not None for selection in selections)
+    assert all(selection.source_region_id is not None for selection in selections)
+
+
+def test_directed_selection_rejects_staged_drift_and_missing_root(tmp_path: Path) -> None:
+    """Staged rescanning must reproduce the exact checkout-derived slice."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "app.ranking")
+    requested = (SymbolId("app.ranking", "score_user"),)
+    selection = _selected_typed_regions(scans, requested_members=requested)[0]
+    assert selection.source_region_id is not None
+    assert selection.slice_root is not None
+
+    missing_root = _SelectedTypedRegion(
+        scan=selection.scan,
+        region=selection.region,
+        variant_id=selection.variant_id,
+        backend=selection.backend,
+        assessment=selection.assessment,
+        members=selection.members,
+        bound_members=selection.bound_members,
+        specialization=selection.specialization,
+        conditional_on_failure_of=selection.conditional_on_failure_of,
+        source_region_id=selection.source_region_id,
+        slice_root=None,
+    )
+    with pytest.raises(ValueError, match="requires a slice root"):
+        _staged_typed_selection(scans[0], missing_root)
+
+    drifted = _SelectedTypedRegion(
+        scan=selection.scan,
+        region=replace(selection.region, id=f"{selection.region.id}:drifted"),
+        variant_id=selection.variant_id,
+        backend=selection.backend,
+        assessment=selection.assessment,
+        members=selection.members,
+        bound_members=selection.bound_members,
+        specialization=selection.specialization,
+        conditional_on_failure_of=selection.conditional_on_failure_of,
+        source_region_id=selection.source_region_id,
+        slice_root=selection.slice_root,
+    )
+    with pytest.raises(ValueError, match="staged directed slice differs"):
+        _staged_typed_selection(scans[0], drifted)
+
+
+def test_profile_and_directed_closure_helpers_cover_backend_boundaries(tmp_path: Path) -> None:
+    """Profile preflight and required-edge closure remain conservative."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "app.ranking")
+    assert _profile_candidate_members(scans, ()) == ()
+
+    region = next(
+        region
+        for region in scans[0].typed_regions
+        if any(
+            isinstance(dependency.dst, SymbolId)
+            and dependency.src
+            in {member.id for member in region.members if member.kind == "function"}
+            and dependency.dst
+            in {member.id for member in region.members if member.kind == "function"}
+            for dependency in region.dependencies
+        )
+    )
+    member_ids = tuple(member.id for member in region.members if member.kind == "function")
+    dependency = next(
+        dependency
+        for dependency in region.dependencies
+        if dependency.src in member_ids
+        and isinstance(dependency.dst, SymbolId)
+        and dependency.dst in member_ids
+    )
+    assert isinstance(dependency.dst, SymbolId)
+    required = replace(
+        region,
+        dependencies=tuple(
+            replace(item, requires_same_unit=True) if item is dependency else item
+            for item in region.dependencies
+        ),
+    )
+    closure = _runtime_member_closure(required, member_ids, frozenset({dependency.src}))
+    assert {dependency.src, dependency.dst} <= set(closure)
+
+    blocked_closure = _runtime_member_closure(
+        required,
+        tuple(member for member in member_ids if member != dependency.dst),
+        frozenset({dependency.src}),
+    )
+    assert blocked_closure == ()
+
+    external = replace(
+        required,
+        dependencies=tuple(
+            replace(item, dst="external.boundary")
+            if item.src == dependency.src and item.dst == dependency.dst and item.requires_same_unit
+            else item
+            for item in required.dependencies
+        ),
+    )
+    assert _runtime_member_closure(
+        external,
+        member_ids,
+        frozenset({dependency.src}),
+    ) == (dependency.src,)
+
+    empty_inputs = _RequestedCallableVariant(
+        scan=scans[0],
+        region=region,
+        closure=(),
+        requested=frozenset({dependency.src}),
+        backends=("mypyc", "cython"),
+        source_region_id=region.id,
+        slice_root=dependency.src,
+    )
+    unsupported_inputs = _RequestedCallableVariant(
+        scan=scans[0],
+        region=region,
+        closure=(dependency.src,),
+        requested=frozenset({dependency.src}),
+        backends=(),
+        source_region_id=region.id,
+        slice_root=dependency.src,
+    )
+    assert _selected_requested_callable_variant(empty_inputs) == ()
+    assert _selected_requested_callable_variant(unsupported_inputs) == ()
+
+
+def test_selected_scans_reject_cross_module_member_scope(tmp_path: Path) -> None:
+    """A module-filtered compile cannot smuggle in a member from another module."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+
+    with pytest.raises(ValueError, match="must belong to the requested module scope"):
+        _selected_scans(
+            project,
+            "app.ranking",
+            (SymbolId("app.models", "User"),),
+        )
 
 
 def test_explicit_package_fails_when_one_requested_region_does_not_compile(
@@ -369,10 +548,10 @@ def test_explicit_package_fails_when_one_requested_region_does_not_compile(
     assert result.cleanup_kept == (output_dir / "build",)
 
 
-def test_function_with_same_region_class_dependency_stays_interpreted(
+def test_function_with_same_region_class_dependency_uses_runtime_boundary(
     tmp_path: Path,
 ) -> None:
-    """Generated callable units never omit a same-region runtime declaration."""
+    """A local class can remain interpreted while its caller compiles."""
     project_root = tmp_path / "simple_project"
     shutil.copytree(FIXTURE_ROOT, project_root)
     module_path = project_root / "src" / "app" / "class_dependency.py"
@@ -399,7 +578,7 @@ def add_one(value: int) -> int:
         for member in (selection.bound_members or selection.members)
     }
     assert SymbolId(module="app.class_dependency", qualname="add_one") in bound
-    assert SymbolId(module="app.class_dependency", qualname="make_payload") not in bound
+    assert SymbolId(module="app.class_dependency", qualname="make_payload") in bound
 
 
 def test_atomic_class_selection_is_exclusive_and_partial_classes_split(
@@ -492,6 +671,58 @@ def test_method_selection_preserves_registered_and_dynamic_owner_classes() -> No
         "module",
         {eager.target: eager},
     )
+
+
+def test_profile_selected_dataclass_methods_use_boxed_cython_slices(
+    tmp_path: Path,
+) -> None:
+    """Hot boxed methods rebind safely on the original recognized dataclass."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    module_path = project_root / "src" / "app" / "boxed_runner.py"
+    module_path.write_text(
+        """from __future__ import annotations
+
+import typing
+from dataclasses import dataclass
+
+
+@dataclass
+class Runner:
+    bias: int
+
+    def dynamic(self, value: typing.Any) -> typing.Any:
+        return value
+
+    def incomplete(self, value):
+        return value + self.bias
+
+    def identity[T](self, value: T) -> T:
+        return value
+""",
+        encoding="utf-8",
+    )
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "app.boxed_runner")
+    hot = tuple(
+        SymbolId("app.boxed_runner", qualname)
+        for qualname in ("Runner.dynamic", "Runner.incomplete", "Runner.identity")
+    )
+
+    static = _selected_typed_regions(scans)
+    selected = _selected_typed_regions(
+        scans,
+        ("mypyc", "cython"),
+        hot,
+        hot_members=hot,
+    )
+
+    assert static == ()
+    assert len(selected) == len(hot)
+    assert all(selection.backend == "cython" for selection in selected)
+    assert {selection.slice_root for selection in selected} == set(hot)
+    assert all(len(selection.members) == 1 for selection in selected)
+    assert all(selection.region.atomic_class is False for selection in selected)
 
 
 def test_package_default_does_not_call_legacy_sidecar_backend(
@@ -661,6 +892,102 @@ def test_typed_region_build_retries_deterministic_mypyc_failure_with_cython(
     assert outcome.skipped == ()
     assert len(mypyc.calls) == 1
     assert len(cython.calls) == 1
+
+
+def test_typed_region_build_restores_rejection_and_cython_artifact_on_second_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged retry path invokes neither native compiler a second time."""
+    project_root = tmp_path / "typed_region_project"
+    build_root = tmp_path / "build"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "typed_region_project.worker")
+    selections = _selected_typed_regions(scans)
+    mypyc_selection = next(selection for selection in selections if selection.backend == "mypyc")
+    staged_source_roots = _copy_source_roots(project, build_root)
+    prepared = _prepare_typed_region(
+        project=project,
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        selection=mypyc_selection,
+    )
+    assert prepared.fallback is not None
+    fallback = prepared.fallback
+    artifact = (
+        build_root / ".atoll" / "artifacts" / fallback.unit.install_relative_dir / "native.so"
+    )
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"native-cython-artifact")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    mypyc = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=False,
+                command=("mypyc",),
+                stdout="",
+                stderr="MYPYC_TYPE_ERROR: deterministic fixture rejection",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    cython = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=True,
+                command=("cython",),
+                stdout="",
+                stderr="",
+                artifact_paths=(artifact,),
+                duration_seconds=0.2,
+            ),
+            artifacts=(
+                ArtifactRecord(
+                    region_id=fallback.unit.region_id,
+                    backend="cython",
+                    logical_module=fallback.unit.logical_module,
+                    role="primary",
+                    install_relative_path=(f"{fallback.unit.install_relative_dir}/native.so"),
+                    digest=digest,
+                    abi="cp312",
+                    platform_tag="test-platform",
+                ),
+            ),
+        )
+    )
+    monkeypatch.setitem(_compiler_backends, "mypyc", mypyc)
+    monkeypatch.setitem(_compiler_backends, "cython", cython)
+    context = _TypedRegionBuildContext(
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        mypy_cache_dir=tmp_path / "mypy-cache",
+        compile_cache_dir=tmp_path / "compile-cache",
+        progress=None,
+    )
+
+    first = _build_typed_regions(
+        prepared=(prepared,),
+        context=context,
+        initial_failures=(),
+    )
+    artifact.unlink()
+    second = _build_typed_regions(
+        prepared=(prepared,),
+        context=context,
+        initial_failures=(),
+    )
+
+    assert first.build.success is True
+    assert second.build.success is True
+    assert len(mypyc.calls) == 1
+    assert len(cython.calls) == 1
+    assert second.successful[0].generation.backend == "cython"
+    assert second.build.artifact_paths[0].read_bytes() == b"native-cython-artifact"
+    assert "backend_decision_cache" in {timing.name for timing in second.build.phase_timings}
+    assert "cache_restore" in {timing.name for timing in second.build.phase_timings}
 
 
 def test_typed_region_build_does_not_compile_speculative_cython_after_mypyc_success(

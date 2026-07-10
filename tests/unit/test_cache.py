@@ -33,6 +33,7 @@ def test_scan_modules_with_cache_hits_on_second_run(tmp_path: Path) -> None:
     assert first_stats == {"hits": 0, "misses": 3}
     assert second_stats == {"hits": 3, "misses": 0}
     assert [scan.module.name for scan in first_scans] == [scan.module.name for scan in second_scans]
+    assert first_scans == second_scans
     cached_ranking = next(scan for scan in second_scans if scan.module.name == "app.ranking")
     cached_score = next(
         symbol for symbol in cached_ranking.symbols if symbol.id.qualname == "score_user"
@@ -43,6 +44,9 @@ def test_scan_modules_with_cache_hits_on_second_run(tmp_path: Path) -> None:
         "list[Event]",
     ]
     assert cached_score.return_annotation == "Score"
+    assert cached_score.call_sites
+    assert cached_score.suspension_points == ()
+    assert cached_score.runtime_imports == ()
     assert cached_score.scope_type_parameters == ()
     cached_identity = next(
         symbol for symbol in cached_ranking.symbols if symbol.id.qualname == "identity"

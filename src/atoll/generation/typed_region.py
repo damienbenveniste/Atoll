@@ -26,7 +26,7 @@ from atoll.models import (
     TypedRegion,
 )
 
-TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-region-v4"
+TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-region-v5"
 _SUPPORTED_BINDINGS = frozenset({"instance_method", "staticmethod", "classmethod"})
 _SUPPORTED_EXECUTION_KINDS = frozenset({"sync", "generator", "coroutine"})
 
@@ -115,10 +115,10 @@ def generate_typed_method_region(
     bindings = tuple(_binding_target(member, options.specialization) for member in members)
     source_text = _generated_source(
         scan,
+        region,
         members,
         bindings,
-        options.backend,
-        options.specialization,
+        options,
     )
     source_hash = hashlib.sha256(source_text.encode()).hexdigest()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,11 +224,13 @@ def _validate_callable_selection(
 
 def _generated_source(
     scan: ModuleScan,
+    region: TypedRegion,
     members: tuple[RegionMember, ...],
     bindings: tuple[BindingTarget, ...],
-    backend: Backend,
-    specialization: RegionSpecialization | None,
+    options: TypedRegionGenerationOptions,
 ) -> str:
+    backend = options.backend
+    specialization = options.specialization
     owner_names: set[str] = set()
     for binding in bindings:
         owner = binding.target_owner_class or binding.owner_class
@@ -236,12 +238,13 @@ def _generated_source(
             owner_names.add(owner)
     owners = tuple(sorted(owner_names))
     atomic_class = len(members) == 1 and members[0].kind == "class"
+    boundary_roots = _runtime_boundary_roots(region, members)
     sections = _generated_sections(
         scan,
         owners,
-        backend,
-        specialization,
+        options,
         atomic_class=atomic_class,
+        runtime_boundary=bool(boundary_roots),
     )
     if atomic_class:
         sections.extend(("", _lowered_atomic_class(members[0], backend)))
@@ -256,6 +259,7 @@ def _generated_source(
                         binding_by_source[member.id],
                         backend,
                         specialization,
+                        boundary_roots,
                     ),
                 )
             )
@@ -270,11 +274,13 @@ def _generated_source(
 def _generated_sections(
     scan: ModuleScan,
     owners: tuple[str, ...],
-    backend: Backend,
-    specialization: RegionSpecialization | None,
+    options: TypedRegionGenerationOptions,
     *,
     atomic_class: bool,
+    runtime_boundary: bool,
 ) -> list[str]:
+    backend = options.backend
+    specialization = options.specialization
     imports = tuple(
         _preserved_import(scan, record)
         for record in scan.imports
@@ -300,6 +306,8 @@ def _generated_sections(
         sections.extend(("", *dict.fromkeys(imports)))
     if constants:
         sections.extend(("", *constants))
+    if runtime_boundary:
+        sections.extend(("", f"import {scan.module.name} as _atoll_source"))
     if backend == "mypyc":
         for owner in owners:
             source_owner = (
@@ -482,17 +490,29 @@ def _lowered_callable(
     binding: BindingTarget,
     backend: Backend,
     specialization: RegionSpecialization | None,
+    boundary_roots: frozenset[str],
 ) -> str:
     node = _callable_node(member)
     node.name = binding.compiled_name
     node.decorator_list = []
+    if backend == "cython" and specialization is None:
+        _lower_cython_type_parameters(node, member)
+    _rewrite_runtime_boundaries(node, boundary_roots)
     if specialization is not None:
         _specialize_annotations(node, specialization.substitutions)
         node.type_params = []
     if backend == "cython":
         return ast.unparse(ast.fix_missing_locations(node))
-    if binding.kind == "module":
-        return ast.unparse(ast.fix_missing_locations(node))
+    if binding.kind != "module":
+        _lower_mypyc_method_receiver(node, member, binding)
+    return ast.unparse(ast.fix_missing_locations(node))
+
+
+def _lower_mypyc_method_receiver(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    member: RegionMember,
+    binding: BindingTarget,
+) -> None:
     owner = binding.target_owner_class or _required_owner(member)
     _rewrite_signature_owner_types(node, owner)
     first = _first_positional_parameter(node)
@@ -510,7 +530,225 @@ def _lowered_callable(
                 slice=ast.Name(id=_facade_name(owner), ctx=ast.Load()),
                 ctx=ast.Load(),
             )
-    return ast.unparse(ast.fix_missing_locations(node))
+
+
+def _lower_cython_type_parameters(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    member: RegionMember,
+) -> None:
+    """Remove unsupported PEP 695 syntax from a Cython-private callable.
+
+    Source annotation expressions remain unchanged and the staged runtime shim
+    restores metadata from the original Python binding. A type parameter used
+    by executable code cannot be removed safely and leaves the member
+    interpreted instead.
+
+    Args:
+        node: Private generated callable submitted to Cython.
+        member: Source member retaining declared type-parameter evidence.
+
+    Raises:
+        ValueError: A declared type parameter is used by runtime code.
+    """
+    names = frozenset(member.type_parameters)
+    if not names or not node.type_params:
+        return
+    visitor = _RuntimeTypeParameterUseVisitor(names)
+    for expression in (*node.args.defaults, *node.args.kw_defaults):
+        if expression is not None:
+            visitor.visit(expression)
+    for statement in node.body:
+        visitor.visit(statement)
+    if visitor.used:
+        raise ValueError(
+            "Cython boxed lowering cannot remove runtime type parameter(s): "
+            + ", ".join(sorted(visitor.used))
+        )
+    node.type_params = []
+
+
+class _RuntimeTypeParameterUseVisitor(ast.NodeVisitor):
+    """Find executable TypeVar name loads while skipping annotation syntax."""
+
+    def __init__(self, names: frozenset[str]) -> None:
+        self.names = names
+        self.used: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        """Record one runtime type-parameter load.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        if isinstance(node.ctx, ast.Load) and node.id in self.names:
+            self.used.add(node.id)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        """Visit assignment runtime expressions without traversing its annotation.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self.visit(node.target)
+        if node.value is not None:
+            self.visit(node.value)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """Visit nested function runtime expressions without annotations.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self._visit_nested_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        """Visit nested async runtime expressions without annotations.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self._visit_nested_function(node)
+
+    def _visit_nested_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for expression in (*node.args.defaults, *node.args.kw_defaults):
+            if expression is not None:
+                self.visit(expression)
+        for statement in node.body:
+            self.visit(statement)
+
+
+def _runtime_boundary_roots(
+    region: TypedRegion,
+    members: tuple[RegionMember, ...],
+) -> frozenset[str]:
+    selected = frozenset(member.id for member in members)
+    member_by_id = {member.id: member for member in members}
+    roots: set[str] = set()
+    for dependency in region.dependencies:
+        if (
+            dependency.src not in selected
+            or dependency.role != "runtime"
+            or dependency.requires_same_unit
+            or not isinstance(dependency.dst, SymbolId)
+            or dependency.dst.module != region.source_module.name
+            or dependency.dst in selected
+        ):
+            continue
+        source_member = member_by_id[dependency.src]
+        if _uses_receiver_dispatch(source_member, dependency.dst, dependency.lineno):
+            continue
+        roots.add(dependency.dst.qualname.split(".", maxsplit=1)[0])
+    return frozenset(roots)
+
+
+def _uses_receiver_dispatch(
+    member: RegionMember,
+    destination: SymbolId,
+    lineno: int | None,
+) -> bool:
+    if "." not in destination.qualname:
+        return False
+    method_name = destination.qualname.rsplit(".", maxsplit=1)[-1]
+    return any(
+        call.target in {f"self.{method_name}", f"cls.{method_name}"}
+        and (lineno is None or call.lineno == lineno)
+        for call in member.call_sites
+    )
+
+
+def _rewrite_runtime_boundaries(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    roots: frozenset[str],
+) -> None:
+    if not roots:
+        return
+    rewriter = _RuntimeBoundaryRewriter(roots)
+    rewritten_body: list[ast.stmt] = []
+    for statement in node.body:
+        rewritten = rewriter.visit(statement)
+        if not isinstance(rewritten, ast.stmt):
+            raise TypeError("runtime-boundary rewrite produced a non-statement")
+        rewritten_body.append(rewritten)
+    node.body = rewritten_body
+    rewritten_defaults: list[ast.expr] = []
+    for default in node.args.defaults:
+        rewritten = rewriter.visit(default)
+        if not isinstance(rewritten, ast.expr):
+            raise TypeError("runtime-boundary default rewrite produced a non-expression")
+        rewritten_defaults.append(rewritten)
+    node.args.defaults = rewritten_defaults
+    node.args.kw_defaults = [
+        _rewrite_optional_runtime_expression(rewriter, default) for default in node.args.kw_defaults
+    ]
+
+
+def _rewrite_optional_runtime_expression(
+    rewriter: _RuntimeBoundaryRewriter,
+    expression: ast.expr | None,
+) -> ast.expr | None:
+    if expression is None:
+        return None
+    rewritten = rewriter.visit(expression)
+    if not isinstance(rewritten, ast.expr):
+        raise TypeError("runtime-boundary expression rewrite produced a non-expression")
+    return rewritten
+
+
+class _RuntimeBoundaryRewriter(ast.NodeTransformer):
+    """Route omitted same-module globals through the live source module."""
+
+    def __init__(self, roots: frozenset[str]) -> None:
+        self.roots = roots
+
+    def visit_Name(self, node: ast.Name) -> ast.expr:
+        """Rewrite one loaded boundary root without touching stores.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+
+        Returns:
+            ast.expr: Live source-module lookup or the unchanged name.
+        """
+        if isinstance(node.ctx, ast.Load) and node.id in self.roots:
+            return ast.copy_location(
+                ast.Attribute(
+                    value=ast.Name(id="_atoll_source", ctx=ast.Load()),
+                    attr=node.id,
+                    ctx=node.ctx,
+                ),
+                node,
+            )
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
+        """Rewrite runtime parts of an annotated assignment, not its annotation.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+
+        Returns:
+            ast.AnnAssign: Assignment with source annotation preserved exactly.
+
+        Raises:
+            TypeError: If rewriting produces a non-expression assignment target or value.
+        """
+        target = self.visit(node.target)
+        if not isinstance(target, ast.Name | ast.Attribute | ast.Subscript):
+            raise TypeError("runtime-boundary assignment target is not an expression")
+        value = self.visit(node.value) if node.value is not None else None
+        if value is not None and not isinstance(value, ast.expr):
+            raise TypeError("runtime-boundary assignment value is not an expression")
+        return ast.copy_location(
+            ast.AnnAssign(
+                target=target,
+                annotation=node.annotation,
+                value=value,
+                simple=node.simple,
+            ),
+            node,
+        )
 
 
 def _callable_node(member: RegionMember) -> ast.FunctionDef | ast.AsyncFunctionDef:

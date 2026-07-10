@@ -8,9 +8,11 @@ from typing import cast
 
 from atoll.analysis.call_graph import build_dependency_edges
 from atoll.models import (
+    CallSiteFact,
     ConstantRecord,
     DependencyEdge,
     ImportRecord,
+    InvocationMode,
     ModuleId,
     ModuleScan,
     SymbolId,
@@ -30,6 +32,8 @@ class FutureSymbolRecord:
     lineno: int = 1
     owner_class: str | None = None
     called_paths: tuple[str, ...] = ()
+    call_sites: tuple[CallSiteFact, ...] = ()
+    local_names: tuple[str, ...] = ()
     annotation_names: tuple[str, ...] = ()
     base_names: tuple[str, ...] = ()
 
@@ -105,6 +109,67 @@ def test_dependency_edges_preserve_function_runtime_behavior(tmp_path: Path) -> 
     ]
 
 
+def test_dependency_edges_preserve_invocation_mode_and_same_unit_evidence(
+    tmp_path: Path,
+) -> None:
+    """Call-site facts enrich call edges without making ordinary calls atomic."""
+    module = _module_scan(
+        tmp_path,
+        symbols=(
+            FutureSymbolRecord(id=SymbolId("pkg.mod", "helper"), kind="function"),
+            FutureSymbolRecord(id=SymbolId("pkg.mod", "Worker"), kind="class"),
+            FutureSymbolRecord(id=SymbolId("pkg.mod", "Worker.fetch"), kind="method"),
+            FutureSymbolRecord(
+                id=SymbolId("pkg.mod", "Worker.run"),
+                kind="method",
+                owner_class="Worker",
+                call_sites=(
+                    _call_site("helper", "helper", "ordinary", 10),
+                    _call_site("Worker", "Worker", "awaited", 11, requires_same_unit=True),
+                    _call_site("self.fetch", "self", "awaited", 12),
+                    _call_site("client.stream", "client", "async_iteration", 13),
+                ),
+            ),
+        ),
+    )
+
+    edges = build_dependency_edges(module)
+
+    assert _call_edge_details(edges) == [
+        ("pkg.mod::helper", "calls", "ordinary", False, 10),
+        ("pkg.mod::Worker", "calls", "awaited", True, 11),
+        ("pkg.mod::Worker.fetch", "calls_method", "awaited", False, 12),
+        ("pkg.api.client", "imports", "async_iteration", False, 13),
+    ]
+
+
+def test_dependency_edges_do_not_resolve_lexically_local_call_roots(
+    tmp_path: Path,
+) -> None:
+    """Assignments and local imports shadow same-named module dependencies."""
+    module = _module_scan(
+        tmp_path,
+        symbols=(
+            FutureSymbolRecord(id=SymbolId("pkg.mod", "helper"), kind="function"),
+            FutureSymbolRecord(
+                id=SymbolId("pkg.mod", "hot"),
+                kind="function",
+                local_names=("helper", "client"),
+                call_sites=(
+                    _call_site("helper", "helper", "ordinary", 10),
+                    _call_site("client.stream", "client", "ordinary", 11),
+                ),
+            ),
+        ),
+    )
+
+    edges = build_dependency_edges(module)
+
+    assert not any(
+        edge.src.qualname == "hot" and edge.kind in {"calls", "imports"} for edge in edges
+    )
+
+
 def _module_scan(
     tmp_path: Path,
     *,
@@ -172,3 +237,40 @@ def _edge_summary(edges: tuple[DependencyEdge, ...]) -> list[tuple[str, str, str
         )
         for edge in edges
     ]
+
+
+def _call_edge_details(
+    edges: tuple[DependencyEdge, ...],
+) -> list[tuple[str, str, str | None, bool, int | None]]:
+    return [
+        (
+            edge.dst.stable_id if isinstance(edge.dst, SymbolId) else edge.dst,
+            edge.kind,
+            edge.invocation_mode,
+            edge.requires_same_unit,
+            edge.lineno,
+        )
+        for edge in edges
+        if edge.kind in {"calls", "calls_method", "imports"}
+        and edge.src == SymbolId("pkg.mod", "Worker.run")
+    ]
+
+
+def _call_site(
+    target: str,
+    root_name: str,
+    invocation_mode: InvocationMode,
+    lineno: int,
+    *,
+    requires_same_unit: bool = False,
+) -> CallSiteFact:
+    return CallSiteFact(
+        target=target,
+        root_name=root_name,
+        invocation_mode=invocation_mode,
+        lineno=lineno,
+        end_lineno=lineno,
+        col_offset=4,
+        end_col_offset=12,
+        requires_same_unit=requires_same_unit,
+    )

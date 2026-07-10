@@ -33,7 +33,7 @@ from atoll.models import (
     TypeParameterRecord,
 )
 
-TYPED_REGION_SCHEMA_VERSION = "atoll-typed-region-v2"
+TYPED_REGION_SCHEMA_VERSION = "atoll-typed-region-v3"
 _UNSAFE_SOFT_BLOCKERS = frozenset({"UNTYPED_DECORATOR"})
 _DEFAULT_ANY_PATHS = frozenset({"Any", "typing.Any", "typing_extensions.Any"})
 _GETATTR_REQUIRED_ARGS = 2
@@ -182,6 +182,107 @@ def build_typed_regions(
     return tuple(_typed_region(context, component) for component in components)
 
 
+def build_directed_region_slice(region: TypedRegion, root: SymbolId) -> TypedRegion:
+    """Build one deterministic hot-binding slice from a connected source region.
+
+    Only dependencies explicitly marked `requires_same_unit` expand the member
+    set. Other local calls remain dependency evidence and are lowered as normal
+    runtime dispatch boundaries. Profile counts and runtime type observations
+    are deliberately absent from the resulting ID and source hash.
+
+    Args:
+        region: Connected backend-neutral source region containing the root.
+        root: Public callable binding that owns this directed slice.
+
+    Returns:
+        TypedRegion: Non-atomic source slice rooted at exactly one public binding.
+
+    Raises:
+        ValueError: The root is absent or a required same-unit target is absent.
+    """
+    member_by_id = {member.id: member for member in region.members}
+    if root not in member_by_id:
+        raise ValueError(f"directed slice root is outside region {region.id}: {root.stable_id}")
+    selected = {root}
+    changed = True
+    while changed:
+        changed = False
+        for dependency in region.dependencies:
+            if (
+                dependency.src not in selected
+                or not dependency.requires_same_unit
+                or not isinstance(dependency.dst, SymbolId)
+            ):
+                continue
+            if dependency.dst not in member_by_id:
+                raise ValueError(
+                    "required same-unit dependency is outside region "
+                    f"{region.id}: {dependency.dst.stable_id}"
+                )
+            if dependency.dst not in selected:
+                selected.add(dependency.dst)
+                changed = True
+    members = tuple(member for member in region.members if member.id in selected)
+    dependencies = tuple(
+        dependency for dependency in region.dependencies if dependency.src in selected
+    )
+    member_prefixes = tuple(f"{member.id.qualname}." for member in members)
+    type_bindings = tuple(
+        binding for binding in region.type_bindings if binding.name.startswith(member_prefixes)
+    )
+    member_decision_targets = {member.id.stable_id for member in members}
+    member_decision_targets.update(
+        f"{region.source_module.name}::{member.owner_class}"
+        for member in members
+        if member.owner_class is not None
+    )
+    decisions = tuple(
+        decision for decision in region.decisions if decision.target in member_decision_targets
+    )
+    specializations = tuple(
+        specialization
+        for specialization in region.specializations
+        if specialization.source_member in selected
+    )
+    source_hash = _region_hash(
+        region.source_module.name,
+        members,
+        dependencies,
+        type_bindings,
+        specializations,
+    )
+    label = root.qualname.replace(".", "_")
+    bindings = tuple(binding for binding in region.bindings if binding.source == root)
+    root_member = member_by_id[root]
+    if not bindings and root_member.kind == "method":
+        method_name = root.qualname.rsplit(".", maxsplit=1)[-1]
+        if method_name.startswith("__"):
+            raise ValueError(f"directed slice root is not independently bindable: {root.stable_id}")
+        bindings = (
+            BindingTarget(
+                source=root,
+                compiled_name=root.qualname.replace(".", "__"),
+                kind=root_member.binding_kind,
+                owner_class=root_member.owner_class,
+                execution_kind=root_member.execution_kind,
+            ),
+        )
+    if len(bindings) != 1:
+        raise ValueError(f"directed slice root must have exactly one binding: {root.stable_id}")
+    return TypedRegion(
+        id=f"{region.source_module.name}::{label}_slice:{source_hash[:12]}",
+        source_module=region.source_module,
+        members=members,
+        dependencies=dependencies,
+        type_bindings=type_bindings,
+        bindings=bindings,
+        decisions=decisions,
+        source_hash=source_hash,
+        atomic_class=False,
+        specializations=specializations,
+    )
+
+
 def _eligible(symbol: SymbolRecord) -> bool:
     if any(blocker.severity == "hard" for blocker in symbol.blockers):
         return False
@@ -189,7 +290,7 @@ def _eligible(symbol: SymbolRecord) -> bool:
         return False
     if symbol.kind == "class":
         return True
-    return _signature_is_complete(symbol)
+    return True
 
 
 def _signature_is_complete(symbol: SymbolRecord) -> bool:
@@ -254,7 +355,10 @@ def _connect_atomic_classes(
                 reason="class remains interpreted because its dynamic behavior is blocked",
             )
             continue
-        if any(method.id not in eligible for method in methods):
+        if any(
+            method.id not in eligible or _method_requires_boxed_lowering(method)
+            for method in methods
+        ):
             eligible.pop(class_symbol.id, None)
             adjacency.pop(class_symbol.id, None)
             _connect_interpreted_owner_methods(methods, eligible, adjacency)
@@ -268,6 +372,10 @@ def _connect_atomic_classes(
             adjacency[class_symbol.id].add(method.id)
             adjacency[method.id].add(class_symbol.id)
     return downgraded
+
+
+def _method_requires_boxed_lowering(method: SymbolRecord) -> bool:
+    return not _signature_is_complete(method) or method.has_any_annotation
 
 
 def _connect_interpreted_owner_methods(
@@ -318,6 +426,10 @@ def _atomic_class_declaration_issue(
     class_symbol: SymbolRecord,
     tree: ast.Module,
 ) -> str | None:
+    if class_symbol.decorators and all(
+        _is_dataclass_decorator(decorator) for decorator in class_symbol.decorators
+    ):
+        return "it is a dataclass whose declared methods may be rebound"
     if class_symbol.decorators:
         return "decorators may register or replace it"
     class_node = next(
@@ -333,6 +445,17 @@ def _atomic_class_declaration_issue(
     if class_node is None:
         return "its declaration cannot be resolved"
     return _atomic_class_definition_issue(class_node)
+
+
+def _is_dataclass_decorator(decorator: str) -> bool:
+    try:
+        expression = ast.parse(decorator, mode="eval").body
+    except SyntaxError:
+        return False
+    target = expression.func if isinstance(expression, ast.Call) else expression
+    if isinstance(target, ast.Name):
+        return target.id == "dataclass"
+    return isinstance(target, ast.Attribute) and target.attr == "dataclass"
 
 
 def _atomic_class_identity_issue(
@@ -680,6 +803,9 @@ def _region_member(
         scope_type_parameter_records=scope_type_parameter_records,
         parameters=symbol.parameters,
         return_annotation=symbol.return_annotation,
+        call_sites=symbol.call_sites,
+        suspension_points=symbol.suspension_points,
+        runtime_imports=symbol.runtime_imports,
         fields=symbol.fields,
     )
 
@@ -697,6 +823,9 @@ def _region_dependencies(
             confidence=edge.confidence,
             role="typing" if edge.kind == "annotation" else "runtime",
             type_only=edge.kind == "annotation",
+            lineno=edge.lineno,
+            invocation_mode=edge.invocation_mode,
+            requires_same_unit=edge.requires_same_unit,
         )
         for edge in edges
         if edge.src in member_ids
@@ -851,6 +980,12 @@ def _lowering_decision(
             target=symbol.id.stable_id,
             action="box",
             reason="source annotation explicitly contains Any",
+        )
+    if symbol.kind != "class" and not _signature_is_complete(symbol):
+        return LoweringDecision(
+            target=symbol.id.stable_id,
+            action="box",
+            reason="source callable has incomplete annotations",
         )
     if scope_type_parameter_records:
         return LoweringDecision(
@@ -1922,6 +2057,30 @@ def _region_hash(
                     }
                     for record in member.scope_type_parameter_records
                 ],
+                "call_sites": [
+                    {
+                        "target": call.target,
+                        "root_name": call.root_name,
+                        "invocation_mode": call.invocation_mode,
+                        "lineno": call.lineno,
+                        "end_lineno": call.end_lineno,
+                        "col_offset": call.col_offset,
+                        "end_col_offset": call.end_col_offset,
+                        "requires_same_unit": call.requires_same_unit,
+                    }
+                    for call in member.call_sites
+                ],
+                "suspension_points": [
+                    {
+                        "kind": point.kind,
+                        "lineno": point.lineno,
+                        "end_lineno": point.end_lineno,
+                        "col_offset": point.col_offset,
+                        "end_col_offset": point.end_col_offset,
+                    }
+                    for point in member.suspension_points
+                ],
+                "runtime_imports": [record.source_text for record in member.runtime_imports],
             }
             for member in members
         ],
@@ -1937,6 +2096,9 @@ def _region_hash(
                 "confidence": dependency.confidence,
                 "role": dependency.role,
                 "type_only": dependency.type_only,
+                "lineno": dependency.lineno,
+                "invocation_mode": dependency.invocation_mode,
+                "requires_same_unit": dependency.requires_same_unit,
             }
             for dependency in dependencies
         ],

@@ -81,7 +81,9 @@ specialization origin, substitutions, and concrete type bindings.
 Compile report schema v3 includes profile coverage, candidate decisions, backend decisions,
 suspension plans, candidate trials, and accepted or rejected variants. It retains the v2
 compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
-are legacy views and normally remain empty with zero counts.
+are legacy views and normally remain empty with zero counts. Region members also expose ordered
+call sites, runtime imports, and suspension points; dependency records state the invocation mode
+and whether a dependency must share a native compilation unit.
 
 Source-clean compile no longer generates Python sidecars or performs generated-AST
 native-readiness scoring before backend compilation. Ordinary functions, methods, classes, sync
@@ -94,8 +96,11 @@ compiles eligible methods independently. Cython owns atomic classes because its 
 class objects can preserve method reflection; mypyc remains preferred for callable members, while
 Cython also handles member execution shapes mypyc rejects and deterministic mypyc type failures.
 Cython annotation typing and C-type inference are disabled so Python integer and container
-semantics are not silently narrowed. Special methods other than a closed class constructor,
-unresolved generics, runtime-incomplete regions, and explicit `Any` remain interpreted.
+semantics are not silently narrowed. When profiling identifies a hot callable, Cython may compile
+explicit `Any`, incomplete annotations, or unresolved TypeVars with boxed Python semantics. PEP
+695 function type-parameter syntax is removed only from the private generated Cython input; the
+public wrapper retains the source function's annotations and type-parameter metadata. Without a
+configured benchmark, those boxed candidates remain interpreted.
 
 Generic definitions remain the authoritative Python fallback. Atoll may compile a separate
 specialization when every TypeVar closes from a same-module concrete subclass or an unambiguous
@@ -104,7 +109,15 @@ the concrete subclass, never on its generic base. The wrapper routes to native c
 constant-time checks for scalar or nominal classes, `None`, or unions of those; incompatible calls
 use the captured Python function. Parameterized containers, generic defaults or variadics,
 conflicting call sites, unresolved TypeVars, semantic `Any`, subclass overrides, and dynamic owner
-classes remain interpreted.
+classes are not specialized. Profile-hot boxed callables can still be compiled without pretending
+that their types became concrete.
+
+Profile-selected methods and functions are lowered as directed slices rooted at one public
+binding. Ordinary same-module calls, awaited calls, class construction, and `self` or `cls` method
+dispatch remain late-bound Python runtime boundaries unless syntax proves the callee must share the
+native unit. This keeps blocked or dynamic callees interpreted without poisoning a hot caller.
+Explicitly declared methods on recognized dataclasses may be rebound while preserving the original
+class object and descriptor kind.
 
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
 staging, cache lookup or restore, backend compilation, wheel writing, verification, and cleanup.
@@ -112,8 +125,10 @@ Compile reports include cache status plus subphase timings such as `mypycify` an
 Duplicate macOS linker `-rpath` warnings are filtered from terminal output; other native compiler
 diagnostics are still captured in Atoll's build diagnostics. Atoll keeps strict reusable compile
 and mypy cache state under `.atoll/cache/`. Typed artifacts are cached independently by backend and
-region under `.atoll/cache/compile/regions/`; unchanged variants restore their native files without
-invoking mypyc or Cython again. `atoll clean --cache` removes all reusable compiler state.
+region under `.atoll/cache/compile/regions/`; deterministic non-transient backend rejections are
+stored separately under `.atoll/cache/compile/decisions/`. An unchanged variant restores the
+rejection decision or native files without invoking mypyc or Cython again. `atoll clean --cache`
+removes all reusable compiler state.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
 scan and compile reports. A callable from such a module is compiled only when the typed-region
 analysis and backend capability assessment can still preserve its source behavior.

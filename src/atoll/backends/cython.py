@@ -118,10 +118,10 @@ class _FailureState:
 class CythonBackend:
     """CompilerBackend adapter around Cython's in-process setuptools build.
 
-    Cython is selected for typed functions and methods, including async
+    Cython is selected for typed and boxed Python callables, including async
     generators, and for closed atomic classes whose method reflection must stay
-    Python-compatible. The adapter rejects analysis decisions that require
-    unresolved generics, explicit ``Any`` boxing, or rejected source members.
+    Python-compatible. Boxed callables preserve Python object semantics and
+    source annotations; rejected class behavior remains unsupported.
     """
 
     @property
@@ -147,7 +147,11 @@ class CythonBackend:
         unsupported: list[SymbolId] = []
         reasons: list[str] = []
         for member in region.members:
-            reason = _unsupported_member_reason(member, decisions.get(member.id.stable_id))
+            reason = _unsupported_member_reason(
+                member,
+                decisions.get(member.id.stable_id),
+                allow_boxed=not region.atomic_class,
+            )
             if reason is None:
                 supported.append(member.id)
             else:
@@ -315,14 +319,19 @@ CYTHON_BACKEND = CythonBackend()
 def _unsupported_member_reason(
     member: RegionMember,
     decision: LoweringDecision | None,
+    *,
+    allow_boxed: bool,
 ) -> str | None:
-    _ = member
     if decision is None or decision.action in {"preserve", "specialize"}:
         return None
-    if decision.action == "box":
-        return "cython preference requires concrete typing; source uses Any"
-    if decision.action == "fallback":
-        return "member requires interpreted fallback before specialization"
+    if (
+        allow_boxed
+        and member.kind in {"function", "method"}
+        and decision.action in {"box", "fallback"}
+    ):
+        return None
+    if member.kind in {"function", "method"} and decision.action in {"box", "fallback"}:
+        return "atomic class lowering requires concrete callable typing"
     return "member was rejected by typed-region analysis"
 
 

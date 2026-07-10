@@ -9,7 +9,8 @@ import pytest
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
-from atoll.models import ModuleId, ModuleScan, RegionSpecialization
+from atoll.analysis.typed_regions import build_directed_region_slice
+from atoll.models import ModuleId, ModuleScan, RegionSpecialization, SymbolId
 
 
 def _scan_source(tmp_path: Path, name: str, lines: list[str]) -> ModuleScan:
@@ -25,6 +26,117 @@ def _specializations(
     return tuple(
         specialization for region in scan.typed_regions for specialization in region.specializations
     )
+
+
+def test_directed_region_slice_keeps_runtime_boundaries_outside_native_unit(
+    tmp_path: Path,
+) -> None:
+    """A hot root expands only through dependencies proven to require one unit."""
+    scan = _scan_source(
+        tmp_path,
+        "directed_slice",
+        [
+            "def helper(value: int) -> int:",
+            "    return value + 1",
+            "",
+            "def hot(value: int) -> int:",
+            "    return helper(value)",
+            "",
+        ],
+    )
+    region = next(
+        item
+        for item in scan.typed_regions
+        if {member.id.qualname for member in item.members} == {"helper", "hot"}
+    )
+    hot = next(member.id for member in region.members if member.id.qualname == "hot")
+    helper = next(member.id for member in region.members if member.id.qualname == "helper")
+
+    sliced = build_directed_region_slice(region, hot)
+    repeated = build_directed_region_slice(region, hot)
+
+    assert sliced == repeated
+    assert tuple(member.id for member in sliced.members) == (hot,)
+    assert sliced.atomic_class is False
+    dependency = next(item for item in sliced.dependencies if item.dst == helper)
+    assert dependency.invocation_mode == "ordinary"
+    assert dependency.requires_same_unit is False
+
+    required_region = replace(
+        region,
+        dependencies=tuple(
+            replace(item, requires_same_unit=True) if item.dst == helper else item
+            for item in region.dependencies
+        ),
+    )
+    required_slice = build_directed_region_slice(required_region, hot)
+    assert {member.id for member in required_slice.members} == {hot, helper}
+
+
+def test_directed_region_slice_rejects_invalid_roots_dependencies_and_bindings(
+    tmp_path: Path,
+) -> None:
+    """Malformed directed plans fail before backend lowering or runtime binding."""
+    scan = _scan_source(
+        tmp_path,
+        "invalid_directed_slice",
+        [
+            "def helper(value: int) -> int:",
+            "    return value + 1",
+            "",
+            "def hot(value: int) -> int:",
+            "    return helper(value)",
+            "",
+            "class Worker:",
+            "    def __init__(self, value: int) -> None:",
+            "        self.value = value",
+            "",
+        ],
+    )
+    function_region = next(
+        region
+        for region in scan.typed_regions
+        if {member.id.qualname for member in region.members} == {"helper", "hot"}
+    )
+    hot = next(member.id for member in function_region.members if member.id.qualname == "hot")
+    helper = next(member.id for member in function_region.members if member.id.qualname == "helper")
+
+    with pytest.raises(ValueError, match="root is outside region"):
+        build_directed_region_slice(
+            function_region,
+            SymbolId("invalid_directed_slice", "missing"),
+        )
+
+    missing_dependency = replace(
+        function_region,
+        dependencies=tuple(
+            replace(
+                dependency,
+                dst=SymbolId("invalid_directed_slice", "missing"),
+                requires_same_unit=True,
+            )
+            if dependency.dst == helper
+            else dependency
+            for dependency in function_region.dependencies
+        ),
+    )
+    with pytest.raises(ValueError, match="required same-unit dependency is outside region"):
+        build_directed_region_slice(missing_dependency, hot)
+
+    hot_binding = next(binding for binding in function_region.bindings if binding.source == hot)
+    duplicate_binding_region = replace(
+        function_region,
+        bindings=(*function_region.bindings, hot_binding),
+    )
+    with pytest.raises(ValueError, match="must have exactly one binding"):
+        build_directed_region_slice(duplicate_binding_region, hot)
+
+    class_region = next(region for region in scan.typed_regions if region.atomic_class)
+    constructor = next(
+        member.id for member in class_region.members if member.id.qualname == "Worker.__init__"
+    )
+    with pytest.raises(ValueError, match="not independently bindable"):
+        build_directed_region_slice(class_region, constructor)
 
 
 def test_typed_regions_group_safe_class_methods_atomically(tmp_path: Path) -> None:
@@ -75,6 +187,14 @@ def test_typed_regions_group_safe_class_methods_atomically(tmp_path: Path) -> No
     )
     assert class_region.id == second.typed_regions[0].id
     assert class_region.source_hash == second.typed_regions[0].source_hash
+
+    score = next(
+        member.id for member in class_region.members if member.id.qualname == "Worker.score"
+    )
+    score_slice = build_directed_region_slice(class_region, score)
+    assert tuple(binding.source for binding in score_slice.bindings) == (score,)
+    assert score_slice.bindings[0].kind == "instance_method"
+    assert score_slice.bindings[0].execution_kind == "coroutine"
 
 
 def test_dynamic_class_downgrades_to_method_regions(tmp_path: Path) -> None:
@@ -394,8 +514,8 @@ def test_dynamic_method_global_prevents_atomic_class_region(tmp_path: Path) -> N
     )
 
 
-def test_unannotated_staticmethod_prevents_atomic_class_region(tmp_path: Path) -> None:
-    """A static method's first argument must be annotated because it is not bound."""
+def test_unannotated_staticmethod_becomes_non_atomic_boxed_region(tmp_path: Path) -> None:
+    """Incomplete static methods remain visible without making their class atomic."""
     module_path = tmp_path / "static_method.py"
     module_path.write_text(
         "\n".join(
@@ -412,7 +532,13 @@ def test_unannotated_staticmethod_prevents_atomic_class_region(tmp_path: Path) -
 
     scan = enrich_island_analysis(scan_module(ModuleId(name="static_method", path=module_path)))
 
-    assert scan.typed_regions == ()
+    assert len(scan.typed_regions) == 1
+    region = scan.typed_regions[0]
+    assert region.atomic_class is False
+    assert tuple(member.id.qualname for member in region.members) == ("Worker.parse",)
+    decision = next(item for item in region.decisions if item.target.endswith("::Worker.parse"))
+    assert decision.action == "box"
+    assert decision.reason == "source callable has incomplete annotations"
 
 
 def test_region_loss_ledger_keeps_explicit_any_and_generics_visible(tmp_path: Path) -> None:
