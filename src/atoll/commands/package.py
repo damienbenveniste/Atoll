@@ -58,6 +58,7 @@ from atoll.runtime.package_verify import (
     PackageVerificationPlan,
     PackageVerificationResult,
     VerificationArtifact,
+    VerificationBinding,
     VerificationStage,
     verify_package_subprocess,
 )
@@ -1610,13 +1611,40 @@ def _typed_verification_plan(
         )
         for record in records
     }
+    bindings = {
+        (config.source_module, _verification_binding_qualname(binding)): VerificationBinding(
+            module=config.source_module,
+            qualname=_verification_binding_qualname(binding),
+            kind=binding.kind,
+            execution_kind=binding.execution_kind,
+        )
+        for config in configs
+        for binding in config.bindings
+        if binding.required
+    }
     return PackageVerificationPlan(
         modules=tuple(sorted(regions_by_module)),
         regions=tuple(
             (module, tuple(region_ids)) for module, region_ids in sorted(regions_by_module.items())
         ),
         artifacts=tuple(artifacts[path] for path in sorted(artifacts)),
+        bindings=tuple(bindings[key] for key in sorted(bindings)),
     )
+
+
+def _verification_binding_qualname(binding: BindingTarget) -> str:
+    """Return the public runtime path used by subprocess binding verification.
+
+    Args:
+        binding: Required source or specialized descriptor binding.
+
+    Returns:
+        str: Module-relative runtime path to the bound callable or class.
+    """
+    member_name = binding.source.qualname.rsplit(".", maxsplit=1)[-1]
+    if binding.target_owner_class is not None:
+        return f"{binding.target_owner_class}.{member_name}"
+    return binding.source.qualname
 
 
 def _verify_package_stage(

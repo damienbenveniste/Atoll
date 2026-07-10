@@ -231,6 +231,9 @@ def test_cython_generation_preserves_async_generator_source(tmp_path: Path) -> N
     assert generation.backend == "cython"
     assert "async def Worker__stream" in generation.source_text
     assert "yield value" in generation.source_text
+    assert "__atoll_execution_kinds__ = {'Worker__stream': 'async_generator'}" in (
+        generation.source_text
+    )
     assert "Protocol" not in generation.source_text
     assert "_AtollWorker" not in generation.source_text
 

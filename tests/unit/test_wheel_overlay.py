@@ -64,10 +64,10 @@ def test_build_baseline_wheel_captures_command_output_and_duration(
         "-m",
         "build",
         "--wheel",
-        "--no-isolation",
         "--outdir",
         str((tmp_path / "dist").resolve()),
     )
+    assert "--no-isolation" not in evidence.command
     assert captured == {
         "command": evidence.command,
         "cwd": tmp_path.resolve(),
@@ -82,6 +82,29 @@ def test_build_baseline_wheel_captures_command_output_and_duration(
     assert evidence.stderr == "stderr text"
     assert evidence.duration_seconds >= 0
     assert evidence.wheel_paths == ((tmp_path / "dist" / BASELINE_NAME).resolve(),)
+
+
+def test_build_baseline_wheel_leaves_pep517_build_isolation_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The baseline build must not depend on target backend packages installed for Atoll."""
+    captured_command: tuple[str, ...] | None = None
+
+    def fake_run(command: tuple[str, ...], **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal captured_command
+        captured_command = command
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("atoll.wheel_overlay.subprocess.run", fake_run)
+
+    evidence = build_baseline_wheel(tmp_path, tmp_path / "dist")
+
+    assert captured_command == evidence.command
+    assert evidence.command[:5] == (sys.executable, "-I", "-m", "build", "--wheel")
+    assert "--no-isolation" not in evidence.command
+    assert "--skip-dependency-check" not in evidence.command
+    assert "--outdir" in evidence.command
 
 
 def test_repack_preserves_payload_metadata_and_recomputes_record(tmp_path: Path) -> None:

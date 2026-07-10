@@ -43,7 +43,8 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
 Atoll builds the target project's normal PEP 517 wheel from a temporary source-clean copy before
-overlaying staged routing code and region-owned native artifacts. This preserves package data,
+overlaying staged routing code and region-owned native artifacts. The PEP 517 build is isolated and
+installs the project's declared build requirements automatically. This preserves package data,
 entry points, and backend-generated metadata. The final platform tag and `RECORD` are regenerated,
 then staged and wheel routing are verified in fresh interpreters before temporary trees are removed.
 For typed regions, `compiled_regions` records each backend variant, class and descriptor-aware

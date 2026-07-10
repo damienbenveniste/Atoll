@@ -781,7 +781,10 @@ class _FunctionNameCollector(ast.NodeVisitor):
         self.local_names: set[str] = set()
         self.referenced_names: set[str] = set()
         self.runtime_referenced_names: set[str] = set()
+        self._declared_global_names: set[str] = set()
+        self._declared_nonlocal_names: set[str] = set()
         self._in_annotation = False
+        self._suppressed_load_names: list[frozenset[str]] = []
 
     def collect(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         """Collect names from a function without visiting its decorator wrapper.
@@ -838,11 +841,11 @@ class _FunctionNameCollector(ast.NodeVisitor):
         Args:
             node: Syntax node being visited without executing target code.
         """
-        if isinstance(node.ctx, ast.Load):
+        if isinstance(node.ctx, ast.Load) and not self._is_suppressed_load(node.id):
             self.referenced_names.add(node.id)
             if not self._in_annotation:
                 self.runtime_referenced_names.add(node.id)
-        elif isinstance(node.ctx, ast.Store | ast.Del):
+        elif isinstance(node.ctx, ast.Store | ast.Del) and not self._is_external_binding(node.id):
             self.local_names.add(node.id)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -851,12 +854,127 @@ class _FunctionNameCollector(ast.NodeVisitor):
         Args:
             node: Syntax node being visited without executing target code.
         """
-        if isinstance(node.func, ast.Name):
+        if isinstance(node.func, ast.Name) and not self._is_suppressed_load(node.func.id):
             self.called_names.add(node.func.id)
         path = _attribute_path(node.func)
-        if path is not None:
+        if path is not None and not self._is_suppressed_load(path[0]):
             self.called_paths.add(".".join(path))
         self.generic_visit(node)
+
+    def visit_Global(self, node: ast.Global) -> None:
+        """Record names explicitly bound outside the scanned function scope.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self._declared_global_names.update(node.names)
+        self.local_names.difference_update(node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        """Record names explicitly bound by an enclosing function scope.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self._declared_nonlocal_names.update(node.names)
+        self.local_names.difference_update(node.names)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        """Treat imports inside a function as lexical local bindings.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        for alias in node.names:
+            name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+            if not self._is_external_binding(name):
+                self.local_names.add(name)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        """Treat imported symbols inside a function as lexical local bindings.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self.local_names.update(
+            name
+            for alias in node.names
+            if not self._is_external_binding(name := alias.asname or alias.name)
+        )
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        """Collect exception targets that the AST stores outside `Name(Store)`.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name is not None and not self._is_external_binding(node.name):
+            self.local_names.add(node.name)
+        for child in node.body:
+            self.visit(child)
+
+    def visit_Match(self, node: ast.Match) -> None:
+        """Collect pattern captures as locals while preserving value references.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self.visit(node.subject)
+        for case in node.cases:
+            self.visit(case.pattern)
+            self.local_names.update(
+                name
+                for name in _pattern_bound_names(case.pattern)
+                if not self._is_external_binding(name)
+            )
+            if case.guard is not None:
+                self.visit(case.guard)
+            for child in case.body:
+                self.visit(child)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        """Visit lambda bodies without leaking lambda parameters as locals.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self._visit_argument_defaults(node.args)
+        with self._suppressed_load_scope(_argument_bound_names(node.args)):
+            self.visit(node.body)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        """Visit list comprehensions as nested scopes inside the function.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        """Visit set comprehensions as nested scopes inside the function.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        """Visit generator expressions as nested scopes inside the function.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        """Visit dictionary comprehensions as nested scopes inside the function.
+
+        Args:
+            node: Syntax node being visited without executing target code.
+        """
+        self._visit_comprehension(node.generators, (node.key, node.value))
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Treat nested functions as local bindings and do not traverse them.
@@ -889,6 +1007,104 @@ class _FunctionNameCollector(ast.NodeVisitor):
             self.visit(node)
         finally:
             self._in_annotation = was_in_annotation
+
+    def _visit_argument_defaults(self, node: ast.arguments) -> None:
+        for default in (*node.defaults, *node.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+    def _visit_comprehension(
+        self,
+        generators: list[ast.comprehension],
+        result_nodes: tuple[ast.expr, ...],
+    ) -> None:
+        bound_names: set[str] = set()
+        for generator in generators:
+            with self._suppressed_load_scope(bound_names):
+                self.visit(generator.iter)
+            bound_names.update(_assignment_target_names(generator.target))
+            with self._suppressed_load_scope(bound_names):
+                for condition in generator.ifs:
+                    self.visit(condition)
+        with self._suppressed_load_scope(bound_names):
+            for result_node in result_nodes:
+                self.visit(result_node)
+
+    def _suppressed_load_scope(self, names: Iterable[str]) -> _SuppressedLoadScope:
+        return _SuppressedLoadScope(self._suppressed_load_names, frozenset(names))
+
+    def _is_suppressed_load(self, name: str) -> bool:
+        return any(name in scope_names for scope_names in self._suppressed_load_names)
+
+    def _is_external_binding(self, name: str) -> bool:
+        return name in self._declared_global_names or name in self._declared_nonlocal_names
+
+
+@dataclass(slots=True)
+class _SuppressedLoadScope:
+    """Temporarily hide nested-scope bindings from enclosing function facts.
+
+    Attributes:
+        stack: Nested-scope suppression stack updated by the context manager.
+        names: Lexical names bound by a nested expression scope.
+    """
+
+    stack: list[frozenset[str]]
+    names: frozenset[str]
+
+    def __enter__(self) -> None:
+        """Push the nested-scope bindings for the active visit."""
+        self.stack.append(self.names)
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None:
+        """Pop the nested-scope bindings after the active visit.
+
+        Args:
+            exc_type: Exception type leaving the managed scope, when present.
+            exc_value: Exception value leaving the managed scope, when present.
+            traceback: Traceback leaving the managed scope, when present.
+        """
+        del exc_type, exc_value, traceback
+        self.stack.pop()
+
+
+def _argument_bound_names(node: ast.arguments) -> frozenset[str]:
+    return frozenset(argument.arg for argument in _arguments(node))
+
+
+def _arguments(node: ast.arguments) -> tuple[ast.arg, ...]:
+    return (
+        *node.posonlyargs,
+        *node.args,
+        *node.kwonlyargs,
+        *((node.vararg,) if node.vararg is not None else ()),
+        *((node.kwarg,) if node.kwarg is not None else ()),
+    )
+
+
+def _assignment_target_names(node: ast.AST) -> frozenset[str]:
+    return frozenset(
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+    )
+
+
+def _pattern_bound_names(node: ast.pattern) -> frozenset[str]:
+    names: set[str] = set()
+    if isinstance(node, ast.MatchAs | ast.MatchStar) and node.name is not None:
+        names.add(node.name)
+    elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+        names.add(node.rest)
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.pattern):
+            names.update(_pattern_bound_names(child))
+    return frozenset(names)
 
 
 def _function_arguments(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.arg, ...]:

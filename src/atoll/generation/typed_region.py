@@ -26,7 +26,7 @@ from atoll.models import (
     TypedRegion,
 )
 
-TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-region-v3"
+TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-region-v4"
 _SUPPORTED_BINDINGS = frozenset({"instance_method", "staticmethod", "classmethod"})
 _SUPPORTED_EXECUTION_KINDS = frozenset({"sync", "generator", "coroutine"})
 
@@ -259,6 +259,11 @@ def _generated_source(
                     ),
                 )
             )
+    execution_kinds = {
+        binding.compiled_name: binding.execution_kind
+        for binding in sorted(bindings, key=lambda item: item.compiled_name)
+    }
+    sections.extend(("", f"__atoll_execution_kinds__ = {execution_kinds!r}"))
     return "\n".join(sections).rstrip() + "\n"
 
 

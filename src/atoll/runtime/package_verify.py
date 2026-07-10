@@ -15,11 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from atoll.models import BindingKind, ExecutionKind
+
 VerificationStage = Literal["payload", "wheel"]
 
 _VERIFY_SCRIPT = r"""
 import hashlib
 import importlib
+import inspect
 import json
 import os
 import pathlib
@@ -63,6 +66,75 @@ for module_name in plan["modules"]:
         region_status = statuses.get(region_id)
         if not isinstance(region_status, dict) or not region_status.get("compiled"):
             raise RuntimeError(f"Atoll region did not compile: {region_id}")
+for binding in plan["bindings"]:
+    module = importlib.import_module(binding["module"])
+    parts = binding["qualname"].split(".")
+    if binding["kind"] in {"module", "class"}:
+        value = module
+        for part in parts:
+            value = getattr(value, part)
+        descriptor = value
+    else:
+        owner = module
+        for part in parts[:-1]:
+            owner = getattr(owner, part)
+        descriptor = vars(owner).get(parts[-1])
+        if descriptor is None:
+            raise RuntimeError(f"Atoll binding target is missing: {binding['qualname']}")
+        if binding["kind"] == "staticmethod":
+            if not isinstance(descriptor, staticmethod):
+                raise RuntimeError(
+                    f"Atoll binding changed staticmethod descriptor: {binding['qualname']}"
+                )
+            value = descriptor.__func__
+        elif binding["kind"] == "classmethod":
+            if not isinstance(descriptor, classmethod):
+                raise RuntimeError(
+                    f"Atoll binding changed classmethod descriptor: {binding['qualname']}"
+                )
+            value = descriptor.__func__
+        else:
+            if isinstance(descriptor, (staticmethod, classmethod)):
+                raise RuntimeError(
+                    f"Atoll binding changed instance method descriptor: {binding['qualname']}"
+                )
+            value = descriptor
+    expected_kind = binding["execution_kind"]
+    actual_kind = (
+        "class"
+        if isinstance(value, type)
+        else "async_generator"
+        if inspect.isasyncgenfunction(value)
+        else "coroutine"
+        if inspect.iscoroutinefunction(value)
+        else "generator"
+        if inspect.isgeneratorfunction(value)
+        else "sync"
+        if callable(value)
+        else "invalid"
+    )
+    if actual_kind != expected_kind:
+        raise RuntimeError(
+            f"Atoll binding changed execution kind for {binding['qualname']}: "
+            f"expected {expected_kind}, got {actual_kind}"
+        )
+    compiled_target = getattr(value, "__atoll_compiled_target__", None)
+    fallback = getattr(value, "__atoll_python_fallback__", None)
+    if compiled_target is None or fallback is None:
+        raise RuntimeError(f"Atoll binding lacks routing metadata: {binding['qualname']}")
+    try:
+        if inspect.signature(value) != inspect.signature(fallback):
+            raise RuntimeError(f"Atoll binding changed signature: {binding['qualname']}")
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"Atoll binding signature cannot be verified: {binding['qualname']}"
+        ) from error
+    if expected_kind != "class" and (
+        getattr(value, "__defaults__", None) is not getattr(fallback, "__defaults__", None)
+        or getattr(value, "__kwdefaults__", None)
+        is not getattr(fallback, "__kwdefaults__", None)
+    ):
+        raise RuntimeError(f"Atoll binding changed default objects: {binding['qualname']}")
 if temporary is not None:
     temporary.cleanup()
 """
@@ -82,6 +154,23 @@ class VerificationArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class VerificationBinding:
+    """One required public binding checked after its compiled wheel is imported.
+
+    Attributes:
+        module: Importable module containing the staged binding.
+        qualname: Public runtime-qualified path within the module.
+        kind: Module, class, or descriptor-aware binding category.
+        execution_kind: Callable shape promised by the typed-region frontend.
+    """
+
+    module: str
+    qualname: str
+    kind: BindingKind
+    execution_kind: ExecutionKind
+
+
+@dataclass(frozen=True, slots=True)
 class PackageVerificationPlan:
     """Modules, region promises, and artifacts checked in a child interpreter.
 
@@ -89,11 +178,13 @@ class PackageVerificationPlan:
         modules: Importable source modules that must report compiled routing.
         regions: Expected compiled region IDs grouped by source module.
         artifacts: Install-relative native files and digests that must be present.
+        bindings: Required public bindings whose descriptor and execution shape must survive.
     """
 
     modules: tuple[str, ...]
     regions: tuple[tuple[str, tuple[str, ...]], ...]
     artifacts: tuple[VerificationArtifact, ...]
+    bindings: tuple[VerificationBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +236,15 @@ def verify_package_subprocess(
             "regions": {module: list(regions) for module, regions in plan.regions},
             "artifacts": [
                 {"path": artifact.path, "digest": artifact.digest} for artifact in plan.artifacts
+            ],
+            "bindings": [
+                {
+                    "module": binding.module,
+                    "qualname": binding.qualname,
+                    "kind": binding.kind,
+                    "execution_kind": binding.execution_kind,
+                }
+                for binding in plan.bindings
             ],
         },
         sort_keys=True,

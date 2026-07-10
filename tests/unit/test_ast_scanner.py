@@ -313,6 +313,108 @@ def test_scan_detects_execution_kinds_without_nested_symbol_bodies(tmp_path: Pat
     assert symbols["async_generator"].execution_kind == "async_generator"
 
 
+def test_scan_treats_exception_targets_as_coroutine_locals(tmp_path: Path) -> None:
+    """Exception aliases stay local in async task handlers."""
+    module_path = tmp_path / "tracked_task.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "async def _run_tracked_task(task):",
+                "    try:",
+                "        await task",
+                "    except Exception as exc:",
+                "        record_failure(task, exc)",
+                "        return exc",
+                "    return None",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="tracked_task", path=module_path))
+    tracked_task = scan.symbols[0]
+
+    assert tracked_task.execution_kind == "coroutine"
+    assert "exc" in tracked_task.local_names
+    assert "exc" in tracked_task.referenced_names
+    assert "exc" not in tracked_task.uses_globals
+    assert tracked_task.uses_globals == ("record_failure",)
+
+
+def test_scan_collects_non_name_store_lexical_bindings(tmp_path: Path) -> None:
+    """Imports and structural pattern captures bind locals without false globals."""
+    module_path = tmp_path / "binding_forms.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "def classify(payload):",
+                "    import json as json_lib",
+                "    from collections import Counter",
+                "    match payload:",
+                "        case {'items': [first, *rest], 'meta': meta, **remaining}:",
+                "            counter = Counter(rest)",
+                "            return json_lib.dumps((first, meta, remaining, counter))",
+                "        case Counter() as fallback:",
+                "            return fallback",
+                "    return None",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="binding_forms", path=module_path))
+    classify = scan.symbols[0]
+
+    assert {
+        "Counter",
+        "fallback",
+        "first",
+        "json_lib",
+        "meta",
+        "remaining",
+        "rest",
+    }.issubset(classify.local_names)
+    assert "Counter" in classify.referenced_names
+    assert "json_lib" in classify.referenced_names
+    assert classify.uses_globals == ()
+
+
+def test_scan_preserves_nested_expression_scope_bindings(tmp_path: Path) -> None:
+    """Comprehension and lambda binders do not leak into enclosing locals."""
+    module_path = tmp_path / "nested_expression_scopes.py"
+    module_path.write_text(
+        "\n".join(
+            [
+                "def summarize(values):",
+                (
+                    "    callbacks = [lambda item, offset=scale: transform(item, offset) "
+                    "for item in values]"
+                ),
+                "    pairs = {name: transform(name, scale) for name in values}",
+                "    unique = {transform(item, scale) for item in values if predicate(item)}",
+                "    stream = (transform(item, scale) for item in values if predicate(item))",
+                "    async def nested():",
+                "        return await async_transform(values)",
+                "    return callbacks, pairs, unique, stream, nested",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="nested_expression_scopes", path=module_path))
+    summarize = scan.symbols[0]
+
+    assert "item" not in summarize.local_names
+    assert "name" not in summarize.local_names
+    assert "item" not in summarize.uses_globals
+    assert "name" not in summarize.uses_globals
+    assert "nested" in summarize.local_names
+    assert summarize.uses_globals == ("predicate", "scale", "transform")
+
+
 def test_scan_has_any_annotation_detects_real_any_import_forms(tmp_path: Path) -> None:
     """Any detection recognizes typing aliases, strings, and qualified references."""
     module_path = tmp_path / "any_annotations.py"

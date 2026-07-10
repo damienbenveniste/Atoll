@@ -88,9 +88,11 @@ def build_baseline_wheel(project_root: Path, outdir: Path) -> WheelBuildEvidence
     """Invoke the target project's normal PEP 517 wheel build.
 
     The build runs in `project_root` with the current interpreter as
-    `python -m build --wheel --no-isolation --outdir <outdir>`.
-    `shell=False` is used through argv form. Non-zero backend exits are returned
-    as structured evidence and are not raised.
+    `python -m build --wheel --outdir <outdir>`. Build isolation is left enabled
+    so the target project's declared build requirements are installed into a
+    temporary PEP 517 environment instead of being assumed from Atoll's caller
+    environment. `shell=False` is used through argv form. Non-zero backend exits
+    are returned as structured evidence and are not raised.
 
     Args:
         project_root: Root directory of the target Python project.
@@ -108,7 +110,6 @@ def build_baseline_wheel(project_root: Path, outdir: Path) -> WheelBuildEvidence
         "-m",
         "build",
         "--wheel",
-        "--no-isolation",
         "--outdir",
         str(resolved_outdir),
     )
