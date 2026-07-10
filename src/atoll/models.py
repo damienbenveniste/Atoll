@@ -407,6 +407,8 @@ class BackendLoweringRequest:
     Source generation remains separate from backend registration. An empty
     `members` tuple asks the backend to include every member it assessed as
     supported; explicit members must be a subset of that assessment.
+    `variant_id` distinguishes backend-specific subsets of the same region and
+    defaults to the semantic region ID for compatibility.
     """
 
     region: TypedRegion
@@ -414,6 +416,7 @@ class BackendLoweringRequest:
     logical_module: str
     install_relative_dir: str = ""
     members: tuple[SymbolId, ...] = ()
+    variant_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,6 +486,29 @@ class ArtifactRecord:
             raise ValueError("artifact region_id and logical_module must be non-empty")
         if not self.abi.strip() or not self.platform_tag.strip():
             raise ValueError("artifact ABI and platform tag must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledRegionVariant:
+    """One backend-specific compiled subset of a semantic typed region.
+
+    A region can produce multiple variants when different members require
+    different backends. ``id`` is unique across those variants and is the
+    artifact/runtime status key; ``region.id`` remains the scanner identity.
+    """
+
+    id: str
+    region: TypedRegion
+    backend: Backend
+    bindings: tuple[BindingTarget, ...]
+
+    def __post_init__(self) -> None:
+        """Require a non-empty variant ID and bindings owned by the region."""
+        if not self.id.strip():
+            raise ValueError("compiled region variant ID must be non-empty")
+        member_ids = {member.id for member in self.region.members}
+        if not self.bindings or any(binding.source not in member_ids for binding in self.bindings):
+            raise ValueError("compiled region variant bindings must belong to the region")
 
 
 @dataclass(frozen=True, slots=True)

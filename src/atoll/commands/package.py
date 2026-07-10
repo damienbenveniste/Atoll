@@ -25,6 +25,8 @@ from packaging import tags
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.analysis.native_readiness import NativeReadiness, analyze_native_readiness
+from atoll.backends.base import CompilerBackend
+from atoll.backends.cython import CYTHON_BACKEND
 from atoll.backends.mypyc import MYPYC_BACKEND, build_sidecars
 from atoll.generation.region_shim import RegionShimConfig, insert_or_replace_region_shim
 from atoll.generation.shim import insert_or_replace_shim, remove_shim
@@ -40,13 +42,16 @@ from atoll.generation.typed_region import (
 )
 from atoll.models import (
     ArtifactRecord,
+    Backend,
     BackendAssessment,
     BackendCompileContext,
+    BackendCompileResult,
     BackendLoweringRequest,
     BindingTarget,
     Blocker,
     CompilationUnit,
     CompileAttempt,
+    CompiledRegionVariant,
     CompilePhaseTiming,
     EnabledIslandConfig,
     LoweringDecision,
@@ -58,6 +63,11 @@ from atoll.models import (
 from atoll.project import DiscoveredProject, discover_project
 
 PackageProgress = Callable[[str], None]
+
+_COMPILER_BACKENDS: dict[Backend, CompilerBackend] = {
+    "mypyc": MYPYC_BACKEND,
+    "cython": CYTHON_BACKEND,
+}
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -110,6 +120,7 @@ class PackageCommandResult:
     typed_regions: tuple[TypedRegion, ...] = ()
     compiled_regions: tuple[TypedRegion, ...] = ()
     compiled_bindings: tuple[BindingTarget, ...] = ()
+    compiled_variants: tuple[CompiledRegionVariant, ...] = ()
     backend_assessments: tuple[BackendAssessment, ...] = ()
     artifact_records: tuple[ArtifactRecord, ...] = ()
     region_skipped: tuple[PackageRegionBuildFailure, ...] = ()
@@ -136,6 +147,8 @@ class PackageRegionBuildFailure:
     """One typed region retained as interpreted after backend failure."""
 
     region: TypedRegion
+    variant_id: str
+    backend: Backend
     assessment: BackendAssessment
     build: CompileAttempt
 
@@ -160,6 +173,8 @@ class _SelectedTypedRegion:
 
     scan: ModuleScan
     region: TypedRegion
+    variant_id: str
+    backend: Backend
     assessment: BackendAssessment
     members: tuple[SymbolId, ...]
 
@@ -172,6 +187,7 @@ class _PreparedTypedRegion:
     assessment: BackendAssessment
     unit: CompilationUnit
     shim: RegionShimConfig
+    fallback: _PreparedTypedRegion | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +208,17 @@ class _TypedRegionBuildContext:
     staged_source_roots: tuple[Path, ...]
     cache_dir: Path
     progress: PackageProgress | None
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedTypedRegionContext:
+    """Copied source evidence shared by primary and fallback backend variants."""
+
+    build_root: Path
+    staged_source_root: Path
+    module: ModuleId
+    scan: ModuleScan
+    region: TypedRegion
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +507,8 @@ def _execute_typed_region_package(
             preparation_failures.append(
                 PackageRegionBuildFailure(
                     region=selection.region,
+                    variant_id=selection.variant_id,
+                    backend=selection.backend,
                     assessment=selection.assessment,
                     build=_failed_region_attempt(f"typed-region lowering failed: {lowering_error}"),
                 )
@@ -487,7 +516,7 @@ def _execute_typed_region_package(
     _progress(
         options.progress,
         (
-            f"lowered {len(prepared)} typed region(s); "
+            f"lowered {len(prepared)} typed region backend variant(s); "
             f"kept {len(preparation_failures)} as fallback in {_duration(generation_started)}"
         ),
     )
@@ -555,8 +584,8 @@ def _execute_typed_region_package(
         project.config.root,
         outcome.build.artifact_paths,
     )
-    for item in prepared:
-        item.generation.source_path.unlink(missing_ok=True)
+    for path in _prepared_source_paths(tuple(prepared)):
+        path.unlink(missing_ok=True)
     _copy_install_payload(staged_source_roots, install_root)
     _copy_atoll_artifacts(staged_source_roots, install_root)
     _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
@@ -583,9 +612,20 @@ def _execute_typed_region_package(
         cleanup_kept = (install_root,)
     _progress(options.progress, f"cleaned temporary outputs in {_duration(cleanup_started)}")
 
-    successful_regions = tuple(item.generation.region for item in outcome.successful)
+    successful_regions = tuple(
+        {item.generation.region.id: item.generation.region for item in outcome.successful}.values()
+    )
     successful_bindings = tuple(
         binding for item in outcome.successful for binding in item.generation.bindings
+    )
+    successful_variants = tuple(
+        CompiledRegionVariant(
+            id=item.unit.region_id,
+            region=item.generation.region,
+            backend=item.generation.backend,
+            bindings=item.generation.bindings,
+        )
+        for item in outcome.successful
     )
     return PackageCommandResult(
         success=True,
@@ -604,6 +644,7 @@ def _execute_typed_region_package(
         typed_regions=context.typed_regions,
         compiled_regions=successful_regions,
         compiled_bindings=successful_bindings,
+        compiled_variants=successful_variants,
         backend_assessments=tuple(selection.assessment for selection in context.selected),
         artifact_records=outcome.artifacts,
         region_skipped=outcome.skipped,
@@ -622,42 +663,91 @@ def _prepare_typed_region(
     staged_region = next(
         region for region in staged_scan.typed_regions if region.id == selection.region.id
     )
-    logical_module = _typed_region_module_name(staged_region)
-    generated_path = build_root / f"{logical_module}.py"
-    generation = generate_typed_method_region(
-        staged_scan,
-        staged_region,
-        selection.members,
-        logical_module=logical_module,
-        output_path=generated_path,
+    staged = _StagedTypedRegionContext(
+        build_root=build_root,
+        staged_source_root=_staged_source_root(
+            selection.scan.module,
+            project,
+            staged_source_roots,
+        ),
+        module=staged_module,
+        scan=staged_scan,
+        region=staged_region,
     )
-    unit = MYPYC_BACKEND.lower(
+    prepared = _prepare_backend_variant(staged, selection)
+    if selection.backend != "mypyc":
+        return prepared
+    cython_assessment = CYTHON_BACKEND.assess(staged_region)
+    if not set(selection.members) <= set(cython_assessment.supported_members):
+        return prepared
+    fallback_selection = replace(
+        selection,
+        variant_id=f"{staged_region.id}@cython-mypyc-fallback",
+        backend="cython",
+        assessment=cython_assessment,
+    )
+    try:
+        fallback = _prepare_backend_variant(staged, fallback_selection)
+    except (SyntaxError, ValueError):
+        return prepared
+    return replace(prepared, fallback=fallback)
+
+
+def _prepare_backend_variant(
+    staged: _StagedTypedRegionContext,
+    selection: _SelectedTypedRegion,
+) -> _PreparedTypedRegion:
+    """Lower one selected backend variant inside the copied build tree."""
+    logical_module = _typed_region_module_name(
+        staged.region,
+        selection.backend,
+        selection.variant_id,
+    )
+    generated_path = staged.build_root / f"{logical_module}.py"
+    generation = generate_typed_method_region(
+        staged.scan,
+        staged.region,
+        selection.members,
+        output_path=generated_path,
+        backend=selection.backend,
+    )
+    unit = _compiler_backend(selection.backend).lower(
         BackendLoweringRequest(
-            region=staged_region,
+            region=staged.region,
             source_path=generated_path,
             logical_module=logical_module,
             install_relative_dir=".atoll/artifacts",
             members=selection.members,
+            variant_id=selection.variant_id,
         )
-    )
-    staged_source_root = _staged_source_root(
-        selection.scan.module,
-        project,
-        staged_source_roots,
     )
     return _PreparedTypedRegion(
         generation=generation,
         assessment=selection.assessment,
         unit=unit,
         shim=RegionShimConfig(
-            source_module=staged_module.name,
-            source_path=staged_module.path,
-            region_id=staged_region.id,
-            backend="mypyc",
+            source_module=staged.module.name,
+            source_path=staged.module.path,
+            region_id=selection.variant_id,
+            backend=selection.backend,
             compiled_module=logical_module,
-            artifact_dir=staged_source_root / ".atoll" / "artifacts",
+            artifact_dir=staged.staged_source_root / ".atoll" / "artifacts",
             bindings=generation.bindings,
         ),
+    )
+
+
+def _prepared_source_paths(
+    prepared: tuple[_PreparedTypedRegion, ...],
+) -> tuple[Path, ...]:
+    """Return primary and speculative fallback source paths for cleanup."""
+    return tuple(
+        path
+        for item in prepared
+        for path in (
+            item.generation.source_path,
+            *((item.fallback.generation.source_path,) if item.fallback is not None else ()),
+        )
     )
 
 
@@ -681,33 +771,110 @@ def _build_typed_regions(
         _progress(
             context.progress,
             (
-                f"compiling typed region {index}/{len(prepared)} with mypyc: "
-                f"{item.generation.region.id}"
+                f"compiling typed region variant {index}/{len(prepared)} with "
+                f"{item.generation.backend}: {item.unit.region_id}"
             ),
         )
-        result = MYPYC_BACKEND.compile((item.unit,), backend_context)
-        attempts.append(_tag_region_timings(result.attempt, item.generation.region.id))
+        result = _compile_typed_variant(item, backend_context)
+        tagged_attempt = _tag_region_timings(result.attempt, item.unit.region_id)
         if result.attempt.success:
+            attempts.append(tagged_attempt)
             successful.append(item)
             artifacts.extend(result.artifacts)
-            _progress(context.progress, f"compiled typed region {item.generation.region.id}")
-        else:
-            skipped.append(
-                PackageRegionBuildFailure(
-                    region=item.generation.region,
-                    assessment=item.assessment,
-                    build=result.attempt,
-                )
-            )
+            _progress(context.progress, f"compiled typed region variant {item.unit.region_id}")
+            continue
+        failure_item = item
+        failure_result = result
+        if _should_retry_with_cython(item, result) and item.fallback is not None:
+            fallback = item.fallback
             _progress(
                 context.progress,
-                f"kept typed region {item.generation.region.id} as fallback",
+                f"retrying deterministic mypyc failure with Cython: {fallback.unit.region_id}",
             )
+            fallback_result = _compile_typed_variant(fallback, backend_context)
+            fallback_attempt = _tag_region_timings(
+                fallback_result.attempt,
+                fallback.unit.region_id,
+            )
+            if fallback_result.attempt.success:
+                attempts.extend(
+                    (
+                        _recovered_mypyc_attempt(tagged_attempt, fallback.unit.region_id),
+                        fallback_attempt,
+                    )
+                )
+                successful.append(fallback)
+                artifacts.extend(fallback_result.artifacts)
+                _progress(
+                    context.progress,
+                    f"compiled Cython fallback variant {fallback.unit.region_id}",
+                )
+                continue
+            attempts.extend((tagged_attempt, fallback_attempt))
+            failure_item = fallback
+            failure_result = fallback_result
+        else:
+            attempts.append(tagged_attempt)
+        skipped.append(
+            PackageRegionBuildFailure(
+                region=failure_item.generation.region,
+                variant_id=failure_item.unit.region_id,
+                backend=failure_item.generation.backend,
+                assessment=failure_item.assessment,
+                build=failure_result.attempt,
+            )
+        )
+        _progress(
+            context.progress,
+            f"kept typed region variant {failure_item.unit.region_id} as fallback",
+        )
     return _TypedRegionBuildOutcome(
         successful=tuple(successful),
         build=_aggregate_region_attempts(tuple(attempts), bool(successful)),
         artifacts=tuple(artifacts),
         skipped=tuple(skipped),
+    )
+
+
+def _compile_typed_variant(
+    item: _PreparedTypedRegion,
+    context: BackendCompileContext,
+) -> BackendCompileResult:
+    """Invoke the adapter selected for one prepared backend variant."""
+    return _compiler_backend(item.generation.backend).compile((item.unit,), context)
+
+
+def _should_retry_with_cython(
+    item: _PreparedTypedRegion,
+    result: BackendCompileResult,
+) -> bool:
+    """Return whether a deterministic mypyc rejection permits Cython retry."""
+    return (
+        item.generation.backend == "mypyc"
+        and not result.attempt.success
+        and result.attempt.stderr.startswith("MYPYC_TYPE_ERROR:")
+    )
+
+
+def _recovered_mypyc_attempt(
+    attempt: CompileAttempt,
+    fallback_variant_id: str,
+) -> CompileAttempt:
+    """Retain deterministic rejection evidence without failing the aggregate build."""
+    return replace(
+        attempt,
+        success=True,
+        stdout="\n".join(
+            part
+            for part in (
+                attempt.stdout,
+                f"mypyc rejected this variant; compiled {fallback_variant_id} with Cython",
+                attempt.stderr,
+            )
+            if part
+        ),
+        stderr="",
+        artifact_paths=(),
     )
 
 
@@ -730,7 +897,7 @@ def _aggregate_region_attempts(
 ) -> CompileAttempt:
     return CompileAttempt(
         success=success,
-        command=("mypyc", "typed-region-build"),
+        command=("atoll", "typed-region-build"),
         stdout="\n".join(attempt.stdout for attempt in attempts if attempt.stdout),
         stderr="\n\n".join(attempt.stderr for attempt in attempts if not attempt.success),
         artifact_paths=tuple(
@@ -779,9 +946,19 @@ def _place_region_artifacts(
             _copy_if_different(artifact, artifact_dir / artifact.name)
 
 
-def _typed_region_module_name(region: TypedRegion) -> str:
+def _typed_region_module_name(
+    region: TypedRegion,
+    backend: Backend,
+    variant_id: str,
+) -> str:
     module = re.sub(r"[^A-Za-z0-9_]", "_", region.source_module.name)
-    return f"_atoll_region_{module}_{region.source_hash[:12]}"
+    variant_hash = hashlib.sha256(variant_id.encode()).hexdigest()[:8]
+    return f"_atoll_region_{module}_{backend}_{region.source_hash[:12]}_{variant_hash}"
+
+
+def _compiler_backend(backend: Backend) -> CompilerBackend:
+    """Return the configured compiler adapter for one automatic selection."""
+    return _COMPILER_BACKENDS[backend]
 
 
 def _no_native_ready_result(
@@ -878,7 +1055,7 @@ def _progress_compile_selection(
         progress,
         (
             f"selected {len(selected_modules)} candidate module(s), {function_count} "
-            f"function(s), and {len(selected_regions)} typed method region(s), "
+            f"function(s), and {len(selected_regions)} typed method backend variant(s), "
             f"{method_count} method(s)"
         ),
     )
@@ -1445,34 +1622,60 @@ def _selected_typed_method_regions(
     selected: list[_SelectedTypedRegion] = []
     for scan in scans:
         for region in scan.typed_regions:
-            assessment = MYPYC_BACKEND.assess(region)
-            supported = set(assessment.supported_members)
             decisions = {decision.target: decision for decision in region.decisions}
-            members = tuple(
-                member.id
-                for member in region.members
-                if member.id in supported
-                and member.kind == "method"
-                and member.binding_kind in {"instance_method", "staticmethod", "classmethod"}
-                and member.execution_kind in {"sync", "generator", "coroutine"}
-                and not member.id.qualname.rsplit(".", 1)[-1].startswith("__")
-                and decisions[member.id.stable_id].action == "preserve"
-                and not _owner_requires_fallback(
-                    member.owner_class,
-                    region.source_module.name,
-                    decisions,
-                )
-            )
-            if members:
+            eligible = _eligible_typed_methods(region, decisions)
+            mypyc_assessment = MYPYC_BACKEND.assess(region)
+            mypyc_supported = set(mypyc_assessment.supported_members)
+            mypyc_members = tuple(member for member in eligible if member in mypyc_supported)
+            if mypyc_members:
                 selected.append(
                     _SelectedTypedRegion(
                         scan=scan,
                         region=region,
-                        assessment=assessment,
-                        members=members,
+                        variant_id=f"{region.id}@mypyc",
+                        backend="mypyc",
+                        assessment=mypyc_assessment,
+                        members=mypyc_members,
+                    )
+                )
+            cython_assessment = CYTHON_BACKEND.assess(region)
+            cython_supported = set(cython_assessment.supported_members)
+            cython_members = tuple(
+                member
+                for member in eligible
+                if member not in mypyc_supported and member in cython_supported
+            )
+            if cython_members:
+                selected.append(
+                    _SelectedTypedRegion(
+                        scan=scan,
+                        region=region,
+                        variant_id=f"{region.id}@cython",
+                        backend="cython",
+                        assessment=cython_assessment,
+                        members=cython_members,
                     )
                 )
     return tuple(selected)
+
+
+def _eligible_typed_methods(
+    region: TypedRegion,
+    decisions: dict[str, LoweringDecision],
+) -> tuple[SymbolId, ...]:
+    return tuple(
+        member.id
+        for member in region.members
+        if member.kind == "method"
+        and member.binding_kind in {"instance_method", "staticmethod", "classmethod"}
+        and not member.id.qualname.rsplit(".", 1)[-1].startswith("__")
+        and decisions[member.id.stable_id].action == "preserve"
+        and not _owner_requires_fallback(
+            member.owner_class,
+            region.source_module.name,
+            decisions,
+        )
+    )
 
 
 def _owner_requires_fallback(

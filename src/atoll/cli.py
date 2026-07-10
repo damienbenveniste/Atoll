@@ -602,7 +602,7 @@ def _run_source_clean_artifact_build(
                 if region_failure.build.stderr
                 else "failed"
             )
-            print(f"- {region_failure.region.id}: {first_line}")
+            print(f"- {region_failure.variant_id} [{region_failure.backend}]: {first_line}")
     if result.install_tree_kept:
         print(f"Install tree: {result.install_root}")
     print(f"Wheel: {result.wheel_path}")
@@ -746,6 +746,7 @@ def _write_source_clean_compile_report(
             typed_regions=result.typed_regions,
             compiled_regions=result.compiled_regions,
             compiled_bindings=result.compiled_bindings,
+            compiled_variants=result.compiled_variants,
             backend_assessments=result.backend_assessments,
             artifact_records=result.artifact_records,
         )

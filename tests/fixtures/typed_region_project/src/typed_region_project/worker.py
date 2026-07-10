@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncGenerator, Iterator
 from typing import Self
 
 from .helpers import twice
@@ -17,10 +17,12 @@ class Worker:
     """Small interpreted class whose eligible methods can be rebound."""
 
     bias: int
+    closed: bool
 
     def __init__(self, bias: int) -> None:
         """Store the additive bias used by the fixture workload."""
         self.bias = bias
+        self.closed = False
 
     def scale(self: Self, value: int) -> int:
         """Run a typed integer loop and apply this worker's bias."""
@@ -48,6 +50,20 @@ class Worker:
     async def score(self, value: int) -> int:
         """Return a scaled value while preserving coroutine behavior."""
         return self.scale(value)
+
+    async def exchange(self, start: int) -> AsyncGenerator[int, int | None]:
+        """Exercise the complete async-generator delegation protocol."""
+        value = start
+        try:
+            while True:
+                try:
+                    received = yield value + self.bias
+                except ValueError:
+                    value = -1
+                else:
+                    value = value + 1 if received is None else received
+        finally:
+            self.closed = True
 
 
 class DynamicWorker:

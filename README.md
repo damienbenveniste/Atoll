@@ -37,9 +37,10 @@ source typing for backend assessment and method-level source-clean compilation.
 
 Atoll's compiler boundary is backend-neutral. `CompilerBackend` separates per-member capability
 assessment, registration of prepared compilation units, native compilation, strict fingerprinting,
-and diagnostic normalization. The mypyc adapter reports partial support when one member is
-unsupported, records native artifacts with region ownership and ABI/platform metadata, and retains
-the existing `build_sidecars` facade for legacy compile, build, and trial workflows.
+and diagnostic normalization. The mypyc and Cython adapters report member-level capabilities,
+record native artifacts with region ownership and ABI/platform metadata, and normalize backend
+diagnostics. The existing `build_sidecars` facade remains available for legacy compile, build, and
+trial workflows.
 
 Use `--no-mypy` to skip mypy diagnostics during a scan.
 
@@ -66,8 +67,8 @@ The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
 wheel artifacts somewhere else. Pass `--keep-install-tree` only when you need to inspect the
 temporary install tree for debugging; the report marks that tree as retained.
-For typed methods, the report's `compiled_regions` section names the selected backend, every
-descriptor-aware binding, and the artifact paths associated with that region.
+For typed methods, the report's `compiled_regions` section names each backend variant, every
+descriptor-aware binding, and the artifact paths associated with that variant.
 
 Before mypyc runs, Atoll regenerates each scan candidate independently and retains only leaf
 kernels whose complete generated function set has concrete builtin annotations and repeated
@@ -78,10 +79,12 @@ kernel remains, compile fails before mypyc and removes any stale wheel for the s
 platform tag.
 
 When a selected module has no accepted top-level function island, source-clean compile can lower
-concretely typed instance methods, static methods, class methods, generators, and ordinary
-coroutines from one safe owner class. The generated unit preserves explicit annotations and binds
-native callables back onto the original Python class with the correct descriptor. Dynamic owner
-classes, dunder methods, unresolved generics, `Any`, and async generators remain interpreted.
+concretely typed instance methods, static methods, class methods, generators, coroutines, and async
+generators from a safe owner class. Backend selection is automatic per member: mypyc is preferred,
+while Cython handles execution shapes mypyc rejects and deterministic mypyc type failures. Cython
+annotation typing and C-type inference are disabled so Python integer and container semantics are
+not silently narrowed. Dynamic owner classes, dunder methods, unresolved generics, and explicit
+`Any` remain interpreted.
 
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
 staging, cache lookup or restore, mypyc batch or retry builds, wheel writing, and cleanup. Compile
@@ -97,15 +100,15 @@ arguments, remain visible in scan and compile reports. A function from such a mo
 only when its generated kernel still preserves concrete native types.
 
 Atoll v1 source-clean compile targets top-level typed leaf kernels and safe typed methods. It does
-not yet replace whole classes, compile async-generator execution loops, or treat object-rich
-orchestration as one native unit. Large gains are therefore expected only when meaningful
-application time is spent inside accepted CPU-bound code; successful compilation is not a speedup
-claim.
+not yet replace whole classes or treat object-rich orchestration as one native unit. Large gains are
+therefore expected only when meaningful application time is spent inside accepted CPU-bound code;
+successful compilation is not a speedup claim.
 
 Compiled exports retain the source function or method's name, qualified name, documentation,
-annotations, signature, and sync, coroutine, or generator shape. Method routing preserves normal,
-static, and class descriptors on the original source class. `ATOLL_DISABLE=1` retains interpreted
-routing, and `ATOLL_REQUIRE_COMPILED=1` checks only bindings promised by the staged wheel.
+annotations, signature, and sync, coroutine, generator, or async-generator shape. Async-generator
+wrappers forward `asend`, `athrow`, and `aclose`; method routing preserves normal, static, and class
+descriptors on the original source class. `ATOLL_DISABLE=1` retains interpreted routing, and
+`ATOLL_REQUIRE_COMPILED=1` checks only bindings promised by the staged wheel.
 
 ```bash
 uv pip install --force-reinstall .atoll/dist/*.whl

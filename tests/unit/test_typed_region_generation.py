@@ -76,7 +76,6 @@ def test_generate_typed_methods_preserves_annotations_and_shapes(tmp_path: Path)
         scan,
         region,
         selected,
-        logical_module="_atoll_worker",
         output_path=output,
     )
 
@@ -124,14 +123,12 @@ def test_generation_is_deterministic(tmp_path: Path) -> None:
         scan,
         region,
         selected,
-        logical_module="_atoll_worker",
         output_path=tmp_path / "first.py",
     )
     second = generate_typed_method_region(
         scan,
         region,
         selected,
-        logical_module="_atoll_worker",
         output_path=tmp_path / "second.py",
     )
 
@@ -150,9 +147,29 @@ def test_generation_rejects_async_generators(tmp_path: Path) -> None:
             scan,
             region,
             (stream,),
-            logical_module="_atoll_worker",
             output_path=tmp_path / "generated.py",
         )
+
+
+def test_cython_generation_preserves_async_generator_source(tmp_path: Path) -> None:
+    """Cython units retain async-generator syntax without mypyc owner facades."""
+    scan = _scan(tmp_path)
+    region = next(region for region in scan.typed_regions if region.atomic_class)
+    stream = next(member.id for member in region.members if member.id.qualname == "Worker.stream")
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (stream,),
+        output_path=tmp_path / "generated.py",
+        backend="cython",
+    )
+
+    assert generation.backend == "cython"
+    assert "async def Worker__stream" in generation.source_text
+    assert "yield value" in generation.source_text
+    assert "Protocol" not in generation.source_text
+    assert "_AtollWorker" not in generation.source_text
 
 
 def test_generation_validates_member_selection(tmp_path: Path) -> None:
@@ -169,7 +186,6 @@ def test_generation_validates_member_selection(tmp_path: Path) -> None:
             scan,
             region,
             (),
-            logical_module="generated",
             output_path=output,
         )
     with pytest.raises(ValueError, match="duplicate"):
@@ -177,7 +193,6 @@ def test_generation_validates_member_selection(tmp_path: Path) -> None:
             scan,
             region,
             (scale, scale),
-            logical_module="generated",
             output_path=output,
         )
     with pytest.raises(ValueError, match="outside typed region"):
@@ -185,7 +200,6 @@ def test_generation_validates_member_selection(tmp_path: Path) -> None:
             scan,
             region,
             (foreign,),
-            logical_module="generated",
             output_path=output,
         )
     with pytest.raises(ValueError, match="unsupported typed-region binding"):
@@ -193,7 +207,6 @@ def test_generation_validates_member_selection(tmp_path: Path) -> None:
             scan,
             region,
             (owner,),
-            logical_module="generated",
             output_path=output,
         )
     assert not output.exists()
@@ -221,7 +234,6 @@ def test_generation_rejects_unknown_decorators_and_missing_receivers(tmp_path: P
             scan,
             replace(region, members=(decorated,)),
             (decorated.id,),
-            logical_module="generated",
             output_path=tmp_path / "decorated.py",
         )
     with pytest.raises(ValueError, match="no self parameter"):
@@ -229,7 +241,6 @@ def test_generation_rejects_unknown_decorators_and_missing_receivers(tmp_path: P
             scan,
             replace(region, members=(no_self,)),
             (no_self.id,),
-            logical_module="generated",
             output_path=tmp_path / "no_self.py",
         )
     with pytest.raises(ValueError, match="no cls parameter"):
@@ -237,7 +248,6 @@ def test_generation_rejects_unknown_decorators_and_missing_receivers(tmp_path: P
             scan,
             replace(region, members=(no_cls,)),
             (no_cls.id,),
-            logical_module="generated",
             output_path=tmp_path / "no_cls.py",
         )
     with pytest.raises(ValueError, match="no owner class"):
@@ -245,7 +255,6 @@ def test_generation_rejects_unknown_decorators_and_missing_receivers(tmp_path: P
             scan,
             replace(region, members=(no_owner,)),
             (no_owner.id,),
-            logical_module="generated",
             output_path=tmp_path / "no_owner.py",
         )
 
@@ -284,7 +293,6 @@ class Worker:
         scan,
         region,
         selected,
-        logical_module="generated",
         output_path=tmp_path / "generated.py",
     )
 
@@ -330,6 +338,5 @@ class Worker:
             scan,
             region,
             (scale,),
-            logical_module="generated",
             output_path=tmp_path / "generated.py",
         )

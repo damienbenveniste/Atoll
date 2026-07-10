@@ -98,20 +98,25 @@ def test_region_shim_insertion_is_idempotent_and_removable(tmp_path: Path) -> No
     assert removed.new_text == source
 
 
-def test_region_shim_rejects_async_generator_binding(tmp_path: Path) -> None:
-    """Async generator routing remains unavailable until the Cython milestone."""
+def test_region_shim_renders_async_generator_protocol_forwarding(tmp_path: Path) -> None:
+    """Async generator wrappers preserve send, throw, and close operations."""
     source_path = tmp_path / "worker.py"
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=source_path,
+        region_id="region@cython",
+        backend="cython",
+        compiled_module="compiled",
+        artifact_dir=tmp_path / "artifacts",
+        bindings=(_binding("stream", "instance_method", "async_generator"),),
+    )
 
-    with pytest.raises(ValueError, match="async-generator"):
-        RegionShimConfig(
-            source_module="pkg.worker",
-            source_path=source_path,
-            region_id="region",
-            backend="mypyc",
-            compiled_module="compiled",
-            artifact_dir=tmp_path / "artifacts",
-            bindings=(_binding("stream", "instance_method", "async_generator"),),
-        )
+    rendered = render_region_shim((config,))
+
+    assert "isasyncgenfunction" in rendered
+    assert "_atoll_generator.asend" in rendered
+    assert "_atoll_generator.athrow" in rendered
+    assert "_atoll_generator.aclose" in rendered
 
 
 def test_region_shim_falls_back_without_artifacts(

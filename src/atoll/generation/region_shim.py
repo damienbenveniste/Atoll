@@ -43,8 +43,6 @@ class RegionShimConfig:
                 raise ValueError(f"unsupported region shim binding: {binding.kind}")
             if binding.owner_class is None:
                 raise ValueError("method region shim binding requires an owner class")
-            if binding.execution_kind == "async_generator":
-                raise ValueError("async-generator region shims require the Cython milestone")
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +97,32 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "    import sys as _atoll_sys",
             "",
             "    def _atoll_bind(_atoll_source, _atoll_target):",
-            "        if _atoll_inspect.iscoroutinefunction(_atoll_source):",
+            "        if _atoll_inspect.isasyncgenfunction(_atoll_source):",
+            "            @_atoll_functools.wraps(_atoll_source)",
+            "            async def _atoll_wrapped(*args, **kwargs):",
+            "                _atoll_generator = _atoll_target(*args, **kwargs)",
+            "                try:",
+            "                    _atoll_value = await _atoll_generator.__anext__()",
+            "                    while True:",
+            "                        try:",
+            "                            _atoll_sent = yield _atoll_value",
+            "                        except GeneratorExit:",
+            "                            await _atoll_generator.aclose()",
+            "                            raise",
+            "                        except BaseException as _atoll_thrown:",
+            "                            _atoll_value = await _atoll_generator.athrow(",
+            "                                _atoll_thrown",
+            "                            )",
+            "                        else:",
+            "                            if _atoll_sent is None:",
+            "                                _atoll_value = await _atoll_generator.__anext__()",
+            "                            else:",
+            "                                _atoll_value = await _atoll_generator.asend(",
+            "                                    _atoll_sent",
+            "                                )",
+            "                except StopAsyncIteration:",
+            "                    return",
+            "        elif _atoll_inspect.iscoroutinefunction(_atoll_source):",
             "            @_atoll_functools.wraps(_atoll_source)",
             "            async def _atoll_wrapped(*args, **kwargs):",
             "                return await _atoll_target(*args, **kwargs)",

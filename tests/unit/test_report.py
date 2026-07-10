@@ -6,12 +6,17 @@ from pathlib import Path
 
 import pytest
 
+from atoll.analysis.ast_scanner import scan_module
+from atoll.analysis.clustering import enrich_island_analysis
 from atoll.analysis.native_readiness import NativeReadiness
 from atoll.models import (
+    ArtifactRecord,
+    BackendAssessment,
     CompileAttempt,
     CompilePhaseTiming,
     EnabledIslandConfig,
     IslandRisk,
+    ModuleId,
     PytestRunResult,
     VerifyResult,
 )
@@ -303,3 +308,78 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
     assert "- Wheel: `.atoll/dist/app-0+atoll-cp312.whl`" in markdown
     assert "## Skipped Modules" in markdown
     assert "`app.blocked` (src/app/blocked.py:4)" in markdown
+
+
+def test_compilation_report_retains_legacy_compiled_region_evidence(tmp_path: Path) -> None:
+    """Schema v2 still derives backend and artifacts from legacy region fields."""
+    source_path = tmp_path / "report_regions.py"
+    source_path.write_text(
+        """def first(value: int) -> int:
+    return value + 1
+
+def second(value: int) -> int:
+    return value + 2
+
+def third(value: int) -> int:
+    return value + 3
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="report_regions", path=source_path)))
+    regions = tuple(
+        next(
+            region
+            for region in scan.typed_regions
+            if any(member.id.qualname == name for member in region.members)
+        )
+        for name in ("first", "second", "third")
+    )
+    first, second, third = regions
+    assessment = BackendAssessment(
+        region_id=first.id,
+        backend="mypyc",
+        status="supported",
+        supported_members=tuple(member.id for member in first.members),
+        unsupported_members=(),
+        capabilities=("typed_function",),
+        reasons=(),
+    )
+    artifact = ArtifactRecord(
+        region_id=second.id,
+        backend="cython",
+        logical_module="_atoll_second",
+        role="primary",
+        install_relative_path=".atoll/artifacts/_atoll_second.so",
+        digest="a" * 64,
+        abi="cp312",
+        platform_tag="macosx_11_0_arm64",
+    )
+
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter="report_regions",
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "typed-region-build"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            typed_regions=regions,
+            compiled_regions=regions,
+            compiled_bindings=tuple(binding for region in regions for binding in region.bindings),
+            backend_assessments=(assessment,),
+            artifact_records=(artifact,),
+        )
+    )
+
+    compiled = {item["id"]: item for item in report["compiled_regions"]}
+    assert compiled[first.id]["backend"] == "mypyc"
+    assert compiled[second.id]["backend"] == "cython"
+    assert compiled[second.id]["artifacts"] == [".atoll/artifacts/_atoll_second.so"]
+    assert compiled[third.id]["backend"] is None
+    assert all(item["variant_id"] == item["id"] for item in compiled.values())

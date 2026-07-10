@@ -49,7 +49,6 @@ def test_mypyc_methods_bind_to_the_original_python_class(
         scan,
         region,
         selected,
-        logical_module=logical_module,
         output_path=generated_path,
     )
     backend = MypycBackend()

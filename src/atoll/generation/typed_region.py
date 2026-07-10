@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from atoll.models import (
+    Backend,
     BindingTarget,
     ImportRecord,
     ModuleScan,
@@ -44,6 +45,7 @@ class TypedRegionGeneration:
     source_hash: str
     selected_members: tuple[SymbolId, ...]
     bindings: tuple[BindingTarget, ...]
+    backend: Backend
 
 
 def generate_typed_method_region(
@@ -51,8 +53,8 @@ def generate_typed_method_region(
     region: TypedRegion,
     selected_members: tuple[SymbolId, ...],
     *,
-    logical_module: str,
     output_path: Path,
+    backend: Backend = "mypyc",
 ) -> TypedRegionGeneration:
     """Write one preserved typed-method module for a native backend.
 
@@ -60,26 +62,28 @@ def generate_typed_method_region(
     remain for the Cython milestone, and unsafe decorators or unresolved member
     identifiers fail before any generated file is written.
     """
-    members = _selected_region_members(region, selected_members)
+    members = _selected_region_members(region, selected_members, backend)
     bindings = tuple(_binding_target(member) for member in members)
-    source_text = _generated_source(scan, members, bindings)
+    source_text = _generated_source(scan, members, bindings, backend)
     source_hash = hashlib.sha256(source_text.encode()).hexdigest()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(source_text, encoding="utf-8")
     return TypedRegionGeneration(
         region=region,
-        logical_module=logical_module,
+        logical_module=output_path.stem,
         source_path=output_path,
         source_text=source_text,
         source_hash=source_hash,
         selected_members=selected_members,
         bindings=bindings,
+        backend=backend,
     )
 
 
 def _selected_region_members(
     region: TypedRegion,
     selected_members: tuple[SymbolId, ...],
+    backend: Backend,
 ) -> tuple[RegionMember, ...]:
     if not selected_members:
         raise ValueError("typed method generation requires at least one selected member")
@@ -94,7 +98,10 @@ def _selected_region_members(
     for member in members:
         if member.kind != "method" or member.binding_kind not in _SUPPORTED_BINDINGS:
             raise ValueError(f"unsupported typed-region binding: {member.id.stable_id}")
-        if member.execution_kind not in _SUPPORTED_EXECUTION_KINDS:
+        execution_supported = member.execution_kind in _SUPPORTED_EXECUTION_KINDS or (
+            backend == "cython" and member.execution_kind == "async_generator"
+        )
+        if not execution_supported:
             raise ValueError(
                 f"unsupported typed-region execution kind {member.execution_kind}: "
                 f"{member.id.stable_id}"
@@ -117,6 +124,7 @@ def _generated_source(
     scan: ModuleScan,
     members: tuple[RegionMember, ...],
     bindings: tuple[BindingTarget, ...],
+    backend: Backend,
 ) -> str:
     owners = tuple(sorted({member.owner_class for member in members if member.owner_class}))
     imports = tuple(
@@ -127,20 +135,19 @@ def _generated_source(
     constants = tuple(
         record.source_text for record in scan.constants if record.kind == "literal_constant"
     )
-    sections: list[str] = [
-        "from __future__ import annotations",
-        "",
-        "from typing import Protocol",
-    ]
+    sections: list[str] = ["from __future__ import annotations"]
+    if backend == "mypyc":
+        sections.extend(("", "from typing import Protocol"))
     if imports:
         sections.extend(("", *dict.fromkeys(imports)))
     if constants:
         sections.extend(("", *constants))
-    for owner in owners:
-        sections.extend(("", _owner_facade(scan, owner)))
+    if backend == "mypyc":
+        for owner in owners:
+            sections.extend(("", _owner_facade(scan, owner)))
     binding_by_source = {binding.source: binding for binding in bindings}
     for member in members:
-        sections.extend(("", _lowered_method(member, binding_by_source[member.id])))
+        sections.extend(("", _lowered_method(member, binding_by_source[member.id], backend)))
     return "\n".join(sections).rstrip() + "\n"
 
 
@@ -233,10 +240,16 @@ def _owner_facade(scan: ModuleScan, owner: str) -> str:
     return ast.unparse(ast.fix_missing_locations(facade))
 
 
-def _lowered_method(member: RegionMember, binding: BindingTarget) -> str:
+def _lowered_method(
+    member: RegionMember,
+    binding: BindingTarget,
+    backend: Backend,
+) -> str:
     node = _method_node(member)
     node.name = binding.compiled_name
     node.decorator_list = []
+    if backend == "cython":
+        return ast.unparse(ast.fix_missing_locations(node))
     owner = _required_owner(member)
     _rewrite_signature_owner_types(node, owner)
     first = _first_positional_parameter(node)

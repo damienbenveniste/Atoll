@@ -24,6 +24,7 @@ from atoll.models import (
     BlockerSeverity,
     CompileAttempt,
     CompileCacheStatus,
+    CompiledRegionVariant,
     Confidence,
     ConstantKind,
     DependencyKind,
@@ -438,6 +439,7 @@ class CompilationCompiledRegionReport(TypedDict):
     """Backend, binding, and artifact evidence for one successful region."""
 
     id: str
+    variant_id: str
     source_module: str
     backend: Backend | None
     bindings: list[CompilationCompiledBindingReport]
@@ -520,6 +522,7 @@ class CompilationReportInput:
     typed_regions: tuple[TypedRegion, ...] = ()
     compiled_regions: tuple[TypedRegion, ...] = ()
     compiled_bindings: tuple[BindingTarget, ...] = ()
+    compiled_variants: tuple[CompiledRegionVariant, ...] = ()
     backend_assessments: tuple[BackendAssessment, ...] = ()
     artifact_records: tuple[ArtifactRecord, ...] = ()
 
@@ -744,6 +747,17 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
 def _compiled_region_reports(
     report_input: CompilationReportInput,
 ) -> list[CompilationCompiledRegionReport]:
+    if report_input.compiled_variants:
+        return [
+            _compiled_region_variant_report(
+                variant_id=variant.id,
+                region=variant.region,
+                backend=variant.backend,
+                bindings=variant.bindings,
+                artifact_records=report_input.artifact_records,
+            )
+            for variant in report_input.compiled_variants
+        ]
     assessments = {
         assessment.region_id: assessment for assessment in report_input.backend_assessments
     }
@@ -765,25 +779,44 @@ def _compiled_region_reports(
         else:
             backend = None
         reports.append(
-            {
-                "id": region.id,
-                "source_module": region.source_module.name,
-                "backend": backend,
-                "bindings": [
-                    {
-                        "source": binding.source.stable_id,
-                        "compiled_name": binding.compiled_name,
-                        "kind": binding.kind,
-                        "owner_class": binding.owner_class,
-                        "execution_kind": binding.execution_kind,
-                        "required": binding.required,
-                    }
-                    for binding in bindings
-                ],
-                "artifacts": sorted(record.install_relative_path for record in records),
-            }
+            _compiled_region_variant_report(
+                variant_id=region.id,
+                region=region,
+                backend=backend,
+                bindings=bindings,
+                artifact_records=report_input.artifact_records,
+            )
         )
     return reports
+
+
+def _compiled_region_variant_report(
+    *,
+    variant_id: str,
+    region: TypedRegion,
+    backend: Backend | None,
+    bindings: tuple[BindingTarget, ...],
+    artifact_records: tuple[ArtifactRecord, ...],
+) -> CompilationCompiledRegionReport:
+    records = tuple(record for record in artifact_records if record.region_id == variant_id)
+    return {
+        "id": region.id,
+        "variant_id": variant_id,
+        "source_module": region.source_module.name,
+        "backend": backend,
+        "bindings": [
+            {
+                "source": binding.source.stable_id,
+                "compiled_name": binding.compiled_name,
+                "kind": binding.kind,
+                "owner_class": binding.owner_class,
+                "execution_kind": binding.execution_kind,
+                "required": binding.required,
+            }
+            for binding in bindings
+        ],
+        "artifacts": sorted(record.install_relative_path for record in records),
+    }
 
 
 def write_compilation_json_report(path: Path, report: CompilationReport) -> None:
@@ -910,7 +943,10 @@ def _compiled_region_markdown(region: CompilationCompiledRegionReport) -> str:
         f"{binding['source']} ({binding['kind']})" for binding in region["bindings"]
     )
     artifacts = ", ".join(region["artifacts"]) or "no recorded artifacts"
-    return f"- `{region['id']}` [{backend}]: {bindings}; artifacts: {artifacts}"
+    return (
+        f"- `{region['variant_id']}` [{backend}] for region `{region['id']}`: "
+        f"{bindings}; artifacts: {artifacts}"
+    )
 
 
 def _append_compiled_regions_markdown(

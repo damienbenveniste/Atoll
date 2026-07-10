@@ -14,10 +14,27 @@ import pytest
 from packaging import tags
 
 from atoll.commands import package as package_command
-from atoll.models import CompileAttempt, CompilePhaseTiming, EnabledIslandConfig, ModuleId
+from atoll.models import (
+    ArtifactRecord,
+    Backend,
+    BackendAssessment,
+    BackendCompileContext,
+    BackendCompileResult,
+    BindingTarget,
+    CompilationUnit,
+    CompileAttempt,
+    CompiledRegionVariant,
+    CompilePhaseTiming,
+    EnabledIslandConfig,
+    ModuleId,
+    ModuleScan,
+    TypedRegion,
+)
 from atoll.project import DiscoveredProject, discover_project
+from atoll.report import CompilationReportInput, build_compilation_report
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
+TYPED_FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
 EXPECTED_REBUILDS = 2
 EXPECTED_PARTIAL_CACHE_BACKEND_CALLS = 3
 EXPECTED_READINESS_COUNT = 2
@@ -53,6 +70,48 @@ class _WriteWheel(Protocol):
 
 class _CacheLookup(Protocol):
     hit: bool
+
+
+class _TypedSelection(Protocol):
+    backend: Backend
+
+
+class _TypedGeneration(Protocol):
+    backend: Backend
+    region: TypedRegion
+    bindings: tuple[BindingTarget, ...]
+
+
+class _PreparedTypedRegion(Protocol):
+    generation: _TypedGeneration
+    assessment: BackendAssessment
+    unit: CompilationUnit
+    fallback: _PreparedTypedRegion | None
+
+
+class _TypedRegionOutcome(Protocol):
+    successful: tuple[_PreparedTypedRegion, ...]
+    build: CompileAttempt
+    artifacts: tuple[ArtifactRecord, ...]
+    skipped: tuple[object, ...]
+
+
+class _FakeCompileBackend:
+    """Backend stub used to force deterministic retry orchestration."""
+
+    def __init__(self, result: BackendCompileResult) -> None:
+        self.result = result
+        self.calls: list[tuple[CompilationUnit, ...]] = []
+
+    def compile(
+        self,
+        units: tuple[CompilationUnit, ...],
+        context: BackendCompileContext,
+    ) -> BackendCompileResult:
+        """Record one invocation and return configured compiler evidence."""
+        _ = context
+        self.calls.append(units)
+        return self.result
 
 
 def _package_attr(name: str) -> object:
@@ -130,6 +189,22 @@ _wheel_payload = cast(
 )
 _wheel_tag = cast(Callable[[], str], _package_attr("_wheel_tag"))
 _write_wheel = cast(_WriteWheel, _package_attr("_write_wheel"))
+_selected_scans = cast(
+    Callable[[DiscoveredProject, str | None], tuple[ModuleScan, ...]],
+    _package_attr("_selected_scans"),
+)
+_selected_typed_method_regions = cast(
+    Callable[[tuple[ModuleScan, ...]], tuple[_TypedSelection, ...]],
+    _package_attr("_selected_typed_method_regions"),
+)
+_prepare_typed_region = cast(
+    Callable[..., _PreparedTypedRegion], _package_attr("_prepare_typed_region")
+)
+_build_typed_regions = cast(
+    Callable[..., _TypedRegionOutcome], _package_attr("_build_typed_regions")
+)
+_TypedRegionBuildContext = cast(Callable[..., object], _package_attr("_TypedRegionBuildContext"))
+_compiler_backends = cast(dict[Backend, object], _package_attr("_COMPILER_BACKENDS"))
 
 
 def test_package_reports_build_failure_without_source_edits(
@@ -173,6 +248,222 @@ def test_package_reports_build_failure_without_source_edits(
     assert not (output_dir / "install").exists()
     assert result.cleanup_removed == (output_dir / "install",)
     assert result.cleanup_kept == (output_dir / "build",)
+
+
+def test_typed_region_build_retries_deterministic_mypyc_failure_with_cython(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mypyc type rejection uses the prepared Cython variant before fallback."""
+    project_root = tmp_path / "typed_region_project"
+    build_root = tmp_path / "build"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "typed_region_project.worker")
+    selections = _selected_typed_method_regions(scans)
+    mypyc_selection = next(selection for selection in selections if selection.backend == "mypyc")
+    staged_source_roots = _copy_source_roots(project, build_root)
+    prepared = _prepare_typed_region(
+        project=project,
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        selection=mypyc_selection,
+    )
+    assert prepared.fallback is not None
+    mypyc = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=False,
+                command=("mypyc",),
+                stdout="",
+                stderr="MYPYC_TYPE_ERROR: fixture",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    cython = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=True,
+                command=("cython",),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.2,
+            ),
+            artifacts=(),
+        )
+    )
+    monkeypatch.setitem(_compiler_backends, "mypyc", mypyc)
+    monkeypatch.setitem(_compiler_backends, "cython", cython)
+
+    outcome = _build_typed_regions(
+        prepared=(prepared,),
+        context=_TypedRegionBuildContext(
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            cache_dir=tmp_path / "cache",
+            progress=None,
+        ),
+        initial_failures=(),
+    )
+
+    assert outcome.build.success is True
+    assert outcome.build.stderr == ""
+    assert "compiled" in outcome.build.stdout
+    assert [item.generation.backend for item in outcome.successful] == ["cython"]
+    assert outcome.skipped == ()
+    assert len(mypyc.calls) == 1
+    assert len(cython.calls) == 1
+
+
+def test_typed_region_build_does_not_compile_speculative_cython_after_mypyc_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prepared Cython fallback remains dormant when the preferred backend succeeds."""
+    project_root = tmp_path / "typed_region_project"
+    build_root = tmp_path / "build"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "typed_region_project.worker")
+    selections = _selected_typed_method_regions(scans)
+    mypyc_selection = next(selection for selection in selections if selection.backend == "mypyc")
+    staged_source_roots = _copy_source_roots(project, build_root)
+    prepared = _prepare_typed_region(
+        project=project,
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        selection=mypyc_selection,
+    )
+    assert prepared.fallback is not None
+    mypyc = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=True,
+                command=("mypyc",),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    cython = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=True,
+                command=("cython",),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.2,
+            ),
+            artifacts=(),
+        )
+    )
+    monkeypatch.setitem(_compiler_backends, "mypyc", mypyc)
+    monkeypatch.setitem(_compiler_backends, "cython", cython)
+
+    outcome = _build_typed_regions(
+        prepared=(prepared,),
+        context=_TypedRegionBuildContext(
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            cache_dir=tmp_path / "cache",
+            progress=None,
+        ),
+        initial_failures=(),
+    )
+
+    assert outcome.build.success is True
+    assert [item.generation.backend for item in outcome.successful] == ["mypyc"]
+    assert outcome.skipped == ()
+    assert len(mypyc.calls) == 1
+    assert cython.calls == []
+
+
+def test_typed_region_build_records_real_cython_artifacts_after_mypyc_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deterministic retry compiles a real Cython artifact owned by its variant."""
+    project_root = tmp_path / "typed_region_project"
+    build_root = tmp_path / "build"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "typed_region_project.worker")
+    selections = _selected_typed_method_regions(scans)
+    mypyc_selection = next(selection for selection in selections if selection.backend == "mypyc")
+    staged_source_roots = _copy_source_roots(project, build_root)
+    prepared = _prepare_typed_region(
+        project=project,
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        selection=mypyc_selection,
+    )
+    assert prepared.fallback is not None
+    mypyc = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=False,
+                command=("mypyc",),
+                stdout="",
+                stderr="MYPYC_TYPE_ERROR: fixture",
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    monkeypatch.setitem(_compiler_backends, "mypyc", mypyc)
+
+    outcome = _build_typed_regions(
+        prepared=(prepared,),
+        context=_TypedRegionBuildContext(
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            cache_dir=tmp_path / "cache",
+            progress=None,
+        ),
+        initial_failures=(),
+    )
+
+    successful = outcome.successful[0]
+    variant = CompiledRegionVariant(
+        id=successful.unit.region_id,
+        region=successful.generation.region,
+        backend=successful.generation.backend,
+        bindings=successful.generation.bindings,
+    )
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=project_root,
+            operation="compile",
+            module_filter="typed_region_project.worker",
+            islands=(),
+            build=outcome.build,
+            typed_regions=(variant.region,),
+            compiled_regions=(variant.region,),
+            compiled_bindings=variant.bindings,
+            compiled_variants=(variant,),
+            backend_assessments=(successful.assessment,),
+            artifact_records=outcome.artifacts,
+        )
+    )
+
+    assert outcome.build.success is True
+    assert successful.generation.backend == "cython"
+    assert successful.unit.region_id.endswith("@cython-mypyc-fallback")
+    assert outcome.artifacts
+    assert all(path.is_file() for path in outcome.build.artifact_paths)
+    assert {artifact.region_id for artifact in outcome.artifacts} == {variant.id}
+    assert report["compiled_regions"][0]["backend"] == "cython"
+    assert report["compiled_regions"][0]["variant_id"] == variant.id
+    assert report["compiled_regions"][0]["artifacts"]
 
 
 def test_package_whole_project_retries_and_skips_failed_islands(
