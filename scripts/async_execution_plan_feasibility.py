@@ -20,7 +20,7 @@ from collections import deque
 from collections.abc import Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass
 from statistics import median
-from typing import Literal, TypedDict, cast
+from typing import Literal, TypedDict, Unpack, cast
 
 ArmName = Literal["baseline", "task_preserving", "callback_backed"]
 WorkMode = Literal["immediate", "suspending", "failure", "task_observing", "cold_decoy"]
@@ -222,6 +222,12 @@ class _ReportJson(TypedDict):
     semantic_repetitions: int
     semantic_snapshot: dict[str, JsonValue]
     semantics_match: bool
+
+
+class _TaskFactoryOptions(TypedDict, total=False):
+    name: str | None
+    context: contextvars.Context | None
+    eager_start: bool
 
 
 @dataclass(slots=True)
@@ -1122,10 +1128,17 @@ async def _task_factory_probe(arm: ArmName) -> dict[str, JsonValue]:
         task_loop: asyncio.AbstractEventLoop,
         coroutine: Coroutine[object, object, object],
         /,
+        **options: Unpack[_TaskFactoryOptions],
     ) -> asyncio.Task[object]:
         nonlocal factory_calls
         factory_calls += 1
-        return asyncio.Task(coroutine, loop=task_loop)
+        return asyncio.Task(
+            coroutine,
+            loop=task_loop,
+            name=options.get("name"),
+            context=options.get("context"),
+            eager_start=options.get("eager_start", False),
+        )
 
     previous = loop.get_task_factory()
     set_factory = cast(Callable[[object], None], loop.set_task_factory)
