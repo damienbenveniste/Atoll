@@ -708,5 +708,21 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# Shared aliases keep source-coordinate policy identical across built-in plan
+# backends without exposing either backend's lowering decisions to the other.
+source_attribute_path: Final = _attribute_path
+source_callsite_lineno_is_planned: Final = _callsite_lineno_is_planned
+source_create_task_scheduler: Final = _create_task_scheduler
+source_function_node: Final = _function_node
+source_module_path: Final = _module_path
+source_name_exists: Final = _name_exists
+source_name_is_bound: Final = _name_is_bound
+source_sha256: Final = _sha256
+source_spawn_callee: Final = _spawn_callee
+source_splice_expressions: Final = _splice_expressions
+source_validate_callsite_fingerprint: Final = _validate_callsite_fingerprint
+source_validate_hash: Final = _validate_source_hash
+
+
 TASK_PRESERVING_BACKEND: Final = TaskPreservingExecutionPlanBackend()
 """Shared task-preserving execution-plan backend instance for command integration."""

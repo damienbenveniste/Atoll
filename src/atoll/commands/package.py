@@ -36,6 +36,7 @@ from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
 from atoll.backends.mypyc import MYPYC_BACKEND
 from atoll.execution_plans.base import ExecutionPlanBackend
+from atoll.execution_plans.callback_backed import CALLBACK_BACKED_BACKEND
 from atoll.execution_plans.models import (
     ExecutionPlan,
     ExecutionPlanAssessmentContext,
@@ -132,7 +133,10 @@ _COMPILER_BACKENDS: dict[Backend, CompilerBackend] = {
     "mypyc": MYPYC_BACKEND,
     "cython": CYTHON_BACKEND,
 }
-_EXECUTION_PLAN_BACKENDS: tuple[ExecutionPlanBackend, ...] = (TASK_PRESERVING_BACKEND,)
+_EXECUTION_PLAN_BACKENDS: tuple[ExecutionPlanBackend, ...] = (
+    CALLBACK_BACKED_BACKEND,
+    TASK_PRESERVING_BACKEND,
+)
 
 _CANDIDATE_BENCHMARK_WARMUPS = 1
 _CANDIDATE_BENCHMARK_SAMPLES = 3
@@ -3168,6 +3172,62 @@ def _execution_plan_application_for_finalized_payload(
 def _apply_execution_plan_trials(
     context: _ExecutionPlanApplicationContext,
 ) -> _ExecutionPlanApplicationOutcome:
+    """Try execution-plan backends in priority order until one plan variant passes.
+
+    A capability-supported callback variant remains speculative until its staged
+    payload passes semantics and marginal profitability. Any failed callback
+    attempt advances to the next backend so the conservative task-preserving
+    lowering is not lost merely because the preferred optimization was unsafe or
+    unprofitable for the configured workload.
+
+    Args:
+        context: Project policy, payload roots, native allowlist, and selected plans.
+
+    Returns:
+        _ExecutionPlanApplicationOutcome: Combined backend trials and applied plan IDs.
+    """
+    selected = tuple(plan for plan in context.plans if isinstance(plan, ExecutionPlan))
+    applied: list[str] = []
+    trials: list[ExecutionPlanTrial] = []
+    timings: list[CompilePhaseTiming] = []
+    for plan in selected:
+        remaining_backends = _EXECUTION_PLAN_BACKENDS
+        while remaining_backends:
+            outcome = _apply_execution_plan_trials_once(
+                replace(context, plans=(plan,)),
+                backends=remaining_backends,
+            )
+            applied.extend(outcome.applied_plan_ids)
+            trials.extend(outcome.trials)
+            timings.extend(outcome.timings)
+            if outcome.applied_plan_ids or not outcome.trials:
+                break
+            attempted_backend = outcome.trials[-1].backend
+            if attempted_backend is None:
+                break
+            attempted_index = next(
+                (
+                    index
+                    for index, backend in enumerate(remaining_backends)
+                    if backend.name == attempted_backend
+                ),
+                None,
+            )
+            if attempted_index is None:
+                break
+            remaining_backends = remaining_backends[attempted_index + 1 :]
+    return _ExecutionPlanApplicationOutcome(
+        applied_plan_ids=tuple(applied),
+        trials=tuple(trials),
+        timings=tuple(timings),
+    )
+
+
+def _apply_execution_plan_trials_once(
+    context: _ExecutionPlanApplicationContext,
+    *,
+    backends: tuple[ExecutionPlanBackend, ...],
+) -> _ExecutionPlanApplicationOutcome:
     """Stage and trial selected scheduler plans without risking the accepted payload.
 
     Each backend writes to a disposable copy of the current payload. Atoll validates
@@ -3177,6 +3237,7 @@ def _apply_execution_plan_trials(
 
     Args:
         context: Project policy, payload roots, native allowlist, and selected plans.
+        backends: Remaining backend candidates in configured priority order.
 
     Returns:
         _ExecutionPlanApplicationOutcome: Applied plan IDs, trial decisions, and timings.
@@ -3199,7 +3260,11 @@ def _apply_execution_plan_trials(
     trials: list[ExecutionPlanTrial] = []
     timings: list[CompilePhaseTiming] = []
     for index, plan in enumerate(selected, start=1):
-        backend, assessment_diagnostics = _select_execution_plan_backend(context, plan)
+        backend, assessment_diagnostics = _select_execution_plan_backend(
+            context,
+            plan,
+            backends=backends,
+        )
         if backend is None:
             trials.append(
                 ExecutionPlanTrial(
@@ -3401,12 +3466,15 @@ def _apply_execution_plan_trials(
 def _select_execution_plan_backend(
     context: _ExecutionPlanApplicationContext,
     plan: ExecutionPlan,
+    *,
+    backends: tuple[ExecutionPlanBackend, ...] | None = None,
 ) -> tuple[ExecutionPlanBackend | None, tuple[ExecutionPlanDiagnostic, ...]]:
     """Return the first backend supporting the complete plan and its assessments.
 
     Args:
         context: Project and profile context for backend capability checks.
         plan: Complete scheduler plan requiring strict lowering.
+        backends: Optional restricted backend suffix used after a failed trial.
 
     Returns:
         tuple[ExecutionPlanBackend | None, tuple[ExecutionPlanDiagnostic, ...]]: Selected backend
@@ -3446,7 +3514,7 @@ def _select_execution_plan_backend(
         source_root=source_root,
         profile_status="profiled",
     )
-    for backend in _EXECUTION_PLAN_BACKENDS:
+    for backend in backends or _EXECUTION_PLAN_BACKENDS:
         try:
             assessment = backend.assess(plan, assessment_context)
         except Exception as error:

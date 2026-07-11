@@ -26,6 +26,7 @@ from atoll.runtime.profiling import (
 _HOT_PLAN_COUNT = 18_000
 _SELECTION_LIMIT = 4
 _LIVE_SPAWN_COUNT = 1_200
+_QUEUE_CAPACITY = 4
 
 
 def test_dialects_recognize_asyncio_and_anyio_spawn_shapes(tmp_path: Path) -> None:
@@ -256,6 +257,40 @@ def test_owner_consumer_forms_bounded_fan_out_reduction_plan(tmp_path: Path) -> 
     assert plan.transport_capacity == 1
     assert plan.ordering_policy == "completion-order"
     assert any(node.role == "reducer" for node in plan.nodes)
+
+
+def test_module_integer_constant_resolves_private_queue_capacity(tmp_path: Path) -> None:
+    """A direct module literal remains a statically known queue capacity."""
+    scan = _scan(
+        tmp_path / "constant_capacity.py",
+        [
+            "QUEUE_CAPACITY = 4",
+            "async def _worker(q, value):",
+            "    q.put_nowait(value)",
+            "async def run(values):",
+            "    q: asyncio.Queue[int] = asyncio.Queue(maxsize=QUEUE_CAPACITY)",
+            "    async with asyncio.TaskGroup() as tg:",
+            "        for value in values:",
+            "            tg.create_task(_worker(q, value))",
+            "        for _ in values:",
+            "            await q.get()",
+        ],
+    )
+    profile = _profile(
+        scan,
+        (
+            ("constant_capacity", "run", 2_000, 2_000),
+            ("constant_capacity", "_worker", 2_000, 2_000),
+        ),
+    )
+
+    plan = next(
+        result
+        for result in build_execution_plans((scan,), profile)
+        if isinstance(result, ExecutionPlan)
+    )
+
+    assert plan.transport_capacity == _QUEUE_CAPACITY
 
 
 def test_unjoined_create_task_site_is_rejected_as_unstructured(tmp_path: Path) -> None:

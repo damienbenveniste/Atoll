@@ -118,6 +118,12 @@ class _FakeTaskPreservingBackend:
         )
 
 
+class _FakeCallbackBackend(_FakeTaskPreservingBackend):
+    """Callback-shaped fake used to assert backend preference and fallback."""
+
+    name = "callback-backed-test"
+
+
 class _PlanTrialOutcome(Protocol):
     applied_plan_ids: tuple[str, ...]
     trials: tuple[ExecutionPlanTrial, ...]
@@ -288,6 +294,99 @@ def test_rejected_backend_records_unavailable_plan_without_staging(
     assert outcome.trials[0].status == "unavailable"
     assert outcome.trials[0].backend is None
     assert install_path.read_text(encoding="utf-8") == original_payload
+
+
+def test_callback_backend_is_preferred_when_both_backends_support_the_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The strict callback lowering receives the first disposable trial."""
+    context, _source_path, _install_path = _trial_context(tmp_path)
+    monkeypatch.setattr(
+        package_command,
+        "_EXECUTION_PLAN_BACKENDS",
+        (_FakeCallbackBackend(), _FakeTaskPreservingBackend()),
+    )
+    monkeypatch.setattr(package_command, "run_performance_command", _passing_semantics)
+    monkeypatch.setattr(package_command, "run_benchmark_gate", _passing_benchmark)
+
+    outcome = _apply_execution_plan_trials(context)
+
+    assert outcome.trials[0].status == "accepted"
+    assert outcome.trials[0].backend == "callback-backed-test"
+
+
+def test_task_preserving_backend_follows_a_callback_capability_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A strict callback rejection falls through to real-task lowering."""
+    context, _source_path, _install_path = _trial_context(tmp_path)
+    monkeypatch.setattr(
+        package_command,
+        "_EXECUTION_PLAN_BACKENDS",
+        (
+            _FakeCallbackBackend(assessment_status="unsupported"),
+            _FakeTaskPreservingBackend(),
+        ),
+    )
+    monkeypatch.setattr(package_command, "run_performance_command", _passing_semantics)
+    monkeypatch.setattr(package_command, "run_benchmark_gate", _passing_benchmark)
+
+    outcome = _apply_execution_plan_trials(context)
+
+    assert outcome.trials[0].status == "accepted"
+    assert outcome.trials[0].backend == "task-preserving-test"
+    assert [diagnostic.code for diagnostic in outcome.trials[0].diagnostics[:2]] == [
+        "backend-rejected",
+        "backend-supported",
+    ]
+
+
+def test_task_preserving_backend_follows_a_callback_semantic_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed speculative callback payload cannot suppress the safe backend."""
+    context, _source_path, install_path = _trial_context(tmp_path)
+    semantic_calls = 0
+
+    def semantics(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: RuntimeMode,
+        region_allowlist: frozenset[str] | None = None,
+    ) -> CommandRunEvidence:
+        nonlocal semantic_calls
+        semantic_calls += 1
+        runner = _failing_semantics if semantic_calls == 1 else _passing_semantics
+        return runner(
+            command,
+            project_root=project_root,
+            payload_root=payload_root,
+            mode=mode,
+            region_allowlist=region_allowlist,
+        )
+
+    monkeypatch.setattr(
+        package_command,
+        "_EXECUTION_PLAN_BACKENDS",
+        (_FakeCallbackBackend(), _FakeTaskPreservingBackend()),
+    )
+    monkeypatch.setattr(package_command, "run_performance_command", semantics)
+    monkeypatch.setattr(package_command, "run_benchmark_gate", _passing_benchmark)
+
+    outcome = _apply_execution_plan_trials(context)
+
+    assert [trial.status for trial in outcome.trials] == ["failed-semantics", "accepted"]
+    assert [trial.backend for trial in outcome.trials] == [
+        "callback-backed-test",
+        "task-preserving-test",
+    ]
+    assert outcome.applied_plan_ids == ("exec-plan-fixture",)
+    assert install_path.read_text(encoding="utf-8").endswith("# planned\n")
 
 
 def test_unreported_payload_change_rejects_plan_before_semantic_execution(

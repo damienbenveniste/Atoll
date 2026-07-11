@@ -225,6 +225,7 @@ def build_execution_plans(
 def _candidate_sites(scan: ModuleScan) -> tuple[_CandidateSite, ...]:
     source = scan.module.path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(scan.module.path), type_comments=True)
+    integer_constants = _module_integer_constants(tree)
     symbol_map = {symbol.id.qualname: symbol for symbol in scan.symbols}
     function_nodes = _function_nodes(tree)
     sites: list[_CandidateSite] = []
@@ -235,7 +236,7 @@ def _candidate_sites(scan: ModuleScan) -> tuple[_CandidateSite, ...]:
         spawns = _spawn_calls(node)
         if not spawns:
             continue
-        sites.append(_site_from_spawns(symbol, spawns, symbol_map, node))
+        sites.append(_site_from_spawns(symbol, spawns, symbol_map, node, integer_constants))
     return tuple(sites)
 
 
@@ -244,11 +245,11 @@ def _site_from_spawns(
     spawns: tuple[SpawnCall, ...],
     symbol_map: Mapping[str, SymbolRecord],
     node: ast.FunctionDef | ast.AsyncFunctionDef,
+    integer_constants: Mapping[str, int],
 ) -> _CandidateSite:
     dialect_names = {spawn.dialect for spawn in spawns}
     if len(dialect_names) != 1:
         return _rejected_site(owner, spawns, "ambiguous-spawn", "multiple scheduler dialects")
-    dialect = _dialect_by_name(spawns[0].dialect)
     callee_symbols = _resolved_callees(owner, spawns, symbol_map)
     if callee_symbols is None:
         return _rejected_site(owner, spawns, "ambiguous-spawn", "unresolved spawned callee")
@@ -267,17 +268,24 @@ def _site_from_spawns(
             "escaping-handle",
             "a spawned task handle escapes the orchestration callable",
         )
-    return _transport_site(owner, spawns, dialect, callee_symbols, node)
+    return _transport_site(
+        owner,
+        spawns,
+        callee_symbols,
+        node,
+        integer_constants,
+    )
 
 
 def _transport_site(
     owner: SymbolRecord,
     spawns: tuple[SpawnCall, ...],
-    dialect: SchedulerDialect,
     callee_symbols: tuple[SymbolRecord, ...],
     node: ast.FunctionDef | ast.AsyncFunctionDef,
+    integer_constants: Mapping[str, int],
 ) -> _CandidateSite:
-    transport = _private_transport(node)
+    dialect = _dialect_by_name(spawns[0].dialect)
+    transport = _private_transport(node, integer_constants)
     if transport is None:
         return _rejected_site(
             owner,
@@ -428,42 +436,61 @@ def _spawn_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[SpawnCal
 
 def _private_transport(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
+    integer_constants: Mapping[str, int],
 ) -> _TransportEvidence | None:
     for child in _walk_function_scope(node):
         if isinstance(child, ast.Assign):
-            transport = _transport_from_assign(child)
+            transport = _transport_from_assign(child, integer_constants)
             if transport is not None:
                 return transport
         if isinstance(child, ast.AnnAssign):
-            transport = _transport_from_ann_assign(child)
+            transport = _transport_from_ann_assign(child, integer_constants)
             if transport is not None:
                 return transport
     return None
 
 
-def _transport_from_assign(node: ast.Assign) -> _TransportEvidence | None:
+def _transport_from_assign(
+    node: ast.Assign,
+    integer_constants: Mapping[str, int],
+) -> _TransportEvidence | None:
     call_path = _call_path(node.value)
     if call_path is None:
         return None
     if call_path in (("asyncio", "Queue"), ("Queue",)):
         for target in node.targets:
             if isinstance(target, ast.Name):
-                capacity = _literal_capacity(node.value, default=0)
+                capacity = _literal_capacity(
+                    node.value,
+                    default=0,
+                    integer_constants=integer_constants,
+                )
                 if capacity is not None:
                     return _TransportEvidence(target.id, (target.id,), capacity)
     if call_path in (("anyio", "create_memory_object_stream"), ("create_memory_object_stream",)):
         for target in node.targets:
             endpoints = _tuple_names(target)
-            capacity = _literal_capacity(node.value, default=None)
+            capacity = _literal_capacity(
+                node.value,
+                default=None,
+                integer_constants=integer_constants,
+            )
             if len(endpoints) == _MEMORY_STREAM_ENDPOINTS and capacity is not None:
                 return _TransportEvidence("|".join(endpoints), endpoints, capacity)
     return None
 
 
-def _transport_from_ann_assign(node: ast.AnnAssign) -> _TransportEvidence | None:
+def _transport_from_ann_assign(
+    node: ast.AnnAssign,
+    integer_constants: Mapping[str, int],
+) -> _TransportEvidence | None:
     call_path = _call_path(node.value)
     if call_path in (("asyncio", "Queue"), ("Queue",)) and isinstance(node.target, ast.Name):
-        capacity = _literal_capacity(node.value, default=0)
+        capacity = _literal_capacity(
+            node.value,
+            default=0,
+            integer_constants=integer_constants,
+        )
         if capacity is not None:
             return _TransportEvidence(node.target.id, (node.target.id,), capacity)
     return None
@@ -539,7 +566,12 @@ def _symbol_uses_local_consumer(
     return any(call.target in consumer_targets for call in symbol.call_sites)
 
 
-def _literal_capacity(node: ast.expr | None, *, default: int | None) -> int | None:
+def _literal_capacity(
+    node: ast.expr | None,
+    *,
+    default: int | None,
+    integer_constants: Mapping[str, int],
+) -> int | None:
     if not isinstance(node, ast.Call):
         return None
     capacity_node: ast.expr | None = node.args[0] if node.args else None
@@ -552,7 +584,50 @@ def _literal_capacity(node: ast.expr | None, *, default: int | None) -> int | No
         return default
     if isinstance(capacity_node, ast.Constant) and isinstance(capacity_node.value, int):
         return capacity_node.value
+    if isinstance(capacity_node, ast.Name):
+        return integer_constants.get(capacity_node.id)
     return None
+
+
+def _module_integer_constants(tree: ast.Module) -> dict[str, int]:
+    """Return direct module-level integer constants usable in capacity expressions.
+
+    Only immutable literal bindings are retained. Imported values, arithmetic,
+    rebinding, and function-local assignments remain unresolved so discovery
+    cannot mistake runtime configuration for a statically fixed capacity.
+
+    Args:
+        tree: Parsed module containing scheduler workflows.
+
+    Returns:
+        dict[str, int]: Names bound exactly once to integer literals.
+    """
+    values: dict[str, int] = {}
+    invalid: set[str] = set()
+    for statement in tree.body:
+        name: str | None = None
+        value: ast.expr | None = None
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            name = statement.targets[0].id
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            name = statement.target.id
+            value = statement.value
+        if name is None:
+            continue
+        if name in values or name in invalid:
+            values.pop(name, None)
+            invalid.add(name)
+            continue
+        if isinstance(value, ast.Constant) and isinstance(value.value, int):
+            values[name] = value.value
+        else:
+            invalid.add(name)
+    return values
 
 
 def _transport_escapes(

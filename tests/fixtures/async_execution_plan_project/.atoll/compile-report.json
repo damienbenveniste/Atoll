@@ -1,0 +1,3229 @@
+{
+  "accepted_variants": [],
+  "applied_execution_plans": [],
+  "backend_decisions": [],
+  "build": {
+    "artifacts": [],
+    "cache_status": "disabled",
+    "command": [
+      "/Users/damienbenveniste/Projects/agentic-management/Atoll/.venv/bin/python",
+      "-I",
+      "-m",
+      "build",
+      "--wheel",
+      "--outdir",
+      "/Users/damienbenveniste/Projects/agentic-management/Atoll/tests/fixtures/async_execution_plan_project/.atoll/dist/build/pep517-dist"
+    ],
+    "duration_seconds": 2.7423234170419164,
+    "phase_timings": [
+      {
+        "detail": "source-clean project copy",
+        "duration_seconds": 0.0025344580062665045,
+        "name": "pep517_project_copy"
+      },
+      {
+        "detail": "exit 0",
+        "duration_seconds": 2.103404458001023,
+        "name": "pep517_wheel"
+      },
+      {
+        "detail": "async_execution_plan_project-0.1.0-py3-none-any.whl",
+        "duration_seconds": 0.0015600840270053595,
+        "name": "wheel_unpack"
+      },
+      {
+        "detail": "benchmark baseline",
+        "duration_seconds": 0.001245416991878301,
+        "name": "baseline_payload_copy"
+      },
+      {
+        "detail": "exit 0",
+        "duration_seconds": 0.30069333300343715,
+        "name": "profile_sampling"
+      },
+      {
+        "detail": "exit 0",
+        "duration_seconds": 0.33288566701230593,
+        "name": "profile_types"
+      }
+    ],
+    "stderr": "baseline profile found no credible hot project members in the compile scope",
+    "stdout": "running egg_info\ncreating src/async_execution_plan_project.egg-info\nwriting src/async_execution_plan_project.egg-info/PKG-INFO\nwriting dependency_links to src/async_execution_plan_project.egg-info/dependency_links.txt\nwriting top-level names to src/async_execution_plan_project.egg-info/top_level.txt\nwriting manifest file 'src/async_execution_plan_project.egg-info/SOURCES.txt'\nreading manifest file 'src/async_execution_plan_project.egg-info/SOURCES.txt'\nwriting manifest file 'src/async_execution_plan_project.egg-info/SOURCES.txt'\nrunning bdist_wheel\nrunning build\nrunning build_py\ncreating build/lib/execution_plan_fixture\ncopying src/execution_plan_fixture/__init__.py -> build/lib/execution_plan_fixture\ncopying src/execution_plan_fixture/workflow.py -> build/lib/execution_plan_fixture\nrunning egg_info\nwriting src/async_execution_plan_project.egg-info/PKG-INFO\nwriting dependency_links to src/async_execution_plan_project.egg-info/dependency_links.txt\nwriting top-level names to src/async_execution_plan_project.egg-info/top_level.txt\nreading manifest file 'src/async_execution_plan_project.egg-info/SOURCES.txt'\nwriting manifest file 'src/async_execution_plan_project.egg-info/SOURCES.txt'\ncopying src/execution_plan_fixture/py.typed -> build/lib/execution_plan_fixture\ninstalling to build/bdist.macosx-11.1-arm64/wheel\nrunning install\nrunning install_lib\ncreating build/bdist.macosx-11.1-arm64/wheel\ncreating build/bdist.macosx-11.1-arm64/wheel/execution_plan_fixture\ncopying build/lib/execution_plan_fixture/__init__.py -> build/bdist.macosx-11.1-arm64/wheel/./execution_plan_fixture\ncopying build/lib/execution_plan_fixture/py.typed -> build/bdist.macosx-11.1-arm64/wheel/./execution_plan_fixture\ncopying build/lib/execution_plan_fixture/workflow.py -> build/bdist.macosx-11.1-arm64/wheel/./execution_plan_fixture\nrunning install_egg_info\nCopying src/async_execution_plan_project.egg-info to build/bdist.macosx-11.1-arm64/wheel/./async_execution_plan_project-0.1.0-py3.12.egg-info\nrunning install_scripts\ncreating build/bdist.macosx-11.1-arm64/wheel/async_execution_plan_project-0.1.0.dist-info/WHEEL\ncreating '/Users/damienbenveniste/Projects/agentic-management/Atoll/tests/fixtures/async_execution_plan_project/.atoll/dist/build/pep517-dist/.tmp-ox6czj6z/async_execution_plan_project-0.1.0-py3-none-any.whl' and adding 'build/bdist.macosx-11.1-arm64/wheel' to it\nadding 'execution_plan_fixture/__init__.py'\nadding 'execution_plan_fixture/py.typed'\nadding 'execution_plan_fixture/workflow.py'\nadding 'async_execution_plan_project-0.1.0.dist-info/METADATA'\nadding 'async_execution_plan_project-0.1.0.dist-info/WHEEL'\nadding 'async_execution_plan_project-0.1.0.dist-info/top_level.txt'\nadding 'async_execution_plan_project-0.1.0.dist-info/RECORD'\nremoving build/bdist.macosx-11.1-arm64/wheel\nSuccessfully built async_execution_plan_project-0.1.0-py3-none-any.whl\n",
+    "success": false,
+    "support_artifacts": []
+  },
+  "candidate_trials": [],
+  "cleanup": {
+    "kept": [
+      ".atoll/dist/build",
+      ".atoll/dist/install"
+    ],
+    "removed": []
+  },
+  "compiled_regions": [],
+  "execution_plan_trials": [],
+  "execution_plans": [
+    {
+      "callsite_fingerprint": "396d958256c140db8d25b55e26da3f5d2d09be1f95fcb22d4e4923bac0a58a53",
+      "completion_transport": "queue",
+      "consumer": "execution_plan_fixture.workflow::run_supported_workflow",
+      "dialect": "asyncio",
+      "edges": [
+        {
+          "dst": "execution_plan_fixture.workflow::publish_immediate",
+          "kind": "spawns",
+          "lineno": 130,
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "transport": "queue"
+        },
+        {
+          "dst": "execution_plan_fixture.workflow::run_supported_workflow::transport::queue",
+          "kind": "produces",
+          "lineno": 130,
+          "src": "execution_plan_fixture.workflow::publish_immediate",
+          "transport": "queue"
+        },
+        {
+          "dst": "execution_plan_fixture.workflow::run_supported_workflow::reducer",
+          "kind": "delivers",
+          "lineno": 130,
+          "src": "execution_plan_fixture.workflow::run_supported_workflow::transport::queue",
+          "transport": "queue"
+        }
+      ],
+      "guarded_callable_identities": [
+        "asyncio.taskgroups.TaskGroup.create_task"
+      ],
+      "guards": [
+        {
+          "expression": "asyncio",
+          "kind": "scheduler",
+          "message": "scheduler dialect must match the discovered spawn semantics"
+        },
+        {
+          "expression": "queue",
+          "kind": "transport",
+          "message": "private transport must remain owned by the orchestration site"
+        },
+        {
+          "expression": "structured-task-group",
+          "kind": "topology",
+          "message": "all spawned work must remain joined before scope exit"
+        }
+      ],
+      "hotness": 3552,
+      "id": "exec-plan-6e3dd98b7fe7b256ebdbc919a974afd3",
+      "lifecycle_share": 1.0,
+      "lifecycle_starts": 3552,
+      "lowering_version": "asyncio-v1",
+      "nodes": [
+        {
+          "id": "execution_plan_fixture.workflow::run_supported_workflow",
+          "lineno": 114,
+          "role": "orchestrator",
+          "symbol": "execution_plan_fixture.workflow::run_supported_workflow"
+        },
+        {
+          "id": "execution_plan_fixture.workflow::publish_immediate",
+          "lineno": 90,
+          "role": "producer",
+          "symbol": "execution_plan_fixture.workflow::publish_immediate"
+        },
+        {
+          "id": "execution_plan_fixture.workflow::run_supported_workflow::transport::queue",
+          "lineno": 130,
+          "role": "transport",
+          "symbol": null
+        },
+        {
+          "id": "execution_plan_fixture.workflow::run_supported_workflow::reducer",
+          "lineno": 114,
+          "role": "reducer",
+          "symbol": "execution_plan_fixture.workflow::run_supported_workflow"
+        }
+      ],
+      "observed_invocations": 3552,
+      "ordering_policy": "completion-order",
+      "owner": "execution_plan_fixture.workflow::run_supported_workflow",
+      "reducer": "execution_plan_fixture.workflow::run_supported_workflow",
+      "rejections": [],
+      "source_hash": "9d1ed46340033257340447e72b78bc4b4028fd510c3859776adde167f9cb98c9",
+      "source_module": "execution_plan_fixture.workflow",
+      "status": "selected",
+      "task_ownership": "structured",
+      "topology_fingerprint": "c935f2f93b4196e7f2f7c4ce5e65cdcd17244eb9639705154aec1a444a751583",
+      "transport_capacity": 4
+    },
+    {
+      "callsite_fingerprint": null,
+      "completion_transport": null,
+      "consumer": null,
+      "dialect": "asyncio",
+      "edges": [],
+      "guarded_callable_identities": [],
+      "guards": [],
+      "hotness": 0,
+      "id": "exec-plan-rejection-0fb5a2abce494ef8",
+      "lifecycle_share": 0.0,
+      "lifecycle_starts": 0,
+      "lowering_version": null,
+      "nodes": [],
+      "observed_invocations": 0,
+      "ordering_policy": null,
+      "owner": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+      "reducer": null,
+      "rejections": [
+        {
+          "code": "ambiguous-spawn",
+          "reason": "unresolved spawned callee"
+        }
+      ],
+      "source_hash": null,
+      "source_module": "execution_plan_fixture.workflow",
+      "status": "rejected",
+      "task_ownership": null,
+      "topology_fingerprint": null,
+      "transport_capacity": null
+    },
+    {
+      "callsite_fingerprint": null,
+      "completion_transport": null,
+      "consumer": null,
+      "dialect": "asyncio",
+      "edges": [],
+      "guarded_callable_identities": [],
+      "guards": [],
+      "hotness": 0,
+      "id": "exec-plan-rejection-157e3eda3c577e7b",
+      "lifecycle_share": 0.0,
+      "lifecycle_starts": 0,
+      "lowering_version": null,
+      "nodes": [],
+      "observed_invocations": 0,
+      "ordering_policy": null,
+      "owner": "execution_plan_fixture.workflow::cold_cancellation_workflow",
+      "reducer": null,
+      "rejections": [
+        {
+          "code": "ambiguous-spawn",
+          "reason": "unresolved spawned callee"
+        }
+      ],
+      "source_hash": null,
+      "source_module": "execution_plan_fixture.workflow",
+      "status": "rejected",
+      "task_ownership": null,
+      "topology_fingerprint": null,
+      "transport_capacity": null
+    }
+  ],
+  "fusion_plans": [],
+  "fusion_trials": [],
+  "islands": [],
+  "mode": "source-clean",
+  "module_filter": null,
+  "native_readiness": [],
+  "operation": "compile",
+  "performance": {
+    "baseline_median_seconds": null,
+    "compiled_median_seconds": null,
+    "minimum_speedup": 1.1,
+    "reason": "baseline profile found no credible hot project members in the compile scope",
+    "samples": [],
+    "speedup": null,
+    "status": "invalid",
+    "warmups": []
+  },
+  "preflight_blockers": [],
+  "profile": {
+    "candidate_mapping_decisions": [
+      {
+        "coverage": 0.007462686567164179,
+        "module": "execution_plan_fixture.workflow",
+        "qualname": "_capture_immediate_failure",
+        "reason": "below-threshold",
+        "samples": 1,
+        "selected": false,
+        "symbol": "execution_plan_fixture.workflow::_capture_immediate_failure"
+      },
+      {
+        "coverage": 0.007462686567164179,
+        "module": "execution_plan_fixture.workflow",
+        "qualname": "_context_isolation_probe",
+        "reason": "below-threshold",
+        "samples": 1,
+        "selected": false,
+        "symbol": "execution_plan_fixture.workflow::_context_isolation_probe"
+      },
+      {
+        "coverage": 0.007462686567164179,
+        "module": "execution_plan_fixture.workflow",
+        "qualname": "run_supported_workflow",
+        "reason": "below-threshold",
+        "samples": 1,
+        "selected": false,
+        "symbol": "execution_plan_fixture.workflow::run_supported_workflow"
+      },
+      {
+        "coverage": 0.0,
+        "module": "execution_plan_fixture.workflow",
+        "qualname": "cold_cancellation_workflow",
+        "reason": "below-threshold",
+        "samples": 0,
+        "selected": false,
+        "symbol": "execution_plan_fixture.workflow::cold_cancellation_workflow"
+      },
+      {
+        "coverage": 0.0,
+        "module": "execution_plan_fixture.workflow",
+        "qualname": "cold_custom_task_factory_workflow",
+        "reason": "below-threshold",
+        "samples": 0,
+        "selected": false,
+        "symbol": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow"
+      },
+      {
+        "coverage": 0.0,
+        "module": "execution_plan_fixture.workflow",
+        "qualname": "publish_immediate",
+        "reason": "below-threshold",
+        "samples": 0,
+        "selected": false,
+        "symbol": "execution_plan_fixture.workflow::publish_immediate"
+      }
+    ],
+    "child_passes": [
+      {
+        "command": [
+          "/Users/damienbenveniste/Projects/agentic-management/Atoll/.venv/bin/python",
+          "/Users/damienbenveniste/Projects/agentic-management/Atoll/src/atoll/runtime/_profile_bootstrap.py",
+          "/Users/damienbenveniste/Projects/agentic-management/Atoll/tests/fixtures/async_execution_plan_project/.atoll/dist/build/profile/atoll-profile-15560-169309893543250-sampling.config.json"
+        ],
+        "duration_seconds": 0.30069333300343715,
+        "pass_kind": "sampling",
+        "returncode": 0
+      },
+      {
+        "command": [
+          "/Users/damienbenveniste/Projects/agentic-management/Atoll/.venv/bin/python",
+          "/Users/damienbenveniste/Projects/agentic-management/Atoll/src/atoll/runtime/_profile_bootstrap.py",
+          "/Users/damienbenveniste/Projects/agentic-management/Atoll/tests/fixtures/async_execution_plan_project/.atoll/dist/build/profile/atoll-profile-15560-169310194892208-types.config.json"
+        ],
+        "duration_seconds": 0.33288566701230593,
+        "pass_kind": "types",
+        "returncode": 0
+      }
+    ],
+    "launch_kind": "script",
+    "lifecycle": {
+      "resume": 3552,
+      "return_": 7104,
+      "start": 7104,
+      "throw": 0,
+      "unwind": 0,
+      "yield_": 3552
+    },
+    "mapped_coverage": 0.022388059701492536,
+    "mapped_project_samples": 3,
+    "members": [
+      {
+        "call_count": 256,
+        "completed_calls": 1184,
+        "coverage": 0.007462686567164179,
+        "invocation_count": 1184,
+        "lifecycle": {
+          "resume": 0,
+          "return_": 1184,
+          "start": 1184,
+          "throw": 0,
+          "unwind": 0,
+          "yield_": 0
+        },
+        "max_active_calls": 1,
+        "module": "execution_plan_fixture.workflow",
+        "observation_capped": true,
+        "polymorphic": false,
+        "pre_completion_suspensions": 0,
+        "qualname": "_capture_immediate_failure",
+        "samples": 1,
+        "signatures": [
+          {
+            "count": 256,
+            "parameters": [
+              {
+                "count": 256,
+                "parameter_name": "label",
+                "type_path": "builtins.str"
+              },
+              {
+                "count": 256,
+                "parameter_name": "evidence",
+                "type_path": "builtins.dict"
+              }
+            ]
+          }
+        ],
+        "symbol": "execution_plan_fixture.workflow::_capture_immediate_failure"
+      },
+      {
+        "call_count": 256,
+        "completed_calls": 1184,
+        "coverage": 0.007462686567164179,
+        "invocation_count": 1184,
+        "lifecycle": {
+          "resume": 1184,
+          "return_": 1184,
+          "start": 1184,
+          "throw": 0,
+          "unwind": 0,
+          "yield_": 1184
+        },
+        "max_active_calls": 1,
+        "module": "execution_plan_fixture.workflow",
+        "observation_capped": true,
+        "polymorphic": false,
+        "pre_completion_suspensions": 1184,
+        "qualname": "_context_isolation_probe",
+        "samples": 1,
+        "signatures": [
+          {
+            "count": 256,
+            "parameters": []
+          }
+        ],
+        "symbol": "execution_plan_fixture.workflow::_context_isolation_probe"
+      },
+      {
+        "call_count": 256,
+        "completed_calls": 1184,
+        "coverage": 0.007462686567164179,
+        "invocation_count": 1184,
+        "lifecycle": {
+          "resume": 2368,
+          "return_": 1184,
+          "start": 1184,
+          "throw": 0,
+          "unwind": 0,
+          "yield_": 2368
+        },
+        "max_active_calls": 1,
+        "module": "execution_plan_fixture.workflow",
+        "observation_capped": true,
+        "polymorphic": false,
+        "pre_completion_suspensions": 2368,
+        "qualname": "run_supported_workflow",
+        "samples": 1,
+        "signatures": [
+          {
+            "count": 256,
+            "parameters": []
+          }
+        ],
+        "symbol": "execution_plan_fixture.workflow::run_supported_workflow"
+      },
+      {
+        "call_count": 0,
+        "completed_calls": 0,
+        "coverage": 0.0,
+        "invocation_count": 0,
+        "lifecycle": {
+          "resume": 0,
+          "return_": 0,
+          "start": 0,
+          "throw": 0,
+          "unwind": 0,
+          "yield_": 0
+        },
+        "max_active_calls": 0,
+        "module": "execution_plan_fixture.workflow",
+        "observation_capped": false,
+        "polymorphic": false,
+        "pre_completion_suspensions": 0,
+        "qualname": "cold_cancellation_workflow",
+        "samples": 0,
+        "signatures": [],
+        "symbol": "execution_plan_fixture.workflow::cold_cancellation_workflow"
+      },
+      {
+        "call_count": 0,
+        "completed_calls": 0,
+        "coverage": 0.0,
+        "invocation_count": 0,
+        "lifecycle": {
+          "resume": 0,
+          "return_": 0,
+          "start": 0,
+          "throw": 0,
+          "unwind": 0,
+          "yield_": 0
+        },
+        "max_active_calls": 0,
+        "module": "execution_plan_fixture.workflow",
+        "observation_capped": false,
+        "polymorphic": false,
+        "pre_completion_suspensions": 0,
+        "qualname": "cold_custom_task_factory_workflow",
+        "samples": 0,
+        "signatures": [],
+        "symbol": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow"
+      },
+      {
+        "call_count": 256,
+        "completed_calls": 3552,
+        "coverage": 0.0,
+        "invocation_count": 3552,
+        "lifecycle": {
+          "resume": 0,
+          "return_": 3552,
+          "start": 3552,
+          "throw": 0,
+          "unwind": 0,
+          "yield_": 0
+        },
+        "max_active_calls": 1,
+        "module": "execution_plan_fixture.workflow",
+        "observation_capped": true,
+        "polymorphic": false,
+        "pre_completion_suspensions": 0,
+        "qualname": "publish_immediate",
+        "samples": 0,
+        "signatures": [
+          {
+            "count": 256,
+            "parameters": [
+              {
+                "count": 256,
+                "parameter_name": "queue",
+                "type_path": "asyncio.queues.Queue"
+              },
+              {
+                "count": 256,
+                "parameter_name": "item",
+                "type_path": "builtins.dict"
+              }
+            ]
+          }
+        ],
+        "symbol": "execution_plan_fixture.workflow::publish_immediate"
+      }
+    ],
+    "reason": "baseline profile collected",
+    "sampling_policy": {
+      "interval_ms": 2,
+      "mode": "statistical leaf-frame sampling"
+    },
+    "selected_hot_coverage": 0.0,
+    "selected_hot_samples": 0,
+    "selected_symbols": [],
+    "spawn_sites": [
+      {
+        "callable_identities": [],
+        "col_offset": 11,
+        "end_col_offset": 49,
+        "end_lineno": 242,
+        "id": "spawn-site-3a672f7d673f40610677f9e5",
+        "invocation_count": 0,
+        "lineno": 242,
+        "owner": "execution_plan_fixture.workflow::cold_cancellation_workflow",
+        "scheduler_method": "create_task"
+      },
+      {
+        "callable_identities": [],
+        "col_offset": 15,
+        "end_col_offset": 70,
+        "end_lineno": 233,
+        "id": "spawn-site-7fea3d75985c87d29bc0043c",
+        "invocation_count": 0,
+        "lineno": 233,
+        "owner": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+        "scheduler_method": "create_task"
+      },
+      {
+        "callable_identities": [
+          {
+            "count": 3552,
+            "identity": "asyncio.taskgroups.TaskGroup.create_task"
+          }
+        ],
+        "col_offset": 12,
+        "end_col_offset": 61,
+        "end_lineno": 130,
+        "id": "spawn-site-e70b56d04da86a478933d337",
+        "invocation_count": 3552,
+        "lineno": 130,
+        "owner": "execution_plan_fixture.workflow::run_supported_workflow",
+        "scheduler_method": "create_task"
+      }
+    ],
+    "status": "profiled",
+    "total_samples": 134
+  },
+  "project_root": "/Users/damienbenveniste/Projects/agentic-management/Atoll/tests/fixtures/async_execution_plan_project",
+  "rejected_variants": [],
+  "skipped_modules": [],
+  "success": false,
+  "summary": {
+    "artifacts": 0,
+    "compiled_regions": 0,
+    "duration_seconds": 2.7423234170419164,
+    "execution_applied_plans": 0,
+    "execution_plan_trials": 0,
+    "execution_plans": 3,
+    "execution_selected_plans": 1,
+    "fusion_eligible_plans": 0,
+    "fusion_plans": 0,
+    "fusion_trials": 0,
+    "islands": 0,
+    "native_ready_symbols": 0,
+    "native_rejected_symbols": 0,
+    "performance_status": "invalid",
+    "preflight_blockers": 0,
+    "profile_accepted_hot_coverage": 0.0,
+    "profile_mapped_coverage": 0.022388059701492536,
+    "profile_selected_hot_coverage": 0.0,
+    "profile_status": "profiled",
+    "semantic_test_failures": 0,
+    "semantic_tests_run": true,
+    "skipped_modules": 0,
+    "subprocess_verification_failures": 0,
+    "subprocess_verifications": 0,
+    "support_artifacts": 0,
+    "symbols": 0,
+    "typed_regions": 9,
+    "verified": 0,
+    "verify_failures": 0
+  },
+  "suspension_plans": [
+    {
+      "blocks": [],
+      "execution_kind": "coroutine",
+      "id": "execution_plan_fixture.workflow::ControlledImmediateError:0fa7cb07119a:execution_plan_fixture.workflow::_capture_immediate_failure",
+      "lowering_mode": "interpreted",
+      "member": "execution_plan_fixture.workflow::_capture_immediate_failure",
+      "native_helpers": [],
+      "points": [
+        {
+          "col_offset": 8,
+          "end_col_offset": 35,
+          "end_lineno": 142,
+          "kind": "await",
+          "lineno": 142
+        }
+      ],
+      "reason": "no accepted compiled binding replaced this callable",
+      "region_id": "execution_plan_fixture.workflow::ControlledImmediateError:0fa7cb07119a",
+      "rejections": []
+    },
+    {
+      "blocks": [
+        {
+          "eligible": true,
+          "end_col_offset": 5,
+          "end_lineno": 14,
+          "id": "susp-052082631748553e",
+          "late_bound_globals": [
+            "QUEUE_CAPACITY",
+            "TracebackEvidence",
+            "WorkItem",
+            "asyncio"
+          ],
+          "live_ins": [
+            "QUEUE_CAPACITY",
+            "TracebackEvidence",
+            "WorkItem",
+            "asyncio"
+          ],
+          "live_outs": [
+            "queue",
+            "traceback_evidence"
+          ],
+          "loop_count": 0,
+          "operation_count": 5,
+          "receiver_dependencies": [],
+          "rejections": [],
+          "start_col_offset": 4,
+          "start_lineno": 2
+        }
+      ],
+      "execution_kind": "coroutine",
+      "id": "execution_plan_fixture.workflow::ControlledImmediateError:0fa7cb07119a:execution_plan_fixture.workflow::run_supported_workflow",
+      "lowering_mode": "interpreted",
+      "member": "execution_plan_fixture.workflow::run_supported_workflow",
+      "native_helpers": [],
+      "points": [
+        {
+          "col_offset": 4,
+          "end_col_offset": 78,
+          "end_lineno": 131,
+          "kind": "async_with",
+          "lineno": 128
+        },
+        {
+          "col_offset": 19,
+          "end_col_offset": 36,
+          "end_lineno": 131,
+          "kind": "await",
+          "lineno": 131
+        },
+        {
+          "col_offset": 4,
+          "end_col_offset": 67,
+          "end_lineno": 133,
+          "kind": "await",
+          "lineno": 133
+        }
+      ],
+      "reason": "no accepted compiled binding replaced this callable",
+      "region_id": "execution_plan_fixture.workflow::ControlledImmediateError:0fa7cb07119a",
+      "rejections": []
+    },
+    {
+      "blocks": [
+        {
+          "eligible": true,
+          "end_col_offset": 47,
+          "end_lineno": 6,
+          "id": "susp-692418dccb6ef937",
+          "late_bound_globals": [
+            "_custom_task_factory",
+            "asyncio"
+          ],
+          "live_ins": [
+            "_custom_task_factory",
+            "asyncio"
+          ],
+          "live_outs": [
+            "loop",
+            "previous_factory"
+          ],
+          "loop_count": 0,
+          "operation_count": 5,
+          "receiver_dependencies": [],
+          "rejections": [],
+          "start_col_offset": 4,
+          "start_lineno": 2
+        }
+      ],
+      "execution_kind": "coroutine",
+      "id": "execution_plan_fixture.workflow::_custom_task_factory:55bb935d65e1:execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+      "lowering_mode": "interpreted",
+      "member": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+      "native_helpers": [],
+      "points": [
+        {
+          "col_offset": 15,
+          "end_col_offset": 25,
+          "end_lineno": 234,
+          "kind": "await",
+          "lineno": 234
+        }
+      ],
+      "reason": "no accepted compiled binding replaced this callable",
+      "region_id": "execution_plan_fixture.workflow::_custom_task_factory:55bb935d65e1",
+      "rejections": []
+    },
+    {
+      "blocks": [],
+      "execution_kind": "generator",
+      "id": "execution_plan_fixture.workflow::_side_effecting_values:057c357664c0:execution_plan_fixture.workflow::_side_effecting_values",
+      "lowering_mode": "interpreted",
+      "member": "execution_plan_fixture.workflow::_side_effecting_values",
+      "native_helpers": [],
+      "points": [
+        {
+          "col_offset": 8,
+          "end_col_offset": 22,
+          "end_lineno": 274,
+          "kind": "yield",
+          "lineno": 274
+        }
+      ],
+      "reason": "no accepted compiled binding replaced this callable",
+      "region_id": "execution_plan_fixture.workflow::_side_effecting_values:057c357664c0",
+      "rejections": []
+    },
+    {
+      "blocks": [
+        {
+          "eligible": true,
+          "end_col_offset": 17,
+          "end_lineno": 5,
+          "id": "susp-354bf0ea0f85dd67",
+          "late_bound_globals": [
+            "asyncio"
+          ],
+          "live_ins": [
+            "asyncio"
+          ],
+          "live_outs": [
+            "task"
+          ],
+          "loop_count": 0,
+          "operation_count": 4,
+          "receiver_dependencies": [],
+          "rejections": [],
+          "start_col_offset": 4,
+          "start_lineno": 2
+        }
+      ],
+      "execution_kind": "coroutine",
+      "id": "execution_plan_fixture.workflow::cold_cancellation_workflow:ba3047ada71d:execution_plan_fixture.workflow::cold_cancellation_workflow",
+      "lowering_mode": "interpreted",
+      "member": "execution_plan_fixture.workflow::cold_cancellation_workflow",
+      "native_helpers": [],
+      "points": [
+        {
+          "col_offset": 8,
+          "end_col_offset": 18,
+          "end_lineno": 245,
+          "kind": "await",
+          "lineno": 245
+        }
+      ],
+      "reason": "no accepted compiled binding replaced this callable",
+      "region_id": "execution_plan_fixture.workflow::cold_cancellation_workflow:ba3047ada71d",
+      "rejections": []
+    },
+    {
+      "blocks": [
+        {
+          "eligible": false,
+          "end_col_offset": 73,
+          "end_lineno": 2,
+          "id": "susp-6e9613e61986da40",
+          "late_bound_globals": [],
+          "live_ins": [],
+          "live_outs": [],
+          "loop_count": 0,
+          "operation_count": 0,
+          "receiver_dependencies": [],
+          "rejections": [
+            {
+              "code": "not_credible",
+              "lineno": 2,
+              "message": "block lacks loop or repeated-operation work signal"
+            }
+          ],
+          "start_col_offset": 4,
+          "start_lineno": 2
+        }
+      ],
+      "execution_kind": "coroutine",
+      "id": "execution_plan_fixture.workflow::cold_suspension_workflow:aa52e4b23edf:execution_plan_fixture.workflow::cold_suspension_workflow",
+      "lowering_mode": "interpreted",
+      "member": "execution_plan_fixture.workflow::cold_suspension_workflow",
+      "native_helpers": [],
+      "points": [
+        {
+          "col_offset": 4,
+          "end_col_offset": 26,
+          "end_lineno": 216,
+          "kind": "await",
+          "lineno": 216
+        }
+      ],
+      "reason": "no accepted compiled binding replaced this callable",
+      "region_id": "execution_plan_fixture.workflow::cold_suspension_workflow:aa52e4b23edf",
+      "rejections": []
+    }
+  ],
+  "test_results": [
+    {
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-q"
+      ],
+      "duration_seconds": 0.11678725000820123,
+      "mode": "baseline",
+      "payload_root": ".atoll/dist/build/baseline-install",
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ".                                                                        [100%]\n1 passed in 0.02s\n",
+      "success": true
+    }
+  ],
+  "tests": null,
+  "tool": "atoll",
+  "typed_regions": [
+    {
+      "atomic_class": true,
+      "bindings": [
+        {
+          "compiled_name": "ControlledImmediateError",
+          "execution_kind": "class",
+          "guards": [],
+          "kind": "class",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::ControlledImmediateError",
+          "target_owner_class": null
+        },
+        {
+          "compiled_name": "TracebackEvidence",
+          "execution_kind": "class",
+          "guards": [],
+          "kind": "class",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::TracebackEvidence",
+          "target_owner_class": null
+        },
+        {
+          "compiled_name": "WorkItem",
+          "execution_kind": "class",
+          "guards": [],
+          "kind": "class",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::WorkItem",
+          "target_owner_class": null
+        },
+        {
+          "compiled_name": "_capture_immediate_failure",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "target_owner_class": null
+        },
+        {
+          "compiled_name": "_successful_items",
+          "execution_kind": "sync",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::_successful_items",
+          "target_owner_class": null
+        },
+        {
+          "compiled_name": "fail_immediate",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::fail_immediate",
+          "target_owner_class": null
+        },
+        {
+          "compiled_name": "publish_immediate",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::publish_immediate",
+          "target_owner_class": null
+        },
+        {
+          "compiled_name": "run_supported_workflow",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::run_supported_workflow",
+          "target_owner_class": null
+        }
+      ],
+      "decisions": [
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::ControlledImmediateError"
+        },
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::TracebackEvidence"
+        },
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::WorkItem"
+        },
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::_capture_immediate_failure"
+        },
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::_successful_items"
+        },
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::fail_immediate"
+        },
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::publish_immediate"
+        },
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::run_supported_workflow"
+        }
+      ],
+      "dependencies": [
+        {
+          "confidence": "medium",
+          "dst": "typing.TypedDict",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::TracebackEvidence",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "typing.TypedDict",
+          "invocation_mode": null,
+          "kind": "inherits",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::TracebackEvidence",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "typing.TypedDict",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::TracebackEvidence",
+          "type_only": true
+        },
+        {
+          "confidence": "medium",
+          "dst": "typing.TypedDict",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::WorkItem",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "typing.TypedDict",
+          "invocation_mode": null,
+          "kind": "inherits",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::WorkItem",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "typing.TypedDict",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::WorkItem",
+          "type_only": true
+        },
+        {
+          "confidence": "low",
+          "dst": "RuntimeError",
+          "invocation_mode": null,
+          "kind": "inherits",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::ControlledImmediateError",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::publish_immediate",
+          "type_only": true
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::WorkItem",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::publish_immediate",
+          "type_only": true
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::ControlledImmediateError",
+          "invocation_mode": "ordinary",
+          "kind": "calls",
+          "lineno": 111,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::fail_immediate",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::ControlledImmediateError",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::fail_immediate",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": "ordinary",
+          "kind": "imports",
+          "lineno": 122,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::TracebackEvidence",
+          "invocation_mode": "ordinary",
+          "kind": "calls",
+          "lineno": 123,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": "ordinary",
+          "kind": "imports",
+          "lineno": 128,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::_successful_items",
+          "invocation_mode": "ordinary",
+          "kind": "calls",
+          "lineno": 129,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::publish_immediate",
+          "invocation_mode": "ordinary",
+          "kind": "calls",
+          "lineno": 130,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::_successful_items",
+          "invocation_mode": "ordinary",
+          "kind": "calls",
+          "lineno": 131,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "invocation_mode": "awaited",
+          "kind": "calls",
+          "lineno": 133,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "QUEUE_CAPACITY",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::TracebackEvidence",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::WorkItem",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::_successful_items",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::publish_immediate",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::TracebackEvidence",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": true
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::WorkItem",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::run_supported_workflow",
+          "type_only": true
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::fail_immediate",
+          "invocation_mode": "awaited",
+          "kind": "calls",
+          "lineno": 142,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "traceback",
+          "invocation_mode": "ordinary",
+          "kind": "imports",
+          "lineno": 144,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::ControlledImmediateError",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::fail_immediate",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "traceback",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::TracebackEvidence",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "type_only": true
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::WorkItem",
+          "invocation_mode": "ordinary",
+          "kind": "calls",
+          "lineno": 195,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_successful_items",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::WorkItem",
+          "invocation_mode": "ordinary",
+          "kind": "calls",
+          "lineno": 196,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_successful_items",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::WorkItem",
+          "invocation_mode": "ordinary",
+          "kind": "calls",
+          "lineno": 197,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_successful_items",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::WorkItem",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_successful_items",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::WorkItem",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::_successful_items",
+          "type_only": true
+        }
+      ],
+      "id": "execution_plan_fixture.workflow::ControlledImmediateError:0fa7cb07119a",
+      "members": [
+        {
+          "binding_kind": "class",
+          "call_sites": [],
+          "execution_kind": "class",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::ControlledImmediateError",
+          "kind": "class",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": null,
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        },
+        {
+          "binding_kind": "class",
+          "call_sites": [],
+          "execution_kind": "class",
+          "fields": [
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "type"
+            },
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "message"
+            },
+            {
+              "annotation": "bool",
+              "class_variable": false,
+              "default_source": null,
+              "name": "producer_frame"
+            }
+          ],
+          "id": "execution_plan_fixture.workflow::TracebackEvidence",
+          "kind": "class",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": null,
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        },
+        {
+          "binding_kind": "class",
+          "call_sites": [],
+          "execution_kind": "class",
+          "fields": [
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "label"
+            },
+            {
+              "annotation": "int",
+              "class_variable": false,
+              "default_source": null,
+              "name": "value"
+            }
+          ],
+          "id": "execution_plan_fixture.workflow::WorkItem",
+          "kind": "class",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": null,
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        },
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 14,
+              "end_col_offset": 35,
+              "end_lineno": 142,
+              "invocation_mode": "awaited",
+              "lineno": 142,
+              "requires_same_unit": false,
+              "root_name": "fail_immediate",
+              "target": "fail_immediate"
+            },
+            {
+              "col_offset": 18,
+              "end_col_offset": 66,
+              "end_lineno": 144,
+              "invocation_mode": "ordinary",
+              "lineno": 144,
+              "requires_same_unit": false,
+              "root_name": "traceback",
+              "target": "traceback.TracebackException.from_exception"
+            },
+            {
+              "col_offset": 27,
+              "end_col_offset": 36,
+              "end_lineno": 145,
+              "invocation_mode": "ordinary",
+              "lineno": 145,
+              "requires_same_unit": false,
+              "root_name": "type",
+              "target": "type"
+            },
+            {
+              "col_offset": 30,
+              "end_col_offset": 38,
+              "end_lineno": 146,
+              "invocation_mode": "ordinary",
+              "lineno": 146,
+              "requires_same_unit": false,
+              "root_name": "str",
+              "target": "str"
+            },
+            {
+              "col_offset": 37,
+              "end_col_offset": 99,
+              "end_lineno": 147,
+              "invocation_mode": "ordinary",
+              "lineno": 147,
+              "requires_same_unit": false,
+              "root_name": "any",
+              "target": "any"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::_capture_immediate_failure",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [
+            {
+              "annotation": "str",
+              "default_source": null,
+              "kind": "positional",
+              "name": "label"
+            },
+            {
+              "annotation": "TracebackEvidence",
+              "default_source": null,
+              "kind": "positional",
+              "name": "evidence"
+            }
+          ],
+          "return_annotation": "None",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [
+            {
+              "col_offset": 8,
+              "end_col_offset": 35,
+              "end_lineno": 142,
+              "kind": "await",
+              "lineno": 142
+            }
+          ],
+          "type_parameter_records": [],
+          "type_parameters": []
+        },
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 8,
+              "end_col_offset": 40,
+              "end_lineno": 195,
+              "invocation_mode": "ordinary",
+              "lineno": 195,
+              "requires_same_unit": false,
+              "root_name": "WorkItem",
+              "target": "WorkItem"
+            },
+            {
+              "col_offset": 8,
+              "end_col_offset": 39,
+              "end_lineno": 196,
+              "invocation_mode": "ordinary",
+              "lineno": 196,
+              "requires_same_unit": false,
+              "root_name": "WorkItem",
+              "target": "WorkItem"
+            },
+            {
+              "col_offset": 8,
+              "end_col_offset": 40,
+              "end_lineno": 197,
+              "invocation_mode": "ordinary",
+              "lineno": 197,
+              "requires_same_unit": false,
+              "root_name": "WorkItem",
+              "target": "WorkItem"
+            }
+          ],
+          "execution_kind": "sync",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::_successful_items",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": "tuple[WorkItem, ...]",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        },
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 10,
+              "end_col_offset": 57,
+              "end_lineno": 111,
+              "invocation_mode": "ordinary",
+              "lineno": 111,
+              "requires_same_unit": false,
+              "root_name": "ControlledImmediateError",
+              "target": "ControlledImmediateError"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::fail_immediate",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [
+            {
+              "annotation": "str",
+              "default_source": null,
+              "kind": "positional",
+              "name": "label"
+            }
+          ],
+          "return_annotation": "None",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        },
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 4,
+              "end_col_offset": 26,
+              "end_lineno": 98,
+              "invocation_mode": "ordinary",
+              "lineno": 98,
+              "requires_same_unit": false,
+              "root_name": "queue",
+              "target": "queue.put_nowait"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::publish_immediate",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [
+            {
+              "annotation": "asyncio.Queue[WorkItem]",
+              "default_source": null,
+              "kind": "positional",
+              "name": "queue"
+            },
+            {
+              "annotation": "WorkItem",
+              "default_source": null,
+              "kind": "positional",
+              "name": "item"
+            }
+          ],
+          "return_annotation": "None",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        },
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 37,
+              "end_col_offset": 74,
+              "end_lineno": 122,
+              "invocation_mode": "ordinary",
+              "lineno": 122,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.Queue"
+            },
+            {
+              "col_offset": 25,
+              "end_col_offset": 5,
+              "end_lineno": 127,
+              "invocation_mode": "ordinary",
+              "lineno": 123,
+              "requires_same_unit": false,
+              "root_name": "TracebackEvidence",
+              "target": "TracebackEvidence"
+            },
+            {
+              "col_offset": 15,
+              "end_col_offset": 34,
+              "end_lineno": 128,
+              "invocation_mode": "ordinary",
+              "lineno": 128,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.TaskGroup"
+            },
+            {
+              "col_offset": 20,
+              "end_col_offset": 39,
+              "end_lineno": 129,
+              "invocation_mode": "ordinary",
+              "lineno": 129,
+              "requires_same_unit": false,
+              "root_name": "_successful_items",
+              "target": "_successful_items"
+            },
+            {
+              "col_offset": 12,
+              "end_col_offset": 61,
+              "end_lineno": 130,
+              "invocation_mode": "ordinary",
+              "lineno": 130,
+              "requires_same_unit": false,
+              "root_name": "group",
+              "target": "group.create_task"
+            },
+            {
+              "col_offset": 30,
+              "end_col_offset": 60,
+              "end_lineno": 130,
+              "invocation_mode": "ordinary",
+              "lineno": 130,
+              "requires_same_unit": false,
+              "root_name": "publish_immediate",
+              "target": "publish_immediate"
+            },
+            {
+              "col_offset": 46,
+              "end_col_offset": 77,
+              "end_lineno": 131,
+              "invocation_mode": "ordinary",
+              "lineno": 131,
+              "requires_same_unit": false,
+              "root_name": "range",
+              "target": "range"
+            },
+            {
+              "col_offset": 52,
+              "end_col_offset": 76,
+              "end_lineno": 131,
+              "invocation_mode": "ordinary",
+              "lineno": 131,
+              "requires_same_unit": false,
+              "root_name": "len",
+              "target": "len"
+            },
+            {
+              "col_offset": 56,
+              "end_col_offset": 75,
+              "end_lineno": 131,
+              "invocation_mode": "ordinary",
+              "lineno": 131,
+              "requires_same_unit": false,
+              "root_name": "_successful_items",
+              "target": "_successful_items"
+            },
+            {
+              "col_offset": 25,
+              "end_col_offset": 36,
+              "end_lineno": 131,
+              "invocation_mode": "awaited",
+              "lineno": 131,
+              "requires_same_unit": false,
+              "root_name": "queue",
+              "target": "queue.get"
+            },
+            {
+              "col_offset": 10,
+              "end_col_offset": 67,
+              "end_lineno": 133,
+              "invocation_mode": "awaited",
+              "lineno": 133,
+              "requires_same_unit": false,
+              "root_name": "_capture_immediate_failure",
+              "target": "_capture_immediate_failure"
+            },
+            {
+              "col_offset": 11,
+              "end_col_offset": 25,
+              "end_lineno": 134,
+              "invocation_mode": "ordinary",
+              "lineno": 134,
+              "requires_same_unit": false,
+              "root_name": "tuple",
+              "target": "tuple"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::run_supported_workflow",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": "tuple[tuple[WorkItem, ...], TracebackEvidence]",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [
+            {
+              "col_offset": 4,
+              "end_col_offset": 78,
+              "end_lineno": 131,
+              "kind": "async_with",
+              "lineno": 128
+            },
+            {
+              "col_offset": 19,
+              "end_col_offset": 36,
+              "end_lineno": 131,
+              "kind": "await",
+              "lineno": 131
+            },
+            {
+              "col_offset": 4,
+              "end_col_offset": 67,
+              "end_lineno": 133,
+              "kind": "await",
+              "lineno": 133
+            }
+          ],
+          "type_parameter_records": [],
+          "type_parameters": []
+        }
+      ],
+      "source_hash": "0fa7cb07119af55c9c7cd6426de19702e09dda582ae7eaed17ebf97013ff338e",
+      "specializations": [],
+      "type_bindings": [
+        {
+          "annotation": "RuntimeError",
+          "concrete": true,
+          "name": "ControlledImmediateError.base",
+          "source": "base",
+          "substitutions": []
+        },
+        {
+          "annotation": "TypedDict",
+          "concrete": true,
+          "name": "TracebackEvidence.base",
+          "source": "base",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "TracebackEvidence.type",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "TracebackEvidence.message",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "bool",
+          "concrete": true,
+          "name": "TracebackEvidence.producer_frame",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "TypedDict",
+          "concrete": true,
+          "name": "WorkItem.base",
+          "source": "base",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "WorkItem.label",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "int",
+          "concrete": true,
+          "name": "WorkItem.value",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "_capture_immediate_failure.label",
+          "source": "parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "TracebackEvidence",
+          "concrete": true,
+          "name": "_capture_immediate_failure.evidence",
+          "source": "parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "None",
+          "concrete": true,
+          "name": "_capture_immediate_failure.return",
+          "source": "return",
+          "substitutions": []
+        },
+        {
+          "annotation": "tuple[WorkItem, ...]",
+          "concrete": true,
+          "name": "_successful_items.return",
+          "source": "return",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "fail_immediate.label",
+          "source": "parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "None",
+          "concrete": true,
+          "name": "fail_immediate.return",
+          "source": "return",
+          "substitutions": []
+        },
+        {
+          "annotation": "asyncio.Queue[WorkItem]",
+          "concrete": true,
+          "name": "publish_immediate.queue",
+          "source": "parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "WorkItem",
+          "concrete": true,
+          "name": "publish_immediate.item",
+          "source": "parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "None",
+          "concrete": true,
+          "name": "publish_immediate.return",
+          "source": "return",
+          "substitutions": []
+        },
+        {
+          "annotation": "tuple[tuple[WorkItem, ...], TracebackEvidence]",
+          "concrete": true,
+          "name": "run_supported_workflow.return",
+          "source": "return",
+          "substitutions": []
+        }
+      ]
+    },
+    {
+      "atomic_class": true,
+      "bindings": [
+        {
+          "compiled_name": "SemanticSnapshot",
+          "execution_kind": "class",
+          "guards": [],
+          "kind": "class",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::SemanticSnapshot",
+          "target_owner_class": null
+        }
+      ],
+      "decisions": [
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::SemanticSnapshot"
+        }
+      ],
+      "dependencies": [
+        {
+          "confidence": "medium",
+          "dst": "typing.TypedDict",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::SemanticSnapshot",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "typing.TypedDict",
+          "invocation_mode": null,
+          "kind": "inherits",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::SemanticSnapshot",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "typing.TypedDict",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::SemanticSnapshot",
+          "type_only": true
+        }
+      ],
+      "id": "execution_plan_fixture.workflow::SemanticSnapshot:277033b74ee9",
+      "members": [
+        {
+          "binding_kind": "class",
+          "call_sites": [],
+          "execution_kind": "class",
+          "fields": [
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "workflow"
+            },
+            {
+              "annotation": "int",
+              "class_variable": false,
+              "default_source": null,
+              "name": "capacity"
+            },
+            {
+              "annotation": "int",
+              "class_variable": false,
+              "default_source": null,
+              "name": "total"
+            },
+            {
+              "annotation": "int",
+              "class_variable": false,
+              "default_source": null,
+              "name": "count"
+            },
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "first"
+            },
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "last"
+            },
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "exception_type"
+            },
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "exception_message"
+            },
+            {
+              "annotation": "bool",
+              "class_variable": false,
+              "default_source": null,
+              "name": "exception_frame_present"
+            },
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "context_parent"
+            },
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "context_child"
+            },
+            {
+              "annotation": "str",
+              "class_variable": false,
+              "default_source": null,
+              "name": "context_sibling"
+            },
+            {
+              "annotation": "int",
+              "class_variable": false,
+              "default_source": null,
+              "name": "cold_decoy_count"
+            }
+          ],
+          "id": "execution_plan_fixture.workflow::SemanticSnapshot",
+          "kind": "class",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": null,
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        }
+      ],
+      "source_hash": "277033b74ee9fa789db34a3a93610e83ea4da6141d01620c985b4b143d57705d",
+      "specializations": [],
+      "type_bindings": [
+        {
+          "annotation": "TypedDict",
+          "concrete": true,
+          "name": "SemanticSnapshot.base",
+          "source": "base",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "SemanticSnapshot.workflow",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "int",
+          "concrete": true,
+          "name": "SemanticSnapshot.capacity",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "int",
+          "concrete": true,
+          "name": "SemanticSnapshot.total",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "int",
+          "concrete": true,
+          "name": "SemanticSnapshot.count",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "SemanticSnapshot.first",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "SemanticSnapshot.last",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "SemanticSnapshot.exception_type",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "SemanticSnapshot.exception_message",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "bool",
+          "concrete": true,
+          "name": "SemanticSnapshot.exception_frame_present",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "SemanticSnapshot.context_parent",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "SemanticSnapshot.context_child",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "SemanticSnapshot.context_sibling",
+          "source": "field",
+          "substitutions": []
+        },
+        {
+          "annotation": "int",
+          "concrete": true,
+          "name": "SemanticSnapshot.cold_decoy_count",
+          "source": "field",
+          "substitutions": []
+        }
+      ]
+    },
+    {
+      "atomic_class": false,
+      "bindings": [
+        {
+          "compiled_name": "_cold_decoy_names",
+          "execution_kind": "sync",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::_cold_decoy_names",
+          "target_owner_class": null
+        }
+      ],
+      "decisions": [
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::_cold_decoy_names"
+        }
+      ],
+      "dependencies": [],
+      "id": "execution_plan_fixture.workflow::_cold_decoy_names:8a7278f5206f",
+      "members": [
+        {
+          "binding_kind": "module",
+          "call_sites": [],
+          "execution_kind": "sync",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::_cold_decoy_names",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": "tuple[str, ...]",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        }
+      ],
+      "source_hash": "8a7278f5206fd40bf1f877dc174f49753af4ffff122c753e9b76d2177e429054",
+      "specializations": [],
+      "type_bindings": [
+        {
+          "annotation": "tuple[str, ...]",
+          "concrete": true,
+          "name": "_cold_decoy_names.return",
+          "source": "return",
+          "substitutions": []
+        }
+      ]
+    },
+    {
+      "atomic_class": false,
+      "bindings": [
+        {
+          "compiled_name": "_custom_task_factory",
+          "execution_kind": "sync",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::_custom_task_factory",
+          "target_owner_class": null
+        },
+        {
+          "compiled_name": "cold_custom_task_factory_workflow",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+          "target_owner_class": null
+        }
+      ],
+      "decisions": [
+        {
+          "action": "fallback",
+          "reason": "generic declaration requires a concrete specialization",
+          "target": "execution_plan_fixture.workflow::_custom_task_factory"
+        },
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow"
+        }
+      ],
+      "dependencies": [
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": "ordinary",
+          "kind": "imports",
+          "lineno": 229,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": "ordinary",
+          "kind": "imports",
+          "lineno": 233,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::_custom_task_factory",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": "ordinary",
+          "kind": "imports",
+          "lineno": 282,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_custom_task_factory",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::_custom_task_factory",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::_custom_task_factory",
+          "type_only": true
+        },
+        {
+          "confidence": "medium",
+          "dst": "collections.abc.Coroutine",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::_custom_task_factory",
+          "type_only": true
+        },
+        {
+          "confidence": "low",
+          "dst": "T",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::_custom_task_factory",
+          "type_only": true
+        }
+      ],
+      "id": "execution_plan_fixture.workflow::_custom_task_factory:55bb935d65e1",
+      "members": [
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 11,
+              "end_col_offset": 40,
+              "end_lineno": 282,
+              "invocation_mode": "ordinary",
+              "lineno": 282,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.Task"
+            }
+          ],
+          "execution_kind": "sync",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::_custom_task_factory",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [
+            {
+              "annotation": "asyncio.AbstractEventLoop",
+              "default_source": null,
+              "kind": "positional_only",
+              "name": "loop"
+            },
+            {
+              "annotation": "Coroutine[object, object, T]",
+              "default_source": null,
+              "kind": "positional_only",
+              "name": "coro"
+            }
+          ],
+          "return_annotation": "asyncio.Future[T]",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [
+            {
+              "declaration": "T",
+              "kind": "type_var",
+              "name": "T"
+            }
+          ],
+          "scope_type_parameters": [
+            "T"
+          ],
+          "suspension_points": [],
+          "type_parameter_records": [
+            {
+              "declaration": "T",
+              "kind": "type_var",
+              "name": "T"
+            }
+          ],
+          "type_parameters": [
+            "T"
+          ]
+        },
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 11,
+              "end_col_offset": 37,
+              "end_lineno": 229,
+              "invocation_mode": "ordinary",
+              "lineno": 229,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.get_running_loop"
+            },
+            {
+              "col_offset": 23,
+              "end_col_offset": 46,
+              "end_lineno": 230,
+              "invocation_mode": "ordinary",
+              "lineno": 230,
+              "requires_same_unit": false,
+              "root_name": "loop",
+              "target": "loop.get_task_factory"
+            },
+            {
+              "col_offset": 4,
+              "end_col_offset": 47,
+              "end_lineno": 231,
+              "invocation_mode": "ordinary",
+              "lineno": 231,
+              "requires_same_unit": false,
+              "root_name": "loop",
+              "target": "loop.set_task_factory"
+            },
+            {
+              "col_offset": 15,
+              "end_col_offset": 70,
+              "end_lineno": 233,
+              "invocation_mode": "ordinary",
+              "lineno": 233,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.create_task"
+            },
+            {
+              "col_offset": 35,
+              "end_col_offset": 69,
+              "end_lineno": 233,
+              "invocation_mode": "ordinary",
+              "lineno": 233,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.sleep"
+            },
+            {
+              "col_offset": 8,
+              "end_col_offset": 47,
+              "end_lineno": 236,
+              "invocation_mode": "ordinary",
+              "lineno": 236,
+              "requires_same_unit": false,
+              "root_name": "loop",
+              "target": "loop.set_task_factory"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::cold_custom_task_factory_workflow",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": "str",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [
+            {
+              "col_offset": 15,
+              "end_col_offset": 25,
+              "end_lineno": 234,
+              "kind": "await",
+              "lineno": 234
+            }
+          ],
+          "type_parameter_records": [],
+          "type_parameters": []
+        }
+      ],
+      "source_hash": "55bb935d65e11b5281fe73aa372793fd0568b70d52c818d85c9af596783791a4",
+      "specializations": [],
+      "type_bindings": [
+        {
+          "annotation": "asyncio.AbstractEventLoop",
+          "concrete": true,
+          "name": "_custom_task_factory.loop",
+          "source": "parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "Coroutine[object, object, T]",
+          "concrete": false,
+          "name": "_custom_task_factory.coro",
+          "source": "parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "asyncio.Future[T]",
+          "concrete": false,
+          "name": "_custom_task_factory.return",
+          "source": "return",
+          "substitutions": []
+        },
+        {
+          "annotation": "T",
+          "concrete": false,
+          "name": "_custom_task_factory.T",
+          "source": "type_parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "cold_custom_task_factory_workflow.return",
+          "source": "return",
+          "substitutions": []
+        }
+      ]
+    },
+    {
+      "atomic_class": false,
+      "bindings": [
+        {
+          "compiled_name": "_side_effecting_values",
+          "execution_kind": "generator",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::_side_effecting_values",
+          "target_owner_class": null
+        },
+        {
+          "compiled_name": "cold_side_effecting_iterable_workflow",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::cold_side_effecting_iterable_workflow",
+          "target_owner_class": null
+        }
+      ],
+      "decisions": [
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::_side_effecting_values"
+        },
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::cold_side_effecting_iterable_workflow"
+        }
+      ],
+      "dependencies": [
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::_side_effecting_values",
+          "invocation_mode": "ordinary",
+          "kind": "calls",
+          "lineno": 269,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_side_effecting_iterable_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "high",
+          "dst": "execution_plan_fixture.workflow::_side_effecting_values",
+          "invocation_mode": null,
+          "kind": "uses_global",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_side_effecting_iterable_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "collections.abc.Iterable",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::cold_side_effecting_iterable_workflow",
+          "type_only": true
+        },
+        {
+          "confidence": "medium",
+          "dst": "collections.abc.Iterable",
+          "invocation_mode": null,
+          "kind": "annotation",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "typing",
+          "src": "execution_plan_fixture.workflow::_side_effecting_values",
+          "type_only": true
+        }
+      ],
+      "id": "execution_plan_fixture.workflow::_side_effecting_values:057c357664c0",
+      "members": [
+        {
+          "binding_kind": "module",
+          "call_sites": [],
+          "execution_kind": "generator",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::_side_effecting_values",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [
+            {
+              "annotation": "Iterable[int]",
+              "default_source": null,
+              "kind": "positional",
+              "name": "items"
+            }
+          ],
+          "return_annotation": "Iterable[int]",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [
+            {
+              "col_offset": 8,
+              "end_col_offset": 22,
+              "end_lineno": 274,
+              "kind": "yield",
+              "lineno": 274
+            }
+          ],
+          "type_parameter_records": [],
+          "type_parameters": []
+        },
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 11,
+              "end_col_offset": 45,
+              "end_lineno": 269,
+              "invocation_mode": "ordinary",
+              "lineno": 269,
+              "requires_same_unit": false,
+              "root_name": "sum",
+              "target": "sum"
+            },
+            {
+              "col_offset": 15,
+              "end_col_offset": 44,
+              "end_lineno": 269,
+              "invocation_mode": "ordinary",
+              "lineno": 269,
+              "requires_same_unit": false,
+              "root_name": "_side_effecting_values",
+              "target": "_side_effecting_values"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::cold_side_effecting_iterable_workflow",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [
+            {
+              "annotation": "Iterable[int]",
+              "default_source": null,
+              "kind": "positional",
+              "name": "items"
+            }
+          ],
+          "return_annotation": "int",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        }
+      ],
+      "source_hash": "057c357664c0f1578005aba4a5631bdbd6183baf9c5b90ad5369ff192cafbe8b",
+      "specializations": [],
+      "type_bindings": [
+        {
+          "annotation": "Iterable[int]",
+          "concrete": true,
+          "name": "_side_effecting_values.items",
+          "source": "parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "Iterable[int]",
+          "concrete": true,
+          "name": "_side_effecting_values.return",
+          "source": "return",
+          "substitutions": []
+        },
+        {
+          "annotation": "Iterable[int]",
+          "concrete": true,
+          "name": "cold_side_effecting_iterable_workflow.items",
+          "source": "parameter",
+          "substitutions": []
+        },
+        {
+          "annotation": "int",
+          "concrete": true,
+          "name": "cold_side_effecting_iterable_workflow.return",
+          "source": "return",
+          "substitutions": []
+        }
+      ]
+    },
+    {
+      "atomic_class": false,
+      "bindings": [
+        {
+          "compiled_name": "cold_cancellation_workflow",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::cold_cancellation_workflow",
+          "target_owner_class": null
+        }
+      ],
+      "decisions": [
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::cold_cancellation_workflow"
+        }
+      ],
+      "dependencies": [
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": "ordinary",
+          "kind": "imports",
+          "lineno": 242,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_cancellation_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_cancellation_workflow",
+          "type_only": false
+        }
+      ],
+      "id": "execution_plan_fixture.workflow::cold_cancellation_workflow:ba3047ada71d",
+      "members": [
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 11,
+              "end_col_offset": 49,
+              "end_lineno": 242,
+              "invocation_mode": "ordinary",
+              "lineno": 242,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.create_task"
+            },
+            {
+              "col_offset": 31,
+              "end_col_offset": 48,
+              "end_lineno": 242,
+              "invocation_mode": "ordinary",
+              "lineno": 242,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.sleep"
+            },
+            {
+              "col_offset": 4,
+              "end_col_offset": 17,
+              "end_lineno": 243,
+              "invocation_mode": "ordinary",
+              "lineno": 243,
+              "requires_same_unit": false,
+              "root_name": "task",
+              "target": "task.cancel"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::cold_cancellation_workflow",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": "bool",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [
+            {
+              "col_offset": 8,
+              "end_col_offset": 18,
+              "end_lineno": 245,
+              "kind": "await",
+              "lineno": 245
+            }
+          ],
+          "type_parameter_records": [],
+          "type_parameters": []
+        }
+      ],
+      "source_hash": "ba3047ada71d80f6aba14e8d8c612fdb0652732f1d717e6c7339cd31e8de14a5",
+      "specializations": [],
+      "type_bindings": [
+        {
+          "annotation": "bool",
+          "concrete": true,
+          "name": "cold_cancellation_workflow.return",
+          "source": "return",
+          "substitutions": []
+        }
+      ]
+    },
+    {
+      "atomic_class": false,
+      "bindings": [
+        {
+          "compiled_name": "cold_debug_mode_workflow",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::cold_debug_mode_workflow",
+          "target_owner_class": null
+        }
+      ],
+      "decisions": [
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::cold_debug_mode_workflow"
+        }
+      ],
+      "dependencies": [
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": "ordinary",
+          "kind": "imports",
+          "lineno": 261,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_debug_mode_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_debug_mode_workflow",
+          "type_only": false
+        }
+      ],
+      "id": "execution_plan_fixture.workflow::cold_debug_mode_workflow:9440c2f98275",
+      "members": [
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 11,
+              "end_col_offset": 37,
+              "end_lineno": 261,
+              "invocation_mode": "ordinary",
+              "lineno": 261,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.get_running_loop"
+            },
+            {
+              "col_offset": 4,
+              "end_col_offset": 24,
+              "end_lineno": 262,
+              "invocation_mode": "ordinary",
+              "lineno": 262,
+              "requires_same_unit": false,
+              "root_name": "loop",
+              "target": "loop.set_debug"
+            },
+            {
+              "col_offset": 11,
+              "end_col_offset": 27,
+              "end_lineno": 263,
+              "invocation_mode": "ordinary",
+              "lineno": 263,
+              "requires_same_unit": false,
+              "root_name": "loop",
+              "target": "loop.get_debug"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::cold_debug_mode_workflow",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": "bool",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        }
+      ],
+      "source_hash": "9440c2f982759cdded663373f7a1f6d1e440af1ee73b2dcfc1b3633eb7d63955",
+      "specializations": [],
+      "type_bindings": [
+        {
+          "annotation": "bool",
+          "concrete": true,
+          "name": "cold_debug_mode_workflow.return",
+          "source": "return",
+          "substitutions": []
+        }
+      ]
+    },
+    {
+      "atomic_class": false,
+      "bindings": [
+        {
+          "compiled_name": "cold_suspension_workflow",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::cold_suspension_workflow",
+          "target_owner_class": null
+        }
+      ],
+      "decisions": [
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::cold_suspension_workflow"
+        }
+      ],
+      "dependencies": [
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": "awaited",
+          "kind": "imports",
+          "lineno": 216,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_suspension_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_suspension_workflow",
+          "type_only": false
+        }
+      ],
+      "id": "execution_plan_fixture.workflow::cold_suspension_workflow:aa52e4b23edf",
+      "members": [
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 10,
+              "end_col_offset": 26,
+              "end_lineno": 216,
+              "invocation_mode": "awaited",
+              "lineno": 216,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.sleep"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::cold_suspension_workflow",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": "str",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [
+            {
+              "col_offset": 4,
+              "end_col_offset": 26,
+              "end_lineno": 216,
+              "kind": "await",
+              "lineno": 216
+            }
+          ],
+          "type_parameter_records": [],
+          "type_parameters": []
+        }
+      ],
+      "source_hash": "aa52e4b23edff523b52f9fd09bac62299986c9977971170a0e08f413b74d42a0",
+      "specializations": [],
+      "type_bindings": [
+        {
+          "annotation": "str",
+          "concrete": true,
+          "name": "cold_suspension_workflow.return",
+          "source": "return",
+          "substitutions": []
+        }
+      ]
+    },
+    {
+      "atomic_class": false,
+      "bindings": [
+        {
+          "compiled_name": "cold_task_introspection_workflow",
+          "execution_kind": "coroutine",
+          "guards": [],
+          "kind": "module",
+          "owner_class": null,
+          "required": true,
+          "source": "execution_plan_fixture.workflow::cold_task_introspection_workflow",
+          "target_owner_class": null
+        }
+      ],
+      "decisions": [
+        {
+          "action": "preserve",
+          "reason": "source typing and declaration remain unchanged",
+          "target": "execution_plan_fixture.workflow::cold_task_introspection_workflow"
+        }
+      ],
+      "dependencies": [
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": "ordinary",
+          "kind": "imports",
+          "lineno": 223,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_task_introspection_workflow",
+          "type_only": false
+        },
+        {
+          "confidence": "medium",
+          "dst": "asyncio",
+          "invocation_mode": null,
+          "kind": "imports",
+          "lineno": null,
+          "requires_same_unit": false,
+          "role": "runtime",
+          "src": "execution_plan_fixture.workflow::cold_task_introspection_workflow",
+          "type_only": false
+        }
+      ],
+      "id": "execution_plan_fixture.workflow::cold_task_introspection_workflow:91d8073c25ec",
+      "members": [
+        {
+          "binding_kind": "module",
+          "call_sites": [
+            {
+              "col_offset": 11,
+              "end_col_offset": 33,
+              "end_lineno": 223,
+              "invocation_mode": "ordinary",
+              "lineno": 223,
+              "requires_same_unit": false,
+              "root_name": "asyncio",
+              "target": "asyncio.current_task"
+            }
+          ],
+          "execution_kind": "coroutine",
+          "fields": [],
+          "id": "execution_plan_fixture.workflow::cold_task_introspection_workflow",
+          "kind": "function",
+          "owner_class": null,
+          "parameters": [],
+          "return_annotation": "bool",
+          "runtime_imports": [],
+          "scope_type_parameter_records": [],
+          "scope_type_parameters": [],
+          "suspension_points": [],
+          "type_parameter_records": [],
+          "type_parameters": []
+        }
+      ],
+      "source_hash": "91d8073c25ec6825b57ac35de234c17d18e98c181ac0f335d02d33b5d4f7972d",
+      "specializations": [],
+      "type_bindings": [
+        {
+          "annotation": "bool",
+          "concrete": true,
+          "name": "cold_task_introspection_workflow.return",
+          "source": "return",
+          "substitutions": []
+        }
+      ]
+    }
+  ],
+  "verification_steps": [],
+  "version": 4,
+  "wheel_path": null
+}
