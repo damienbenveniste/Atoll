@@ -94,6 +94,8 @@ convention = "google"
 "src/atoll/runtime/package_verify.py" = ["S603"]
 "src/atoll/runtime/performance.py" = ["S603"]
 "src/atoll/wheel_overlay.py" = ["S603"]
+"scripts/pydantic_graph_ceiling.py" = ["S603"]
+"scripts/run_pydantic_graph_ceiling_experiment.py" = ["S603"]
 "scripts/run_pydantic_graph_benchmark.py" = ["S603"]
 "tests/**/*.py" = ["D", "S101"]
 

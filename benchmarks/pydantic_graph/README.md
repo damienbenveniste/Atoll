@@ -46,3 +46,21 @@ at least `1.05x` over the unfused payload, and at least `1.10x` over baseline.
 
 The GitHub workflow **Pydantic Graph Hard Benchmark** exposes the same gate through
 `workflow_dispatch` and uploads evidence even when an acceptance condition fails.
+
+## Optimization ceiling experiment
+
+Before promoting scheduler-level optimization into `atoll compile`, run the
+disposable ceiling experiment against an existing pinned checkout:
+
+```bash
+uv run --python 3.12 python -m scripts.run_pydantic_graph_ceiling_experiment \
+  --checkout /tmp/atoll-pydantic-ai \
+  --evidence-root /tmp/atoll-pydantic-graph-ceiling
+```
+
+The experiment never edits the checkout. It separates unchanged source, lazy
+guarded reducer-signature hoisting, unsafe result buffering, and an unsafe
+combined immediate-completion ceiling. The last two arms deliberately change
+observable async behavior and are not candidates for wheel promotion. A
+`1.15x` ceiling only recommends investigating a separately proven guarded
+design; it does not establish semantic equivalence or an Atoll speedup.

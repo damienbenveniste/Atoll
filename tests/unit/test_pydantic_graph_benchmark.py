@@ -247,6 +247,8 @@ def test_source_manifest_detects_only_python_source_changes(tmp_path: Path) -> N
 def test_benchmark_templates_and_baseline_are_well_formed() -> None:
     workload = TEMPLATE_ROOT / "workload.py.in"
     compile(workload.read_text(encoding="utf-8"), str(workload), "exec")
+    semantic_probe = TEMPLATE_ROOT / "ceiling_semantics.py.in"
+    compile(semantic_probe.read_text(encoding="utf-8"), str(semantic_probe), "exec")
     probe = (TEMPLATE_ROOT / "compiler_probe.sh.in").read_text(encoding="utf-8")
     assert probe.startswith("#!/bin/sh\n")
     assert 'exec "$compiler" "$@"' in probe

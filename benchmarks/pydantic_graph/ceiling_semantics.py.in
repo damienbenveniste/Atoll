@@ -1,0 +1,184 @@
+"""Correctness smoke for disposable Pydantic Graph ceiling variants."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import inspect
+import json
+import os
+from contextvars import ContextVar
+from pathlib import Path
+
+import pydantic_graph
+from pydantic_graph import GraphBuilder, StepContext
+from pydantic_graph.join import reduce_sum
+
+RUN_CONTEXT: ContextVar[str] = ContextVar("atoll_ceiling_context", default="missing")
+
+
+async def verify_graph() -> None:
+    """Exercise suspended context handling, reduction, and immediate exceptions."""
+    expected_payload = Path(os.environ["ATOLL_CEILING_PAYLOAD"]).resolve()
+    imported_package = Path(pydantic_graph.__file__).resolve()
+    if not imported_package.is_relative_to(expected_payload):
+        raise AssertionError(
+            f"probe imported {imported_package}, expected payload {expected_payload}"
+        )
+    builder = GraphBuilder(output_type=int)
+
+    @builder.step
+    async def generate(ctx: StepContext[None, None, None]) -> list[int]:
+        del ctx
+        return [1, 2, 3, 4]
+
+    @builder.step
+    async def transform(ctx: StepContext[None, None, int]) -> int:
+        await asyncio.sleep(0)
+        if RUN_CONTEXT.get() != "probe":
+            raise AssertionError("context variable was not preserved across suspension")
+        return ctx.inputs
+
+    collect = builder.join(reduce_sum, initial=0)
+    builder.add(
+        builder.edge_from(builder.start_node).to(generate),
+        builder.edge_from(generate).map().to(transform),
+        builder.edge_from(transform).to(collect),
+        builder.edge_from(collect).to(builder.end_node),
+    )
+    token = RUN_CONTEXT.set("probe")
+    try:
+        observed = await builder.build().run(infer_name=False)
+    finally:
+        RUN_CONTEXT.reset(token)
+    if observed != 10:
+        raise AssertionError(f"probe graph returned {observed}; expected 10")
+
+    failing = GraphBuilder(output_type=int)
+
+    @failing.step
+    async def fail(ctx: StepContext[None, None, None]) -> int:
+        del ctx
+        raise LookupError("immediate failure")
+
+    failing.add(
+        failing.edge_from(failing.start_node).to(fail),
+        failing.edge_from(fail).to(failing.end_node),
+    )
+    try:
+        await failing.build().run(infer_name=False)
+    except LookupError as error:
+        if str(error) != "immediate failure":
+            raise
+    else:
+        raise AssertionError("immediate exception was not preserved")
+
+
+async def verify_signature_guards() -> None:
+    """Require reducer signature mutation and lazy reflection to match baseline."""
+
+    def signature(count: int) -> inspect.Signature:
+        return inspect.Signature(
+            [
+                inspect.Parameter(
+                    f"p{index}",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+                for index in range(count)
+            ]
+        )
+
+    def reducer(*args: object) -> int:
+        return len(args)
+
+    reducer.__signature__ = signature(2)
+    builder = GraphBuilder(output_type=int)
+
+    @builder.step
+    async def generate(ctx: StepContext[None, None, None]) -> list[int]:
+        del ctx
+        return [1]
+
+    @builder.step
+    async def transform(ctx: StepContext[None, None, int]) -> int:
+        return ctx.inputs
+
+    collect = builder.join(reducer, initial=0)
+    builder.add(
+        builder.edge_from(builder.start_node).to(generate),
+        builder.edge_from(generate).map().to(transform),
+        builder.edge_from(transform).to(collect),
+        builder.edge_from(collect).to(builder.end_node),
+    )
+    graph = builder.build()
+    first = await graph.run(infer_name=False)
+    reducer.__signature__ = signature(3)
+    second = await graph.run(infer_name=False)
+    if (first, second) != (2, 3):
+        raise AssertionError(f"mutable reducer signature produced {(first, second)}")
+
+    class BrokenReducer:
+        __signature__ = object()
+
+        def __call__(self, *args: object) -> int:
+            return len(args)
+
+    lazy_builder = GraphBuilder(output_type=int)
+    lazy_builder.join(BrokenReducer(), initial=0)
+
+
+def mutate_context_indirectly() -> None:
+    """Mutate task-local state through a helper hidden from shallow bytecode checks."""
+    RUN_CONTEXT.set("child")
+
+
+async def context_remains_isolated() -> bool:
+    """Return whether a no-await child retains its independent task context."""
+    builder = GraphBuilder(output_type=int)
+
+    @builder.step
+    async def step(ctx: StepContext[None, None, None]) -> int:
+        del ctx
+        mutate_context_indirectly()
+        return 1
+
+    builder.add(
+        builder.edge_from(builder.start_node).to(step),
+        builder.edge_from(step).to(builder.end_node),
+    )
+    token = RUN_CONTEXT.set("outer")
+    try:
+        observed = await builder.build().run(infer_name=False)
+        if observed != 1:
+            raise AssertionError(f"context graph returned {observed}; expected 1")
+        return RUN_CONTEXT.get() == "outer"
+    finally:
+        RUN_CONTEXT.reset(token)
+
+
+async def run_probe() -> dict[str, object]:
+    """Run all probes and classify known unsafe-arm context divergence."""
+    await verify_graph()
+    await verify_signature_guards()
+    context_isolated = await context_remains_isolated()
+    arm = os.environ["ATOLL_CEILING_ARM"]
+    if arm != "unsafe_ceiling" and not context_isolated:
+        raise AssertionError(f"{arm} leaked child task context")
+    return {
+        "arm": arm,
+        "context_isolated": context_isolated,
+        "signature_guarded": True,
+    }
+
+
+def main() -> int:
+    """Accept the harness verify flag and emit structured probe evidence."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verify", action="store_true")
+    parser.parse_args()
+    print(json.dumps(asyncio.run(run_probe()), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
