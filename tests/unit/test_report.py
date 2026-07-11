@@ -11,6 +11,7 @@ import pytest
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.analysis.native_readiness import NativeReadiness
+from atoll.analysis.task_fusion import FusionGateRejection, FusionPlan
 from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.models import (
     ArtifactRecord,
@@ -40,6 +41,7 @@ from atoll.report import (
     score_label,
     score_summary,
 )
+from atoll.runtime.fusion_performance import FusionTrial
 from atoll.runtime.profiling import (
     CanonicalTypeObservation,
     LifecycleCounts,
@@ -54,6 +56,8 @@ REPORT_SCHEMA_VERSION = 3
 PROFILE_MAPPED_COVERAGE = 0.75
 PROFILE_SELECTED_HOT_COVERAGE = 0.8
 PROFILE_SAMPLING_INTERVAL_MS = 2
+PROFILE_COMPLETED_CALLS = 11
+PROFILE_MAX_ACTIVE_CALLS = 2
 
 
 @pytest.mark.parametrize(
@@ -418,6 +422,9 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                 ),
                 polymorphic_overflow=True,
                 observation_capped=True,
+                completed_calls=PROFILE_COMPLETED_CALLS,
+                max_active_calls=PROFILE_MAX_ACTIVE_CALLS,
+                pre_completion_suspensions=1,
             ),
             ProfiledMember(
                 module="app.ranking",
@@ -497,6 +504,49 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                     benchmark_status="passed",
                 ),
             ),
+            fusion_plans=(
+                FusionPlan(
+                    id="task-fusion:1234567890abcdef",
+                    source_hash="a" * 64,
+                    root="app.ranking::score_user",
+                    caller="app.ranking::score_user",
+                    callee="app.ranking::_run_task",
+                    spawn_api="task_group.start_soon",
+                    lineno=20,
+                    end_lineno=20,
+                    col_offset=8,
+                    end_col_offset=52,
+                    eligible=False,
+                    observed_calls=12,
+                    completed_calls=11,
+                    max_active_calls=2,
+                    pre_completion_suspensions=1,
+                    observed_signatures=1,
+                    observation_capped=True,
+                    rejections=(
+                        FusionGateRejection(
+                            code="overlapping_calls",
+                            reason="callee had overlapping active invocations",
+                        ),
+                    ),
+                ),
+            ),
+            fusion_trials=(
+                FusionTrial(
+                    plan_id="task-fusion:test",
+                    status="not-profitable",
+                    reason="fused ratios missed thresholds",
+                    semantic_runs=(),
+                    baseline_median_seconds=1.0,
+                    unfused_median_seconds=0.99,
+                    fused_median_seconds=1.01,
+                    baseline_over_unfused=1.01,
+                    baseline_over_fused=0.99,
+                    unfused_over_fused=0.98,
+                    warmups=(),
+                    samples=(),
+                ),
+            ),
         )
     )
     markdown = render_compilation_markdown_report(report)
@@ -544,11 +594,23 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
     ]
     assert report["profile"]["members"][0]["polymorphic"] is True
     assert report["profile"]["members"][0]["observation_capped"] is True
+    assert report["profile"]["members"][0]["completed_calls"] == PROFILE_COMPLETED_CALLS
+    assert report["profile"]["members"][0]["max_active_calls"] == PROFILE_MAX_ACTIVE_CALLS
+    assert report["profile"]["members"][0]["pre_completion_suspensions"] == 1
     assert report["profile"]["candidate_mapping_decisions"][1]["reason"] == "unmapped"
     assert report["profile"]["selected_symbols"] == ["app.ranking::score_user"]
     assert "## Candidate Profitability" in markdown
     assert "marginal speedup 1.040x" in markdown
     assert "fallback: mypyc rejected unresolved source TypeVars" in markdown
+    assert report["summary"]["fusion_plans"] == 1
+    assert report["summary"]["fusion_eligible_plans"] == 0
+    assert report["summary"]["fusion_trials"] == 1
+    assert report["fusion_plans"][0]["rejections"][0]["code"] == "overlapping_calls"
+    assert report["fusion_trials"][0]["plan_id"] == "task-fusion:test"
+    assert report["fusion_trials"][0]["status"] == "not-profitable"
+    assert "## Experimental Task-Fusion Research" in markdown
+    assert "rejected before trial" in markdown
+    assert "### Three-Arm Trials" in markdown
     assert "SECRET_VALUE" not in serialized
     assert "repr(payload)" not in serialized
     assert "- Status: profiled" in markdown

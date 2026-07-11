@@ -81,7 +81,8 @@ variant lists the private synchronous `native_helpers` called by its staged Pyth
 shell. Typed-region entries retain the original generic declaration plus the specialization origin,
 substitutions, and concrete type bindings.
 Compile report schema v3 includes profile coverage, candidate decisions, backend decisions,
-suspension plans, candidate trials, and accepted or rejected variants. It retains the v2
+suspension plans, candidate trials, task-fusion plans and trials, and accepted or rejected
+variants. It retains the v2
 compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
 are legacy views and normally remain empty with zero counts. Region members also expose ordered
 call sites, runtime imports, and suspension points; dependency records state the invocation mode
@@ -177,6 +178,9 @@ selecting regions. A 2 ms statistical leaf-frame sampler identifies project hot 
 Python 3.12 monitoring pass records lifecycle counts and canonical `module.qualname` argument type
 identities for those members. Reports never persist argument values or representations, retain at
 most eight signatures per member, and mark polymorphic or observation-capped evidence explicitly.
+Recognized task-spawn callees are observed even when leaf sampling attributes their cost to an event
+loop or nested callback. Their evidence includes completed calls, maximum overlapping active calls,
+and suspensions before completion.
 Atoll requires 100 workload samples, then considers members with at least 20 samples and 2% of the
 workload. It selects at most four in descending order until they cover 80% of mapped project
 samples. Unsupported launchers or insufficient samples use static selection, but still run the
@@ -190,6 +194,19 @@ removed before final packaging. The report records candidate coverage, lowering 
 reason, marginal speedup, and the hot-path coverage retained by the accepted set.
 If every profiled candidate is rejected, Atoll still records the final full-gate evidence but does
 not publish a wheel with zero native regions.
+
+Schema v3 also records deterministic, report-only task-fusion plans for recognized `start_soon`,
+`create_task`, and `ensure_future` sites reachable from selected hot roots. A plan is eligible for
+research only when one same-module coroutine has at least 20 complete monomorphic observations,
+no overlapping invocation, no pre-completion suspension, and no static cancellation,
+instrumentation, context-variable, additional concurrency, or unresolved dynamic effect. Rejected
+plans list every failed gate. When the normal compiled payload misses its full performance gate,
+each eligible plan is staged in a disposable payload and tested through separate baseline,
+unfused, and fused semantic and timing arms, including at least `1.05x` over unfused and `1.10x`
+overall.
+Task fusion remains unavailable in normal compile configuration and is never enabled by default;
+`experimental_task_fusion` will not become public unless the pinned hard benchmark satisfies those
+gates.
 
 Atoll's manual [Pydantic Graph hard benchmark](benchmarks/pydantic_graph/README.md) pins a difficult
 async orchestration workload, compiles it twice, and retains cold/warm reports, source hashes, and

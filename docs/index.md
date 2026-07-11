@@ -53,7 +53,8 @@ bindings, runtime guards, concrete target owners, and native artifact paths. It 
 their staged Python suspension shell. Typed-region entries preserve the original generic
 declaration and list specialization origins, substitutions, and concrete type bindings separately.
 Compile report schema v3 includes profile coverage, candidate decisions, backend decisions,
-suspension plans, candidate trials, and accepted or rejected variants. It retains the v2
+suspension plans, candidate trials, task-fusion plans and trials, and accepted or rejected
+variants. It retains the v2
 compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
 are legacy views and normally remain empty with zero counts. Region members expose ordered call
 sites, runtime imports, and suspension points, while dependency records identify invocation mode
@@ -146,7 +147,9 @@ commands, it builds and tests the baseline wheel before region selection, then r
 profiling. A 2 ms statistical leaf-frame sampler identifies hot project members. A bounded Python
 3.12 monitoring pass records lifecycle counts and canonical `module.qualname` argument type
 identities without retaining values or representations. Reports keep at most eight signatures per
-member and distinguish polymorphism from a reached observation budget. Atoll requires 100 total
+member and distinguish polymorphism from a reached observation budget. Recognized task-spawn
+callees are targeted even when leaf sampling attributes their cost elsewhere; reports retain their
+completion count, maximum overlap, and pre-completion suspension count. Atoll requires 100 total
 samples, considers candidates with at least 20 samples and 2% of workload samples, and selects at
 most four in descending order until they cover 80% of mapped project samples. Unsupported launchers
 or insufficient samples fall back to static selection while retaining the final performance gate.
@@ -159,6 +162,16 @@ baseline, and removes rejected shims and artifacts. Reports distinguish mapped c
 hot coverage, accepted hot coverage, lowering mode, fallback reason, and marginal speedup.
 When every profiled candidate is rejected, Atoll records the final full-gate evidence but does not
 publish a wheel containing no native regions.
+
+Atoll also emits deterministic report-only task-fusion plans for recognized `start_soon`,
+`create_task`, and `ensure_future` sites reachable from selected hot roots. A plan cannot proceed
+unless one same-module coroutine has at least 20 complete monomorphic observations, no overlap, no
+pre-completion suspension, and no cancellation, instrumentation, context-variable, additional
+concurrency, or unresolved dynamic-effect dependency. Reports list every rejection. If the safe
+compiled payload misses its full performance gate, the internal research runner stages each
+eligible plan in a disposable payload, compares baseline, unfused, and fused arms, and requires at
+least `1.05x` over unfused plus `1.10x` overall. Normal compile never enables task fusion, and no
+`experimental_task_fusion` setting is public unless the pinned hard benchmark passes those gates.
 
 The repository also contains a manual Pydantic Graph hard benchmark. It pins one external revision,
 uses a deterministic async graph workload, compiles cold and warm, and verifies source hashes,

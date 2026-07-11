@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.machinery
 import shutil
@@ -14,6 +15,7 @@ from typing import Protocol, cast
 import pytest
 
 from atoll import cli as cli_module
+from atoll.analysis.task_fusion import FusionPlan
 from atoll.commands import package as package_command
 from atoll.generation.region_shim import RegionShimConfig
 from atoll.models import (
@@ -40,6 +42,11 @@ from atoll.models import (
 )
 from atoll.project import DiscoveredProject, discover_project
 from atoll.report import CompilationReportInput, build_compilation_report
+from atoll.runtime.fusion_performance import (
+    FusionArmRunEvidence,
+    FusionBenchmarkConfig,
+    FusionTrial,
+)
 from atoll.runtime.package_verify import (
     PackageVerificationPlan,
     PackageVerificationResult,
@@ -121,6 +128,11 @@ class _PromotionResultView(Protocol):
     success: bool
     wheel_path: Path | None
     error: str | None
+
+
+class _FusionResearchOutcomeView(Protocol):
+    trials: tuple[FusionTrial, ...]
+    timings: tuple[CompilePhaseTiming, ...]
 
 
 class _SelectedScans(Protocol):
@@ -357,6 +369,19 @@ _SourceCleanPromotionContext = cast(
 _promote_source_clean_payload = cast(
     Callable[[object], _PromotionResultView],
     _package_attr("_promote_source_clean_payload"),
+)
+_FusionResearchContext = cast(Callable[..., object], _package_attr("_FusionResearchContext"))
+_run_conditional_task_fusion_research = cast(
+    Callable[[object], _FusionResearchOutcomeView],
+    _package_attr("_run_conditional_task_fusion_research"),
+)
+_task_fusion_source_path = cast(
+    Callable[[DiscoveredProject, Path, FusionPlan], Path],
+    _package_attr("_task_fusion_source_path"),
+)
+_fusion_trial_timings = cast(
+    Callable[[FusionTrial], tuple[CompilePhaseTiming, ...]],
+    _package_attr("_fusion_trial_timings"),
 )
 _print_source_clean_success = cast(
     Callable[..., None],
@@ -2119,13 +2144,16 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
         project_root: Path,
         payload_root: Path,
         module_paths: tuple[tuple[str, str], ...],
-        scratch_dir: Path,
+        **options: object,
     ) -> ProfileResult:
+        scratch_dir = cast(Path, options["scratch_dir"])
+        observation_targets = cast(tuple[SymbolId, ...], options["observation_targets"])
         assert command == ("python", "bench.py")
         assert project_root != target_project_root
         assert payload_root.is_dir()
         assert module_paths
         assert scratch_dir.name == "profile"
+        assert observation_targets == ()
         return replace(
             unconfigured_profile(),
             status="static-fallback",
@@ -2288,14 +2316,17 @@ minimum_speedup = 1.10
         project_root: Path,
         payload_root: Path,
         module_paths: tuple[tuple[str, str], ...],
-        scratch_dir: Path,
+        **options: object,
     ) -> ProfileResult:
+        scratch_dir = cast(Path, options["scratch_dir"])
+        observation_targets = cast(tuple[SymbolId, ...], options["observation_targets"])
         events.append("profile")
         assert command == ("python", "bench.py")
         assert project_root != target_project_root
         assert payload_root.is_dir()
         assert ("app.ranking", "app/ranking.py") in module_paths
         assert scratch_dir.name == "profile"
+        assert observation_targets == (SymbolId("app.ranking", "normalize_features"),)
         return replace(
             unconfigured_profile(),
             status="profiled",
@@ -2361,8 +2392,13 @@ minimum_speedup = 1.10
             samples=(),
         )
 
+    def fusion_targets(scans: tuple[ModuleScan, ...]) -> tuple[str, ...]:
+        assert scans
+        return ("app.ranking::normalize_features",)
+
     monkeypatch.setattr(package_command, "run_performance_command", run_test)
     monkeypatch.setattr(package_command, "run_baseline_profile", profile_baseline)
+    monkeypatch.setattr(package_command, "fusion_observation_targets", fusion_targets)
     monkeypatch.setattr(package_command, "_selected_typed_regions", record_selection)
     monkeypatch.setattr(package_command, "run_benchmark_gate", pass_benchmark)
 
@@ -2389,6 +2425,327 @@ minimum_speedup = 1.10
     ]
     assert "benchmark sample pair 1 baseline completed in 0.12s" in progress_messages
     assert {binding.source.qualname for binding in result.compiled_bindings} == {"rank_candidates"}
+
+
+def test_conditional_task_fusion_trials_disposable_payload_after_safe_miss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _quality_gate_project(
+        tmp_path,
+        (
+            'test_command = ["python", "verify.py"]',
+            'benchmark_command = ["python", "bench.py"]',
+        ),
+    )
+    source_path = project.config.source_roots[0] / "app" / "fusion_case.py"
+    source_text = (
+        "import asyncio\n\n"
+        "async def worker(value: int) -> int:\n"
+        "    return value + 1\n\n"
+        "async def root(value: int):\n"
+        "    return asyncio.create_task(worker(value))\n"
+    )
+    source_path.write_text(source_text, encoding="utf-8")
+    project = discover_project(project.config.root)
+    spawn = next(
+        node
+        for node in ast.walk(ast.parse(source_text))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "create_task"
+    )
+    plan = FusionPlan(
+        id="task-fusion:fixture",
+        source_hash="source-hash",
+        root="app.fusion_case::root",
+        caller="app.fusion_case::root",
+        callee="app.fusion_case::worker",
+        spawn_api="asyncio.create_task",
+        lineno=spawn.lineno,
+        end_lineno=spawn.end_lineno or spawn.lineno,
+        col_offset=spawn.col_offset,
+        end_col_offset=spawn.end_col_offset,
+        eligible=True,
+        observed_calls=25,
+        completed_calls=25,
+        max_active_calls=1,
+        pre_completion_suspensions=0,
+        observed_signatures=1,
+        observation_capped=False,
+        rejections=(),
+        spawn_source=ast.get_source_segment(source_text, spawn) or "",
+    )
+    install_root = tmp_path / "install"
+    baseline_root = tmp_path / "baseline"
+    installed_source = install_root / "app" / "fusion_case.py"
+    installed_source.parent.mkdir(parents=True)
+    installed_source.write_text(source_text, encoding="utf-8")
+    shutil.copytree(install_root, baseline_root)
+    build_root = tmp_path / "build"
+    build_root.mkdir()
+    calls: list[str] = []
+
+    def run_trial(
+        config: FusionBenchmarkConfig,
+        **kwargs: object,
+    ) -> FusionTrial:
+        calls.append(config.plan_id)
+        fused_root = cast(Path, kwargs["fused_payload_root"])
+        transformed = (fused_root / "app" / "fusion_case.py").read_text(encoding="utf-8")
+        assert "_atoll_eager_spawn_fixture" in transformed
+        assert installed_source.read_text(encoding="utf-8") == source_text
+        assert source_path.read_text(encoding="utf-8") == source_text
+        return FusionTrial(
+            plan_id=config.plan_id,
+            status="not-profitable",
+            reason="fixture ratios missed thresholds",
+            semantic_runs=(),
+            baseline_median_seconds=1.0,
+            unfused_median_seconds=1.0,
+            fused_median_seconds=1.0,
+            baseline_over_unfused=1.0,
+            baseline_over_fused=1.0,
+            unfused_over_fused=1.0,
+            warmups=(),
+            samples=(),
+        )
+
+    monkeypatch.setattr(package_command, "run_fusion_trial", run_trial)
+    performance = BenchmarkGateResult(
+        status="not-profitable",
+        reason="safe payload below threshold",
+        minimum_speedup=1.1,
+        baseline_median_seconds=1.0,
+        compiled_median_seconds=1.0,
+        speedup=1.0,
+        warmups=(),
+        samples=(),
+    )
+
+    outcome = _run_conditional_task_fusion_research(
+        _FusionResearchContext(
+            options=package_command.PackageOptions(root=project.config.root),
+            project=project,
+            baseline=_BaselineWheelPayload(
+                wheel_path=tmp_path / "baseline.whl",
+                build=_successful_attempt(),
+                baseline_install_root=baseline_root,
+                quality_project_root=project.config.root,
+            ),
+            build_root=build_root,
+            install_root=install_root,
+            plans=(plan,),
+            accepted=(),
+            performance=performance,
+        )
+    )
+
+    assert calls == [plan.id]
+    assert [trial.plan_id for trial in outcome.trials] == [plan.id]
+    assert [timing.name for timing in outcome.timings] == ["fusion_stage"]
+    assert not (build_root / "fusion-research").exists()
+    assert installed_source.read_text(encoding="utf-8") == source_text
+    assert source_path.read_text(encoding="utf-8") == source_text
+
+
+def test_conditional_task_fusion_does_not_run_after_safe_gate_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _quality_gate_project(tmp_path, ())
+
+    def unexpected_trial(*args: object, **kwargs: object) -> FusionTrial:
+        raise AssertionError(f"unexpected task-fusion trial: {args!r} {kwargs!r}")
+
+    monkeypatch.setattr(package_command, "run_fusion_trial", unexpected_trial)
+    outcome = _run_conditional_task_fusion_research(
+        _FusionResearchContext(
+            options=package_command.PackageOptions(root=project.config.root),
+            project=project,
+            baseline=_BaselineWheelPayload(
+                wheel_path=None,
+                build=_successful_attempt(),
+            ),
+            build_root=tmp_path / "build",
+            install_root=tmp_path / "install",
+            plans=(),
+            accepted=(),
+            performance=BenchmarkGateResult(
+                status="passed",
+                reason="safe payload passed",
+                minimum_speedup=1.1,
+                baseline_median_seconds=1.1,
+                compiled_median_seconds=1.0,
+                speedup=1.1,
+                warmups=(),
+                samples=(),
+            ),
+        )
+    )
+
+    assert outcome.trials == ()
+    assert outcome.timings == ()
+
+
+def test_conditional_task_fusion_records_unavailable_delegated_gate(tmp_path: Path) -> None:
+    project = _quality_gate_project(tmp_path, ())
+    outcome = _run_conditional_task_fusion_research(
+        _FusionResearchContext(
+            options=package_command.PackageOptions(
+                root=project.config.root,
+                run_quality_gates=False,
+            ),
+            project=project,
+            baseline=_BaselineWheelPayload(
+                wheel_path=None,
+                build=_successful_attempt(),
+            ),
+            build_root=tmp_path / "build",
+            install_root=tmp_path / "install",
+            plans=(_eligible_fusion_plan(),),
+            accepted=(),
+            performance=_benchmark_result("not-profitable"),
+        )
+    )
+
+    assert len(outcome.trials) == 1
+    assert outcome.trials[0].plan_id == "task-fusion:fixture"
+    assert outcome.trials[0].status == "unavailable"
+    assert outcome.trials[0].reason == "quality gates are delegated to the calling workflow"
+
+
+def test_conditional_task_fusion_reports_stale_staged_source(tmp_path: Path) -> None:
+    project = _quality_gate_project(
+        tmp_path,
+        (
+            'test_command = ["python", "verify.py"]',
+            'benchmark_command = ["python", "bench.py"]',
+        ),
+    )
+    source_path = project.config.source_roots[0] / "app" / "fusion_case.py"
+    source_text = (
+        "import asyncio\n\n"
+        "async def worker(value: int) -> int:\n"
+        "    return value + 1\n\n"
+        "async def root(value: int):\n"
+        "    return asyncio.create_task(worker(value))\n"
+    )
+    source_path.write_text(source_text, encoding="utf-8")
+    project = discover_project(project.config.root)
+    spawn = next(
+        node
+        for node in ast.walk(ast.parse(source_text))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "create_task"
+    )
+    plan = replace(
+        _eligible_fusion_plan(
+            caller="app.fusion_case::root",
+            callee="app.fusion_case::worker",
+        ),
+        lineno=spawn.lineno,
+        end_lineno=spawn.end_lineno or spawn.lineno,
+        col_offset=spawn.col_offset,
+        end_col_offset=spawn.end_col_offset,
+        spawn_source="stale source",
+    )
+    install_root = tmp_path / "install"
+    installed_source = install_root / "app" / "fusion_case.py"
+    installed_source.parent.mkdir(parents=True)
+    installed_source.write_text(source_text, encoding="utf-8")
+    baseline_root = tmp_path / "baseline"
+    shutil.copytree(install_root, baseline_root)
+    build_root = tmp_path / "build"
+    build_root.mkdir()
+
+    outcome = _run_conditional_task_fusion_research(
+        _FusionResearchContext(
+            options=package_command.PackageOptions(root=project.config.root),
+            project=project,
+            baseline=_BaselineWheelPayload(
+                wheel_path=None,
+                build=_successful_attempt(),
+                baseline_install_root=baseline_root,
+                quality_project_root=project.config.root,
+            ),
+            build_root=build_root,
+            install_root=install_root,
+            plans=(plan,),
+            accepted=(),
+            performance=_benchmark_result("not-profitable"),
+        )
+    )
+
+    assert outcome.trials[0].status == "unavailable"
+    assert "spawn source changed" in outcome.trials[0].reason
+    assert outcome.timings[0].detail == "task-fusion:fixture; failed"
+    assert not (build_root / "fusion-research").exists()
+
+
+def test_task_fusion_source_resolution_rejects_invalid_boundaries(tmp_path: Path) -> None:
+    project = _quality_gate_project(tmp_path, ())
+    payload_root = tmp_path / "payload"
+
+    with pytest.raises(ValueError, match="no module identity"):
+        _task_fusion_source_path(
+            project,
+            payload_root,
+            _eligible_fusion_plan(caller="malformed"),
+        )
+    with pytest.raises(ValueError, match="not part of the project"):
+        _task_fusion_source_path(
+            project,
+            payload_root,
+            _eligible_fusion_plan(caller="missing.module::root"),
+        )
+    with pytest.raises(ValueError, match="installed source is unavailable"):
+        _task_fusion_source_path(
+            project,
+            payload_root,
+            _eligible_fusion_plan(caller="app.ranking::root"),
+        )
+
+
+def test_fusion_trial_timings_preserve_arm_and_phase() -> None:
+    run = CommandRunEvidence(
+        command=("python", "bench.py"),
+        project_root=Path("project"),
+        payload_root=Path("payload"),
+        mode="compiled",
+        returncode=0,
+        stdout="",
+        stderr="",
+        duration_seconds=0.5,
+    )
+    trial = FusionTrial(
+        plan_id="task-fusion:fixture",
+        status="passed",
+        reason="fixture passed",
+        semantic_runs=(FusionArmRunEvidence(arm="baseline", run=run),),
+        baseline_median_seconds=1.2,
+        unfused_median_seconds=1.1,
+        fused_median_seconds=1.0,
+        baseline_over_unfused=1.09,
+        baseline_over_fused=1.2,
+        unfused_over_fused=1.1,
+        warmups=(FusionArmRunEvidence(arm="unfused", run=run),),
+        samples=(FusionArmRunEvidence(arm="fused", run=run),),
+    )
+
+    timings = _fusion_trial_timings(trial)
+
+    assert [timing.name for timing in timings] == [
+        "fusion_semantic_test",
+        "fusion_benchmark_warmup",
+        "fusion_benchmark",
+    ]
+    assert [timing.detail for timing in timings] == [
+        "task-fusion:fixture; baseline; exit 0",
+        "task-fusion:fixture; unfused",
+        "task-fusion:fixture; fused; passed",
+    ]
 
 
 def test_package_greedily_keeps_only_profitable_profile_candidates(
@@ -3213,4 +3570,45 @@ def _successful_attempt() -> CompileAttempt:
         stderr="",
         artifact_paths=(),
         duration_seconds=0.0,
+    )
+
+
+def _benchmark_result(status: BenchmarkStatus) -> BenchmarkGateResult:
+    return BenchmarkGateResult(
+        status=status,
+        reason=f"fixture {status}",
+        minimum_speedup=1.1,
+        baseline_median_seconds=1.0,
+        compiled_median_seconds=1.0,
+        speedup=1.0,
+        warmups=(),
+        samples=(),
+    )
+
+
+def _eligible_fusion_plan(
+    *,
+    caller: str = "sample::root",
+    callee: str = "sample::worker",
+) -> FusionPlan:
+    return FusionPlan(
+        id="task-fusion:fixture",
+        source_hash="source-hash",
+        root=caller,
+        caller=caller,
+        callee=callee,
+        spawn_api="asyncio.create_task",
+        lineno=1,
+        end_lineno=1,
+        col_offset=0,
+        end_col_offset=1,
+        eligible=True,
+        observed_calls=25,
+        completed_calls=25,
+        max_active_calls=1,
+        pre_completion_suspensions=0,
+        observed_signatures=1,
+        observation_capped=False,
+        rejections=(),
+        spawn_source="asyncio.create_task(worker())",
     )

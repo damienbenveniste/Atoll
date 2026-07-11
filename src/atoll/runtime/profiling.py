@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, NotRequired, TypedDict, Unpack, cast
 
 from atoll.models import SymbolId, SymbolRecord
 
@@ -50,6 +50,11 @@ type JsonObject = dict[str, JsonValue]
 type _RunSubprocess = Callable[..., subprocess.CompletedProcess[str]]
 
 _subprocess_run: _RunSubprocess = subprocess.run
+
+
+class _BaselineProfileOptions(TypedDict):
+    scratch_dir: Path
+    observation_targets: NotRequired[tuple[SymbolId, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +171,9 @@ class ProfiledMember:
         signatures: Canonical argument-type signatures observed in the targeted pass.
         polymorphic_overflow: Whether more than eight unique signatures were observed.
         observation_capped: Whether type observation stopped at its per-member budget.
+        completed_calls: Target invocations observed through a return or unwind event.
+        max_active_calls: Maximum simultaneous active invocations observed for this member.
+        pre_completion_suspensions: Yield events observed while a target invocation was active.
     """
 
     module: str
@@ -177,6 +185,9 @@ class ProfiledMember:
     signatures: tuple[ObservedSignature, ...]
     polymorphic_overflow: bool
     observation_capped: bool = False
+    completed_calls: int = 0
+    max_active_calls: int = 0
+    pre_completion_suspensions: int = 0
 
     @property
     def symbol(self) -> SymbolId:
@@ -282,7 +293,7 @@ def run_baseline_profile(
     project_root: Path,
     payload_root: Path,
     module_paths: tuple[tuple[str, str], ...],
-    scratch_dir: Path,
+    **options: Unpack[_BaselineProfileOptions],
 ) -> ProfileResult:
     """Run the two-pass baseline profiler for a supported Python benchmark command.
 
@@ -291,7 +302,9 @@ def run_baseline_profile(
         project_root: Target project working directory for child processes.
         payload_root: Import root placed first on `PYTHONPATH` for child processes.
         module_paths: `(module, install-relative .py suffix)` entries used for mapping frames.
-        scratch_dir: Directory for temporary JSON files removed before return.
+        options: Required `scratch_dir` directory for temporary JSON files removed before
+            return, plus optional `observation_targets` symbols to observe even when sampling
+            does not identify them as hot members.
 
     Returns:
         ProfileResult: Baseline profile evidence without candidate decisions.
@@ -307,7 +320,7 @@ def run_baseline_profile(
 
     resolved_project_root = project_root.resolve()
     resolved_payload_root = payload_root.resolve()
-    resolved_scratch_dir = scratch_dir.resolve()
+    resolved_scratch_dir = options["scratch_dir"].resolve()
     resolved_scratch_dir.mkdir(parents=True, exist_ok=True)
     sampling_payload, sampling_run = _run_bootstrap_pass(
         _BootstrapRequest(
@@ -331,6 +344,9 @@ def run_baseline_profile(
         )
 
     hot_targets = tuple(member_key for member_key, _ in _hot_member_keys(sampling_payload))
+    explicit_targets = tuple(
+        _member_key(target) for target in options.get("observation_targets", ())
+    )
     type_payload, type_run = _run_bootstrap_pass(
         _BootstrapRequest(
             profile_stage="types",
@@ -339,7 +355,7 @@ def run_baseline_profile(
             payload_root=resolved_payload_root,
             module_paths=module_paths,
             scratch_dir=resolved_scratch_dir,
-            targets=hot_targets,
+            targets=tuple(dict.fromkeys((*hot_targets, *explicit_targets))),
         )
     )
     runs = (sampling_run, type_run)
@@ -555,11 +571,22 @@ def _profile_from_payload(
     signature_payload = _object_field(payload, "signatures")
     member_lifecycle_payload = _object_field(payload, "member_lifecycle")
     mapped_project_samples = sum(_int_value(value) for value in sample_counts.values())
+    member_keys = frozenset(
+        _string_key(key)
+        for container in (sample_counts, signature_payload, member_lifecycle_payload)
+        for key in container
+    )
     members = tuple(
-        _profiled_member(key, count, total_samples, signature_payload, member_lifecycle_payload)
-        for key, count in sorted(
-            ((_string_key(key), _int_value(value)) for key, value in sample_counts.items()),
-            key=lambda item: (-item[1], item[0]),
+        _profiled_member(
+            key,
+            _int_value(sample_counts.get(key, 0)),
+            total_samples,
+            signature_payload,
+            member_lifecycle_payload,
+        )
+        for key in sorted(
+            member_keys,
+            key=lambda item: (-_int_value(sample_counts.get(item, 0)), item),
         )
     )
     return ProfileResult(
@@ -598,6 +625,9 @@ def _profiled_member(
         signatures=_signatures(_list_value(member_payload.get("signatures", []))),
         polymorphic_overflow=_bool_value(member_payload.get("polymorphic_overflow", False)),
         observation_capped=_bool_value(member_payload.get("observation_capped", False)),
+        completed_calls=_int_field(member_payload, "completed_calls"),
+        max_active_calls=_int_field(member_payload, "max_active_calls"),
+        pre_completion_suspensions=_int_field(member_payload, "pre_completion_suspensions"),
     )
 
 
@@ -683,6 +713,10 @@ def _empty_payload() -> JsonObject:
         "member_lifecycle": {},
         "signatures": {},
     }
+
+
+def _member_key(symbol: SymbolId) -> str:
+    return f"{symbol.module}::{symbol.qualname}"
 
 
 def _read_json_object(path: Path) -> JsonObject:

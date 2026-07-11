@@ -20,6 +20,7 @@ COLD_MYPYC_BASELINE_SECONDS = 192.70191520900698
 COLD_MYPYC_TARGET_SECONDS = COLD_MYPYC_BASELINE_SECONDS / 2
 MINIMUM_MARGINAL_SPEEDUP = 1.01
 MINIMUM_FINAL_SPEEDUP = 1.10
+MINIMUM_FUSION_OVER_UNFUSED = 1.05
 BENCHMARK_SAMPLES = 7
 COMPILE_REPORT_VERSION = 3
 NATIVE_PHASES = frozenset({"mypycify", "cythonize", "build_ext"})
@@ -51,6 +52,9 @@ class BenchmarkEvaluation:
     warm_cache_status: str
     final_speedup: float | None
     accepted_candidates: int
+    fusion_plan_count: int
+    eligible_fusion_plan_count: int
+    fusion_trial_count: int
     errors: tuple[str, ...]
 
     @property
@@ -68,6 +72,9 @@ class BenchmarkEvaluation:
             "cold_compiler_probe_count": self.cold_compiler_probe_count,
             "errors": list(self.errors),
             "final_speedup": self.final_speedup,
+            "fusion_plan_count": self.fusion_plan_count,
+            "eligible_fusion_plan_count": self.eligible_fusion_plan_count,
+            "fusion_trial_count": self.fusion_trial_count,
             "minimum_final_speedup": MINIMUM_FINAL_SPEEDUP,
             "minimum_marginal_speedup": MINIMUM_MARGINAL_SPEEDUP,
             "succeeded": self.succeeded,
@@ -325,6 +332,8 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
         _mapping_field(inputs.warm_report, "performance"), "speedup"
     )
     accepted_speedups = _accepted_candidate_speedups(inputs.warm_report)
+    fusion_plans = _fusion_plans(inputs.warm_report)
+    fusion_trials = _fusion_trials(inputs.warm_report)
     errors = _evaluation_errors(
         _EvaluationInputs(
             cold_report=inputs.cold_report,
@@ -341,6 +350,11 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
             warm_cache_status=warm_cache_status,
             final_speedup=final_speedup,
             accepted_speedups=accepted_speedups,
+            fusion_plan_count=len(fusion_plans),
+            eligible_fusion_plan_count=sum(
+                _boolean_field(plan, "eligible") for plan in fusion_plans
+            ),
+            fusion_trial_count=len(fusion_trials),
         )
     )
     return BenchmarkEvaluation(
@@ -352,6 +366,9 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
         warm_cache_status=warm_cache_status,
         final_speedup=final_speedup,
         accepted_candidates=len(accepted_speedups),
+        fusion_plan_count=len(fusion_plans),
+        eligible_fusion_plan_count=sum(_boolean_field(plan, "eligible") for plan in fusion_plans),
+        fusion_trial_count=len(fusion_trials),
         errors=errors,
     )
 
@@ -372,6 +389,9 @@ class _EvaluationInputs:
     warm_cache_status: str
     final_speedup: float | None
     accepted_speedups: tuple[float | None, ...]
+    fusion_plan_count: int
+    eligible_fusion_plan_count: int
+    fusion_trial_count: int
 
 
 def _evaluation_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
@@ -379,6 +399,7 @@ def _evaluation_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
         *_report_errors(inputs),
         *_cache_errors(inputs),
         *_source_errors(inputs),
+        *_fusion_errors(inputs),
         *_profitability_errors(inputs),
     )
 
@@ -434,6 +455,51 @@ def _source_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
         errors.append("pydantic_graph source hashes changed during compilation")
     if _typed_region_hashes(inputs.cold_report) != _typed_region_hashes(inputs.warm_report):
         errors.append("typed-region source hashes changed between cold and warm reports")
+    if _fusion_plan_hashes(inputs.cold_report) != _fusion_plan_hashes(inputs.warm_report):
+        errors.append("task-fusion plan identities or source hashes changed between runs")
+    return tuple(errors)
+
+
+def _fusion_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+    errors: list[str] = []
+    plans = _fusion_plans(inputs.warm_report)
+    trials = _fusion_trials(inputs.warm_report)
+    if not plans:
+        errors.append("warm report contains no task-fusion safety plan")
+    eligible_plan_ids = {
+        _string_field(plan, "id") for plan in plans if _boolean_field(plan, "eligible")
+    }
+    trials_by_plan: dict[str, list[dict[str, object]]] = {}
+    for trial in trials:
+        trials_by_plan.setdefault(_string_field(trial, "plan_id"), []).append(trial)
+    required_plan_ids = (
+        eligible_plan_ids
+        if inputs.final_speedup is None or inputs.final_speedup < MINIMUM_FINAL_SPEEDUP
+        else set()
+    )
+    for plan_id in sorted(required_plan_ids):
+        matching = trials_by_plan.get(plan_id, [])
+        if len(matching) != 1 or _string_field(matching[0], "status") != "passed":
+            errors.append(f"eligible task-fusion plan {plan_id} has no passed three-arm trial")
+            continue
+        trial = matching[0]
+        over_unfused = _optional_number_field(trial, "unfused_over_fused")
+        overall = _optional_number_field(trial, "baseline_over_fused")
+        if (
+            over_unfused is None
+            or over_unfused < MINIMUM_FUSION_OVER_UNFUSED
+            or overall is None
+            or overall < MINIMUM_FINAL_SPEEDUP
+        ):
+            errors.append("a passed task-fusion trial is below its required speedup thresholds")
+    unmatched_passed = tuple(
+        plan_id
+        for plan_id, matching in trials_by_plan.items()
+        if plan_id not in required_plan_ids
+        and any(_string_field(trial, "status") == "passed" for trial in matching)
+    )
+    if unmatched_passed:
+        errors.append("a passed task-fusion trial does not match an eligible safety plan")
     return tuple(errors)
 
 
@@ -501,6 +567,21 @@ def _typed_region_hashes(report: dict[str, object]) -> dict[str, str]:
         _string_field(region, "id"): _string_field(region, "source_hash")
         for item in _list_field(report, "typed_regions")
         for region in (_mapping(item, "typed_regions[]"),)
+    }
+
+
+def _fusion_plans(report: dict[str, object]) -> tuple[dict[str, object], ...]:
+    return tuple(_mapping(item, "fusion_plans[]") for item in _list_field(report, "fusion_plans"))
+
+
+def _fusion_trials(report: dict[str, object]) -> tuple[dict[str, object], ...]:
+    return tuple(_mapping(item, "fusion_trials[]") for item in _list_field(report, "fusion_trials"))
+
+
+def _fusion_plan_hashes(report: dict[str, object]) -> dict[str, str]:
+    return {
+        _string_field(plan, "id"): _string_field(plan, "source_hash")
+        for plan in _fusion_plans(report)
     }
 
 

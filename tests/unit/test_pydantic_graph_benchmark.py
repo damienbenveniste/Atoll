@@ -51,6 +51,9 @@ def test_evaluate_reports_accepts_profiled_cold_and_cache_only_warm_builds() -> 
     assert evaluation.warm_compiler_probe_count == 0
     assert evaluation.final_speedup == FINAL_TEST_SPEEDUP
     assert evaluation.accepted_candidates == 1
+    assert evaluation.fusion_plan_count == 1
+    assert evaluation.eligible_fusion_plan_count == 0
+    assert evaluation.fusion_trial_count == 0
 
 
 def test_evaluate_reports_explains_every_hard_gate_failure() -> None:
@@ -64,6 +67,15 @@ def test_evaluate_reports_explains_every_hard_gate_failure() -> None:
     )
     warm["version"] = 2
     cast(dict[str, object], warm["profile"])["status"] = "static-fallback"
+    warm["fusion_plans"] = []
+    warm["fusion_trials"] = [
+        {
+            "plan_id": "task-fusion:unrelated",
+            "status": "passed",
+            "unfused_over_fused": 1.0,
+            "baseline_over_fused": 1.0,
+        }
+    ]
 
     evaluation = evaluate_reports(
         BenchmarkEvidenceInputs(
@@ -91,6 +103,9 @@ def test_evaluate_reports_explains_every_hard_gate_failure() -> None:
     assert "warm report contains" in message
     assert "compiler probe observed 2 warm invocation" in message
     assert "source hashes changed" in message
+    assert "task-fusion plan identities or source hashes changed" in message
+    assert "contains no task-fusion safety plan" in message
+    assert "does not match an eligible" in message
     assert "did not leave a promoted wheel" in message
     assert "missing the required 1.01x" in message
     assert "final speedup is below 1.10x" in message
@@ -117,6 +132,102 @@ def test_append_compile_policy_uses_external_profiled_workload(tmp_path: Path) -
     assert compile_config["benchmark_warmups"] == 1
     assert compile_config["benchmark_samples"] == BENCHMARK_SAMPLES
     assert compile_config["minimum_speedup"] == MINIMUM_FINAL_SPEEDUP
+
+
+def test_evaluate_reports_requires_one_passing_trial_for_each_eligible_plan() -> None:
+    cold = _report(cache_status="miss", mypyc_seconds=COLD_TEST_SECONDS)
+    warm = _report(
+        cache_status="hit",
+        mypyc_seconds=0.0,
+        final_speedup=MINIMUM_FINAL_SPEEDUP - 0.01,
+    )
+    plan = cast(dict[str, object], cast(list[object], warm["fusion_plans"])[0])
+    plan["eligible"] = True
+    warm["fusion_trials"] = [
+        {
+            "plan_id": plan["id"],
+            "status": "not-profitable",
+            "unfused_over_fused": 1.20,
+            "baseline_over_fused": 1.20,
+        }
+    ]
+
+    evaluation = evaluate_reports(
+        BenchmarkEvidenceInputs(
+            cold_report=cold,
+            warm_report=warm,
+            sources_unchanged=True,
+            cold_exit_code=0,
+            warm_exit_code=0,
+            wheel_present=True,
+            cold_compiler_probe_count=PROBE_TEST_COUNT,
+            warm_compiler_probe_count=0,
+        )
+    )
+
+    assert "has no passed three-arm trial" in "\n".join(evaluation.errors)
+
+
+def test_evaluate_reports_rejects_passed_trial_for_unrelated_plan() -> None:
+    cold = _report(cache_status="miss", mypyc_seconds=COLD_TEST_SECONDS)
+    warm = _report(cache_status="hit", mypyc_seconds=0.0)
+    warm["fusion_trials"] = [
+        {
+            "plan_id": "task-fusion:unrelated",
+            "status": "passed",
+            "unfused_over_fused": 1.20,
+            "baseline_over_fused": 1.20,
+        }
+    ]
+
+    evaluation = evaluate_reports(
+        BenchmarkEvidenceInputs(
+            cold_report=cold,
+            warm_report=warm,
+            sources_unchanged=True,
+            cold_exit_code=0,
+            warm_exit_code=0,
+            wheel_present=True,
+            cold_compiler_probe_count=PROBE_TEST_COUNT,
+            warm_compiler_probe_count=0,
+        )
+    )
+
+    assert "does not match an eligible" in "\n".join(evaluation.errors)
+
+
+def test_evaluate_reports_rejects_subthreshold_matching_fusion_trial() -> None:
+    cold = _report(cache_status="miss", mypyc_seconds=COLD_TEST_SECONDS)
+    warm = _report(
+        cache_status="hit",
+        mypyc_seconds=0.0,
+        final_speedup=MINIMUM_FINAL_SPEEDUP - 0.01,
+    )
+    plan = cast(dict[str, object], cast(list[object], warm["fusion_plans"])[0])
+    plan["eligible"] = True
+    warm["fusion_trials"] = [
+        {
+            "plan_id": plan["id"],
+            "status": "passed",
+            "unfused_over_fused": 1.0,
+            "baseline_over_fused": 1.0,
+        }
+    ]
+
+    evaluation = evaluate_reports(
+        BenchmarkEvidenceInputs(
+            cold_report=cold,
+            warm_report=warm,
+            sources_unchanged=True,
+            cold_exit_code=0,
+            warm_exit_code=0,
+            wheel_present=True,
+            cold_compiler_probe_count=PROBE_TEST_COUNT,
+            warm_compiler_probe_count=0,
+        )
+    )
+
+    assert "passed task-fusion trial is below" in "\n".join(evaluation.errors)
 
 
 def test_source_manifest_detects_only_python_source_changes(tmp_path: Path) -> None:
@@ -167,4 +278,12 @@ def _report(
         "candidate_trials": [{"status": "accepted", "marginal_speedup": marginal_speedup}],
         "compiled_regions": [{"cache_status": region_cache_status}],
         "typed_regions": [{"id": "fixture::hot", "source_hash": "source-hash"}],
+        "fusion_plans": [
+            {
+                "id": "task-fusion:fixture",
+                "source_hash": "fusion-source-hash",
+                "eligible": False,
+            }
+        ],
+        "fusion_trials": [],
     }

@@ -31,6 +31,8 @@ from atoll.runtime.profiling import (
 
 MAX_SIGNATURES_PER_MEMBER = 8
 MAX_TYPE_OBSERVATIONS_PER_MEMBER = 256
+ASYNC_WORKER_CALLS = 5
+ASYNC_CAPPED_WORKER_CALLS = 300
 BOOTSTRAP_EXIT_CODE = 7
 BOOTSTRAP_USAGE_ERROR_CODE = 2
 BOOTSTRAP_STRING_EXIT_CODE = 1
@@ -162,6 +164,57 @@ def test_module_launch_collects_project_samples(tmp_path: Path) -> None:
     assert result.launch_kind == "module"
     assert result.runs[0].stdout == "module-done\n"
     assert result.mapped_project_samples >= 0
+
+
+def test_observation_targets_track_async_overlap_and_zero_sample_members(
+    tmp_path: Path,
+) -> None:
+    _write_async_observation_project(tmp_path)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench_async.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("async_case", "async_case.py"),),
+        scratch_dir=tmp_path / "scratch",
+        observation_targets=(
+            SymbolId("async_case", "worker"),
+            SymbolId("async_case", "zero_sample"),
+            SymbolId("async_case", "dormant"),
+        ),
+    )
+
+    worker = _member(result, "async_case", "worker")
+    zero_sample = _member(result, "async_case", "zero_sample")
+    dormant = _member(result, "async_case", "dormant")
+    assert worker.call_count == ASYNC_WORKER_CALLS
+    assert worker.completed_calls == ASYNC_WORKER_CALLS
+    assert worker.max_active_calls > 1
+    assert worker.pre_completion_suspensions >= ASYNC_WORKER_CALLS
+    assert zero_sample.call_count == 1
+    assert zero_sample.completed_calls == 1
+    assert dormant.samples == 0
+    assert dormant.call_count == 0
+    assert dormant.completed_calls == 0
+
+
+def test_capped_async_observation_does_not_mix_later_untracked_returns(tmp_path: Path) -> None:
+    _write_capped_async_observation_project(tmp_path)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench_async_capped.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("async_capped", "async_capped.py"),),
+        scratch_dir=tmp_path / "scratch",
+        observation_targets=(SymbolId("async_capped", "worker"),),
+    )
+
+    worker = _member(result, "async_capped", "worker")
+    assert worker.observation_capped is True
+    assert worker.call_count == MAX_TYPE_OBSERVATIONS_PER_MEMBER
+    assert worker.completed_calls < worker.call_count
+    assert worker.max_active_calls > 1
 
 
 def test_type_observation_stores_canonical_types_without_values_or_repr(tmp_path: Path) -> None:
@@ -438,9 +491,15 @@ def test_profile_bootstrap_type_entrypoint_bounds_hot_observation(
     hot = payload["signatures"]["frequent::hot"]
     assert exit_code == 0
     assert hot["call_count"] == MAX_TYPE_OBSERVATIONS_PER_MEMBER
+    assert hot["completed_calls"] == MAX_TYPE_OBSERVATIONS_PER_MEMBER - 1
+    assert hot["max_active_calls"] == 1
+    assert hot["pre_completion_suspensions"] == 0
     assert hot["observation_capped"] is True
     assert payload["member_lifecycle"]["frequent::hot"]["start"] == (
         MAX_TYPE_OBSERVATIONS_PER_MEMBER
+    )
+    assert payload["member_lifecycle"]["frequent::hot"]["return"] == (
+        MAX_TYPE_OBSERVATIONS_PER_MEMBER - 1
     )
 
 
@@ -624,6 +683,8 @@ def test_type_profiler_callbacks_are_bounded_and_ignore_non_targets(
     signatures = cast(dict[str, dict[str, object]], payload["signatures"])
     hot_payload = signatures["callback_case::hot"]
     assert hot_payload["call_count"] == MAX_TYPE_OBSERVATIONS_PER_MEMBER
+    assert hot_payload["completed_calls"] == 0
+    assert cast(int, hot_payload["max_active_calls"]) >= MAX_TYPE_OBSERVATIONS_PER_MEMBER
     assert hot_payload["observation_capped"] is True
     assert hot_payload["polymorphic_overflow"] is True
 
@@ -772,6 +833,67 @@ def _write_signature_project(root: Path) -> None:
                 "",
             ]
         ),
+        encoding="utf-8",
+    )
+
+
+def _write_async_observation_project(root: Path) -> None:
+    (root / "async_case.py").write_text(
+        "\n".join(
+            [
+                "import asyncio",
+                "",
+                "async def worker(value: int) -> int:",
+                "    await asyncio.sleep(0)",
+                "    await asyncio.sleep(0)",
+                "    return value",
+                "",
+                "def zero_sample(value: int) -> int:",
+                "    return value + 1",
+                "",
+                "def dormant(value: int) -> int:",
+                "    return value - 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (root / "bench_async.py").write_text(
+        "\n".join(
+            [
+                "import asyncio",
+                "from async_case import worker, zero_sample",
+                "",
+                "async def main() -> None:",
+                "    tasks = [asyncio.create_task(worker(item)) for item in range(5)]",
+                "    await asyncio.gather(*tasks)",
+                "    zero_sample(10)",
+                "    print('async-done')",
+                "",
+                "asyncio.run(main())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_capped_async_observation_project(root: Path) -> None:
+    (root / "async_capped.py").write_text(
+        "import asyncio\n\n"
+        "async def worker(value: int) -> int:\n"
+        "    await asyncio.sleep(0)\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    (root / "bench_async_capped.py").write_text(
+        "import asyncio\n"
+        "from async_capped import worker\n\n"
+        "async def main() -> None:\n"
+        "    tasks = [asyncio.create_task(worker(item)) "
+        f"for item in range({ASYNC_CAPPED_WORKER_CALLS})]\n"
+        "    await asyncio.gather(*tasks)\n\n"
+        "asyncio.run(main())\n",
         encoding="utf-8",
     )
 

@@ -141,6 +141,10 @@ class _TypeProfiler:
         self._targets = config.targets
         self._signatures: dict[str, Counter[tuple[tuple[str, str], ...]]] = {}
         self._call_counts: Counter[str] = Counter()
+        self._completed_calls: Counter[str] = Counter()
+        self._active_calls: Counter[str] = Counter()
+        self._max_active_calls: Counter[str] = Counter()
+        self._pre_completion_suspensions: Counter[str] = Counter()
         self._overflow: set[str] = set()
         self._observation_capped: set[str] = set()
         self._lifecycle_counts: Counter[str] = Counter(dict.fromkeys(_LIFECYCLE_EVENT_NAMES, 0))
@@ -231,16 +235,23 @@ class _TypeProfiler:
                     )
                 ],
             }
-        for key in sorted(self._call_counts):
+        for key in sorted(self._targets | frozenset(self._call_counts)):
             signatures.setdefault(
                 key,
                 {
                     "call_count": self._call_counts[key],
+                    "completed_calls": self._completed_calls[key],
+                    "max_active_calls": self._max_active_calls[key],
+                    "pre_completion_suspensions": self._pre_completion_suspensions[key],
                     "polymorphic_overflow": key in self._overflow,
                     "observation_capped": key in self._observation_capped,
                     "signatures": [],
                 },
             )
+            member_payload = _object_value(signatures[key])
+            member_payload["completed_calls"] = self._completed_calls[key]
+            member_payload["max_active_calls"] = self._max_active_calls[key]
+            member_payload["pre_completion_suspensions"] = self._pre_completion_suspensions[key]
         return {
             "total_samples": 0,
             "sample_counts": {},
@@ -257,6 +268,7 @@ class _TypeProfiler:
             return sys.monitoring.DISABLE
         self._enable_target_lifecycle(code)
         self._count_lifecycle(key, "start")
+        self._start_invocation(key)
         callback_frame = inspect.currentframe()
         frame = callback_frame.f_back if callback_frame is not None else None
         if frame is None or frame.f_code is not code:
@@ -293,10 +305,24 @@ class _TypeProfiler:
         def callback(code: CodeType, *_args: object) -> object:
             key = self._mapper.code_key(code)
             if key is not None and key in self._targets:
-                self._count_lifecycle(key, name)
+                self._count_active_lifecycle(key, name)
             return None
 
         return callback
+
+    def _start_invocation(self, key: str) -> None:
+        self._active_calls[key] += 1
+        self._max_active_calls[key] = max(self._max_active_calls[key], self._active_calls[key])
+
+    def _count_active_lifecycle(self, key: str, name: str) -> None:
+        if self._active_calls[key] <= 0:
+            return
+        self._count_lifecycle(key, name)
+        if name == "yield":
+            self._pre_completion_suspensions[key] += 1
+        if name in {"return", "unwind"}:
+            self._completed_calls[key] += 1
+            self._active_calls[key] -= 1
 
     def _count_lifecycle(self, key: str, name: str) -> None:
         self._lifecycle_counts[name] += 1

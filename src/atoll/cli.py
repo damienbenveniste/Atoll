@@ -825,6 +825,8 @@ def _write_source_clean_compile_report(
             performance=result.performance,
             profile=result.profile,
             candidate_trials=result.candidate_trials,
+            fusion_plans=result.fusion_plans,
+            fusion_trials=result.fusion_trials,
         )
     )
     json_path = result.project_root / ".atoll" / "compile-report.json"

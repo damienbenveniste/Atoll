@@ -26,7 +26,9 @@ source hash manifests. The run fails unless:
 - cold mypyc time is at most 50% of the recorded `192.701915s` reference;
 - the cold run records native compiler phases and independent compiler-probe events;
 - the warm compile restores every region without a native compiler invocation;
-- typed-region and checkout source hashes remain unchanged; and
+- typed-region, task-fusion-plan, and checkout source hashes remain unchanged;
+- the report contains task-fusion safety evidence and, when the safe payload misses `1.10x`, every
+  eligible plan has a passing plan-bound three-arm trial;
 - the warm compile promotes a verified wheel.
 
 The fixed cold-time reference came from the Apple Silicon environment described in
@@ -35,6 +37,12 @@ same-machine timing. The end-to-end speedup and candidate decisions are paired w
 Zero cold mypyc time is valid when backend selection routes every hot region directly to Cython;
 the separate cold native-phase and compiler-probe requirements prevent that from becoming a
 no-compilation false positive.
+
+Task-fusion plans are evidence, not an enabled optimization. Pydantic Graph's scheduler intentionally
+stresses overlapping tasks, suspension, cancellation, stream dispatch, and instrumentation. A plan
+that detects any of those conditions is rejected before a fused variant runs. The public
+`experimental_task_fusion` setting remains absent unless a safe plan later passes semantic checks,
+at least `1.05x` over the unfused payload, and at least `1.10x` over baseline.
 
 The GitHub workflow **Pydantic Graph Hard Benchmark** exposes the same gate through
 `workflow_dispatch` and uploads evidence even when an acceptance condition fails.

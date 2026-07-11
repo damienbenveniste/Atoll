@@ -21,6 +21,11 @@ from packaging import tags
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
 from atoll.analysis.native_readiness import NativeReadiness
+from atoll.analysis.task_fusion import (
+    FusionPlan,
+    build_fusion_plans,
+    fusion_observation_targets,
+)
 from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
@@ -34,6 +39,7 @@ from atoll.generation.region_shim import (
     insert_or_replace_region_shim,
     remove_region_shim,
 )
+from atoll.generation.task_fusion import generate_eager_task_fusion
 from atoll.generation.typed_region import (
     TYPED_METHOD_GENERATOR_VERSION,
     TypedRegionGeneration,
@@ -67,6 +73,12 @@ from atoll.models import (
 )
 from atoll.project import DiscoveredProject, discover_project
 from atoll.region_cache import compile_with_region_cache
+from atoll.runtime.fusion_performance import (
+    FusionBenchmarkConfig,
+    FusionTrial,
+    run_fusion_trial,
+    unavailable_fusion_trial,
+)
 from atoll.runtime.package_verify import (
     PackageVerificationPlan,
     PackageVerificationResult,
@@ -200,6 +212,8 @@ class PackageCommandResult:
         performance: Paired performance-gate evidence.
         profile: Unmeasured baseline profile and hot-candidate selection evidence.
         candidate_trials: Greedy marginal-profitability decisions in profile order.
+        fusion_plans: Deterministic report-only task-fusion safety decisions.
+        fusion_trials: Three-arm research trials run only for eligible generated variants.
     """
 
     success: bool
@@ -229,6 +243,8 @@ class PackageCommandResult:
     performance: BenchmarkGateResult | None = None
     profile: ProfileResult | None = None
     candidate_trials: tuple[CandidateTrial, ...] = ()
+    fusion_plans: tuple[FusionPlan, ...] = ()
+    fusion_trials: tuple[FusionTrial, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,12 +458,14 @@ class _TypedRegionPackageContext:
         typed_regions: Backend-neutral typed regions considered by packaging.
         preflight_skipped: Modules rejected before native compilation.
         native_readiness: Post-generation native-readiness evidence.
+        fusion_plans: Deterministic task-fusion safety evidence for profiled scheduler sites.
     """
 
     selected: tuple[_SelectedTypedRegion, ...]
     typed_regions: tuple[TypedRegion, ...]
     preflight_skipped: tuple[PackagePreflightFailure, ...]
     native_readiness: tuple[NativeReadiness, ...]
+    fusion_plans: tuple[FusionPlan, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,11 +585,13 @@ class _ProfilePreparation:
         baseline: Built baseline wheel payload, when profile-guided selection is configured.
         profile: Unmeasured profile evidence, when profiling reached a supported launcher.
         failure: Early failure that must stop region scanning and native compilation.
+        fusion_plans: Deterministic task-fusion safety evidence formed after profile selection.
     """
 
     baseline: _BaselineWheelPayload | None = None
     profile: ProfileResult | None = None
     failure: PackageCommandResult | None = None
+    fusion_plans: tuple[FusionPlan, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -677,6 +697,44 @@ class _TypedPayloadFinalizationResult:
     profitability_applied: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _FusionResearchOutcome:
+    """Conditional three-arm task-fusion evidence and measured phase timings.
+
+    Attributes:
+        trials: Plan-bound semantic and profitability decisions.
+        timings: Subprocess timings appended to the compile report.
+    """
+
+    trials: tuple[FusionTrial, ...] = ()
+    timings: tuple[CompilePhaseTiming, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _FusionResearchContext:
+    """Inputs for conditional eager-task trials after the safe gate misses.
+
+    Attributes:
+        options: Command options supplying progress and quality-gate ownership.
+        project: Discovered target project and compile policy.
+        baseline: Immutable interpreted payload and quality-project roots.
+        build_root: Temporary build root owning disposable research copies.
+        install_root: Final unfused compiled payload.
+        plans: Safety plans emitted from the baseline profile.
+        accepted: Native variants retained by greedy candidate selection.
+        performance: Full safe-payload benchmark decision.
+    """
+
+    options: PackageOptions
+    project: DiscoveredProject
+    baseline: _BaselineWheelPayload
+    build_root: Path
+    install_root: Path
+    plans: tuple[FusionPlan, ...]
+    accepted: tuple[_PreparedTypedRegion, ...]
+    performance: BenchmarkGateResult | None
+
+
 def execute_package(options: PackageOptions) -> PackageCommandResult:
     """Build a source-clean wheel from backend-neutral typed regions.
 
@@ -731,7 +789,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             preflight_error,
             typed_regions=typed_regions,
         )
-    preparation = _prepare_profile_guided_selection(options, project)
+    preparation = _prepare_profile_guided_selection(options, project, scans)
     if preparation.failure is not None:
         return preparation.failure
     baseline = preparation.baseline
@@ -748,6 +806,17 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
                 f"{profile.selected_hot_coverage:.1%} of mapped project samples"
             ),
         )
+    fusion_plans = build_fusion_plans(scans, profile) if profile is not None else ()
+    if fusion_plans:
+        eligible_fusion_plans = sum(plan.eligible for plan in fusion_plans)
+        _progress(
+            options.progress,
+            (
+                f"task-fusion planning produced {len(fusion_plans)} plan(s); "
+                f"{eligible_fusion_plans} passed every safety gate"
+            ),
+        )
+    preparation = replace(preparation, profile=profile, fusion_plans=fusion_plans)
     profile_members = (
         profile.selected_symbols if profile is not None and profile.status == "profiled" else ()
     )
@@ -782,7 +851,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         return _failed_region_selection(
             options=options,
             project=project,
-            preparation=replace(preparation, profile=profile),
+            preparation=preparation,
             error=selection_error,
             typed_regions=typed_regions,
         )
@@ -794,6 +863,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             typed_regions=typed_regions,
             preflight_skipped=(),
             native_readiness=(),
+            fusion_plans=fusion_plans,
         ),
         prepared_baseline=baseline,
         profile=profile,
@@ -847,6 +917,7 @@ def _execute_typed_region_package(
             typed_regions=context.typed_regions,
             backend_assessments=tuple(selection.assessment for selection in context.selected),
             profile=profile,
+            fusion_plans=context.fusion_plans,
         )
 
     copy_started = time.perf_counter()
@@ -905,6 +976,7 @@ def _execute_typed_region_package(
             backend_assessments=tuple(selection.assessment for selection in context.selected),
             region_skipped=tuple(preparation_failures),
             profile=profile,
+            fusion_plans=context.fusion_plans,
         )
 
     prepared_assessments = _prepared_backend_assessments(tuple(prepared))
@@ -946,6 +1018,7 @@ def _execute_typed_region_package(
             artifact_records=outcome.artifacts,
             region_skipped=outcome.skipped,
             profile=profile,
+            fusion_plans=context.fusion_plans,
         )
 
     successful_bindings = tuple(
@@ -985,6 +1058,7 @@ def _execute_typed_region_package(
             artifact_records=outcome.artifacts,
             region_skipped=outcome.skipped,
             profile=profile,
+            fusion_plans=context.fusion_plans,
         )
 
     payload_started = time.perf_counter()
@@ -1042,6 +1116,19 @@ def _execute_typed_region_package(
                 error=finalized.overlay_error,
             ),
         )
+    promotion, fusion_research = _attach_conditional_task_fusion_research(
+        promotion,
+        _FusionResearchContext(
+            options=options,
+            project=project,
+            baseline=baseline,
+            build_root=build_root,
+            install_root=install_root,
+            plans=context.fusion_plans,
+            accepted=accepted_successful,
+            performance=promotion.performance,
+        ),
+    )
     cache_statuses = dict(outcome.cache_statuses)
     successful_regions = tuple(
         {item.generation.region.id: item.generation.region for item in accepted_successful}.values()
@@ -1088,6 +1175,8 @@ def _execute_typed_region_package(
         performance=promotion.performance,
         profile=profile,
         candidate_trials=finalized.trials,
+        fusion_plans=context.fusion_plans,
+        fusion_trials=fusion_research.trials,
     )
 
 
@@ -1949,12 +2038,14 @@ def _failed_result(
 def _prepare_profile_guided_selection(
     options: PackageOptions,
     project: DiscoveredProject,
+    scans: tuple[ModuleScan, ...],
 ) -> _ProfilePreparation:
     """Build, test, and profile the baseline before static region selection.
 
     Args:
         options: Validated command or generation options.
         project: Discovered target project configuration and modules.
+        scans: Static scan facts used to include task-spawn callees in targeted observation.
 
     Returns:
         _ProfilePreparation: Prepared baseline/profile evidence or an early failure.
@@ -2006,6 +2097,7 @@ def _prepare_profile_guided_selection(
         payload_root=baseline.baseline_install_root,
         module_paths=_profile_module_paths(project),
         scratch_dir=build_root / "profile",
+        observation_targets=_fusion_observation_symbols(scans),
     )
     baseline = _append_profile_timings(baseline, profile)
     preparation = replace(preparation, baseline=baseline, profile=profile)
@@ -2161,6 +2253,7 @@ def _failed_before_region_selection(
             samples=(),
         ),
         profile=preparation.profile,
+        fusion_plans=preparation.fusion_plans,
     )
 
 
@@ -2216,6 +2309,27 @@ def _profile_module_paths(project: DiscoveredProject) -> tuple[tuple[str, str], 
             for module in project.modules
         )
     )
+
+
+def _fusion_observation_symbols(scans: tuple[ModuleScan, ...]) -> tuple[SymbolId, ...]:
+    """Convert planner target identities into profiler symbol contracts.
+
+    Args:
+        scans: Static module scans inspected for recognized task-spawn callees.
+
+    Returns:
+        tuple[SymbolId, ...]: Deterministically ordered resolved task-spawn callees.
+
+    Raises:
+        ValueError: If the internal planner emits a malformed canonical identity.
+    """
+    symbols: list[SymbolId] = []
+    for target in fusion_observation_targets(scans):
+        module, separator, qualname = target.partition("::")
+        if not separator or not module or not qualname:
+            raise ValueError(f"invalid task-fusion observation target: {target}")
+        symbols.append(SymbolId(module=module, qualname=qualname))
+    return tuple(symbols)
 
 
 def _remove_tree(path: Path) -> tuple[Path, ...]:
@@ -2884,6 +2998,230 @@ def _finalize_typed_payload(
         trials=profitability.trials,
         overlay_error=overlay_error,
         profitability_applied=profitability_applied,
+    )
+
+
+def _attach_conditional_task_fusion_research(
+    promotion: _SourceCleanPromotionResult,
+    context: _FusionResearchContext,
+) -> tuple[_SourceCleanPromotionResult, _FusionResearchOutcome]:
+    """Run conditional research and append its timings to promotion evidence.
+
+    Args:
+        promotion: Completed safe-payload promotion or rejection result.
+        context: Inputs required by the conditional fusion workflow.
+
+    Returns:
+        tuple[_SourceCleanPromotionResult, _FusionResearchOutcome]: Promotion
+            evidence with research timings plus the plan-bound trial results.
+    """
+    outcome = _run_conditional_task_fusion_research(context)
+    return (
+        replace(
+            promotion,
+            build=_append_phase_timings(promotion.build, outcome.timings),
+        ),
+        outcome,
+    )
+
+
+def _run_conditional_task_fusion_research(
+    context: _FusionResearchContext,
+) -> _FusionResearchOutcome:
+    """Trial eligible eager-task plans only after the safe payload misses 1.10x.
+
+    Every fused arm is a disposable copy of the final unfused payload. Passing
+    evidence never changes the staged wheel or enables fusion by default; it
+    only establishes whether a future explicit opt-in could be justified.
+
+    Args:
+        context: Safe benchmark result, eligible plans, payloads, and policy.
+
+    Returns:
+        _FusionResearchOutcome: Plan-bound trials and subprocess timings.
+
+    Raises:
+        ValueError: If validated compile policy and prepared baseline roots become inconsistent.
+    """
+    if context.performance is None or context.performance.status != "not-profitable":
+        return _FusionResearchOutcome()
+    eligible = tuple(plan for plan in context.plans if plan.eligible)
+    if not eligible:
+        return _FusionResearchOutcome()
+    config = context.project.config.compile
+    prerequisite_error = _fusion_research_prerequisite_error(context)
+    if prerequisite_error is not None:
+        return _FusionResearchOutcome(
+            trials=tuple(unavailable_fusion_trial(plan.id, prerequisite_error) for plan in eligible)
+        )
+    if config.test_command is None or config.benchmark_command is None:
+        raise ValueError("fusion research prerequisites were accepted without commands")
+    if (
+        context.baseline.quality_project_root is None
+        or context.baseline.baseline_install_root is None
+    ):
+        raise ValueError("fusion research prerequisites were accepted without baseline roots")
+
+    accepted_ids = frozenset(item.unit.region_id for item in context.accepted)
+    scratch_root = context.build_root / "fusion-research"
+    trials: list[FusionTrial] = []
+    timings: list[CompilePhaseTiming] = []
+    for index, plan in enumerate(eligible, start=1):
+        fused_root = scratch_root / f"{index:02d}-{_wheel_safe_name(plan.id)}"
+        stage_started = time.perf_counter()
+        try:
+            _reset_dir(fused_root)
+            shutil.copytree(context.install_root, fused_root, dirs_exist_ok=True)
+            staged_source = _task_fusion_source_path(context.project, fused_root, plan)
+            generated = generate_eager_task_fusion(
+                staged_source.read_text(encoding="utf-8"),
+                plan,
+            )
+            staged_source.write_text(generated.new_text, encoding="utf-8")
+            timings.append(
+                CompilePhaseTiming(
+                    name="fusion_stage",
+                    duration_seconds=time.perf_counter() - stage_started,
+                    detail=plan.id,
+                )
+            )
+            _progress(
+                context.options.progress,
+                f"task-fusion trial {index}/{len(eligible)} testing {plan.id}",
+            )
+            trial = run_fusion_trial(
+                FusionBenchmarkConfig(
+                    plan_id=plan.id,
+                    command=config.benchmark_command,
+                    semantic_command=config.test_command,
+                ),
+                project_root=context.baseline.quality_project_root,
+                baseline_payload_root=context.baseline.baseline_install_root,
+                unfused_payload_root=context.install_root,
+                fused_payload_root=fused_root,
+                unfused_region_allowlist=accepted_ids,
+                fused_region_allowlist=accepted_ids,
+            )
+        except (OSError, SyntaxError, ValueError) as error:
+            trial = unavailable_fusion_trial(
+                plan.id,
+                f"task-fusion staged trial could not run: {error}",
+            )
+            if not any(
+                timing.name == "fusion_stage" and timing.detail == plan.id for timing in timings
+            ):
+                timings.append(
+                    CompilePhaseTiming(
+                        name="fusion_stage",
+                        duration_seconds=time.perf_counter() - stage_started,
+                        detail=f"{plan.id}; failed",
+                    )
+                )
+        finally:
+            shutil.rmtree(fused_root, ignore_errors=True)
+        trials.append(trial)
+        timings.extend(_fusion_trial_timings(trial))
+        _progress(
+            context.options.progress,
+            f"task-fusion trial {index}/{len(eligible)} {trial.status}: {plan.id}",
+        )
+    shutil.rmtree(scratch_root, ignore_errors=True)
+    return _FusionResearchOutcome(trials=tuple(trials), timings=tuple(timings))
+
+
+def _fusion_research_prerequisite_error(context: _FusionResearchContext) -> str | None:
+    """Return the first missing research prerequisite in stable order.
+
+    Args:
+        context: Safe result, configured commands, and payload boundaries.
+
+    Returns:
+        str | None: Concrete unavailable reason, or `None` when trials can run.
+    """
+    config = context.project.config.compile
+    checks = (
+        (
+            not context.options.run_quality_gates,
+            "quality gates are delegated to the calling workflow",
+        ),
+        (config.test_command is None, "task-fusion research requires test_command"),
+        (config.benchmark_command is None, "task-fusion research requires benchmark_command"),
+        (
+            context.baseline.quality_project_root is None,
+            "task-fusion research quality-project root is unavailable",
+        ),
+        (
+            context.baseline.baseline_install_root is None,
+            "task-fusion research baseline payload is unavailable",
+        ),
+        (not context.install_root.is_dir(), "task-fusion research unfused payload is unavailable"),
+    )
+    return next((reason for failed, reason in checks if failed), None)
+
+
+def _task_fusion_source_path(
+    project: DiscoveredProject,
+    payload_root: Path,
+    plan: FusionPlan,
+) -> Path:
+    """Resolve one plan's installed module without consulting checkout imports.
+
+    Args:
+        project: Discovered module and source-root mapping.
+        payload_root: Disposable fused payload copy.
+        plan: Eligible plan identifying the caller module.
+
+    Returns:
+        Path: Existing installed Python source file to transform.
+
+    Raises:
+        ValueError: If the plan identity is malformed or its module/source is unavailable.
+    """
+    module_name, separator, _qualname = plan.caller.partition("::")
+    if separator == "":
+        raise ValueError(f"task-fusion caller has no module identity: {plan.caller}")
+    module = next((item for item in project.modules if item.name == module_name), None)
+    if module is None:
+        raise ValueError(f"task-fusion module is not part of the project: {module_name}")
+    relative_path = _source_relative_path(module.path, project.config.source_roots)
+    source_path = payload_root / relative_path
+    if not source_path.is_file():
+        raise ValueError(f"task-fusion installed source is unavailable: {relative_path}")
+    return source_path
+
+
+def _fusion_trial_timings(trial: FusionTrial) -> tuple[CompilePhaseTiming, ...]:
+    """Convert three-arm command evidence into compile-report phase timings.
+
+    Args:
+        trial: Completed, rejected, invalid, or unavailable plan-bound trial.
+
+    Returns:
+        tuple[CompilePhaseTiming, ...]: Ordered semantic, warmup, and sample timings.
+    """
+    timings = tuple(
+        CompilePhaseTiming(
+            name="fusion_semantic_test",
+            duration_seconds=evidence.run.duration_seconds,
+            detail=f"{trial.plan_id}; {evidence.arm}; exit {evidence.run.returncode}",
+        )
+        for evidence in trial.semantic_runs
+    )
+    timings += tuple(
+        CompilePhaseTiming(
+            name="fusion_benchmark_warmup",
+            duration_seconds=evidence.run.duration_seconds,
+            detail=f"{trial.plan_id}; {evidence.arm}",
+        )
+        for evidence in trial.warmups
+    )
+    return timings + tuple(
+        CompilePhaseTiming(
+            name="fusion_benchmark",
+            duration_seconds=evidence.run.duration_seconds,
+            detail=f"{trial.plan_id}; {evidence.arm}; {trial.status}",
+        )
+        for evidence in trial.samples
     )
 
 

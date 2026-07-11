@@ -19,6 +19,7 @@ from atoll.analysis.suspension_planner import (
     SuspensionBlock,
     plan_suspension_blocks,
 )
+from atoll.analysis.task_fusion import FusionPlan
 from atoll.models import (
     ArtifactRecord,
     Backend,
@@ -61,6 +62,7 @@ from atoll.models import (
     VerifyResult,
     Visibility,
 )
+from atoll.runtime.fusion_performance import FusionArmRunEvidence, FusionTrial
 from atoll.runtime.package_verify import PackageVerificationResult
 from atoll.runtime.performance import BenchmarkGateResult, CommandRunEvidence
 from atoll.runtime.profiling import LifecycleCounts, ProfileResult
@@ -701,6 +703,9 @@ class CompilationSummaryReport(TypedDict):
         profile_mapped_coverage: Fraction of samples mapped to configured project modules.
         profile_selected_hot_coverage: Fraction of mapped samples covered by selected candidates.
         profile_accepted_hot_coverage: Fraction of mapped samples covered by profitable candidates.
+        fusion_plans: Number of deterministic task-fusion plans emitted.
+        fusion_eligible_plans: Plans that passed every static and dynamic safety gate.
+        fusion_trials: Number of three-arm fusion profitability trials run.
         duration_seconds: Elapsed wall-clock duration in seconds.
     """
 
@@ -725,6 +730,9 @@ class CompilationSummaryReport(TypedDict):
     profile_mapped_coverage: float
     profile_selected_hot_coverage: float
     profile_accepted_hot_coverage: float
+    fusion_plans: int
+    fusion_eligible_plans: int
+    fusion_trials: int
     duration_seconds: float
 
 
@@ -816,6 +824,9 @@ class CompilationProfileMemberReport(TypedDict):
         signatures: Canonical argument-type signatures observed for this member.
         polymorphic: Whether the member exceeded the retained signature budget.
         observation_capped: Whether targeted observation reached its call budget.
+        completed_calls: Target invocations observed through return or unwind.
+        max_active_calls: Maximum simultaneous active invocations for this member.
+        pre_completion_suspensions: Yield events observed while an invocation was active.
     """
 
     module: str
@@ -828,6 +839,9 @@ class CompilationProfileMemberReport(TypedDict):
     signatures: list[CompilationProfileSignatureReport]
     polymorphic: bool
     observation_capped: bool
+    completed_calls: int
+    max_active_calls: int
+    pre_completion_suspensions: int
 
 
 class CompilationProfileCandidateDecisionReport(TypedDict):
@@ -994,6 +1008,62 @@ class CompilationCandidateTrialReport(TypedDict):
     semantic_test_exit_code: int | None
     semantic_test_duration_seconds: float | None
     benchmark_status: str
+
+
+class CompilationFusionGateRejectionReport(TypedDict):
+    """One coded reason a task-fusion plan cannot be trialed safely.
+
+    Attributes:
+        code: Stable machine-readable safety-gate identifier.
+        reason: Plain-language explanation of the rejected condition.
+    """
+
+    code: str
+    reason: str
+
+
+class CompilationFusionPlanReport(TypedDict):
+    """Deterministic task-fusion plan and its static/dynamic gate evidence.
+
+    Attributes:
+        id: Content-derived plan identity stable across profile count changes.
+        source_hash: Digest of the spawn site and spawned coroutine closure.
+        root: Profile-selected hot root that reaches the spawn site.
+        caller: Callable containing the recognized task-spawn expression.
+        callee: Same-module spawned coroutine when resolution succeeded.
+        spawn_api: Source-level scheduling API expression.
+        lineno: One-based first line of the spawn call.
+        end_lineno: One-based final line of the spawn call.
+        col_offset: Zero-based first column of the spawn call.
+        end_col_offset: Zero-based final column of the spawn call, when available.
+        eligible: Whether every conservative fusion gate passed.
+        observed_calls: Targeted callee invocations represented by profile evidence.
+        completed_calls: Invocations observed through return or unwind.
+        max_active_calls: Maximum overlapping active invocations.
+        pre_completion_suspensions: Yield events observed before invocation completion.
+        observed_signatures: Number of retained canonical call signatures.
+        observation_capped: Whether targeted type observation reached its budget.
+        rejections: Ordered coded reasons preventing a fusion trial.
+    """
+
+    id: str
+    source_hash: str
+    root: str
+    caller: str
+    callee: str | None
+    spawn_api: str
+    lineno: int
+    end_lineno: int
+    col_offset: int
+    end_col_offset: int | None
+    eligible: bool
+    observed_calls: int
+    completed_calls: int
+    max_active_calls: int
+    pre_completion_suspensions: int
+    observed_signatures: int
+    observation_capped: bool
+    rejections: list[CompilationFusionGateRejectionReport]
 
 
 class CompilationSuspensionPlanReport(TypedDict):
@@ -1316,6 +1386,50 @@ class CompilationCommandRunReport(TypedDict):
     stderr: str
 
 
+class CompilationFusionArmRunReport(TypedDict):
+    """One semantic or benchmark subprocess tagged with its fusion arm.
+
+    Attributes:
+        arm: Baseline, unfused, or fused research role.
+        run: Ordinary command evidence captured for that role.
+    """
+
+    arm: str
+    run: CompilationCommandRunReport
+
+
+class CompilationFusionTrialReport(TypedDict):
+    """Three-arm task-fusion semantic and profitability evidence.
+
+    Attributes:
+        plan_id: Stable fusion plan identity represented by the trial.
+        status: Passed, not-profitable, invalid, or unavailable decision.
+        reason: Concrete semantic, timing, or prerequisite explanation.
+        baseline_median_seconds: Median interpreted duration, when stable.
+        unfused_median_seconds: Median safe compiled duration, when stable.
+        fused_median_seconds: Median experimental fused duration, when stable.
+        baseline_over_unfused: Baseline divided by unfused median.
+        baseline_over_fused: Baseline divided by fused median.
+        unfused_over_fused: Unfused divided by fused median.
+        semantic_runs: One semantic command result per arm.
+        warmups: Unmeasured rotated three-arm benchmark runs.
+        samples: Measured rotated three-arm benchmark runs.
+    """
+
+    plan_id: str
+    status: str
+    reason: str
+    baseline_median_seconds: float | None
+    unfused_median_seconds: float | None
+    fused_median_seconds: float | None
+    baseline_over_unfused: float | None
+    baseline_over_fused: float | None
+    unfused_over_fused: float | None
+    semantic_runs: list[CompilationFusionArmRunReport]
+    warmups: list[CompilationFusionArmRunReport]
+    samples: list[CompilationFusionArmRunReport]
+
+
 class CompilationPerformanceReport(TypedDict):
     """Measured profitability evidence or an explicit unbenchmarked status.
 
@@ -1360,6 +1474,8 @@ class CompilationReport(TypedDict):
         performance: Paired performance-gate evidence.
         profile: Profile-guided selection evidence or explicit static fallback.
         candidate_trials: Candidate variants evaluated by profitability selection.
+        fusion_plans: Report-only task-fusion safety plans rooted in profiled hot paths.
+        fusion_trials: Three-arm fusion trials run for generated eligible variants.
         suspension_plans: Per-callable suspension evidence and lowering decisions.
         backend_decisions: Normalized backend capability assessments.
         accepted_variants: Compatibility view of accepted compiled variants.
@@ -1389,6 +1505,8 @@ class CompilationReport(TypedDict):
     performance: CompilationPerformanceReport
     profile: CompilationProfileReport
     candidate_trials: list[CompilationCandidateTrialReport]
+    fusion_plans: list[CompilationFusionPlanReport]
+    fusion_trials: list[CompilationFusionTrialReport]
     suspension_plans: list[CompilationSuspensionPlanReport]
     backend_decisions: list[CompilationBackendDecisionReport]
     accepted_variants: list[CompilationAcceptedVariantReport]
@@ -1484,6 +1602,8 @@ class CompilationReportInput:
         performance: Paired performance-gate evidence.
         profile: Profile-guided candidate evidence, or `None` for explicit static fallback.
         candidate_trials: Greedy marginal-profitability decisions in profile order.
+        fusion_plans: Deterministic task-fusion safety plans.
+        fusion_trials: Three-arm task-fusion research evidence.
     """
 
     root: Path
@@ -1511,6 +1631,8 @@ class CompilationReportInput:
     performance: BenchmarkGateResult | None = None
     profile: ProfileResult | None = None
     candidate_trials: tuple[CandidateTrial, ...] = ()
+    fusion_plans: tuple[FusionPlan, ...] = ()
+    fusion_trials: tuple[FusionTrial, ...] = ()
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -1649,6 +1771,8 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     performance = _compilation_performance_report(report_input.root, report_input.performance)
     profile = _compilation_profile_report(report_input.profile)
     candidate_trials = _candidate_trial_reports(report_input.candidate_trials)
+    fusion_plans = _fusion_plan_reports(report_input.fusion_plans)
+    fusion_trials = _fusion_trial_reports(report_input.root, report_input.fusion_trials)
     accepted_hot_coverage = (
         candidate_trials[-1]["accepted_hot_coverage"] if candidate_trials else 0.0
     )
@@ -1711,6 +1835,9 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             "profile_mapped_coverage": profile["mapped_coverage"],
             "profile_selected_hot_coverage": profile["selected_hot_coverage"],
             "profile_accepted_hot_coverage": accepted_hot_coverage,
+            "fusion_plans": len(fusion_plans),
+            "fusion_eligible_plans": sum(plan["eligible"] for plan in fusion_plans),
+            "fusion_trials": len(fusion_trials),
             "duration_seconds": report_input.build.duration_seconds,
         },
         "build": {
@@ -1745,6 +1872,8 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         "performance": performance,
         "profile": profile,
         "candidate_trials": candidate_trials,
+        "fusion_plans": fusion_plans,
+        "fusion_trials": fusion_trials,
         "suspension_plans": suspension_plans,
         "backend_decisions": backend_decisions,
         "accepted_variants": accepted_variants,
@@ -1963,6 +2092,12 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
             "- Profitable hot-path coverage: "
             f"{report['summary']['profile_accepted_hot_coverage']:.1%}"
         ),
+        (
+            "- Task-fusion plans: "
+            f"{report['summary']['fusion_plans']} total, "
+            f"{report['summary']['fusion_eligible_plans']} eligible"
+        ),
+        f"- Task-fusion trials: {report['summary']['fusion_trials']}",
         f"- Build duration: {report['summary']['duration_seconds']:.3f}s",
         "",
         "## Verification Scope",
@@ -1972,6 +2107,8 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
     ]
     _append_profile_guided_selection_markdown(lines, report["profile"])
     _append_candidate_trials_markdown(lines, report["candidate_trials"])
+    _append_fusion_plans_markdown(lines, report["fusion_plans"])
+    _append_fusion_trials_markdown(lines, report["fusion_trials"])
     _append_suspension_plans_markdown(lines, report["suspension_plans"])
     if report["typed_regions"]:
         lines.extend(["## Planned Regions", ""])
@@ -2169,6 +2306,74 @@ def _append_candidate_trials_markdown(
             f"candidate coverage {trial['profile_coverage']:.1%}; "
             f"accepted coverage {trial['accepted_hot_coverage']:.1%}; "
             f"{trial['reason']}{fallback}"
+        )
+    lines.append("")
+
+
+def _append_fusion_plans_markdown(
+    lines: list[str],
+    plans: list[CompilationFusionPlanReport],
+) -> None:
+    """Render task-fusion safety evidence without implying runtime activation.
+
+    Args:
+        lines: Mutable Markdown line buffer receiving the section.
+        plans: Ordered deterministic fusion plans.
+    """
+    if not plans:
+        return
+    lines.extend(["## Experimental Task-Fusion Research", ""])
+    for plan in plans:
+        status = "eligible for a trial" if plan["eligible"] else "rejected before trial"
+        rejection_text = (
+            "; ".join(
+                f"{rejection['code']}: {rejection['reason']}" for rejection in plan["rejections"]
+            )
+            or "all safety gates passed"
+        )
+        callee = plan["callee"] or "unresolved callee"
+        lines.append(
+            f"- `{plan['id']}`: {status}; `{plan['caller']}` -> `{callee}` via "
+            f"`{plan['spawn_api']}`; calls {plan['completed_calls']}/"
+            f"{plan['observed_calls']} complete; max overlap {plan['max_active_calls']}; "
+            f"pre-completion suspensions {plan['pre_completion_suspensions']}; "
+            f"{rejection_text}"
+        )
+    lines.extend(
+        [
+            "- Runtime status: research evidence only; task fusion is not enabled by default.",
+            "",
+        ]
+    )
+
+
+def _append_fusion_trials_markdown(
+    lines: list[str],
+    trials: list[CompilationFusionTrialReport],
+) -> None:
+    """Render measured three-arm fusion trials when an eligible variant exists.
+
+    Args:
+        lines: Mutable Markdown line buffer receiving the section.
+        trials: Three-arm semantic and profitability evidence.
+    """
+    if not trials:
+        return
+    lines.extend(["### Three-Arm Trials", ""])
+    for trial in trials:
+        overall = (
+            f"{trial['baseline_over_fused']:.3f}x"
+            if trial["baseline_over_fused"] is not None
+            else "unavailable"
+        )
+        marginal = (
+            f"{trial['unfused_over_fused']:.3f}x"
+            if trial["unfused_over_fused"] is not None
+            else "unavailable"
+        )
+        lines.append(
+            f"- `{trial['plan_id']}` {trial['status']}: overall {overall}; "
+            f"over unfused {marginal}; {trial['reason']}"
         )
     lines.append("")
 
@@ -2807,6 +3012,94 @@ def _candidate_trial_reports(
     ]
 
 
+def _fusion_plan_reports(plans: tuple[FusionPlan, ...]) -> list[CompilationFusionPlanReport]:
+    """Serialize deterministic fusion plans without changing compile success.
+
+    Args:
+        plans: Ordered report-only plans and their conservative gate rejections.
+
+    Returns:
+        list[CompilationFusionPlanReport]: JSON-compatible fusion safety evidence.
+    """
+    return [
+        {
+            "id": plan.id,
+            "source_hash": plan.source_hash,
+            "root": plan.root,
+            "caller": plan.caller,
+            "callee": plan.callee,
+            "spawn_api": plan.spawn_api,
+            "lineno": plan.lineno,
+            "end_lineno": plan.end_lineno,
+            "col_offset": plan.col_offset,
+            "end_col_offset": plan.end_col_offset,
+            "eligible": plan.eligible,
+            "observed_calls": plan.observed_calls,
+            "completed_calls": plan.completed_calls,
+            "max_active_calls": plan.max_active_calls,
+            "pre_completion_suspensions": plan.pre_completion_suspensions,
+            "observed_signatures": plan.observed_signatures,
+            "observation_capped": plan.observation_capped,
+            "rejections": [
+                {"code": rejection.code, "reason": rejection.reason}
+                for rejection in plan.rejections
+            ],
+        }
+        for plan in plans
+    ]
+
+
+def _fusion_trial_reports(
+    root: Path,
+    trials: tuple[FusionTrial, ...],
+) -> list[CompilationFusionTrialReport]:
+    """Serialize three-arm research evidence separately from wheel promotion.
+
+    Args:
+        root: Root directory used to normalize payload paths.
+        trials: Fusion semantic and profitability trials.
+
+    Returns:
+        list[CompilationFusionTrialReport]: JSON-compatible three-arm evidence.
+    """
+    return [
+        {
+            "plan_id": trial.plan_id,
+            "status": trial.status,
+            "reason": trial.reason,
+            "baseline_median_seconds": trial.baseline_median_seconds,
+            "unfused_median_seconds": trial.unfused_median_seconds,
+            "fused_median_seconds": trial.fused_median_seconds,
+            "baseline_over_unfused": trial.baseline_over_unfused,
+            "baseline_over_fused": trial.baseline_over_fused,
+            "unfused_over_fused": trial.unfused_over_fused,
+            "semantic_runs": [_fusion_arm_run_report(root, run) for run in trial.semantic_runs],
+            "warmups": [_fusion_arm_run_report(root, run) for run in trial.warmups],
+            "samples": [_fusion_arm_run_report(root, run) for run in trial.samples],
+        }
+        for trial in trials
+    ]
+
+
+def _fusion_arm_run_report(
+    root: Path,
+    evidence: FusionArmRunEvidence,
+) -> CompilationFusionArmRunReport:
+    """Tag ordinary command evidence with its baseline, unfused, or fused arm.
+
+    Args:
+        root: Root directory used to normalize payload paths.
+        evidence: Arm-tagged child-process evidence.
+
+    Returns:
+        CompilationFusionArmRunReport: JSON-compatible arm and command evidence.
+    """
+    return {
+        "arm": evidence.arm,
+        "run": _compilation_command_run_report(root, evidence.run),
+    }
+
+
 def _compilation_profile_report(result: ProfileResult | None) -> CompilationProfileReport:
     """Serialize profile evidence without retaining runtime values or object reprs.
 
@@ -2879,6 +3172,9 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
                 ],
                 "polymorphic": member.polymorphic_overflow,
                 "observation_capped": member.observation_capped,
+                "completed_calls": member.completed_calls,
+                "max_active_calls": member.max_active_calls,
+                "pre_completion_suspensions": member.pre_completion_suspensions,
             }
             for member in result.members
         ],
