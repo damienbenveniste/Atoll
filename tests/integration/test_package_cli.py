@@ -21,7 +21,7 @@ EXIT_USAGE = 2
 RANKING_SYMBOL_COUNT = 3
 GATE_FAILURE_CODE = 7
 PROFILE_BENCHMARK_ITERATIONS = 100_000
-PROFILE_REPORT_SCHEMA_VERSION = 3
+PROFILE_REPORT_SCHEMA_VERSION = 4
 MINIMUM_PROFILE_SAMPLES = 100
 CLASS_DEPENDENCY_COMPILED_SYMBOLS = 2
 
@@ -67,6 +67,9 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     assert report["build"]["cache_status"] == "miss"
     assert report["performance"]["status"] == "unbenchmarked"
     assert report["performance"]["speedup"] is None
+    assert report["execution_plans"] == []
+    assert report["applied_execution_plans"] == []
+    assert report["execution_plan_trials"] == []
     assert any(timing["name"] == "mypycify" for timing in report["build"]["phase_timings"])
     assert any(timing["name"] == "build_ext" for timing in report["build"]["phase_timings"])
     assert report["cleanup"]["removed"] == [".atoll/dist/build", ".atoll/dist/install"]
@@ -132,6 +135,46 @@ def test_compile_uses_cache_on_unchanged_second_run(
     assert not (output_dir / "install").exists()
     with zipfile.ZipFile(wheel_path) as wheel:
         assert any(name.startswith(".atoll/artifacts/") for name in wheel.namelist())
+
+
+def test_compile_reports_static_async_execution_plan_candidates(tmp_path: Path) -> None:
+    """Unbenchmarked scheduler sites are reported without activating a plan."""
+    project_root = tmp_path / "execution_plan_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    module_path = project_root / "src" / "app" / "scheduler.py"
+    module_path.write_text(
+        """import asyncio
+
+async def _produce(queue: asyncio.Queue[int]) -> None:
+    await queue.put(1)
+
+async def _consume(queue: asyncio.Queue[int]) -> int:
+    return await queue.get()
+
+async def run() -> int:
+    queue: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
+    async with asyncio.TaskGroup() as group:
+        group.create_task(_produce(queue))
+        consumer = group.create_task(_consume(queue))
+    return consumer.result()
+""",
+        encoding="utf-8",
+    )
+    original = module_path.read_text(encoding="utf-8")
+
+    main(["compile", "app.scheduler", "--root", str(project_root)])
+
+    report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    assert report["version"] == PROFILE_REPORT_SCHEMA_VERSION
+    assert module_path.read_text(encoding="utf-8") == original
+    assert report["summary"]["execution_plans"] == 1
+    assert report["summary"]["execution_selected_plans"] == 0
+    assert report["summary"]["execution_applied_plans"] == 0
+    assert report["execution_plans"][0]["owner"] == "app.scheduler::run"
+    assert report["execution_plans"][0]["status"] == "rejected"
+    assert report["execution_plans"][0]["rejections"][0]["code"] == "low-hotness"
+    assert report["applied_execution_plans"] == []
+    assert report["execution_plan_trials"] == []
 
 
 def test_compile_runs_semantic_gate_without_flat_checkout_shadowing(

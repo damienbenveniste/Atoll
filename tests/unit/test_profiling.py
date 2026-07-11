@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import os
@@ -10,7 +11,9 @@ import sys
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from dis import get_instructions
 from pathlib import Path
+from types import FunctionType
 from typing import Protocol, cast
 
 import pytest
@@ -24,6 +27,7 @@ from atoll.runtime.profiling import (
     ObservedSignature,
     ProfiledMember,
     ProfileResult,
+    ProfileSpawnSiteTarget,
     run_baseline_profile,
     select_profile_candidates,
     unconfigured_profile,
@@ -33,6 +37,9 @@ MAX_SIGNATURES_PER_MEMBER = 8
 MAX_TYPE_OBSERVATIONS_PER_MEMBER = 256
 ASYNC_WORKER_CALLS = 5
 ASYNC_CAPPED_WORKER_CALLS = 300
+FREQUENT_CALLS = 800_000
+SPAWN_SITE_CALLS = 1_200
+DIRECT_SPAWN_CALLBACKS = 2
 BOOTSTRAP_EXIT_CODE = 7
 BOOTSTRAP_USAGE_ERROR_CODE = 2
 BOOTSTRAP_STRING_EXIT_CODE = 1
@@ -80,6 +87,16 @@ class _TypeProfilerHarness:
         )
         return factory(name)
 
+    def call_callback(
+        self,
+        code: object,
+        offset: int,
+        callable_object: object,
+        arg0: object,
+    ) -> object:
+        callback = _callable_attribute(self.wrapped, "_on_call")
+        return callback(code, offset, callable_object, arg0)
+
 
 @dataclass(frozen=True, slots=True)
 class _BootstrapConfigInput:
@@ -89,6 +106,7 @@ class _BootstrapConfigInput:
     args: tuple[str, ...] = ()
     module_paths: tuple[tuple[str, str], ...] = ()
     targets: tuple[str, ...] = ()
+    spawn_targets: tuple[ProfileSpawnSiteTarget, ...] = ()
 
 
 def test_unconfigured_profile_returns_deterministic_no_benchmark_evidence() -> None:
@@ -198,7 +216,7 @@ def test_observation_targets_track_async_overlap_and_zero_sample_members(
     assert dormant.completed_calls == 0
 
 
-def test_capped_async_observation_does_not_mix_later_untracked_returns(tmp_path: Path) -> None:
+def test_capped_async_type_observation_keeps_counting_lifecycle(tmp_path: Path) -> None:
     _write_capped_async_observation_project(tmp_path)
 
     result = run_baseline_profile(
@@ -213,8 +231,45 @@ def test_capped_async_observation_does_not_mix_later_untracked_returns(tmp_path:
     worker = _member(result, "async_capped", "worker")
     assert worker.observation_capped is True
     assert worker.call_count == MAX_TYPE_OBSERVATIONS_PER_MEMBER
-    assert worker.completed_calls < worker.call_count
+    assert worker.invocation_count == ASYNC_CAPPED_WORKER_CALLS
+    assert worker.completed_calls == ASYNC_CAPPED_WORKER_CALLS
+    assert worker.lifecycle.start == ASYNC_CAPPED_WORKER_CALLS
     assert worker.max_active_calls > 1
+
+
+def test_targeted_profile_counts_exact_spawn_site_beyond_type_budget(tmp_path: Path) -> None:
+    """Scheduler call counts remain exact after argument-type sampling caps."""
+    _write_spawn_site_project(tmp_path)
+    target = ProfileSpawnSiteTarget(
+        id="spawn-site-test",
+        owner=SymbolId("scheduler_case", "run"),
+        lineno=10,
+        col_offset=12,
+        scheduler_method="create_task",
+    )
+
+    result = run_baseline_profile(
+        (sys.executable, "bench_scheduler.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("scheduler_case", "scheduler_case.py"),),
+        scratch_dir=tmp_path / "scratch",
+        observation_targets=(
+            SymbolId("scheduler_case", "run"),
+            SymbolId("scheduler_case", "worker"),
+        ),
+        spawn_targets=(target,),
+    )
+
+    worker = _member(result, "scheduler_case", "worker")
+    spawn = result.spawn_sites[0]
+    assert spawn.target == target
+    assert spawn.invocation_count == SPAWN_SITE_CALLS
+    assert sum(item.count for item in spawn.callable_identities) == SPAWN_SITE_CALLS
+    assert all("object at" not in item.identity for item in spawn.callable_identities)
+    assert worker.call_count == MAX_TYPE_OBSERVATIONS_PER_MEMBER
+    assert worker.invocation_count == SPAWN_SITE_CALLS
+    assert worker.lifecycle.start == SPAWN_SITE_CALLS
 
 
 def test_type_observation_stores_canonical_types_without_values_or_repr(tmp_path: Path) -> None:
@@ -491,16 +546,13 @@ def test_profile_bootstrap_type_entrypoint_bounds_hot_observation(
     hot = payload["signatures"]["frequent::hot"]
     assert exit_code == 0
     assert hot["call_count"] == MAX_TYPE_OBSERVATIONS_PER_MEMBER
-    assert hot["completed_calls"] == MAX_TYPE_OBSERVATIONS_PER_MEMBER - 1
+    assert hot["invocation_count"] == FREQUENT_CALLS
+    assert hot["completed_calls"] == FREQUENT_CALLS
     assert hot["max_active_calls"] == 1
     assert hot["pre_completion_suspensions"] == 0
     assert hot["observation_capped"] is True
-    assert payload["member_lifecycle"]["frequent::hot"]["start"] == (
-        MAX_TYPE_OBSERVATIONS_PER_MEMBER
-    )
-    assert payload["member_lifecycle"]["frequent::hot"]["return"] == (
-        MAX_TYPE_OBSERVATIONS_PER_MEMBER - 1
-    )
+    assert payload["member_lifecycle"]["frequent::hot"]["start"] == FREQUENT_CALLS
+    assert payload["member_lifecycle"]["frequent::hot"]["return"] == FREQUENT_CALLS
 
 
 def test_profile_bootstrap_module_entrypoint_returns_system_exit(
@@ -689,6 +741,77 @@ def test_type_profiler_callbacks_are_bounded_and_ignore_non_targets(
     assert hot_payload["polymorphic_overflow"] is True
 
 
+def test_type_profiler_matches_full_spawn_spans_and_helper_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct callback tests cover exact spans, cache reuse, and conservative fallbacks."""
+    source = (
+        "class TaskGroup:\n"
+        "    def create_task(self, value):\n"
+        "        return value\n\n"
+        "def schedule(group):\n"
+        "    return group.create_task(1)\n"
+    )
+    source_path = tmp_path / "spawn_callback.py"
+    source_path.write_text(source, encoding="utf-8")
+    tree = ast.parse(source)
+    scheduler_call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "create_task"
+    )
+    target = ProfileSpawnSiteTarget(
+        id="spawn-callback",
+        owner=SymbolId("spawn_callback", "schedule"),
+        lineno=scheduler_call.lineno,
+        col_offset=scheduler_call.col_offset,
+        scheduler_method="create_task",
+        end_lineno=scheduler_call.end_lineno,
+        end_col_offset=scheduler_call.end_col_offset,
+    )
+    config_path, _result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="types",
+            launch_kind="script",
+            target="unused.py",
+            module_paths=(("spawn_callback", "spawn_callback.py"),),
+            targets=("spawn_callback::schedule",),
+            spawn_targets=(target,),
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path, "spawn_callback", add_root=True)
+    callback_module = importlib.import_module("spawn_callback")
+    schedule = cast(FunctionType, _callable_attribute(callback_module, "schedule"))
+    task_group_type = cast(type[object], _attribute(callback_module, "TaskGroup"))
+    create_task = _callable_attribute(task_group_type(), "create_task")
+    call_instruction = next(
+        instruction
+        for instruction in get_instructions(schedule)
+        if instruction.opname == "CALL"
+        and instruction.positions is not None
+        and instruction.positions.col_offset == scheduler_call.col_offset
+        and instruction.positions.end_col_offset == scheduler_call.end_col_offset
+    )
+    profiler = _type_profiler(config_path)
+
+    profiler.call_callback(schedule.__code__, call_instruction.offset, create_task, None)
+    profiler.call_callback(schedule.__code__, call_instruction.offset, create_task, None)
+    profiler.call_callback(schedule.__code__, call_instruction.offset, lambda: None, None)
+    profiler.call_callback((lambda: None).__code__, 0, create_task, None)
+
+    payload = profiler.payload()
+    spawn_sites = cast(list[dict[str, object]], payload["spawn_sites"])
+    assert spawn_sites[0]["invocation_count"] == DIRECT_SPAWN_CALLBACKS
+    assert spawn_sites[0]["callable_identities"] == {
+        "spawn_callback.TaskGroup.create_task": DIRECT_SPAWN_CALLBACKS
+    }
+    _assert_profile_bootstrap_position_helpers(profiler, target)
+
+
 def test_type_profiler_reports_monitoring_tool_conflict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -803,7 +926,7 @@ def _write_frequent_call_project(root: Path) -> None:
         encoding="utf-8",
     )
     (root / "bench_frequent.py").write_text(
-        "from frequent import hot\nfor item in range(800000): hot(item)\n",
+        f"from frequent import hot\nfor item in range({FREQUENT_CALLS}): hot(item)\n",
         encoding="utf-8",
     )
 
@@ -898,6 +1021,24 @@ def _write_capped_async_observation_project(root: Path) -> None:
     )
 
 
+def _write_spawn_site_project(root: Path) -> None:
+    (root / "scheduler_case.py").write_text(
+        "import asyncio\n\n"
+        "async def worker(value: int) -> int:\n"
+        "    await asyncio.sleep(0)\n"
+        "    return value\n\n"
+        "async def run() -> None:\n"
+        "    async with asyncio.TaskGroup() as group:\n"
+        f"        for item in range({SPAWN_SITE_CALLS}):\n"
+        "            group.create_task(worker(item))\n",
+        encoding="utf-8",
+    )
+    (root / "bench_scheduler.py").write_text(
+        "import asyncio\nfrom scheduler_case import run\nasyncio.run(run())\n",
+        encoding="utf-8",
+    )
+
+
 def _profile_bootstrap() -> ProfileBootstrapModule:
     return cast(
         ProfileBootstrapModule,
@@ -919,7 +1060,55 @@ def _type_profiler(config_path: Path) -> _TypeProfilerHarness:
 
 
 def _callable_attribute(value: object, name: str) -> Callable[..., object]:
-    return cast(Callable[..., object], getattr(value, name))
+    return cast(Callable[..., object], _attribute(value, name))
+
+
+def _attribute(value: object, name: str) -> object:
+    return getattr(value, name)
+
+
+def _assert_profile_bootstrap_position_helpers(
+    profiler: _TypeProfilerHarness,
+    target: ProfileSpawnSiteTarget,
+) -> None:
+    module = importlib.import_module("atoll.runtime._profile_bootstrap")
+    position_matches = _callable_attribute(module, "_position_within_spawn_target")
+    source_position = _callable_attribute(module, "_instruction_source_position")
+    canonical_callable = _callable_attribute(module, "_canonical_callable_identity")
+    target_factory = _callable_attribute(module, "_SpawnTarget")
+    internal_targets = cast(tuple[object, ...], _attribute(profiler.wrapped, "_spawn_targets"))
+    internal_target = internal_targets[0]
+    fallback_target = target_factory(
+        id=target.id,
+        owner=target.owner.stable_id,
+        lineno=target.lineno,
+        col_offset=target.col_offset,
+        scheduler_method=target.scheduler_method,
+        end_lineno=None,
+        end_col_offset=None,
+    )
+
+    assert source_position(None) == (None, None, None, None)
+    assert position_matches((None, None, None, None), internal_target) is False
+    assert (
+        position_matches((target.lineno, target.col_offset, None, None), internal_target) is False
+    )
+    assert (
+        position_matches(
+            (target.lineno, target.col_offset, target.end_lineno, target.end_col_offset),
+            internal_target,
+        )
+        is True
+    )
+    assert (
+        position_matches(
+            (target.lineno, target.col_offset - 1, target.end_lineno, target.end_col_offset),
+            internal_target,
+        )
+        is False
+    )
+    assert position_matches((target.lineno, target.col_offset, None, None), fallback_target) is True
+    assert cast(str, canonical_callable(object())).startswith("builtins.object")
 
 
 def _write_bootstrap_config(
@@ -940,6 +1129,18 @@ def _write_bootstrap_config(
                 "module_paths": [list(item) for item in config.module_paths],
                 "result_path": str(result_path),
                 "targets": list(config.targets),
+                "spawn_targets": [
+                    {
+                        "id": target.id,
+                        "owner": target.owner.stable_id,
+                        "lineno": target.lineno,
+                        "col_offset": target.col_offset,
+                        "scheduler_method": target.scheduler_method,
+                        "end_lineno": target.end_lineno,
+                        "end_col_offset": target.end_col_offset,
+                    }
+                    for target in config.spawn_targets
+                ],
             }
         ),
         encoding="utf-8",

@@ -52,9 +52,12 @@ bindings, runtime guards, concrete target owners, and native artifact paths. It 
 `lowering_mode`; `outlined-block` variants list the private synchronous `native_helpers` called by
 their staged Python suspension shell. Typed-region entries preserve the original generic
 declaration and list specialization origins, substitutions, and concrete type bindings separately.
-Compile report schema v3 includes profile coverage, candidate decisions, backend decisions,
-suspension plans, candidate trials, task-fusion plans and trials, and accepted or rejected
-variants. It retains the v2
+Compile report schema v4 includes profile coverage, exact scheduler spawn-site invocation evidence,
+candidate decisions, backend decisions, suspension plans, candidate trials, execution-plan
+candidates and trials, task-fusion research, and accepted or rejected variants. Execution plans are
+reported separately from native regions. Unless `applied_execution_plans` lists a plan with passing
+trial evidence, it is discovery evidence only and does not change runtime behavior. The schema
+retains the v2
 compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
 are legacy views and normally remain empty with zero counts. Region members expose ordered call
 sites, runtime imports, and suspension points, while dependency records identify invocation mode

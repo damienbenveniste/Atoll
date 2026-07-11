@@ -20,6 +20,12 @@ from atoll.analysis.suspension_planner import (
     plan_suspension_blocks,
 )
 from atoll.analysis.task_fusion import FusionPlan
+from atoll.execution_plans.models import (
+    ExecutionPlan,
+    ExecutionPlanDiagnostic,
+    ExecutionPlanTrial,
+    PlanRejection,
+)
 from atoll.models import (
     ArtifactRecord,
     Backend,
@@ -703,6 +709,10 @@ class CompilationSummaryReport(TypedDict):
         profile_mapped_coverage: Fraction of samples mapped to configured project modules.
         profile_selected_hot_coverage: Fraction of mapped samples covered by selected candidates.
         profile_accepted_hot_coverage: Fraction of mapped samples covered by profitable candidates.
+        execution_plans: Number of selected and rejected scheduler execution-plan candidates.
+        execution_selected_plans: Candidates selected by profile-guided plan policy.
+        execution_applied_plans: Plans staged into the promoted payload.
+        execution_plan_trials: Semantic or performance trials run for staged plans.
         fusion_plans: Number of deterministic task-fusion plans emitted.
         fusion_eligible_plans: Plans that passed every static and dynamic safety gate.
         fusion_trials: Number of three-arm fusion profitability trials run.
@@ -730,6 +740,10 @@ class CompilationSummaryReport(TypedDict):
     profile_mapped_coverage: float
     profile_selected_hot_coverage: float
     profile_accepted_hot_coverage: float
+    execution_plans: int
+    execution_selected_plans: int
+    execution_applied_plans: int
+    execution_plan_trials: int
     fusion_plans: int
     fusion_eligible_plans: int
     fusion_trials: int
@@ -820,6 +834,7 @@ class CompilationProfileMemberReport(TypedDict):
         samples: Statistical samples mapped to this member.
         coverage: Fraction of total workload samples represented by this member.
         call_count: Targeted type-observation calls observed for this member.
+        invocation_count: Total target invocations, including calls after type observation capped.
         lifecycle: Python lifecycle event counts for this member.
         signatures: Canonical argument-type signatures observed for this member.
         polymorphic: Whether the member exceeded the retained signature budget.
@@ -835,6 +850,7 @@ class CompilationProfileMemberReport(TypedDict):
     samples: int
     coverage: float
     call_count: int
+    invocation_count: int
     lifecycle: CompilationProfileLifecycleReport
     signatures: list[CompilationProfileSignatureReport]
     polymorphic: bool
@@ -866,8 +882,46 @@ class CompilationProfileCandidateDecisionReport(TypedDict):
     reason: str
 
 
+class CompilationProfileCallableIdentityReport(TypedDict):
+    """Canonical scheduler callable identity observed at one spawn site.
+
+    Attributes:
+        identity: Runtime callable type path without values or representations.
+        count: Calls attributed to this identity at the spawn site.
+    """
+
+    identity: str
+    count: int
+
+
+class CompilationProfileSpawnSiteReport(TypedDict):
+    """Exact scheduler call-site invocation evidence.
+
+    Attributes:
+        id: Stable source-derived spawn-site identity.
+        owner: Module-qualified callable containing the scheduler call.
+        lineno: First source line of the scheduler call.
+        col_offset: First source column of the scheduler call.
+        end_lineno: Final source line of the scheduler call.
+        end_col_offset: Final source column of the scheduler call.
+        scheduler_method: Recognized scheduling method such as `create_task`.
+        invocation_count: Calls observed at this exact source span.
+        callable_identities: Canonical runtime scheduler identities and counts.
+    """
+
+    id: str
+    owner: str
+    lineno: int
+    col_offset: int
+    end_lineno: int | None
+    end_col_offset: int | None
+    scheduler_method: str
+    invocation_count: int
+    callable_identities: list[CompilationProfileCallableIdentityReport]
+
+
 class CompilationProfileReport(TypedDict):
-    """Profile-guided selection evidence for compile report schema v3.
+    """Profile-guided selection evidence for compile report schema v4.
 
     Attributes:
         status: Profile status describing dynamic evidence or static fallback.
@@ -882,6 +936,7 @@ class CompilationProfileReport(TypedDict):
         child_passes: Child-process profiling pass evidence.
         lifecycle: Aggregate Python lifecycle event counts.
         members: Profiled project members with sample and type evidence.
+        spawn_sites: Exact scheduler call-site invocation evidence.
         candidate_mapping_decisions: Static mapping and hotness policy decisions.
         selected_symbols: Static symbols accepted by the profile candidate policy.
     """
@@ -898,6 +953,7 @@ class CompilationProfileReport(TypedDict):
     child_passes: list[CompilationProfilePassReport]
     lifecycle: CompilationProfileLifecycleReport
     members: list[CompilationProfileMemberReport]
+    spawn_sites: list[CompilationProfileSpawnSiteReport]
     candidate_mapping_decisions: list[CompilationProfileCandidateDecisionReport]
     selected_symbols: list[str]
 
@@ -1020,6 +1076,158 @@ class CompilationFusionGateRejectionReport(TypedDict):
 
     code: str
     reason: str
+
+
+class CompilationExecutionPlanNodeReport(TypedDict):
+    """One callable or transport role in a scheduler execution plan.
+
+    Attributes:
+        id: Stable node identity within the plan topology.
+        symbol: Module-qualified source symbol, when the node represents a callable.
+        role: Orchestrator, producer, consumer, reducer, transport, or support role.
+        lineno: Relevant one-based source line.
+    """
+
+    id: str
+    symbol: str | None
+    role: str
+    lineno: int
+
+
+class CompilationExecutionPlanEdgeReport(TypedDict):
+    """One directed scheduler or transport relation in an execution plan.
+
+    Attributes:
+        src: Source plan-node identity.
+        dst: Destination plan-node identity.
+        kind: Spawn, production, delivery, reduction, or report relation.
+        transport: Private transport identity carried by the relation.
+        lineno: One-based source line establishing the relation.
+    """
+
+    src: str
+    dst: str
+    kind: str
+    transport: str | None
+    lineno: int
+
+
+class CompilationExecutionPlanGuardReport(TypedDict):
+    """One runtime or lowering invariant required by an execution plan.
+
+    Attributes:
+        kind: Scheduler, transport, topology, or semantic guard category.
+        expression: Stable predicate or invariant identifier.
+        message: Plain-language explanation of the required invariant.
+    """
+
+    kind: str
+    expression: str
+    message: str
+
+
+class CompilationExecutionPlanRejectionReport(TypedDict):
+    """One coded reason a scheduler plan remains report-only.
+
+    Attributes:
+        code: Stable machine-readable rejection category.
+        reason: Plain-language rejection explanation.
+    """
+
+    code: str
+    reason: str
+
+
+class CompilationExecutionPlanReport(TypedDict):
+    """Selected or rejected scheduler execution-plan evidence.
+
+    Attributes:
+        id: Content-derived plan or rejection identity.
+        status: Selected or rejected discovery status.
+        source_module: Importable module containing the orchestration site.
+        owner: Module-qualified orchestration callable.
+        dialect: Recognized scheduler dialect, when available.
+        lowering_version: Dialect lowering version included in the plan identity.
+        source_hash: Digest of every source member required by the plan.
+        callsite_fingerprint: Digest of scheduler coordinates and callees.
+        topology_fingerprint: Digest of plan nodes, edges, and transport relations.
+        completion_transport: Private result-delivery transport identity.
+        consumer: Module-qualified result consumer.
+        reducer: Module-qualified reduction owner.
+        transport_capacity: Statically known positive delivery capacity.
+        ordering_policy: Result ordering policy a lowering must preserve.
+        task_ownership: Static proof category for task-handle ownership and joining.
+        observed_invocations: Maximum exact invocation count among plan spawn sites.
+        lifecycle_starts: Child coroutine starts attributed to the plan.
+        lifecycle_share: Fraction of mapped hot spawn activity represented by the plan.
+        guarded_callable_identities: Canonical scheduler callables required at runtime.
+        hotness: Dynamic ranking value excluded from plan identity.
+        nodes: Deterministic plan topology nodes.
+        edges: Deterministic directed topology relations.
+        guards: Runtime and lowering invariants required by the plan.
+        rejections: Coded reasons preventing selection or application.
+    """
+
+    id: str
+    status: str
+    source_module: str
+    owner: str
+    dialect: str | None
+    lowering_version: str | None
+    source_hash: str | None
+    callsite_fingerprint: str | None
+    topology_fingerprint: str | None
+    completion_transport: str | None
+    consumer: str | None
+    reducer: str | None
+    transport_capacity: int | None
+    ordering_policy: str | None
+    task_ownership: str | None
+    observed_invocations: int
+    lifecycle_starts: int
+    lifecycle_share: float
+    guarded_callable_identities: list[str]
+    hotness: int
+    nodes: list[CompilationExecutionPlanNodeReport]
+    edges: list[CompilationExecutionPlanEdgeReport]
+    guards: list[CompilationExecutionPlanGuardReport]
+    rejections: list[CompilationExecutionPlanRejectionReport]
+
+
+class CompilationExecutionPlanDiagnosticReport(TypedDict):
+    """Normalized execution-plan trial diagnostic.
+
+    Attributes:
+        code: Stable diagnostic category.
+        severity: Error, warning, or note severity.
+        message: Plain-language diagnostic summary.
+        details: Deterministic supporting lines without target values.
+    """
+
+    code: str
+    severity: str
+    message: str
+    details: list[str]
+
+
+class CompilationExecutionPlanTrialReport(TypedDict):
+    """Semantic or performance evidence for one staged execution plan.
+
+    Attributes:
+        plan_id: Content-derived plan identity under trial.
+        status: Accepted, rejected, failed-semantics, or unavailable result.
+        command: Exact argv executed with `shell=False`.
+        exit_code: Child exit status, when a command ran.
+        duration_seconds: Parent-observed command duration.
+        diagnostics: Normalized failure or decision evidence.
+    """
+
+    plan_id: str
+    status: str
+    command: list[str]
+    exit_code: int | None
+    duration_seconds: float | None
+    diagnostics: list[CompilationExecutionPlanDiagnosticReport]
 
 
 class CompilationFusionPlanReport(TypedDict):
@@ -1474,6 +1682,9 @@ class CompilationReport(TypedDict):
         performance: Paired performance-gate evidence.
         profile: Profile-guided selection evidence or explicit static fallback.
         candidate_trials: Candidate variants evaluated by profitability selection.
+        execution_plans: Selected and rejected scheduler execution-plan candidates.
+        applied_execution_plans: Plan IDs staged into the promoted payload.
+        execution_plan_trials: Semantic and performance evidence for staged plans.
         fusion_plans: Report-only task-fusion safety plans rooted in profiled hot paths.
         fusion_trials: Three-arm fusion trials run for generated eligible variants.
         suspension_plans: Per-callable suspension evidence and lowering decisions.
@@ -1505,6 +1716,9 @@ class CompilationReport(TypedDict):
     performance: CompilationPerformanceReport
     profile: CompilationProfileReport
     candidate_trials: list[CompilationCandidateTrialReport]
+    execution_plans: list[CompilationExecutionPlanReport]
+    applied_execution_plans: list[str]
+    execution_plan_trials: list[CompilationExecutionPlanTrialReport]
     fusion_plans: list[CompilationFusionPlanReport]
     fusion_trials: list[CompilationFusionTrialReport]
     suspension_plans: list[CompilationSuspensionPlanReport]
@@ -1602,6 +1816,9 @@ class CompilationReportInput:
         performance: Paired performance-gate evidence.
         profile: Profile-guided candidate evidence, or `None` for explicit static fallback.
         candidate_trials: Greedy marginal-profitability decisions in profile order.
+        execution_plans: Selected and rejected scheduler execution-plan candidates.
+        applied_execution_plans: Plan IDs staged into the promoted payload.
+        execution_plan_trials: Semantic or performance evidence for staged plans.
         fusion_plans: Deterministic task-fusion safety plans.
         fusion_trials: Three-arm task-fusion research evidence.
     """
@@ -1631,6 +1848,9 @@ class CompilationReportInput:
     performance: BenchmarkGateResult | None = None
     profile: ProfileResult | None = None
     candidate_trials: tuple[CandidateTrial, ...] = ()
+    execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = ()
+    applied_execution_plans: tuple[str, ...] = ()
+    execution_plan_trials: tuple[ExecutionPlanTrial, ...] = ()
     fusion_plans: tuple[FusionPlan, ...] = ()
     fusion_trials: tuple[FusionTrial, ...] = ()
 
@@ -1771,6 +1991,8 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     performance = _compilation_performance_report(report_input.root, report_input.performance)
     profile = _compilation_profile_report(report_input.profile)
     candidate_trials = _candidate_trial_reports(report_input.candidate_trials)
+    execution_plans = _execution_plan_reports(report_input.execution_plans)
+    execution_plan_trials = _execution_plan_trial_reports(report_input.execution_plan_trials)
     fusion_plans = _fusion_plan_reports(report_input.fusion_plans)
     fusion_trials = _fusion_trial_reports(report_input.root, report_input.fusion_trials)
     accepted_hot_coverage = (
@@ -1796,7 +2018,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         and not wheel_missing
     )
     return {
-        "version": 3,
+        "version": 4,
         "tool": "atoll",
         "operation": report_input.operation,
         "mode": report_input.mode,
@@ -1835,6 +2057,12 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             "profile_mapped_coverage": profile["mapped_coverage"],
             "profile_selected_hot_coverage": profile["selected_hot_coverage"],
             "profile_accepted_hot_coverage": accepted_hot_coverage,
+            "execution_plans": len(execution_plans),
+            "execution_selected_plans": sum(
+                plan["status"] == "selected" for plan in execution_plans
+            ),
+            "execution_applied_plans": len(report_input.applied_execution_plans),
+            "execution_plan_trials": len(execution_plan_trials),
             "fusion_plans": len(fusion_plans),
             "fusion_eligible_plans": sum(plan["eligible"] for plan in fusion_plans),
             "fusion_trials": len(fusion_trials),
@@ -1872,6 +2100,9 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         "performance": performance,
         "profile": profile,
         "candidate_trials": candidate_trials,
+        "execution_plans": execution_plans,
+        "applied_execution_plans": list(report_input.applied_execution_plans),
+        "execution_plan_trials": execution_plan_trials,
         "fusion_plans": fusion_plans,
         "fusion_trials": fusion_trials,
         "suspension_plans": suspension_plans,
@@ -2093,6 +2324,13 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
             f"{report['summary']['profile_accepted_hot_coverage']:.1%}"
         ),
         (
+            "- Execution plans: "
+            f"{report['summary']['execution_plans']} candidates, "
+            f"{report['summary']['execution_selected_plans']} selected, "
+            f"{report['summary']['execution_applied_plans']} applied"
+        ),
+        f"- Execution-plan trials: {report['summary']['execution_plan_trials']}",
+        (
             "- Task-fusion plans: "
             f"{report['summary']['fusion_plans']} total, "
             f"{report['summary']['fusion_eligible_plans']} eligible"
@@ -2107,6 +2345,12 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
     ]
     _append_profile_guided_selection_markdown(lines, report["profile"])
     _append_candidate_trials_markdown(lines, report["candidate_trials"])
+    _append_execution_plans_markdown(
+        lines,
+        report["execution_plans"],
+        report["applied_execution_plans"],
+        report["execution_plan_trials"],
+    )
     _append_fusion_plans_markdown(lines, report["fusion_plans"])
     _append_fusion_trials_markdown(lines, report["fusion_trials"])
     _append_suspension_plans_markdown(lines, report["suspension_plans"])
@@ -2308,6 +2552,51 @@ def _append_candidate_trials_markdown(
             f"{trial['reason']}{fallback}"
         )
     lines.append("")
+
+
+def _append_execution_plans_markdown(
+    lines: list[str],
+    plans: list[CompilationExecutionPlanReport],
+    applied: list[str],
+    trials: list[CompilationExecutionPlanTrialReport],
+) -> None:
+    """Render scheduler execution-plan discovery separately from native regions.
+
+    Args:
+        lines: Mutable Markdown line buffer receiving the section.
+        plans: Selected and rejected execution-plan candidates.
+        applied: Plan IDs staged into the promoted payload.
+        trials: Semantic or performance evidence for staged plans.
+    """
+    if not plans and not applied and not trials:
+        return
+    lines.extend(["## Async Execution Plans", ""])
+    for plan in plans:
+        rejection_text = "; ".join(
+            f"{rejection['code']}: {rejection['reason']}" for rejection in plan["rejections"]
+        )
+        detail = rejection_text or "selected for backend assessment"
+        lines.append(
+            f"- `{plan['id']}` [{plan['status']}]: `{plan['owner']}`; "
+            f"dialect `{plan['dialect'] or 'unresolved'}`; "
+            f"observed invocations {plan['observed_invocations']}; "
+            f"lifecycle starts {plan['lifecycle_starts']} "
+            f"({plan['lifecycle_share']:.1%} mapped async activity); {detail}"
+        )
+    lines.append("- Applied plans: " + (", ".join(f"`{plan_id}`" for plan_id in applied) or "none"))
+    lines.extend(
+        (
+            f"- Trial `{trial['plan_id']}`: {trial['status']}; "
+            f"exit {trial['exit_code'] if trial['exit_code'] is not None else 'not run'}"
+        )
+        for trial in trials
+    )
+    lines.extend(
+        [
+            "- Runtime status: report-only unless an applied plan and passing trial are listed.",
+            "",
+        ]
+    )
 
 
 def _append_fusion_plans_markdown(
@@ -3012,6 +3301,144 @@ def _candidate_trial_reports(
     ]
 
 
+def _execution_plan_reports(
+    plans: tuple[ExecutionPlan | PlanRejection, ...],
+) -> list[CompilationExecutionPlanReport]:
+    """Serialize selected and rejected scheduler execution-plan candidates.
+
+    Args:
+        plans: Profile-ranked execution plans and report-only rejections.
+
+    Returns:
+        list[CompilationExecutionPlanReport]: Stable JSON-compatible plan evidence.
+    """
+    reports: list[CompilationExecutionPlanReport] = []
+    for plan in plans:
+        if isinstance(plan, PlanRejection):
+            reports.append(
+                {
+                    "id": plan.id,
+                    "status": "rejected",
+                    "source_module": plan.source_module,
+                    "owner": plan.owner.stable_id,
+                    "dialect": plan.dialect,
+                    "lowering_version": None,
+                    "source_hash": None,
+                    "callsite_fingerprint": None,
+                    "topology_fingerprint": None,
+                    "completion_transport": None,
+                    "consumer": None,
+                    "reducer": None,
+                    "transport_capacity": None,
+                    "ordering_policy": None,
+                    "task_ownership": None,
+                    "observed_invocations": plan.hotness,
+                    "lifecycle_starts": 0,
+                    "lifecycle_share": 0.0,
+                    "guarded_callable_identities": [],
+                    "hotness": plan.hotness,
+                    "nodes": [],
+                    "edges": [],
+                    "guards": [],
+                    "rejections": [{"code": plan.reason, "reason": plan.message}],
+                }
+            )
+            continue
+        reports.append(
+            {
+                "id": plan.id,
+                "status": "selected",
+                "source_module": plan.source_module,
+                "owner": plan.owner.stable_id,
+                "dialect": plan.dialect,
+                "lowering_version": plan.lowering_version,
+                "source_hash": plan.source_hash,
+                "callsite_fingerprint": plan.callsite_fingerprint,
+                "topology_fingerprint": plan.topology_fingerprint,
+                "completion_transport": plan.completion_transport,
+                "consumer": plan.consumer.stable_id if plan.consumer is not None else None,
+                "reducer": plan.reducer.stable_id if plan.reducer is not None else None,
+                "transport_capacity": plan.transport_capacity,
+                "ordering_policy": plan.ordering_policy,
+                "task_ownership": plan.task_ownership,
+                "observed_invocations": plan.observed_invocations,
+                "lifecycle_starts": plan.lifecycle_starts,
+                "lifecycle_share": plan.lifecycle_share,
+                "guarded_callable_identities": list(plan.guarded_callable_identities),
+                "hotness": plan.hotness,
+                "nodes": [
+                    {
+                        "id": node.id,
+                        "symbol": node.symbol.stable_id if node.symbol is not None else None,
+                        "role": node.role,
+                        "lineno": node.lineno,
+                    }
+                    for node in plan.nodes
+                ],
+                "edges": [
+                    {
+                        "src": edge.src,
+                        "dst": edge.dst,
+                        "kind": edge.kind,
+                        "transport": edge.transport,
+                        "lineno": edge.lineno,
+                    }
+                    for edge in plan.edges
+                ],
+                "guards": [
+                    {
+                        "kind": guard.kind,
+                        "expression": guard.expression,
+                        "message": guard.message,
+                    }
+                    for guard in plan.guards
+                ],
+                "rejections": [
+                    {"code": rejection.reason, "reason": rejection.message}
+                    for rejection in plan.rejections
+                ],
+            }
+        )
+    return reports
+
+
+def _execution_plan_trial_reports(
+    trials: tuple[ExecutionPlanTrial, ...],
+) -> list[CompilationExecutionPlanTrialReport]:
+    """Serialize execution-plan semantic and performance trial evidence.
+
+    Args:
+        trials: Ordered staged-plan trials.
+
+    Returns:
+        list[CompilationExecutionPlanTrialReport]: Stable JSON-compatible trial evidence.
+    """
+    return [
+        {
+            "plan_id": trial.plan_id,
+            "status": trial.status,
+            "command": list(trial.command),
+            "exit_code": trial.exit_code,
+            "duration_seconds": trial.duration_seconds,
+            "diagnostics": [
+                _execution_plan_diagnostic_report(diagnostic) for diagnostic in trial.diagnostics
+            ],
+        }
+        for trial in trials
+    ]
+
+
+def _execution_plan_diagnostic_report(
+    diagnostic: ExecutionPlanDiagnostic,
+) -> CompilationExecutionPlanDiagnosticReport:
+    return {
+        "code": diagnostic.code,
+        "severity": diagnostic.severity,
+        "message": diagnostic.message,
+        "details": list(diagnostic.details),
+    }
+
+
 def _fusion_plan_reports(plans: tuple[FusionPlan, ...]) -> list[CompilationFusionPlanReport]:
     """Serialize deterministic fusion plans without changing compile success.
 
@@ -3124,6 +3551,7 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
             "child_passes": [],
             "lifecycle": _empty_profile_lifecycle_report(),
             "members": [],
+            "spawn_sites": [],
             "candidate_mapping_decisions": [],
             "selected_symbols": [],
         }
@@ -3155,6 +3583,7 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
                 "samples": member.samples,
                 "coverage": member.coverage,
                 "call_count": member.call_count,
+                "invocation_count": member.invocation_count,
                 "lifecycle": _profile_lifecycle_report(member.lifecycle),
                 "signatures": [
                     {
@@ -3177,6 +3606,23 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
                 "pre_completion_suspensions": member.pre_completion_suspensions,
             }
             for member in result.members
+        ],
+        "spawn_sites": [
+            {
+                "id": site.target.id,
+                "owner": site.target.owner.stable_id,
+                "lineno": site.target.lineno,
+                "col_offset": site.target.col_offset,
+                "end_lineno": site.target.end_lineno,
+                "end_col_offset": site.target.end_col_offset,
+                "scheduler_method": site.target.scheduler_method,
+                "invocation_count": site.invocation_count,
+                "callable_identities": [
+                    {"identity": callable_count.identity, "count": callable_count.count}
+                    for callable_count in site.callable_identities
+                ],
+            }
+            for site in result.spawn_sites
         ],
         "candidate_mapping_decisions": [
             {

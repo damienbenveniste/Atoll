@@ -825,6 +825,7 @@ def _write_source_clean_compile_report(
             performance=result.performance,
             profile=result.profile,
             candidate_trials=result.candidate_trials,
+            execution_plans=result.execution_plans,
             fusion_plans=result.fusion_plans,
             fusion_trials=result.fusion_trials,
         )

@@ -17,6 +17,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from dis import Positions, get_instructions
 from pathlib import Path
 from types import CodeType, FrameType
 from typing import Literal, cast
@@ -47,6 +48,7 @@ class _Config:
     module_paths: tuple[tuple[str, str], ...]
     result_path: Path
     targets: frozenset[str]
+    spawn_targets: tuple[_SpawnTarget, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +57,17 @@ class _ModulePath:
     suffix: str
     project_path: Path
     payload_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _SpawnTarget:
+    id: str
+    owner: str
+    lineno: int
+    col_offset: int
+    scheduler_method: str
+    end_lineno: int | None
+    end_col_offset: int | None
 
 
 def main(argv: tuple[str, ...] | None = None) -> int:
@@ -112,6 +125,7 @@ class _SamplingProfiler:
         """Disable sampling and monitoring callbacks installed by this pass."""
         signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
         if self._previous_handler is not None:
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
             signal.signal(signal.SIGALRM, self._previous_handler)
 
     def payload(self) -> JsonObject:
@@ -126,6 +140,7 @@ class _SamplingProfiler:
             "lifecycle": _empty_lifecycle_payload(),
             "member_lifecycle": {},
             "signatures": {},
+            "spawn_sites": [],
         }
 
     def _sample(self, _signum: int, frame: FrameType | None) -> None:
@@ -139,8 +154,11 @@ class _TypeProfiler:
     def __init__(self, config: _Config) -> None:
         self._mapper = _FrameMapper(config)
         self._targets = config.targets
+        self._spawn_targets = config.spawn_targets
+        self._spawn_targets_by_owner = _spawn_targets_by_owner(config.spawn_targets)
         self._signatures: dict[str, Counter[tuple[tuple[str, str], ...]]] = {}
         self._call_counts: Counter[str] = Counter()
+        self._invocation_counts: Counter[str] = Counter()
         self._completed_calls: Counter[str] = Counter()
         self._active_calls: Counter[str] = Counter()
         self._max_active_calls: Counter[str] = Counter()
@@ -150,10 +168,16 @@ class _TypeProfiler:
         self._lifecycle_counts: Counter[str] = Counter(dict.fromkeys(_LIFECYCLE_EVENT_NAMES, 0))
         self._member_lifecycle_counts: dict[str, Counter[str]] = {}
         self._target_codes: set[CodeType] = set()
+        self._instruction_positions: dict[
+            CodeType,
+            dict[int, tuple[int | None, int | None, int | None, int | None]],
+        ] = {}
+        self._spawn_counts: Counter[str] = Counter()
+        self._spawn_callable_counts: dict[str, Counter[str]] = {}
         self._enabled = False
 
     def start(self) -> None:
-        """Enable bounded monitoring for hot-member lifecycle and argument types.
+        """Enable complete lifecycle counts and bounded hot-member argument types.
 
         Raises:
             RuntimeError: Python's monitoring tool slot cannot be reserved.
@@ -166,6 +190,11 @@ class _TypeProfiler:
                 _MONITORING_TOOL_ID,
                 events.PY_START,
                 self._on_start,
+            )
+            monitoring.register_callback(
+                _MONITORING_TOOL_ID,
+                events.CALL,
+                self._on_call,
             )
             for event, name in (
                 (events.PY_RETURN, "return"),
@@ -208,13 +237,14 @@ class _TypeProfiler:
         """Return JSON evidence from the type-observation pass.
 
         Returns:
-            JsonObject: Bounded lifecycle and canonical argument-type observations.
+            JsonObject: Complete invocation/lifecycle and bounded canonical type observations.
         """
         signatures: JsonObject = {}
         for key in sorted(self._signatures):
             counter = self._signatures[key]
             signatures[key] = {
                 "call_count": self._call_counts[key],
+                "invocation_count": self._invocation_counts[key],
                 "polymorphic_overflow": key in self._overflow,
                 "observation_capped": key in self._observation_capped,
                 "signatures": [
@@ -240,6 +270,7 @@ class _TypeProfiler:
                 key,
                 {
                     "call_count": self._call_counts[key],
+                    "invocation_count": self._invocation_counts[key],
                     "completed_calls": self._completed_calls[key],
                     "max_active_calls": self._max_active_calls[key],
                     "pre_completion_suspensions": self._pre_completion_suspensions[key],
@@ -260,15 +291,34 @@ class _TypeProfiler:
                 key: dict(counts) for key, counts in sorted(self._member_lifecycle_counts.items())
             },
             "signatures": signatures,
+            "spawn_sites": [
+                {
+                    "id": target.id,
+                    "owner": target.owner,
+                    "lineno": target.lineno,
+                    "col_offset": target.col_offset,
+                    "scheduler_method": target.scheduler_method,
+                    "end_lineno": target.end_lineno,
+                    "end_col_offset": target.end_col_offset,
+                    "invocation_count": self._spawn_counts[target.id],
+                    "callable_identities": dict(
+                        sorted(self._spawn_callable_counts.get(target.id, Counter()).items())
+                    ),
+                }
+                for target in self._spawn_targets
+            ],
         }
 
     def _on_start(self, code: CodeType, _offset: int) -> object:
         key = self._mapper.code_key(code)
-        if key is None or key not in self._targets or key in self._observation_capped:
+        if key is None or key not in self._targets:
             return sys.monitoring.DISABLE
-        self._enable_target_lifecycle(code)
+        self._enable_target_lifecycle(code, key)
         self._count_lifecycle(key, "start")
         self._start_invocation(key)
+        self._invocation_counts[key] += 1
+        if key in self._observation_capped:
+            return None
         callback_frame = inspect.currentframe()
         frame = callback_frame.f_back if callback_frame is not None else None
         if frame is None or frame.f_code is not code:
@@ -283,23 +333,58 @@ class _TypeProfiler:
         if self._call_counts[key] < _MAX_TYPE_OBSERVATIONS_PER_MEMBER:
             return None
         self._observation_capped.add(key)
-        sys.monitoring.set_local_events(
-            _MONITORING_TOOL_ID,
-            code,
-            sys.monitoring.events.NO_EVENTS,
-        )
-        return sys.monitoring.DISABLE
+        return None
 
-    def _enable_target_lifecycle(self, code: CodeType) -> None:
+    def _enable_target_lifecycle(self, code: CodeType, key: str) -> None:
         if code in self._target_codes:
             return
         events = sys.monitoring.events
+        local_events = events.PY_RETURN | events.PY_YIELD | events.PY_RESUME
+        if key in self._spawn_targets_by_owner:
+            local_events |= events.CALL
         sys.monitoring.set_local_events(
             _MONITORING_TOOL_ID,
             code,
-            events.PY_RETURN | events.PY_YIELD | events.PY_RESUME,
+            local_events,
         )
         self._target_codes.add(code)
+
+    def _on_call(
+        self,
+        code: CodeType,
+        instruction_offset: int,
+        callable_object: object,
+        _arg0: object,
+    ) -> object:
+        key = self._mapper.code_key(code)
+        targets = self._spawn_targets_by_owner.get(key or "", ())
+        if not targets:
+            return None
+        position = self._instruction_position(code, instruction_offset)
+        callable_name = getattr(callable_object, "__name__", None)
+        for target in targets:
+            if target.scheduler_method != callable_name or not _position_within_spawn_target(
+                position, target
+            ):
+                continue
+            self._spawn_counts[target.id] += 1
+            identity = _canonical_callable_identity(callable_object)
+            self._spawn_callable_counts.setdefault(target.id, Counter())[identity] += 1
+        return None
+
+    def _instruction_position(
+        self,
+        code: CodeType,
+        offset: int,
+    ) -> tuple[int | None, int | None, int | None, int | None]:
+        positions = self._instruction_positions.get(code)
+        if positions is None:
+            positions = {
+                instruction.offset: _instruction_source_position(instruction.positions)
+                for instruction in get_instructions(code)
+            }
+            self._instruction_positions[code] = positions
+        return positions.get(offset, (None, None, None, None))
 
     def _lifecycle_callback(self, name: str) -> Callable[..., object]:
         def callback(code: CodeType, *_args: object) -> object:
@@ -420,6 +505,51 @@ def _canonical_type(value: object) -> str:
     return f"{value_type.__module__}.{value_type.__qualname__}"
 
 
+def _canonical_callable_identity(value: object) -> str:
+    module = getattr(value, "__module__", None)
+    qualname = getattr(value, "__qualname__", None)
+    if isinstance(module, str) and isinstance(qualname, str):
+        return f"{module}.{qualname}"
+    return _canonical_type(value)
+
+
+def _instruction_source_position(
+    position: Positions | None,
+) -> tuple[int | None, int | None, int | None, int | None]:
+    if position is None:
+        return None, None, None, None
+    return position.lineno, position.col_offset, position.end_lineno, position.end_col_offset
+
+
+def _position_within_spawn_target(
+    position: tuple[int | None, int | None, int | None, int | None],
+    target: _SpawnTarget,
+) -> bool:
+    lineno, col_offset, end_lineno, end_col_offset = position
+    if lineno is None or col_offset is None:
+        return False
+    if target.end_lineno is None or target.end_col_offset is None:
+        return lineno == target.lineno and col_offset >= target.col_offset
+    if end_lineno is None or end_col_offset is None:
+        return False
+    return (lineno, col_offset) >= (target.lineno, target.col_offset) and (
+        end_lineno,
+        end_col_offset,
+    ) <= (target.end_lineno, target.end_col_offset)
+
+
+def _spawn_targets_by_owner(
+    targets: tuple[_SpawnTarget, ...],
+) -> dict[str, tuple[_SpawnTarget, ...]]:
+    grouped: dict[str, list[_SpawnTarget]] = {}
+    for target in targets:
+        grouped.setdefault(target.owner, []).append(target)
+    return {
+        owner: tuple(sorted(items, key=lambda item: (item.lineno, item.col_offset, item.id)))
+        for owner, items in grouped.items()
+    }
+
+
 def _empty_lifecycle_payload() -> JsonObject:
     return {"start": 0, "return": 0, "yield": 0, "resume": 0, "unwind": 0, "throw": 0}
 
@@ -452,6 +582,22 @@ def _read_config(path: Path) -> _Config:
         ),
         result_path=Path(_string_field(payload, "result_path")).resolve(),
         targets=frozenset(_string_items(payload.get("targets", []))),
+        spawn_targets=tuple(
+            _spawn_target(_object_value(item))
+            for item in _list_value(payload.get("spawn_targets", []))
+        ),
+    )
+
+
+def _spawn_target(payload: JsonObject) -> _SpawnTarget:
+    return _SpawnTarget(
+        id=_string_field(payload, "id"),
+        owner=_string_field(payload, "owner"),
+        lineno=_int_field(payload, "lineno"),
+        col_offset=_int_field(payload, "col_offset"),
+        scheduler_method=_string_field(payload, "scheduler_method"),
+        end_lineno=_optional_int_field(payload, "end_lineno"),
+        end_col_offset=_optional_int_field(payload, "end_col_offset"),
     )
 
 
@@ -496,6 +642,16 @@ def _string_items(value: JsonValue) -> tuple[str, ...]:
 def _string_field(payload: JsonObject, key: str) -> str:
     value = payload.get(key, "")
     return value if isinstance(value, str) else ""
+
+
+def _int_field(payload: JsonObject, key: str) -> int:
+    value = payload.get(key, 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _optional_int_field(payload: JsonObject, key: str) -> int | None:
+    value = payload.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 if __name__ == "__main__":

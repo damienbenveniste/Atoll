@@ -20,6 +20,11 @@ from packaging import tags
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
+from atoll.analysis.execution_plans import (
+    build_execution_plans,
+    execution_plan_observation_targets,
+    execution_plan_profile_targets,
+)
 from atoll.analysis.native_readiness import NativeReadiness
 from atoll.analysis.task_fusion import (
     FusionPlan,
@@ -30,6 +35,7 @@ from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
 from atoll.backends.mypyc import MYPYC_BACKEND
+from atoll.execution_plans.models import ExecutionPlan, PlanRejection
 from atoll.generation.outlined_region import (
     OUTLINED_REGION_GENERATOR_VERSION,
     generate_outlined_region,
@@ -212,6 +218,7 @@ class PackageCommandResult:
         performance: Paired performance-gate evidence.
         profile: Unmeasured baseline profile and hot-candidate selection evidence.
         candidate_trials: Greedy marginal-profitability decisions in profile order.
+        execution_plans: Selected and rejected scheduler execution-plan candidates.
         fusion_plans: Deterministic report-only task-fusion safety decisions.
         fusion_trials: Three-arm research trials run only for eligible generated variants.
     """
@@ -243,6 +250,7 @@ class PackageCommandResult:
     performance: BenchmarkGateResult | None = None
     profile: ProfileResult | None = None
     candidate_trials: tuple[CandidateTrial, ...] = ()
+    execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = ()
     fusion_plans: tuple[FusionPlan, ...] = ()
     fusion_trials: tuple[FusionTrial, ...] = ()
 
@@ -458,6 +466,7 @@ class _TypedRegionPackageContext:
         typed_regions: Backend-neutral typed regions considered by packaging.
         preflight_skipped: Modules rejected before native compilation.
         native_readiness: Post-generation native-readiness evidence.
+        execution_plans: Scheduler execution-plan candidates retained for reporting.
         fusion_plans: Deterministic task-fusion safety evidence for profiled scheduler sites.
     """
 
@@ -465,6 +474,7 @@ class _TypedRegionPackageContext:
     typed_regions: tuple[TypedRegion, ...]
     preflight_skipped: tuple[PackagePreflightFailure, ...]
     native_readiness: tuple[NativeReadiness, ...]
+    execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = ()
     fusion_plans: tuple[FusionPlan, ...] = ()
 
 
@@ -585,12 +595,14 @@ class _ProfilePreparation:
         baseline: Built baseline wheel payload, when profile-guided selection is configured.
         profile: Unmeasured profile evidence, when profiling reached a supported launcher.
         failure: Early failure that must stop region scanning and native compilation.
+        execution_plans: Scheduler execution-plan candidates formed from static or profile evidence.
         fusion_plans: Deterministic task-fusion safety evidence formed after profile selection.
     """
 
     baseline: _BaselineWheelPayload | None = None
     profile: ProfileResult | None = None
     failure: PackageCommandResult | None = None
+    execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = ()
     fusion_plans: tuple[FusionPlan, ...] = ()
 
 
@@ -759,6 +771,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     scan_started = time.perf_counter()
     scans = _selected_scans(project, options.module_name, options.selected_members)
     typed_regions = tuple(region for scan in scans for region in scan.typed_regions)
+    execution_plans = build_execution_plans(scans, None)
     _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
     preflight_selected = _selected_typed_regions(
         scans,
@@ -788,6 +801,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             options.output_dir,
             preflight_error,
             typed_regions=typed_regions,
+            execution_plans=execution_plans,
         )
     preparation = _prepare_profile_guided_selection(options, project, scans)
     if preparation.failure is not None:
@@ -806,6 +820,16 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
                 f"{profile.selected_hot_coverage:.1%} of mapped project samples"
             ),
         )
+    execution_plans = build_execution_plans(scans, profile)
+    if execution_plans:
+        selected_execution_plans = sum(isinstance(plan, ExecutionPlan) for plan in execution_plans)
+        _progress(
+            options.progress,
+            (
+                f"execution-plan discovery produced {len(execution_plans)} candidate(s); "
+                f"{selected_execution_plans} selected for future backend assessment"
+            ),
+        )
     fusion_plans = build_fusion_plans(scans, profile) if profile is not None else ()
     if fusion_plans:
         eligible_fusion_plans = sum(plan.eligible for plan in fusion_plans)
@@ -816,7 +840,12 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
                 f"{eligible_fusion_plans} passed every safety gate"
             ),
         )
-    preparation = replace(preparation, profile=profile, fusion_plans=fusion_plans)
+    preparation = replace(
+        preparation,
+        profile=profile,
+        execution_plans=execution_plans,
+        fusion_plans=fusion_plans,
+    )
     profile_members = (
         profile.selected_symbols if profile is not None and profile.status == "profiled" else ()
     )
@@ -863,6 +892,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             typed_regions=typed_regions,
             preflight_skipped=(),
             native_readiness=(),
+            execution_plans=execution_plans,
             fusion_plans=fusion_plans,
         ),
         prepared_baseline=baseline,
@@ -917,6 +947,7 @@ def _execute_typed_region_package(
             typed_regions=context.typed_regions,
             backend_assessments=tuple(selection.assessment for selection in context.selected),
             profile=profile,
+            execution_plans=context.execution_plans,
             fusion_plans=context.fusion_plans,
         )
 
@@ -976,6 +1007,7 @@ def _execute_typed_region_package(
             backend_assessments=tuple(selection.assessment for selection in context.selected),
             region_skipped=tuple(preparation_failures),
             profile=profile,
+            execution_plans=context.execution_plans,
             fusion_plans=context.fusion_plans,
         )
 
@@ -1018,6 +1050,7 @@ def _execute_typed_region_package(
             artifact_records=outcome.artifacts,
             region_skipped=outcome.skipped,
             profile=profile,
+            execution_plans=context.execution_plans,
             fusion_plans=context.fusion_plans,
         )
 
@@ -1058,6 +1091,7 @@ def _execute_typed_region_package(
             artifact_records=outcome.artifacts,
             region_skipped=outcome.skipped,
             profile=profile,
+            execution_plans=context.execution_plans,
             fusion_plans=context.fusion_plans,
         )
 
@@ -1175,6 +1209,7 @@ def _execute_typed_region_package(
         performance=promotion.performance,
         profile=profile,
         candidate_trials=finalized.trials,
+        execution_plans=context.execution_plans,
         fusion_plans=context.fusion_plans,
         fusion_trials=fusion_research.trials,
     )
@@ -2010,8 +2045,8 @@ def _failed_result(
     output_dir: Path | None,
     error: str,
     *,
-    preflight_skipped: tuple[PackagePreflightFailure, ...] = (),
     typed_regions: tuple[TypedRegion, ...] = (),
+    execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = (),
 ) -> PackageCommandResult:
     resolved_output_dir = _resolve_output_dir(root, output_dir)
     return PackageCommandResult(
@@ -2030,8 +2065,8 @@ def _failed_result(
             duration_seconds=0.0,
         ),
         error=error,
-        preflight_skipped=preflight_skipped,
         typed_regions=typed_regions,
+        execution_plans=execution_plans,
     )
 
 
@@ -2051,8 +2086,9 @@ def _prepare_profile_guided_selection(
         _ProfilePreparation: Prepared baseline/profile evidence or an early failure.
     """
     benchmark = project.config.compile.benchmark_command
+    static_execution_plans = build_execution_plans(scans, None)
     if not options.run_quality_gates or benchmark is None:
-        return _ProfilePreparation()
+        return _ProfilePreparation(execution_plans=static_execution_plans)
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
     build_root = output_dir / "build"
     install_root = output_dir / "install"
@@ -2066,7 +2102,10 @@ def _prepare_profile_guided_selection(
         progress=options.progress,
         run_quality_gates=options.run_quality_gates,
     )
-    preparation = _ProfilePreparation(baseline=baseline)
+    preparation = _ProfilePreparation(
+        baseline=baseline,
+        execution_plans=static_execution_plans,
+    )
     if baseline.wheel_path is None:
         return _profile_preparation_failure(options, project, preparation, baseline.build.stderr)
     baseline = _run_baseline_semantic_test(
@@ -2097,7 +2136,8 @@ def _prepare_profile_guided_selection(
         payload_root=baseline.baseline_install_root,
         module_paths=_profile_module_paths(project),
         scratch_dir=build_root / "profile",
-        observation_targets=_fusion_observation_symbols(scans),
+        observation_targets=_profile_observation_symbols(scans),
+        spawn_targets=execution_plan_profile_targets(scans),
     )
     baseline = _append_profile_timings(baseline, profile)
     preparation = replace(preparation, baseline=baseline, profile=profile)
@@ -2185,6 +2225,7 @@ def _failed_region_selection(
         options.output_dir,
         error,
         typed_regions=typed_regions,
+        execution_plans=preparation.execution_plans,
     )
 
 
@@ -2253,6 +2294,7 @@ def _failed_before_region_selection(
             samples=(),
         ),
         profile=preparation.profile,
+        execution_plans=preparation.execution_plans,
         fusion_plans=preparation.fusion_plans,
     )
 
@@ -2311,23 +2353,27 @@ def _profile_module_paths(project: DiscoveredProject) -> tuple[tuple[str, str], 
     )
 
 
-def _fusion_observation_symbols(scans: tuple[ModuleScan, ...]) -> tuple[SymbolId, ...]:
-    """Convert planner target identities into profiler symbol contracts.
+def _profile_observation_symbols(scans: tuple[ModuleScan, ...]) -> tuple[SymbolId, ...]:
+    """Convert scheduler planner targets into profiler symbol contracts.
 
     Args:
         scans: Static module scans inspected for recognized task-spawn callees.
 
     Returns:
-        tuple[SymbolId, ...]: Deterministically ordered resolved task-spawn callees.
+        tuple[SymbolId, ...]: Deterministically ordered scheduler observation targets.
 
     Raises:
         ValueError: If the internal planner emits a malformed canonical identity.
     """
     symbols: list[SymbolId] = []
-    for target in fusion_observation_targets(scans):
+    targets = {
+        *fusion_observation_targets(scans),
+        *execution_plan_observation_targets(scans),
+    }
+    for target in sorted(targets):
         module, separator, qualname = target.partition("::")
         if not separator or not module or not qualname:
-            raise ValueError(f"invalid task-fusion observation target: {target}")
+            raise ValueError(f"invalid scheduler observation target: {target}")
         symbols.append(SymbolId(module=module, qualname=qualname))
     return tuple(symbols)
 

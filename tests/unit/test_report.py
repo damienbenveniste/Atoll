@@ -13,6 +13,15 @@ from atoll.analysis.clustering import enrich_island_analysis
 from atoll.analysis.native_readiness import NativeReadiness
 from atoll.analysis.task_fusion import FusionGateRejection, FusionPlan
 from atoll.analysis.typed_regions import build_directed_region_slice
+from atoll.execution_plans.models import (
+    ExecutionPlan,
+    ExecutionPlanDiagnostic,
+    ExecutionPlanTrial,
+    PlanEdge,
+    PlanGuard,
+    PlanNode,
+    PlanRejection,
+)
 from atoll.models import (
     ArtifactRecord,
     BackendAssessment,
@@ -43,21 +52,26 @@ from atoll.report import (
 )
 from atoll.runtime.fusion_performance import FusionTrial
 from atoll.runtime.profiling import (
+    CanonicalCallableCount,
     CanonicalTypeObservation,
     LifecycleCounts,
     MappedCandidateDecision,
     ObservedSignature,
     ProfiledMember,
+    ProfiledSpawnSite,
     ProfileResult,
+    ProfileSpawnSiteTarget,
     SubprocessPassEvidence,
 )
 
-REPORT_SCHEMA_VERSION = 3
+REPORT_SCHEMA_VERSION = 4
 PROFILE_MAPPED_COVERAGE = 0.75
 PROFILE_SELECTED_HOT_COVERAGE = 0.8
 PROFILE_SAMPLING_INTERVAL_MS = 2
 PROFILE_COMPLETED_CALLS = 11
 PROFILE_MAX_ACTIVE_CALLS = 2
+PROFILE_SPAWN_INVOCATIONS = 1_200
+EXECUTION_PLAN_CANDIDATE_COUNT = 2
 
 
 @pytest.mark.parametrize(
@@ -346,6 +360,7 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
         "child_passes": [],
         "lifecycle": {"start": 0, "return_": 0, "yield_": 0, "resume": 0, "unwind": 0, "throw": 0},
         "members": [],
+        "spawn_sites": [],
         "candidate_mapping_decisions": [],
         "selected_symbols": [],
     }
@@ -400,6 +415,7 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                 samples=120,
                 coverage=0.6,
                 call_count=12,
+                invocation_count=PROFILE_SPAWN_INVOCATIONS,
                 lifecycle=LifecycleCounts(
                     start=12,
                     return_=12,
@@ -432,6 +448,7 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                 samples=30,
                 coverage=0.15,
                 call_count=3,
+                invocation_count=3,
                 lifecycle=LifecycleCounts(
                     start=3,
                     return_=3,
@@ -465,6 +482,24 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
             ),
         ),
         selected_symbols=(SymbolId("app.ranking", "score_user"),),
+        spawn_sites=(
+            ProfiledSpawnSite(
+                target=ProfileSpawnSiteTarget(
+                    id="spawn-site-report",
+                    owner=SymbolId("app.ranking", "score_user"),
+                    lineno=20,
+                    col_offset=8,
+                    scheduler_method="create_task",
+                ),
+                invocation_count=PROFILE_SPAWN_INVOCATIONS,
+                callable_identities=(
+                    CanonicalCallableCount(
+                        identity="asyncio.taskgroups.TaskGroup.create_task",
+                        count=PROFILE_SPAWN_INVOCATIONS,
+                    ),
+                ),
+            ),
+        ),
     )
 
     report = build_compilation_report(
@@ -597,6 +632,25 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
     assert report["profile"]["members"][0]["completed_calls"] == PROFILE_COMPLETED_CALLS
     assert report["profile"]["members"][0]["max_active_calls"] == PROFILE_MAX_ACTIVE_CALLS
     assert report["profile"]["members"][0]["pre_completion_suspensions"] == 1
+    assert report["profile"]["members"][0]["invocation_count"] == PROFILE_SPAWN_INVOCATIONS
+    assert report["profile"]["spawn_sites"] == [
+        {
+            "id": "spawn-site-report",
+            "owner": "app.ranking::score_user",
+            "lineno": 20,
+            "col_offset": 8,
+            "end_lineno": None,
+            "end_col_offset": None,
+            "scheduler_method": "create_task",
+            "invocation_count": PROFILE_SPAWN_INVOCATIONS,
+            "callable_identities": [
+                {
+                    "identity": "asyncio.taskgroups.TaskGroup.create_task",
+                    "count": PROFILE_SPAWN_INVOCATIONS,
+                }
+            ],
+        }
+    ]
     assert report["profile"]["candidate_mapping_decisions"][1]["reason"] == "unmapped"
     assert report["profile"]["selected_symbols"] == ["app.ranking::score_user"]
     assert "## Candidate Profitability" in markdown
@@ -973,6 +1027,99 @@ def test_compilation_report_accepts_explicit_compiled_variants(tmp_path: Path) -
             "artifacts": [".atoll/artifacts/_atoll_variant_score.so"],
         }
     ]
+
+
+def test_compilation_report_serializes_execution_plan_schema_v4(tmp_path: Path) -> None:
+    """Execution plans remain distinct from native regions and fusion research."""
+    owner = SymbolId(module="app.scheduler", qualname="run")
+    producer = SymbolId(module="app.scheduler", qualname="_produce")
+    consumer = SymbolId(module="app.scheduler", qualname="_consume")
+    plan = ExecutionPlan(
+        id="exec-plan-selected",
+        source_module="app.scheduler",
+        owner=owner,
+        dialect="asyncio",
+        lowering_version="asyncio-v1",
+        source_hash="a" * 64,
+        callsite_fingerprint="b" * 64,
+        topology_fingerprint="c" * 64,
+        nodes=(
+            PlanNode(owner.stable_id, owner, "orchestrator", 10),
+            PlanNode(producer.stable_id, producer, "producer", 4),
+            PlanNode(consumer.stable_id, consumer, "consumer", 7),
+        ),
+        edges=(
+            PlanEdge(owner.stable_id, producer.stable_id, "spawns", "queue", 12),
+            PlanEdge(producer.stable_id, consumer.stable_id, "passes_transport", "queue", 12),
+        ),
+        guards=(PlanGuard("scheduler", "asyncio", "scheduler must remain asyncio"),),
+        hotness=2_000,
+    )
+    rejected = PlanRejection(
+        id="exec-plan-rejected",
+        source_module="app.scheduler",
+        owner=SymbolId(module="app.scheduler", qualname="cold"),
+        reason="low-hotness",
+        message="site did not meet the invocation threshold",
+        dialect="asyncio",
+        lineno=20,
+        hotness=12,
+    )
+    trial = ExecutionPlanTrial(
+        plan_id=plan.id,
+        status="accepted",
+        command=("python", "benchmark.py"),
+        exit_code=0,
+        duration_seconds=0.5,
+        diagnostics=(
+            ExecutionPlanDiagnostic(
+                code="verified",
+                severity="note",
+                message="semantic command passed",
+            ),
+        ),
+    )
+
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter="app.scheduler",
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "compile"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=1.0,
+            ),
+            execution_plans=(plan, rejected),
+            applied_execution_plans=(plan.id,),
+            execution_plan_trials=(trial,),
+        )
+    )
+    markdown = render_compilation_markdown_report(report)
+
+    assert report["version"] == REPORT_SCHEMA_VERSION
+    assert report["summary"]["execution_plans"] == EXECUTION_PLAN_CANDIDATE_COUNT
+    assert report["summary"]["execution_selected_plans"] == 1
+    assert report["summary"]["execution_applied_plans"] == 1
+    assert report["summary"]["execution_plan_trials"] == 1
+    assert report["execution_plans"][0]["status"] == "selected"
+    assert report["execution_plans"][0]["callsite_fingerprint"] == "b" * 64
+    assert report["execution_plans"][0]["topology_fingerprint"] == "c" * 64
+    assert report["execution_plans"][0]["task_ownership"] == "structured"
+    assert report["execution_plans"][1]["rejections"] == [
+        {
+            "code": "low-hotness",
+            "reason": "site did not meet the invocation threshold",
+        }
+    ]
+    assert report["applied_execution_plans"] == [plan.id]
+    assert report["execution_plan_trials"][0]["diagnostics"][0]["code"] == "verified"
+    assert "## Async Execution Plans" in markdown
+    assert "Runtime status: report-only unless an applied plan" in markdown
 
 
 def test_suspension_report_applies_member_rejections_to_block_eligibility(

@@ -55,6 +55,7 @@ _subprocess_run: _RunSubprocess = subprocess.run
 class _BaselineProfileOptions(TypedDict):
     scratch_dir: Path
     observation_targets: NotRequired[tuple[SymbolId, ...]]
+    spawn_targets: NotRequired[tuple[ProfileSpawnSiteTarget, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,7 @@ class _BootstrapRequest:
     module_paths: tuple[tuple[str, str], ...]
     scratch_dir: Path
     targets: tuple[str, ...]
+    spawn_targets: tuple[ProfileSpawnSiteTarget, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +132,57 @@ class LifecycleCounts:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileSpawnSiteTarget:
+    """Static scheduler call site to count during the targeted profiling pass.
+
+    Attributes:
+        id: Stable source-derived call-site identity.
+        owner: Callable containing the scheduler call.
+        lineno: One-based scheduler-call source line.
+        col_offset: Zero-based scheduler-call source column.
+        scheduler_method: Expected scheduler method name such as `create_task` or `start_soon`.
+        end_lineno: One-based final scheduler-call source line.
+        end_col_offset: Zero-based final scheduler-call source column.
+    """
+
+    id: str
+    owner: SymbolId
+    lineno: int
+    col_offset: int
+    scheduler_method: str
+    end_lineno: int | None = None
+    end_col_offset: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCallableCount:
+    """Canonical scheduler callable identity and observation count.
+
+    Attributes:
+        identity: Runtime callable type path without values or representations.
+        count: Invocations attributed to this identity at one exact spawn site.
+    """
+
+    identity: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProfiledSpawnSite:
+    """Runtime invocation evidence for one configured scheduler call site.
+
+    Attributes:
+        target: Static call-site contract used to collect the evidence.
+        invocation_count: Scheduler calls observed at the exact source site.
+        callable_identities: Canonical runtime scheduler callable identities and counts.
+    """
+
+    target: ProfileSpawnSiteTarget
+    invocation_count: int
+    callable_identities: tuple[CanonicalCallableCount, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalTypeObservation:
     """Canonical parameter type count for a profiled callable.
 
@@ -167,6 +220,7 @@ class ProfiledMember:
         samples: Statistical leaf-frame samples mapped to this member.
         coverage: Fraction of total workload samples represented by this member.
         call_count: Targeted type-observation calls observed for this member.
+        invocation_count: Total target invocations, including calls after type observation capped.
         lifecycle: Python lifecycle event counts observed for this member.
         signatures: Canonical argument-type signatures observed in the targeted pass.
         polymorphic_overflow: Whether more than eight unique signatures were observed.
@@ -184,6 +238,7 @@ class ProfiledMember:
     lifecycle: LifecycleCounts
     signatures: tuple[ObservedSignature, ...]
     polymorphic_overflow: bool
+    invocation_count: int = 0
     observation_capped: bool = False
     completed_calls: int = 0
     max_active_calls: int = 0
@@ -236,10 +291,11 @@ class ProfileResult:
         selected_hot_samples: Samples covered by selected candidates.
         selected_hot_coverage: Fraction of samples covered by selected candidates.
         runs: Child-process evidence for each profiling pass.
-        lifecycle: Python lifecycle event counts from the sampling pass.
+        lifecycle: Python lifecycle event counts from the targeted observation pass.
         members: Profiled project members with sample and type evidence.
         candidates: Candidate mapping decisions derived from static symbols.
         selected_symbols: Static symbols accepted by the candidate policy.
+        spawn_sites: Exact scheduler call-site invocation evidence.
     """
 
     status: ProfileStatus
@@ -255,6 +311,7 @@ class ProfileResult:
     members: tuple[ProfiledMember, ...]
     candidates: tuple[MappedCandidateDecision, ...]
     selected_symbols: tuple[SymbolId, ...]
+    spawn_sites: tuple[ProfiledSpawnSite, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,7 +361,8 @@ def run_baseline_profile(
         module_paths: `(module, install-relative .py suffix)` entries used for mapping frames.
         options: Required `scratch_dir` directory for temporary JSON files removed before
             return, plus optional `observation_targets` symbols to observe even when sampling
-            does not identify them as hot members.
+            does not identify them as hot members and `spawn_targets` scheduler calls whose exact
+            invocation counts and canonical callable identities must be retained.
 
     Returns:
         ProfileResult: Baseline profile evidence without candidate decisions.
@@ -331,6 +389,7 @@ def run_baseline_profile(
             module_paths=module_paths,
             scratch_dir=resolved_scratch_dir,
             targets=(),
+            spawn_targets=(),
         )
     )
     runs: tuple[SubprocessPassEvidence, ...] = (sampling_run,)
@@ -356,6 +415,7 @@ def run_baseline_profile(
             module_paths=module_paths,
             scratch_dir=resolved_scratch_dir,
             targets=tuple(dict.fromkeys((*hot_targets, *explicit_targets))),
+            spawn_targets=options.get("spawn_targets", ()),
         )
     )
     runs = (sampling_run, type_run)
@@ -522,6 +582,18 @@ def _bootstrap_config(request: _BootstrapRequest, *, result_path: Path) -> JsonO
         "module_paths": [[module, suffix] for module, suffix in request.module_paths],
         "result_path": str(result_path),
         "targets": list(request.targets),
+        "spawn_targets": [
+            {
+                "id": target.id,
+                "owner": _member_key(target.owner),
+                "lineno": target.lineno,
+                "col_offset": target.col_offset,
+                "scheduler_method": target.scheduler_method,
+                "end_lineno": target.end_lineno,
+                "end_col_offset": target.end_col_offset,
+            }
+            for target in request.spawn_targets
+        ],
     }
 
 
@@ -603,6 +675,10 @@ def _profile_from_payload(
         members=members,
         candidates=(),
         selected_symbols=(),
+        spawn_sites=tuple(
+            _profiled_spawn_site(_object_value(item))
+            for item in _list_value(payload.get("spawn_sites", []))
+        ),
     )
 
 
@@ -621,6 +697,7 @@ def _profiled_member(
         samples=samples,
         coverage=_coverage(samples, total_samples),
         call_count=_int_field(member_payload, "call_count"),
+        invocation_count=_int_field(member_payload, "invocation_count"),
         lifecycle=_lifecycle_counts(_object_value(member_lifecycle_payload.get(key, {}))),
         signatures=_signatures(_list_value(member_payload.get("signatures", []))),
         polymorphic_overflow=_bool_value(member_payload.get("polymorphic_overflow", False)),
@@ -628,6 +705,27 @@ def _profiled_member(
         completed_calls=_int_field(member_payload, "completed_calls"),
         max_active_calls=_int_field(member_payload, "max_active_calls"),
         pre_completion_suspensions=_int_field(member_payload, "pre_completion_suspensions"),
+    )
+
+
+def _profiled_spawn_site(payload: JsonObject) -> ProfiledSpawnSite:
+    owner_module, owner_qualname = _split_member_key(_string_field(payload, "owner"))
+    callable_identities = _object_field(payload, "callable_identities")
+    return ProfiledSpawnSite(
+        target=ProfileSpawnSiteTarget(
+            id=_string_field(payload, "id"),
+            owner=SymbolId(module=owner_module, qualname=owner_qualname),
+            lineno=_int_field(payload, "lineno"),
+            col_offset=_int_field(payload, "col_offset"),
+            scheduler_method=_string_field(payload, "scheduler_method"),
+            end_lineno=_optional_int_field(payload, "end_lineno"),
+            end_col_offset=_optional_int_field(payload, "end_col_offset"),
+        ),
+        invocation_count=_int_field(payload, "invocation_count"),
+        callable_identities=tuple(
+            CanonicalCallableCount(identity=_string_key(identity), count=_int_value(count))
+            for identity, count in sorted(callable_identities.items())
+        ),
     )
 
 
@@ -702,6 +800,7 @@ def _merge_payloads(sampling_payload: JsonObject, type_payload: JsonObject) -> J
     merged["signatures"] = type_payload.get("signatures", {})
     merged["lifecycle"] = type_payload.get("lifecycle", {})
     merged["member_lifecycle"] = type_payload.get("member_lifecycle", {})
+    merged["spawn_sites"] = type_payload.get("spawn_sites", [])
     return merged
 
 
@@ -712,6 +811,7 @@ def _empty_payload() -> JsonObject:
         "lifecycle": {"start": 0, "return": 0, "yield": 0, "resume": 0, "unwind": 0, "throw": 0},
         "member_lifecycle": {},
         "signatures": {},
+        "spawn_sites": [],
     }
 
 
@@ -747,6 +847,11 @@ def _string_field(payload: JsonObject, key: str) -> str:
 
 def _int_field(payload: JsonObject, key: str) -> int:
     return _int_value(payload.get(key, 0))
+
+
+def _optional_int_field(payload: JsonObject, key: str) -> int | None:
+    value = payload.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _int_value(value: JsonValue) -> int:
