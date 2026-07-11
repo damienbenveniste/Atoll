@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -14,6 +14,7 @@ from atoll.analysis.native_readiness import NativeReadiness
 from atoll.analysis.task_fusion import FusionGateRejection, FusionPlan
 from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.execution_plans.models import (
+    ChangedPayloadFile,
     ExecutionPlan,
     ExecutionPlanDiagnostic,
     ExecutionPlanTrial,
@@ -1078,6 +1079,22 @@ def test_compilation_report_serializes_execution_plan_schema_v4(tmp_path: Path) 
                 message="semantic command passed",
             ),
         ),
+        backend="task-preserving",
+        reason="planned payload passed the marginal gate",
+        benchmark_command=("python", "benchmark.py"),
+        benchmark_status="passed",
+        minimum_speedup=1.05,
+        baseline_median_seconds=1.0,
+        planned_median_seconds=0.8,
+        marginal_speedup=1.25,
+        payload_files=(
+            ChangedPayloadFile(
+                install_path=PurePosixPath("app/scheduler.py"),
+                before_hash="d" * 64,
+                after_hash="e" * 64,
+                role="source-overlay",
+            ),
+        ),
     )
 
     report = build_compilation_report(
@@ -1118,6 +1135,16 @@ def test_compilation_report_serializes_execution_plan_schema_v4(tmp_path: Path) 
     ]
     assert report["applied_execution_plans"] == [plan.id]
     assert report["execution_plan_trials"][0]["diagnostics"][0]["code"] == "verified"
+    assert report["execution_plan_trials"][0]["backend"] == "task-preserving"
+    assert report["execution_plan_trials"][0]["marginal_speedup"] == pytest.approx(1.25)
+    assert report["execution_plan_trials"][0]["payload_files"] == [
+        {
+            "install_path": "app/scheduler.py",
+            "before_hash": "d" * 64,
+            "after_hash": "e" * 64,
+            "role": "source-overlay",
+        }
+    ]
     assert "## Async Execution Plans" in markdown
     assert "Runtime status: report-only unless an applied plan" in markdown
 

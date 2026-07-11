@@ -50,6 +50,13 @@ ExecutionPlanRejectionReason = Literal[
     "escaping-handle",
 ]
 ExecutionPlanTrialStatus = Literal["accepted", "rejected", "failed-semantics", "unavailable"]
+ExecutionPlanBenchmarkStatus = Literal[
+    "not-run",
+    "passed",
+    "not-profitable",
+    "invalid",
+    "unbenchmarked",
+]
 
 _DIGEST_SIZE = 16
 
@@ -332,6 +339,15 @@ class ExecutionPlanTrial:
         exit_code: Trial process exit status, when a process was run.
         duration_seconds: Parent-observed trial duration, when measured.
         diagnostics: Normalized backend or trial diagnostics.
+        backend: Execution-plan backend that staged the candidate.
+        reason: Plain-language acceptance or rejection reason.
+        benchmark_command: Exact benchmark argv used for marginal comparison.
+        benchmark_status: Marginal benchmark decision, or `not-run`.
+        minimum_speedup: Required speedup over the current unplanned payload.
+        baseline_median_seconds: Median duration of the current accepted payload.
+        planned_median_seconds: Median duration of the candidate planned payload.
+        marginal_speedup: Current-payload median divided by planned-payload median.
+        payload_files: Staged payload changes validated before semantic testing.
     """
 
     plan_id: str
@@ -340,6 +356,15 @@ class ExecutionPlanTrial:
     exit_code: int | None
     duration_seconds: float | None
     diagnostics: tuple[ExecutionPlanDiagnostic, ...] = ()
+    backend: str | None = None
+    reason: str | None = None
+    benchmark_command: tuple[str, ...] = ()
+    benchmark_status: ExecutionPlanBenchmarkStatus = "not-run"
+    minimum_speedup: float | None = None
+    baseline_median_seconds: float | None = None
+    planned_median_seconds: float | None = None
+    marginal_speedup: float | None = None
+    payload_files: tuple[ChangedPayloadFile, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

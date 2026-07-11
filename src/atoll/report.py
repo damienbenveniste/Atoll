@@ -1210,6 +1210,22 @@ class CompilationExecutionPlanDiagnosticReport(TypedDict):
     details: list[str]
 
 
+class CompilationExecutionPlanPayloadFileReport(TypedDict):
+    """One payload change made by a disposable execution-plan candidate.
+
+    Attributes:
+        install_path: POSIX path below the unpacked wheel payload root.
+        before_hash: Digest before staging, or `None` for a generated file.
+        after_hash: Digest after staging.
+        role: Backend-defined purpose of the changed file.
+    """
+
+    install_path: str
+    before_hash: str | None
+    after_hash: str
+    role: str
+
+
 class CompilationExecutionPlanTrialReport(TypedDict):
     """Semantic or performance evidence for one staged execution plan.
 
@@ -1220,6 +1236,15 @@ class CompilationExecutionPlanTrialReport(TypedDict):
         exit_code: Child exit status, when a command ran.
         duration_seconds: Parent-observed command duration.
         diagnostics: Normalized failure or decision evidence.
+        backend: Execution-plan backend used for staging.
+        reason: Plain-language acceptance or rejection reason.
+        benchmark_command: Exact argv used for marginal measurement.
+        benchmark_status: Marginal benchmark result, or `not-run`.
+        minimum_speedup: Required speedup over the current accepted payload.
+        baseline_median_seconds: Current-payload median duration.
+        planned_median_seconds: Planned-payload median duration.
+        marginal_speedup: Current-payload median divided by planned-payload median.
+        payload_files: Validated staged payload changes.
     """
 
     plan_id: str
@@ -1228,6 +1253,15 @@ class CompilationExecutionPlanTrialReport(TypedDict):
     exit_code: int | None
     duration_seconds: float | None
     diagnostics: list[CompilationExecutionPlanDiagnosticReport]
+    backend: str | None
+    reason: str | None
+    benchmark_command: list[str]
+    benchmark_status: str
+    minimum_speedup: float | None
+    baseline_median_seconds: float | None
+    planned_median_seconds: float | None
+    marginal_speedup: float | None
+    payload_files: list[CompilationExecutionPlanPayloadFileReport]
 
 
 class CompilationFusionPlanReport(TypedDict):
@@ -2587,7 +2621,15 @@ def _append_execution_plans_markdown(
     lines.extend(
         (
             f"- Trial `{trial['plan_id']}`: {trial['status']}; "
-            f"exit {trial['exit_code'] if trial['exit_code'] is not None else 'not run'}"
+            f"backend `{trial['backend'] or 'unavailable'}`; semantic exit "
+            f"{trial['exit_code'] if trial['exit_code'] is not None else 'not run'}; "
+            f"marginal benchmark {trial['benchmark_status']}"
+            + (
+                f" at {trial['marginal_speedup']:.3f}x"
+                if trial["marginal_speedup"] is not None
+                else ""
+            )
+            + (f"; {trial['reason']}" if trial["reason"] else "")
         )
         for trial in trials
     )
@@ -3422,6 +3464,23 @@ def _execution_plan_trial_reports(
             "duration_seconds": trial.duration_seconds,
             "diagnostics": [
                 _execution_plan_diagnostic_report(diagnostic) for diagnostic in trial.diagnostics
+            ],
+            "backend": trial.backend,
+            "reason": trial.reason,
+            "benchmark_command": list(trial.benchmark_command),
+            "benchmark_status": trial.benchmark_status,
+            "minimum_speedup": trial.minimum_speedup,
+            "baseline_median_seconds": trial.baseline_median_seconds,
+            "planned_median_seconds": trial.planned_median_seconds,
+            "marginal_speedup": trial.marginal_speedup,
+            "payload_files": [
+                {
+                    "install_path": payload_file.install_path.as_posix(),
+                    "before_hash": payload_file.before_hash,
+                    "after_hash": payload_file.after_hash,
+                    "role": payload_file.role,
+                }
+                for payload_file in trial.payload_files
             ],
         }
         for trial in trials

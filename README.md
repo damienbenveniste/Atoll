@@ -198,6 +198,15 @@ reason, marginal speedup, and the hot-path coverage retained by the accepted set
 If every profiled candidate is rejected, Atoll still records the final full-gate evidence but does
 not publish a wheel with zero native regions.
 
+Profile-selected async execution plans are trialed only when both `test_command` and
+`benchmark_command` are configured. The task-preserving backend stages each candidate in a
+disposable copy of the accepted native payload, keeps one real scheduler task per logical work
+item, and leaves the original staged implementation as a guard-selected fallback. Atoll rejects
+unreported payload changes before running project code, runs the semantic command once, then uses
+one warmup and seven alternating benchmark pairs. A plan replaces the unplanned payload only when
+its marginal median speedup is at least `1.05x`; the configured full benchmark still controls final
+wheel promotion. Without both commands, plans remain report-only.
+
 Schema v3 also records deterministic, report-only task-fusion plans for recognized `start_soon`,
 `create_task`, and `ensure_future` sites reachable from selected hot roots. A plan is eligible for
 research only when one same-module coroutine has at least 20 complete monomorphic observations,

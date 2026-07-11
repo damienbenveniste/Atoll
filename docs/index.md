@@ -166,6 +166,15 @@ hot coverage, accepted hot coverage, lowering mode, fallback reason, and margina
 When every profiled candidate is rejected, Atoll records the final full-gate evidence but does not
 publish a wheel containing no native regions.
 
+Profile-selected async execution plans are trialed only when both semantic and benchmark commands
+are configured. The task-preserving backend works in a disposable copy of the accepted native
+payload, keeps one real scheduler task per logical item, and preserves the staged source path as a
+guarded fallback. Atoll verifies that every payload change was reported before project code runs,
+executes the semantic command once, then compares one warmup and seven alternating timing pairs.
+The planned payload must be at least `1.05x` faster than the unplanned payload and must still pass
+the configured full benchmark before its wheel is promoted. Otherwise the plan remains report-only
+or is recorded as rejected without discarding an accepted native wheel.
+
 Atoll also emits deterministic report-only task-fusion plans for recognized `start_soon`,
 `create_task`, and `ensure_future` sites reachable from selected hot roots. A plan cannot proceed
 unless one same-module coroutine has at least 20 complete monomorphic observations, no overlap, no

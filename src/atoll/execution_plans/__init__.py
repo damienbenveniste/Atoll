@@ -23,8 +23,13 @@ from atoll.execution_plans.models import (
     StagedExecutionPlan,
     stable_execution_plan_id,
 )
+from atoll.execution_plans.task_preserving import (
+    TASK_PRESERVING_BACKEND,
+    TaskPreservingExecutionPlanBackend,
+)
 
 __all__ = (
+    "TASK_PRESERVING_BACKEND",
     "AnyioOnAsyncioDialect",
     "AsyncioDialect",
     "ChangedPayloadFile",
@@ -42,6 +47,7 @@ __all__ = (
     "PlanRejection",
     "SchedulerDialect",
     "StagedExecutionPlan",
+    "TaskPreservingExecutionPlanBackend",
     "built_in_scheduler_dialects",
     "stable_execution_plan_id",
 )

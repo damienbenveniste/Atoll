@@ -35,7 +35,19 @@ from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
 from atoll.backends.mypyc import MYPYC_BACKEND
-from atoll.execution_plans.models import ExecutionPlan, PlanRejection
+from atoll.execution_plans.base import ExecutionPlanBackend
+from atoll.execution_plans.models import (
+    ExecutionPlan,
+    ExecutionPlanAssessmentContext,
+    ExecutionPlanDiagnostic,
+    ExecutionPlanDiagnosticSeverity,
+    ExecutionPlanStageContext,
+    ExecutionPlanTrial,
+    ExecutionPlanTrialStatus,
+    PlanRejection,
+    StagedExecutionPlan,
+)
+from atoll.execution_plans.task_preserving import TASK_PRESERVING_BACKEND
 from atoll.generation.outlined_region import (
     OUTLINED_REGION_GENERATOR_VERSION,
     generate_outlined_region,
@@ -120,10 +132,14 @@ _COMPILER_BACKENDS: dict[Backend, CompilerBackend] = {
     "mypyc": MYPYC_BACKEND,
     "cython": CYTHON_BACKEND,
 }
+_EXECUTION_PLAN_BACKENDS: tuple[ExecutionPlanBackend, ...] = (TASK_PRESERVING_BACKEND,)
 
 _CANDIDATE_BENCHMARK_WARMUPS = 1
 _CANDIDATE_BENCHMARK_SAMPLES = 3
 _CANDIDATE_MINIMUM_SPEEDUP = 1.01
+_EXECUTION_PLAN_BENCHMARK_WARMUPS = 1
+_EXECUTION_PLAN_BENCHMARK_SAMPLES = 7
+_EXECUTION_PLAN_MINIMUM_SPEEDUP = 1.05
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -219,6 +235,8 @@ class PackageCommandResult:
         profile: Unmeasured baseline profile and hot-candidate selection evidence.
         candidate_trials: Greedy marginal-profitability decisions in profile order.
         execution_plans: Selected and rejected scheduler execution-plan candidates.
+        applied_execution_plans: Plan IDs retained in the promoted payload.
+        execution_plan_trials: Semantic and marginal benchmark evidence for plan candidates.
         fusion_plans: Deterministic report-only task-fusion safety decisions.
         fusion_trials: Three-arm research trials run only for eligible generated variants.
     """
@@ -251,6 +269,8 @@ class PackageCommandResult:
     profile: ProfileResult | None = None
     candidate_trials: tuple[CandidateTrial, ...] = ()
     execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = ()
+    applied_execution_plans: tuple[str, ...] = ()
+    execution_plan_trials: tuple[ExecutionPlanTrial, ...] = ()
     fusion_plans: tuple[FusionPlan, ...] = ()
     fusion_trials: tuple[FusionTrial, ...] = ()
 
@@ -747,6 +767,69 @@ class _FusionResearchContext:
     performance: BenchmarkGateResult | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionPlanApplicationContext:
+    """Inputs for disposable task-preserving plan trials.
+
+    Attributes:
+        options: Command options controlling quality gates and progress output.
+        project: Discovered target project and compile policy.
+        baseline: Immutable baseline wheel and quality-project roots.
+        build_root: Temporary build root that owns disposable trial payloads.
+        install_root: Current accepted native or planned payload.
+        plans: Profile-selected scheduler plans considered in hotness order.
+        accepted_region_ids: Native region variants enabled during plan trials.
+    """
+
+    options: PackageOptions
+    project: DiscoveredProject
+    baseline: _BaselineWheelPayload
+    build_root: Path
+    install_root: Path
+    plans: tuple[ExecutionPlan | PlanRejection, ...]
+    accepted_region_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionPlanApplicationOutcome:
+    """Applied plan IDs and trial evidence retained after disposable trials.
+
+    Attributes:
+        applied_plan_ids: Plans whose staged payload passed semantics and profitability.
+        trials: Ordered staging, semantic, and benchmark decisions.
+        timings: Trial command timings appended to compile evidence.
+    """
+
+    applied_plan_ids: tuple[str, ...] = ()
+    trials: tuple[ExecutionPlanTrial, ...] = ()
+    timings: tuple[CompilePhaseTiming, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionPlanTrialRecord:
+    """Inputs normalized into one immutable plan-trial report record.
+
+    Attributes:
+        plan: Plan represented by the trial.
+        backend: Backend that staged the disposable candidate.
+        staged: Validated staged payload files.
+        semantic: Configured semantic-command evidence.
+        status: Accepted, rejected, failed-semantics, or unavailable outcome.
+        reason: Plain-language decision evidence.
+        diagnostics: Ordered backend and trial diagnostics.
+        benchmark: Marginal benchmark evidence, when semantics passed.
+    """
+
+    plan: ExecutionPlan
+    backend: ExecutionPlanBackend
+    staged: StagedExecutionPlan
+    semantic: CommandRunEvidence
+    status: ExecutionPlanTrialStatus
+    reason: str
+    diagnostics: tuple[ExecutionPlanDiagnostic, ...]
+    benchmark: BenchmarkGateResult | None
+
+
 def execute_package(options: PackageOptions) -> PackageCommandResult:
     """Build a source-clean wheel from backend-neutral typed regions.
 
@@ -1115,7 +1198,21 @@ def _execute_typed_region_package(
             overlay_error=overlay_error,
         )
     )
-    accepted_successful = finalized.successful
+    accepted_successful, plan_application = (
+        finalized.successful,
+        _execution_plan_application_for_finalized_payload(
+            _ExecutionPlanApplicationContext(
+                options=options,
+                project=project,
+                baseline=baseline,
+                build_root=build_root,
+                install_root=install_root,
+                plans=context.execution_plans,
+                accepted_region_ids=frozenset(item.unit.region_id for item in finalized.successful),
+            ),
+            finalized=finalized,
+        ),
+    )
     accepted_shims = tuple(item.shim for item in accepted_successful)
     accepted_artifacts = finalized.artifacts
     report_artifact_paths = _source_clean_region_report_artifact_paths(
@@ -1131,7 +1228,7 @@ def _execute_typed_region_package(
         install_root=install_root,
         baseline=baseline,
         verification_plan=verification_plan,
-        build=finalized.build,
+        build=_append_phase_timings(finalized.build, plan_application.timings),
         requires_native_artifact=finalized.profitability_applied,
     )
     if finalized.overlay_error is None:
@@ -1210,6 +1307,8 @@ def _execute_typed_region_package(
         profile=profile,
         candidate_trials=finalized.trials,
         execution_plans=context.execution_plans,
+        applied_execution_plans=plan_application.applied_plan_ids,
+        execution_plan_trials=plan_application.trials,
         fusion_plans=context.fusion_plans,
         fusion_trials=fusion_research.trials,
     )
@@ -3044,6 +3143,536 @@ def _finalize_typed_payload(
         trials=profitability.trials,
         overlay_error=overlay_error,
         profitability_applied=profitability_applied,
+    )
+
+
+def _execution_plan_application_for_finalized_payload(
+    context: _ExecutionPlanApplicationContext,
+    *,
+    finalized: _TypedPayloadFinalizationResult,
+) -> _ExecutionPlanApplicationOutcome:
+    """Build trial context only after native payload finalization succeeds.
+
+    Args:
+        context: Validated command, project, payload, selected plan, and native-region state.
+        finalized: Native payload finalization result.
+
+    Returns:
+        _ExecutionPlanApplicationOutcome: Applied plan IDs and disposable trial evidence.
+    """
+    if finalized.overlay_error is not None:
+        return _ExecutionPlanApplicationOutcome()
+    return _apply_execution_plan_trials(context)
+
+
+def _apply_execution_plan_trials(
+    context: _ExecutionPlanApplicationContext,
+) -> _ExecutionPlanApplicationOutcome:
+    """Stage and trial selected scheduler plans without risking the accepted payload.
+
+    Each backend writes to a disposable copy of the current payload. Atoll validates
+    every reported file change, runs the configured semantic command once, and then
+    compares the planned copy with the current accepted payload. Only a passing
+    semantic result and at least 1.05x marginal speedup replace the accepted payload.
+
+    Args:
+        context: Project policy, payload roots, native allowlist, and selected plans.
+
+    Returns:
+        _ExecutionPlanApplicationOutcome: Applied plan IDs, trial decisions, and timings.
+    """
+    config = context.project.config.compile
+    selected = tuple(plan for plan in context.plans if isinstance(plan, ExecutionPlan))
+    quality_root = context.baseline.quality_project_root
+    if (
+        not selected
+        or not context.options.run_quality_gates
+        or config.test_command is None
+        or config.benchmark_command is None
+        or quality_root is None
+    ):
+        return _ExecutionPlanApplicationOutcome()
+
+    trials_root = context.build_root / "execution-plan-trials"
+    _reset_dir(trials_root)
+    applied: list[str] = []
+    trials: list[ExecutionPlanTrial] = []
+    timings: list[CompilePhaseTiming] = []
+    for index, plan in enumerate(selected, start=1):
+        backend, assessment_diagnostics = _select_execution_plan_backend(context, plan)
+        if backend is None:
+            trials.append(
+                ExecutionPlanTrial(
+                    plan_id=plan.id,
+                    status="unavailable",
+                    command=(),
+                    exit_code=None,
+                    duration_seconds=None,
+                    diagnostics=assessment_diagnostics,
+                    reason="no execution-plan backend accepted the complete plan",
+                )
+            )
+            continue
+
+        trial_root = trials_root / f"{index:02d}-{plan.id}-{backend.name}"
+        staging_started = time.perf_counter()
+        try:
+            shutil.copytree(context.install_root, trial_root)
+            staged = backend.stage(
+                plan,
+                ExecutionPlanStageContext(
+                    project_root=context.project.config.root,
+                    payload_root=trial_root,
+                    cache_root=context.project.config.cache_dir / "execution-plans",
+                ),
+            )
+            _validate_staged_execution_plan(
+                staged=staged,
+                backend=backend,
+                plan=plan,
+                baseline_root=context.install_root,
+                trial_root=trial_root,
+            )
+        except Exception as error:
+            diagnostic = backend.normalize_diagnostic(
+                error,
+                diagnostics=str(error),
+                log_path=None,
+            )
+            duration = time.perf_counter() - staging_started
+            timings.append(
+                CompilePhaseTiming(
+                    name="execution_plan_staging",
+                    duration_seconds=duration,
+                    detail=f"{plan.id}; {backend.name}; failed",
+                )
+            )
+            trials.append(
+                ExecutionPlanTrial(
+                    plan_id=plan.id,
+                    status="unavailable",
+                    command=(),
+                    exit_code=None,
+                    duration_seconds=None,
+                    diagnostics=(*assessment_diagnostics, diagnostic),
+                    backend=backend.name,
+                    reason=diagnostic.message,
+                )
+            )
+            _remove_tree(trial_root)
+            continue
+
+        staging_duration = time.perf_counter() - staging_started
+        timings.append(
+            CompilePhaseTiming(
+                name="execution_plan_staging",
+                duration_seconds=staging_duration,
+                detail=f"{plan.id}; {backend.name}; {len(staged.payload_files)} file(s)",
+            )
+        )
+        _progress(
+            context.options.progress,
+            (
+                f"execution plan {index}/{len(selected)} staged {plan.id} with "
+                f"{backend.name} in {staging_duration:.2f}s"
+            ),
+        )
+        semantic = run_performance_command(
+            config.test_command,
+            project_root=quality_root,
+            payload_root=trial_root,
+            mode="compiled",
+            region_allowlist=context.accepted_region_ids,
+        )
+        timings.append(
+            CompilePhaseTiming(
+                name="execution_plan_semantic_test",
+                duration_seconds=semantic.duration_seconds,
+                detail=f"{plan.id}; exit {semantic.returncode}",
+            )
+        )
+        if not semantic.succeeded:
+            reason = _command_failure_summary(semantic, "execution-plan semantic test failed")
+            trials.append(
+                _execution_plan_trial(
+                    _ExecutionPlanTrialRecord(
+                        plan=plan,
+                        backend=backend,
+                        staged=staged,
+                        semantic=semantic,
+                        status="failed-semantics",
+                        reason=reason,
+                        diagnostics=(
+                            *assessment_diagnostics,
+                            ExecutionPlanDiagnostic(
+                                code="semantic-test-failed",
+                                severity="error",
+                                message=reason,
+                            ),
+                        ),
+                        benchmark=None,
+                    )
+                )
+            )
+            _remove_tree(trial_root)
+            continue
+
+        _progress(
+            context.options.progress,
+            f"execution plan {index}/{len(selected)} benchmarking {plan.id}",
+        )
+        benchmark = run_benchmark_gate(
+            BenchmarkGateConfig(
+                command=config.benchmark_command,
+                warmups=_EXECUTION_PLAN_BENCHMARK_WARMUPS,
+                samples=_EXECUTION_PLAN_BENCHMARK_SAMPLES,
+                minimum_speedup=_EXECUTION_PLAN_MINIMUM_SPEEDUP,
+            ),
+            project_root=quality_root,
+            baseline_payload_root=context.install_root,
+            compiled_payload_root=trial_root,
+            baseline_region_allowlist=context.accepted_region_ids,
+            compiled_region_allowlist=context.accepted_region_ids,
+            progress=partial(_execution_plan_benchmark_progress, context.options.progress, plan.id),
+        )
+        timings.extend(_execution_plan_benchmark_timings(plan.id, benchmark))
+        status: ExecutionPlanTrialStatus = (
+            "accepted" if benchmark.status == "passed" else "rejected"
+        )
+        if benchmark.status in {"invalid", "unbenchmarked"}:
+            status = "unavailable"
+        diagnostic_severity: ExecutionPlanDiagnosticSeverity = (
+            "note" if status == "accepted" else "warning"
+        )
+        trial = _execution_plan_trial(
+            _ExecutionPlanTrialRecord(
+                plan=plan,
+                backend=backend,
+                staged=staged,
+                semantic=semantic,
+                status=status,
+                reason=benchmark.reason,
+                diagnostics=(
+                    *assessment_diagnostics,
+                    ExecutionPlanDiagnostic(
+                        code=f"marginal-benchmark-{benchmark.status}",
+                        severity=diagnostic_severity,
+                        message=benchmark.reason,
+                    ),
+                ),
+                benchmark=benchmark,
+            )
+        )
+        if status == "accepted":
+            try:
+                _replace_payload_transactionally(
+                    current_root=context.install_root,
+                    candidate_root=trial_root,
+                    backup_root=trials_root / ".accepted-backup",
+                )
+            except OSError as error:
+                diagnostic = backend.normalize_diagnostic(
+                    error,
+                    diagnostics=str(error),
+                    log_path=None,
+                )
+                trial = replace(
+                    trial,
+                    status="unavailable",
+                    reason="accepted plan could not replace the current payload",
+                    diagnostics=(*trial.diagnostics, diagnostic),
+                )
+            else:
+                applied.append(plan.id)
+        else:
+            _remove_tree(trial_root)
+        trials.append(trial)
+        _progress(
+            context.options.progress,
+            f"execution plan {plan.id} {trial.status}: {trial.reason or 'no reason recorded'}",
+        )
+    return _ExecutionPlanApplicationOutcome(
+        applied_plan_ids=tuple(applied),
+        trials=tuple(trials),
+        timings=tuple(timings),
+    )
+
+
+def _select_execution_plan_backend(
+    context: _ExecutionPlanApplicationContext,
+    plan: ExecutionPlan,
+) -> tuple[ExecutionPlanBackend | None, tuple[ExecutionPlanDiagnostic, ...]]:
+    """Return the first backend supporting the complete plan and its assessments.
+
+    Args:
+        context: Project and profile context for backend capability checks.
+        plan: Complete scheduler plan requiring strict lowering.
+
+    Returns:
+        tuple[ExecutionPlanBackend | None, tuple[ExecutionPlanDiagnostic, ...]]: Selected backend
+            and normalized assessment notes, or `None` when every backend rejects the plan.
+    """
+    module = next(
+        (
+            candidate
+            for candidate in context.project.modules
+            if candidate.name == plan.source_module
+        ),
+        None,
+    )
+    if module is None:
+        return None, (
+            ExecutionPlanDiagnostic(
+                code="source-module-missing",
+                severity="error",
+                message=f"source module {plan.source_module} is unavailable",
+            ),
+        )
+    source_root = next(
+        (root for root in context.project.config.source_roots if module.path.is_relative_to(root)),
+        None,
+    )
+    if source_root is None:
+        return None, (
+            ExecutionPlanDiagnostic(
+                code="source-root-missing",
+                severity="error",
+                message=f"source root for {plan.source_module} is unavailable",
+            ),
+        )
+    diagnostics: list[ExecutionPlanDiagnostic] = []
+    assessment_context = ExecutionPlanAssessmentContext(
+        project_root=context.project.config.root,
+        source_root=source_root,
+        profile_status="profiled",
+    )
+    for backend in _EXECUTION_PLAN_BACKENDS:
+        try:
+            assessment = backend.assess(plan, assessment_context)
+        except Exception as error:
+            diagnostics.append(
+                backend.normalize_diagnostic(
+                    error,
+                    diagnostics=str(error),
+                    log_path=None,
+                )
+            )
+            continue
+        if assessment.status == "supported" and not assessment.unsupported_nodes:
+            diagnostics.append(
+                ExecutionPlanDiagnostic(
+                    code="backend-supported",
+                    severity="note",
+                    message=f"{backend.name} accepted the complete execution plan",
+                    details=assessment.reasons,
+                )
+            )
+            return backend, tuple(diagnostics)
+        diagnostics.append(
+            ExecutionPlanDiagnostic(
+                code="backend-rejected",
+                severity="note",
+                message=f"{backend.name} rejected the execution plan",
+                details=assessment.reasons,
+            )
+        )
+    return None, tuple(diagnostics)
+
+
+def _validate_staged_execution_plan(
+    *,
+    staged: StagedExecutionPlan,
+    backend: ExecutionPlanBackend,
+    plan: ExecutionPlan,
+    baseline_root: Path,
+    trial_root: Path,
+) -> None:
+    """Verify backend identity, file boundaries, digests, and complete change reporting.
+
+    Args:
+        staged: Backend output to validate before subprocess execution.
+        backend: Backend expected to own the staged output.
+        plan: Plan expected to own the staged output.
+        baseline_root: Current accepted payload before staging.
+        trial_root: Disposable candidate payload after staging.
+
+    Raises:
+        ValueError: If identity, path, digest, or changed-file evidence is inconsistent.
+    """
+    if staged.plan.id != plan.id or staged.backend != backend.name:
+        raise ValueError("execution-plan backend returned mismatched plan identity")
+    if not staged.payload_files:
+        raise ValueError("execution-plan backend did not change any payload files")
+    reported: dict[PurePosixPath, tuple[str | None, str]] = {}
+    for payload_file in staged.payload_files:
+        install_path = payload_file.install_path
+        if install_path.is_absolute() or ".." in install_path.parts:
+            raise ValueError(f"execution-plan payload path escapes the wheel: {install_path}")
+        before_path = baseline_root / install_path
+        after_path = trial_root / install_path
+        before_hash = _file_digest(before_path) if before_path.is_file() else None
+        if not after_path.is_file():
+            raise ValueError(f"staged execution-plan file is missing: {install_path}")
+        after_hash = _file_digest(after_path)
+        if payload_file.before_hash != before_hash or payload_file.after_hash != after_hash:
+            raise ValueError(f"staged execution-plan digest mismatch: {install_path}")
+        if install_path in reported:
+            raise ValueError(f"staged execution-plan file was reported twice: {install_path}")
+        reported[install_path] = (before_hash, after_hash)
+    actual = _changed_payload_files(baseline_root, trial_root)
+    if set(reported) != set(actual):
+        missing = sorted(path.as_posix() for path in set(actual) - set(reported))
+        extra = sorted(path.as_posix() for path in set(reported) - set(actual))
+        raise ValueError(
+            "execution-plan changed-file report is incomplete: "
+            f"missing={missing or 'none'} extra={extra or 'none'}"
+        )
+
+
+def _changed_payload_files(
+    baseline_root: Path,
+    candidate_root: Path,
+) -> dict[PurePosixPath, tuple[str | None, str | None]]:
+    """Return digest pairs for files changed between two unpacked wheel payloads.
+
+    Args:
+        baseline_root: Current accepted payload root.
+        candidate_root: Disposable staged payload root.
+
+    Returns:
+        dict[PurePosixPath, tuple[str | None, str | None]]: Changed paths and before/after digests.
+    """
+    baseline = _payload_file_digests(baseline_root)
+    candidate = _payload_file_digests(candidate_root)
+    return {
+        path: (baseline.get(path), candidate.get(path))
+        for path in sorted(set(baseline) | set(candidate), key=PurePosixPath.as_posix)
+        if baseline.get(path) != candidate.get(path)
+    }
+
+
+def _payload_file_digests(root: Path) -> dict[PurePosixPath, str]:
+    """Hash every regular payload file using install-relative POSIX paths.
+
+    Args:
+        root: Unpacked wheel payload root.
+
+    Returns:
+        dict[PurePosixPath, str]: File digests keyed by install-relative path.
+    """
+    return {
+        PurePosixPath(path.relative_to(root).as_posix()): _file_digest(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _execution_plan_trial(record: _ExecutionPlanTrialRecord) -> ExecutionPlanTrial:
+    """Build one immutable execution-plan trial from subprocess evidence.
+
+    Args:
+        record: Normalized backend, staging, subprocess, and decision evidence.
+
+    Returns:
+        ExecutionPlanTrial: Report-ready immutable trial evidence.
+    """
+    return ExecutionPlanTrial(
+        plan_id=record.plan.id,
+        status=record.status,
+        command=record.semantic.command,
+        exit_code=record.semantic.returncode,
+        duration_seconds=record.semantic.duration_seconds,
+        diagnostics=record.diagnostics,
+        backend=record.backend.name,
+        reason=record.reason,
+        benchmark_command=(
+            record.benchmark.samples[0].command
+            if record.benchmark and record.benchmark.samples
+            else ()
+        ),
+        benchmark_status=(record.benchmark.status if record.benchmark is not None else "not-run"),
+        minimum_speedup=(
+            record.benchmark.minimum_speedup if record.benchmark is not None else None
+        ),
+        baseline_median_seconds=(
+            record.benchmark.baseline_median_seconds if record.benchmark is not None else None
+        ),
+        planned_median_seconds=(
+            record.benchmark.compiled_median_seconds if record.benchmark is not None else None
+        ),
+        marginal_speedup=(record.benchmark.speedup if record.benchmark is not None else None),
+        payload_files=record.staged.payload_files,
+    )
+
+
+def _replace_payload_transactionally(
+    *,
+    current_root: Path,
+    candidate_root: Path,
+    backup_root: Path,
+) -> None:
+    """Atomically swap a passing candidate payload with rollback on rename failure.
+
+    Args:
+        current_root: Current accepted payload.
+        candidate_root: Passing disposable candidate payload.
+        backup_root: Temporary rollback location on the same filesystem.
+
+    Raises:
+        OSError: If the payload cannot be replaced or rolled back.
+    """
+    _remove_tree(backup_root)
+    current_root.rename(backup_root)
+    try:
+        candidate_root.rename(current_root)
+    except OSError:
+        backup_root.rename(current_root)
+        raise
+    shutil.rmtree(backup_root, ignore_errors=True)
+
+
+def _execution_plan_benchmark_progress(
+    progress: PackageProgress | None,
+    plan_id: str,
+    event: BenchmarkProgress,
+) -> None:
+    """Render one marginal execution-plan benchmark event.
+
+    Args:
+        progress: Optional package progress callback.
+        plan_id: Plan measured by the event.
+        event: Runtime benchmark phase notification.
+    """
+    _progress(
+        progress,
+        (
+            f"execution-plan benchmark {plan_id} {event.phase} pair {event.pair_index} "
+            f"{event.mode} completed in {event.duration_seconds:.2f}s"
+        ),
+    )
+
+
+def _execution_plan_benchmark_timings(
+    plan_id: str,
+    result: BenchmarkGateResult,
+) -> tuple[CompilePhaseTiming, ...]:
+    """Convert marginal execution-plan measurements into compile phase timings.
+
+    Args:
+        plan_id: Plan measured by the benchmark.
+        result: Marginal benchmark decision and child-process evidence.
+
+    Returns:
+        tuple[CompilePhaseTiming, ...]: Ordered warmup and sample timings.
+    """
+    return tuple(
+        CompilePhaseTiming(
+            name="execution_plan_benchmark",
+            duration_seconds=run.duration_seconds,
+            detail=f"{plan_id}; {phase}; {run.mode}; {result.status}",
+        )
+        for phase, runs in (("warmup", result.warmups), ("sample", result.samples))
+        for run in runs
     )
 
 
