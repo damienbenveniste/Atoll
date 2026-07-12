@@ -69,9 +69,16 @@ uv run --python 3.12 python -m scripts.run_pydantic_graph_ceiling_experiment \
   --evidence-root /tmp/atoll-pydantic-graph-ceiling
 ```
 
-The experiment never edits the checkout. It separates unchanged source, lazy
-guarded reducer-signature hoisting, unsafe result buffering, and an unsafe
-combined immediate-completion ceiling. The last two arms deliberately change
-observable async behavior and are not candidates for wheel promotion. A
-`1.15x` ceiling only recommends investigating a separately proven guarded
-design; it does not establish semantic equivalence or an Atoll speedup.
+The experiment never edits the checkout. It separates unchanged source,
+guarded reducer-signature hoisting, result buffering, immediate execution,
+nonblocking batch draining, an absolute unsafe ceiling, and a context-isolated
+guarded scheduler fusion.
+
+The guarded arm keeps the existing graph scheduler and combines copied-context
+immediate execution, batch draining, and lazy reducer scanning. It falls back
+for suspension and task-sensitive shapes before transformed execution begins.
+The experiment proceeds to product work only when the unsafe ceiling reaches
+`3.30x`, the guarded arm reaches `3.00x`, every correctness probe passes, the
+guarded route is exercised, and checkout source hashes remain unchanged. The
+unsafe and intermediate arms remain research evidence and are never promotion
+candidates.

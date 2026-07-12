@@ -1,11 +1,13 @@
-"""Measure semantics and headroom for callback-backed async execution plans.
+"""Measure semantics and headroom for fused async execution plans.
 
 This benchmark is deliberately independent from Atoll's product pipeline. It
 models one shared capacity-one completion channel and compares ordinary tasks,
-task-preserving dispatch, and callback-backed dispatch. The callback arm only
-drives source-known non-suspending coroutines; suspending or task-observing work
-retains a real task. The harness owns semantic evidence and feasibility timing,
-not production eligibility or wheel generation.
+task-preserving dispatch, callback-backed dispatch, unsafe fused dispatch, and
+guarded fused dispatch. Callback-backed and guarded fused semantic arms only
+drive source-known non-suspending coroutines; suspending or task-observing work
+retains a real task. Unsafe fused dispatch is benchmark-only evidence because it
+deliberately skips semantic protections. The harness owns semantic evidence and
+feasibility timing, not production eligibility or wheel generation.
 """
 
 from __future__ import annotations
@@ -22,15 +24,48 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Literal, TypedDict, Unpack, cast
 
-ArmName = Literal["baseline", "task_preserving", "callback_backed"]
+SemanticArmName = Literal[
+    "baseline",
+    "task_preserving",
+    "callback_backed",
+    "guarded_fused_state_machine",
+]
+BenchmarkArmName = Literal[
+    "baseline",
+    "task_preserving",
+    "callback_backed",
+    "unsafe_fused_state_machine",
+    "guarded_fused_state_machine",
+]
+ArmName = SemanticArmName
 WorkMode = Literal["immediate", "suspending", "failure", "task_observing", "cold_decoy"]
-ExecutionPath = Literal["task", "task_preserving", "callback", "task_fallback"]
+ExecutionPath = Literal[
+    "task",
+    "task_preserving",
+    "callback",
+    "guarded_fused",
+    "task_fallback",
+]
 ResultStatus = Literal["ok", "error"]
 JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
-ARMS: tuple[ArmName, ...] = ("baseline", "task_preserving", "callback_backed")
-DEFAULT_MINIMUM_SPEEDUP = 1.50
+ARMS: tuple[ArmName, ...] = (
+    "baseline",
+    "task_preserving",
+    "callback_backed",
+    "guarded_fused_state_machine",
+)
+BENCHMARK_ARMS: tuple[BenchmarkArmName, ...] = (
+    "baseline",
+    "task_preserving",
+    "callback_backed",
+    "unsafe_fused_state_machine",
+    "guarded_fused_state_machine",
+)
+DEFAULT_MINIMUM_CALLBACK_SPEEDUP = 1.50
+DEFAULT_MINIMUM_UNSAFE_SPEEDUP = 3.30
+DEFAULT_MINIMUM_GUARDED_SPEEDUP = 3.00
 DEFAULT_SEMANTIC_REPETITIONS = 32
 DEFAULT_BENCHMARK_WIDTH = 5_000
 DEFAULT_WARMUPS = 1
@@ -148,7 +183,7 @@ class BenchmarkSummary:
         speedup_over_baseline: Baseline median divided by this median.
     """
 
-    arm: ArmName
+    arm: BenchmarkArmName
     sample_seconds: tuple[float, ...]
     median_seconds: float
     speedup_over_baseline: float
@@ -166,7 +201,11 @@ class FeasibilityReport:
         benchmark_rounds: Calibrated rounds per measured arm invocation.
         benchmark_summaries: Rotating wall-clock evidence for every arm.
         callback_speedup: Callback-backed median speedup over baseline.
-        minimum_callback_speedup: Required feasibility threshold.
+        unsafe_fused_speedup: Unsafe fused median speedup over baseline.
+        guarded_fused_speedup: Guarded fused median speedup over baseline.
+        minimum_callback_speedup: Informational callback-backed threshold.
+        minimum_unsafe_fused_speedup: Required unsafe fused threshold.
+        minimum_guarded_fused_speedup: Required guarded fused threshold.
         stable_timings: Whether every median reached the noise floor.
         gate_passed: Combined semantic, stability, and speed verdict.
     """
@@ -178,7 +217,11 @@ class FeasibilityReport:
     benchmark_rounds: int
     benchmark_summaries: tuple[BenchmarkSummary, ...]
     callback_speedup: float
+    unsafe_fused_speedup: float
+    guarded_fused_speedup: float
     minimum_callback_speedup: float
+    minimum_unsafe_fused_speedup: float
+    minimum_guarded_fused_speedup: float
     stable_timings: bool
     gate_passed: bool
 
@@ -192,7 +235,9 @@ class FeasibilityOptions:
         benchmark_width: Immediate logical items per benchmark round.
         warmups: Unmeasured rotating benchmark groups.
         samples: Measured rotating benchmark groups.
-        minimum_callback_speedup: Required callback-to-baseline ratio.
+        minimum_callback_speedup: Informational callback-to-baseline ratio.
+        minimum_unsafe_fused_speedup: Required unsafe-fused-to-baseline ratio.
+        minimum_guarded_fused_speedup: Required guarded-fused-to-baseline ratio.
         minimum_stable_seconds: Required median duration for every arm.
     """
 
@@ -200,7 +245,9 @@ class FeasibilityOptions:
     benchmark_width: int = DEFAULT_BENCHMARK_WIDTH
     warmups: int = DEFAULT_WARMUPS
     samples: int = DEFAULT_SAMPLES
-    minimum_callback_speedup: float = DEFAULT_MINIMUM_SPEEDUP
+    minimum_callback_speedup: float = DEFAULT_MINIMUM_CALLBACK_SPEEDUP
+    minimum_unsafe_fused_speedup: float = DEFAULT_MINIMUM_UNSAFE_SPEEDUP
+    minimum_guarded_fused_speedup: float = DEFAULT_MINIMUM_GUARDED_SPEEDUP
     minimum_stable_seconds: float = MINIMUM_STABLE_SECONDS
 
 
@@ -210,8 +257,10 @@ DEFAULT_FEASIBILITY_OPTIONS = FeasibilityOptions()
 class _BenchmarkJson(TypedDict):
     arms: list[dict[str, JsonValue]]
     callback_speedup: float
+    guarded_fused_speedup: float
     rounds: int
     stable_timings: bool
+    unsafe_fused_speedup: float
     width: int
 
 
@@ -219,6 +268,8 @@ class _ReportJson(TypedDict):
     benchmark: _BenchmarkJson
     gate_passed: bool
     minimum_callback_speedup: float
+    minimum_guarded_fused_speedup: float
+    minimum_unsafe_fused_speedup: float
     semantic_repetitions: int
     semantic_snapshot: dict[str, JsonValue]
     semantics_match: bool
@@ -233,6 +284,16 @@ class _TaskFactoryOptions(TypedDict, total=False):
 @dataclass(slots=True)
 class _PendingSend:
     record: ResultRecord
+    completion: asyncio.Future[None]
+
+
+@dataclass(slots=True)
+class _GuardedFusedInvocation:
+    item: WorkItem
+    coroutine: Coroutine[object, object, ResultRecord]
+    context: contextvars.Context
+    channel: _CapacityOneChannel
+    trace: list[str]
     completion: asyncio.Future[None]
 
 
@@ -371,6 +432,46 @@ class _PendingBenchmarkSend:
     completion: asyncio.Future[None]
 
 
+class _BenchmarkBatchQueue:
+    """Bounded FIFO queue used by fused benchmark-only arms."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("benchmark queue capacity must be positive")
+        self._capacity = capacity
+        self._values: list[int] = []
+        self._drained = False
+
+    @property
+    def depth(self) -> int:
+        """Return the number of queued values awaiting batch drain."""
+        return len(self._values)
+
+    @property
+    def is_full(self) -> bool:
+        """Return whether publication filled the bounded queue."""
+        return len(self._values) == self._capacity
+
+    def publish(self, value: int) -> None:
+        """Publish one value while enforcing the configured capacity."""
+        if self._drained:
+            raise FeasibilityError("cannot publish after benchmark batch drain")
+        if len(self._values) >= self._capacity:
+            raise FeasibilityError("benchmark batch queue exceeded capacity")
+        self._values.append(value)
+
+    def drain_fifo(self) -> int:
+        """Drain a full queue in publication order and return its checksum."""
+        if not self.is_full:
+            raise FeasibilityError("benchmark batch queue drained before full publication")
+        self._drained = True
+        total = 0
+        for value in self._values:
+            total += value
+        self._values.clear()
+        return total
+
+
 class _BenchmarkChannel:
     """Minimal capacity-one integer channel for scheduler-only timing."""
 
@@ -481,7 +582,9 @@ def main(argv: tuple[str, ...] | None = None) -> int:
                 benchmark_width=args.benchmark_width,
                 warmups=args.warmups,
                 samples=args.samples,
-                minimum_callback_speedup=args.minimum_speedup,
+                minimum_callback_speedup=args.minimum_callback_speedup,
+                minimum_unsafe_fused_speedup=args.minimum_unsafe_fused_speedup,
+                minimum_guarded_fused_speedup=args.minimum_guarded_fused_speedup,
                 minimum_stable_seconds=args.minimum_stable_seconds,
             )
         )
@@ -494,7 +597,10 @@ def main(argv: tuple[str, ...] | None = None) -> int:
     print(
         "async execution-plan feasibility gate failed: "
         f"callback={report.callback_speedup:.3f}x, "
-        f"required={report.minimum_callback_speedup:.3f}x, "
+        f"unsafe={report.unsafe_fused_speedup:.3f}x/"
+        f"{report.minimum_unsafe_fused_speedup:.3f}x, "
+        f"guarded={report.guarded_fused_speedup:.3f}x/"
+        f"{report.minimum_guarded_fused_speedup:.3f}x, "
         f"semantics={report.semantics_match}, stable={report.stable_timings}",
         file=sys.stderr,
     )
@@ -529,6 +635,14 @@ def run_feasibility(
         samples=options.samples,
     )
     callback_speedup = _summary_for(summaries, "callback_backed").speedup_over_baseline
+    unsafe_speedup = _summary_for(
+        summaries,
+        "unsafe_fused_state_machine",
+    ).speedup_over_baseline
+    guarded_speedup = _summary_for(
+        summaries,
+        "guarded_fused_state_machine",
+    ).speedup_over_baseline
     stable = all(summary.median_seconds >= options.minimum_stable_seconds for summary in summaries)
     return FeasibilityReport(
         semantic_repetitions=options.semantic_repetitions,
@@ -538,11 +652,16 @@ def run_feasibility(
         benchmark_rounds=rounds,
         benchmark_summaries=summaries,
         callback_speedup=callback_speedup,
+        unsafe_fused_speedup=unsafe_speedup,
+        guarded_fused_speedup=guarded_speedup,
         minimum_callback_speedup=options.minimum_callback_speedup,
+        minimum_unsafe_fused_speedup=options.minimum_unsafe_fused_speedup,
+        minimum_guarded_fused_speedup=options.minimum_guarded_fused_speedup,
         stable_timings=stable,
         gate_passed=semantics_match
         and stable
-        and callback_speedup >= options.minimum_callback_speedup,
+        and unsafe_speedup >= options.minimum_unsafe_fused_speedup
+        and guarded_speedup >= options.minimum_guarded_fused_speedup,
     )
 
 
@@ -645,18 +764,33 @@ async def execute_arm(
     callback_completions: list[asyncio.Future[None]] = []
     token = _RUN_CONTEXT.set("parent")
     try:
-        callback_allowed = (
-            arm == "callback_backed"
+        fused_allowed = (
+            arm in {"callback_backed", "guarded_fused_state_machine"}
             and not force_task_fallback
             and asyncio.get_running_loop().get_task_factory() is None
         )
         for item in runnable:
             trace.append(f"registered:{item.name}")
             item_context = _item_context(item)
-            if callback_allowed and _callback_eligible(item):
-                completion = _schedule_callback_item(item, item_context, channel, trace)
+            if fused_allowed and _callback_eligible(item):
+                if arm == "callback_backed":
+                    completion = _schedule_callback_item(
+                        item,
+                        item_context,
+                        channel,
+                        trace,
+                    )
+                    path: ExecutionPath = "callback"
+                else:
+                    completion = _schedule_guarded_fused_item(
+                        item,
+                        item_context,
+                        channel,
+                        trace,
+                    )
+                    path = "guarded_fused"
                 callback_completions.append(completion)
-                paths.append((item.name, "callback"))
+                paths.append((item.name, path))
                 continue
             task = _create_task(
                 _task_producer(item, channel, trace),
@@ -734,10 +868,12 @@ async def run_semantic_probes(arm: ArmName) -> dict[str, JsonValue]:
     cancellation = await _cancellation_probe()
     blocked = await _blocked_publication_probe()
     factory = await _task_factory_probe(arm)
+    guarded = await _guarded_direct_probe()
     return {
         "blocked_publication": blocked,
         "cancellation": cancellation,
         "custom_factory": factory,
+        "guarded_direct": guarded,
     }
 
 
@@ -764,7 +900,7 @@ def benchmark(
     """
     if width < 1 or rounds < 1 or warmups < 0 or samples < 1:
         raise ValueError("benchmark width, rounds, and samples must be positive")
-    durations: dict[ArmName, list[float]] = {arm: [] for arm in ARMS}
+    durations: dict[BenchmarkArmName, list[float]] = {arm: [] for arm in BENCHMARK_ARMS}
     for group_index in range(warmups + samples):
         for arm in rotated_arms(group_index):
             duration = _measure_benchmark_arm(arm, width=width, rounds=rounds)
@@ -778,7 +914,7 @@ def benchmark(
             median_seconds=median(durations[arm]),
             speedup_over_baseline=baseline_median / median(durations[arm]),
         )
-        for arm in ARMS
+        for arm in BENCHMARK_ARMS
     )
 
 
@@ -799,7 +935,9 @@ def calibrate_benchmark_rounds(*, width: int, minimum_seconds: float) -> int:
         return 1
     rounds = 1
     while rounds <= MAX_CALIBRATION_ROUNDS:
-        durations = tuple(_measure_benchmark_arm(arm, width=width, rounds=rounds) for arm in ARMS)
+        durations = tuple(
+            _measure_benchmark_arm(arm, width=width, rounds=rounds) for arm in BENCHMARK_ARMS
+        )
         if min(durations) >= minimum_seconds:
             return rounds
         rounds *= 2
@@ -809,7 +947,7 @@ def calibrate_benchmark_rounds(*, width: int, minimum_seconds: float) -> int:
 
 
 def summarize_samples(
-    samples: dict[ArmName, Sequence[float]],
+    samples: dict[BenchmarkArmName, Sequence[float]],
 ) -> tuple[BenchmarkSummary, ...]:
     """Summarize externally supplied samples for deterministic unit tests.
 
@@ -822,7 +960,7 @@ def summarize_samples(
     Raises:
         ValueError: If an arm has no positive samples.
     """
-    for arm in ARMS:
+    for arm in BENCHMARK_ARMS:
         if not samples.get(arm) or any(value <= 0 for value in samples[arm]):
             raise ValueError(f"positive samples are required for {arm}")
     baseline_median = median(samples["baseline"])
@@ -833,11 +971,11 @@ def summarize_samples(
             median_seconds=median(samples[arm]),
             speedup_over_baseline=baseline_median / median(samples[arm]),
         )
-        for arm in ARMS
+        for arm in BENCHMARK_ARMS
     )
 
 
-def rotated_arms(group_index: int) -> tuple[ArmName, ...]:
+def rotated_arms(group_index: int) -> tuple[BenchmarkArmName, ...]:
     """Return a deterministic rotation for one benchmark group.
 
     Args:
@@ -846,8 +984,8 @@ def rotated_arms(group_index: int) -> tuple[ArmName, ...]:
     Returns:
         tuple[ArmName, ...]: Rotated arm order.
     """
-    offset = group_index % len(ARMS)
-    return ARMS[offset:] + ARMS[:offset]
+    offset = group_index % len(BENCHMARK_ARMS)
+    return BENCHMARK_ARMS[offset:] + BENCHMARK_ARMS[:offset]
 
 
 def canonical_json(payload: object) -> str:
@@ -875,12 +1013,16 @@ def report_as_json(report: FeasibilityReport) -> _ReportJson:
         "benchmark": {
             "arms": [_summary_json(summary) for summary in report.benchmark_summaries],
             "callback_speedup": report.callback_speedup,
+            "guarded_fused_speedup": report.guarded_fused_speedup,
             "rounds": report.benchmark_rounds,
             "stable_timings": report.stable_timings,
+            "unsafe_fused_speedup": report.unsafe_fused_speedup,
             "width": report.benchmark_width,
         },
         "gate_passed": report.gate_passed,
         "minimum_callback_speedup": report.minimum_callback_speedup,
+        "minimum_guarded_fused_speedup": report.minimum_guarded_fused_speedup,
+        "minimum_unsafe_fused_speedup": report.minimum_unsafe_fused_speedup,
         "semantic_repetitions": report.semantic_repetitions,
         "semantic_snapshot": report.semantic_snapshot,
         "semantics_match": report.semantics_match,
@@ -919,6 +1061,29 @@ def _schedule_callback_item(
     return logical_completion
 
 
+def _schedule_guarded_fused_item(
+    item: WorkItem,
+    item_context: contextvars.Context,
+    channel: _CapacityOneChannel,
+    trace: list[str],
+) -> asyncio.Future[None]:
+    loop = asyncio.get_running_loop()
+    logical_completion: asyncio.Future[None] = loop.create_future()
+    coroutine = item_context.run(_capture_result, item)
+    loop.call_soon(
+        _drive_guarded_fused_item,
+        _GuardedFusedInvocation(
+            item=item,
+            coroutine=coroutine,
+            context=item_context,
+            channel=channel,
+            trace=trace,
+            completion=logical_completion,
+        ),
+    )
+    return logical_completion
+
+
 def _drive_callback_item(
     item: WorkItem,
     coroutine: Coroutine[object, object, ResultRecord],
@@ -948,6 +1113,47 @@ def _drive_callback_item(
         publication.add_done_callback(
             lambda _future: _complete_logical_callback(logical_completion)
         )
+
+
+def _drive_guarded_fused_item(invocation: _GuardedFusedInvocation) -> None:
+    item = invocation.item
+    item_context = invocation.context
+    logical_completion = invocation.completion
+    invocation.trace.append(f"started:{item.name}")
+    try:
+        record = _drive_guarded_coroutine(
+            invocation.coroutine,
+            item_context,
+            suspend_message=f"guarded fused work suspended unexpectedly: {item.name}",
+        )
+    except BaseException as error:
+        logical_completion.set_exception(error)
+        return
+    invocation.trace.append(f"completed:{item.name}")
+    publication = item_context.run(invocation.channel.begin_send, record)
+    if publication.done():
+        logical_completion.set_result(None)
+    else:
+        publication.add_done_callback(
+            lambda _future: _complete_logical_callback(logical_completion)
+        )
+
+
+def _drive_guarded_coroutine[T](
+    coroutine: Coroutine[object, object, T],
+    context: contextvars.Context,
+    *,
+    suspend_message: str,
+) -> T:
+    try:
+        context.run(coroutine.send, None)
+    except StopIteration as completed:
+        return cast(T, completed.value)
+    except BaseException:
+        context.run(coroutine.close)
+        raise
+    context.run(coroutine.close)
+    raise FeasibilityError(suspend_message)
 
 
 def _complete_logical_callback(completion: asyncio.Future[None]) -> None:
@@ -1155,6 +1361,41 @@ async def _task_factory_probe(arm: ArmName) -> dict[str, JsonValue]:
     }
 
 
+async def _guarded_direct_probe() -> dict[str, JsonValue]:
+    token = _RUN_CONTEXT.set("parent")
+    try:
+        direct_item = WorkItem("guarded-direct", 0, 7, "immediate")
+        direct_context = _item_context(direct_item)
+        direct_record = _drive_guarded_coroutine(
+            direct_context.run(_capture_result, direct_item),
+            direct_context,
+            suspend_message="guarded direct probe suspended unexpectedly",
+        )
+        fallback_workload = (
+            WorkItem("guarded-suspending", 0, 11, "suspending"),
+            WorkItem("guarded-task-observing", 1, 13, "task_observing"),
+        )
+        fallback_execution = await execute_arm(
+            "guarded_fused_state_machine",
+            fallback_workload,
+        )
+        task_observer = next(
+            record
+            for record in fallback_execution.records
+            if record.name == "guarded-task-observing"
+        )
+        return {
+            "direct_mutated_context": direct_record.mutated_context,
+            "direct_path": "guarded_fused",
+            "direct_starting_context": direct_record.starting_context,
+            "fallback_paths": [cast(JsonValue, path) for _name, path in fallback_execution.paths],
+            "parent_context_after": _RUN_CONTEXT.get(),
+            "task_observer_saw_task": task_observer.task_identity_observed,
+        }
+    finally:
+        _RUN_CONTEXT.reset(token)
+
+
 def _probe_record(name: str, order: int) -> ResultRecord:
     return ResultRecord(
         name=name,
@@ -1168,7 +1409,7 @@ def _probe_record(name: str, order: int) -> ResultRecord:
     )
 
 
-def _measure_benchmark_arm(arm: ArmName, *, width: int, rounds: int) -> float:
+def _measure_benchmark_arm(arm: BenchmarkArmName, *, width: int, rounds: int) -> float:
     started = time.perf_counter()
     checksum = asyncio.run(_benchmark_arm(arm, width=width, rounds=rounds))
     duration = time.perf_counter() - started
@@ -1180,14 +1421,18 @@ def _measure_benchmark_arm(arm: ArmName, *, width: int, rounds: int) -> float:
     return duration
 
 
-async def _benchmark_arm(arm: ArmName, *, width: int, rounds: int) -> int:
+async def _benchmark_arm(arm: BenchmarkArmName, *, width: int, rounds: int) -> int:
     checksum = 0
     for _ in range(rounds):
         checksum += await _benchmark_round(arm, width)
     return checksum
 
 
-async def _benchmark_round(arm: ArmName, width: int) -> int:
+async def _benchmark_round(arm: BenchmarkArmName, width: int) -> int:
+    if arm == "unsafe_fused_state_machine":
+        return _benchmark_unsafe_fused_round(width)
+    if arm == "guarded_fused_state_machine":
+        return _benchmark_guarded_fused_round(width)
     channel = _BenchmarkChannel()
     tasks, completions = _schedule_benchmark_work(arm, width, channel)
     total = 0
@@ -1202,7 +1447,7 @@ async def _benchmark_round(arm: ArmName, width: int) -> int:
 
 
 def _schedule_benchmark_work(
-    arm: ArmName,
+    arm: BenchmarkArmName,
     width: int,
     channel: _BenchmarkChannel,
 ) -> tuple[list[asyncio.Task[None]], list[asyncio.Future[None]]]:
@@ -1227,7 +1472,47 @@ def _schedule_benchmark_work(
     return tasks, completions
 
 
+def _benchmark_guarded_fused_round(width: int) -> int:
+    queue = _BenchmarkBatchQueue(width)
+    for value in range(width):
+        context = contextvars.copy_context()
+        coroutine = context.run(_benchmark_immediate, value)
+        queue.publish(
+            _drive_guarded_coroutine(
+                coroutine,
+                context,
+                suspend_message="guarded fused benchmark leaf suspended",
+            )
+        )
+    return _benchmark_batch_drain(queue)
+
+
+def _benchmark_unsafe_fused_round(width: int) -> int:
+    queue = _BenchmarkBatchQueue(width)
+    for value in range(width):
+        coroutine = _benchmark_immediate(value)
+        queue.publish(_drive_unsafe_benchmark_coroutine(coroutine))
+    return _benchmark_batch_drain(queue)
+
+
+def _drive_unsafe_benchmark_coroutine(coroutine: Coroutine[object, object, int]) -> int:
+    try:
+        coroutine.send(None)
+    except StopIteration as completed:
+        return cast(int, completed.value)
+    coroutine.close()
+    raise FeasibilityError("unsafe fused benchmark leaf suspended")
+
+
+def _benchmark_batch_drain(queue: _BenchmarkBatchQueue) -> int:
+    return queue.drain_fifo()
+
+
 async def _benchmark_immediate(value: int) -> int:
+    mixed = (value ^ 0x5A5A5A5A) & 0xFFFFFFFF
+    mixed ^= mixed >> 11
+    if mixed < 0:
+        raise FeasibilityError("unreachable benchmark payload branch")
     return value + 1
 
 
@@ -1285,7 +1570,7 @@ def _summary_json(summary: BenchmarkSummary) -> dict[str, JsonValue]:
 
 def _summary_for(
     summaries: Iterable[BenchmarkSummary],
-    arm: ArmName,
+    arm: BenchmarkArmName,
 ) -> BenchmarkSummary:
     for summary in summaries:
         if summary.arm == arm:
@@ -1302,6 +1587,10 @@ def _validate_options(options: FeasibilityOptions) -> None:
         raise ValueError("warmups must be non-negative and samples positive")
     if options.minimum_callback_speedup <= 1:
         raise ValueError("minimum callback speedup must be greater than one")
+    if options.minimum_unsafe_fused_speedup <= 1:
+        raise ValueError("minimum unsafe fused speedup must be greater than one")
+    if options.minimum_guarded_fused_speedup <= 1:
+        raise ValueError("minimum guarded fused speedup must be greater than one")
     if options.minimum_stable_seconds < 0:
         raise ValueError("minimum stable seconds must be non-negative")
 
@@ -1318,7 +1607,21 @@ def _parse_args(argv: tuple[str, ...]) -> argparse.Namespace:
     parser.add_argument("--benchmark-width", type=int, default=DEFAULT_BENCHMARK_WIDTH)
     parser.add_argument("--warmups", type=int, default=DEFAULT_WARMUPS)
     parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES)
-    parser.add_argument("--minimum-speedup", type=float, default=DEFAULT_MINIMUM_SPEEDUP)
+    parser.add_argument(
+        "--minimum-callback-speedup",
+        type=float,
+        default=DEFAULT_MINIMUM_CALLBACK_SPEEDUP,
+    )
+    parser.add_argument(
+        "--minimum-unsafe-fused-speedup",
+        type=float,
+        default=DEFAULT_MINIMUM_UNSAFE_SPEEDUP,
+    )
+    parser.add_argument(
+        "--minimum-guarded-fused-speedup",
+        type=float,
+        default=DEFAULT_MINIMUM_GUARDED_SPEEDUP,
+    )
     parser.add_argument(
         "--minimum-stable-seconds",
         type=float,

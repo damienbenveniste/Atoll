@@ -17,12 +17,17 @@ from scripts.pydantic_graph_ceiling import (
     ExperimentArm,
 )
 
-BASELINE_SAMPLE_SECONDS = 4.0
-REFLECTION_SAMPLE_SECONDS = 2.0
-BUFFERED_SAMPLE_SECONDS = 1.5
-UNSAFE_CEILING_SAMPLE_SECONDS = 1.0
-REPORT_HEADROOM = 3.0
+BASELINE_SAMPLE_SECONDS = 6.6
+REFLECTION_SAMPLE_SECONDS = 5.0
+BUFFERED_SAMPLE_SECONDS = 4.0
+IMMEDIATE_SAMPLE_SECONDS = 3.0
+BATCH_DRAIN_SAMPLE_SECONDS = 2.4
+UNSAFE_CEILING_SAMPLE_SECONDS = 2.0
+GUARDED_FUSION_SAMPLE_SECONDS = 2.1
+REPORT_HEADROOM = 3.3
+REPORT_GUARDED_SPEEDUP = 3.0
 EXPECTED_CEILING_HEADROOM = BASELINE_SAMPLE_SECONDS / UNSAFE_CEILING_SAMPLE_SECONDS
+EXPECTED_GUARDED_SPEEDUP = BASELINE_SAMPLE_SECONDS / GUARDED_FUSION_SAMPLE_SECONDS
 EXPECTED_MANIFEST_CALLS = 2
 
 
@@ -34,6 +39,7 @@ def test_summary_reports_markdown_and_sorted_json(tmp_path: Path) -> None:
     markdown = result.report_markdown.read_text(encoding="utf-8")
 
     assert payload["observed_headroom"] == EXPECTED_CEILING_HEADROOM
+    assert payload["guarded_speedup"] == EXPECTED_GUARDED_SPEEDUP
     assert payload["promising_research_direction"] is True
     assert payload["source_unchanged"] is True
     assert [summary["arm"] for summary in payload["summaries"]] == list(ARMS)
@@ -48,10 +54,10 @@ def test_summary_reports_markdown_and_sorted_json(tmp_path: Path) -> None:
     }
     assert markdown.startswith("# Pydantic Graph Optimization Ceiling\n\n")
     assert "- Checkout sources unchanged: yes" in markdown
-    assert "- Scheduler semantics: `not established`" in markdown
+    assert "- Guarded scheduler semantics: `established by deterministic probes`" in markdown
     assert "- Recommendation: `investigate-guarded-design`" in markdown
-    assert "| baseline | 4.000000s | 1.000x | passed | yes | reference |" in markdown
-    assert "| unsafe_ceiling | 1.000000s | 4.000x | passed | no | not-established |" in markdown
+    assert "| baseline | 6.600000s | 1.000x | passed | yes | no | reference |" in markdown
+    assert "| guarded_fusion | 2.100000s | 3.143x | passed | yes | yes | guarded |" in markdown
 
 
 def test_runner_marks_fast_result_unpromising_when_staged_sources_change(
@@ -84,7 +90,10 @@ def test_runner_marks_fast_result_unpromising_when_staged_sources_change(
             "baseline": [BASELINE_SAMPLE_SECONDS],
             "reflection": [REFLECTION_SAMPLE_SECONDS],
             "buffered": [BUFFERED_SAMPLE_SECONDS],
+            "immediate": [IMMEDIATE_SAMPLE_SECONDS],
+            "batch_drain": [BATCH_DRAIN_SAMPLE_SECONDS],
             "unsafe_ceiling": [UNSAFE_CEILING_SAMPLE_SECONDS],
+            "guarded_fusion": [GUARDED_FUSION_SAMPLE_SECONDS],
         }
 
     monkeypatch.setattr(pydantic_graph_ceiling, "_validate_inputs", fake_validate_inputs)
@@ -101,6 +110,7 @@ def test_runner_marks_fast_result_unpromising_when_staged_sources_change(
             semantic_probe=tmp_path / "semantic.py",
             python=tmp_path / "python",
             minimum_headroom=REPORT_HEADROOM,
+            minimum_guarded_speedup=REPORT_GUARDED_SPEEDUP,
         )
     )
 
@@ -117,7 +127,24 @@ def test_runner_marks_fast_result_unpromising_when_staged_sources_change(
     assert "- Recommendation: `stop`" in markdown
 
 
-def _summarize_result(tmp_path: Path, *, source_unchanged: bool) -> CeilingExperimentResult:
+def test_guarded_speedup_below_threshold_blocks_product_work(tmp_path: Path) -> None:
+    result = _summarize_result(
+        tmp_path,
+        source_unchanged=True,
+        guarded_sample_seconds=BASELINE_SAMPLE_SECONDS / (REPORT_GUARDED_SPEEDUP - 0.1),
+    )
+
+    assert result.observed_headroom >= REPORT_HEADROOM
+    assert result.guarded_speedup < REPORT_GUARDED_SPEEDUP
+    assert result.promising_research_direction is False
+
+
+def _summarize_result(
+    tmp_path: Path,
+    *,
+    source_unchanged: bool,
+    guarded_sample_seconds: float = GUARDED_FUSION_SAMPLE_SECONDS,
+) -> CeilingExperimentResult:
     return _summarize(
         CeilingExperimentOptions(
             checkout=tmp_path / "checkout",
@@ -126,6 +153,7 @@ def _summarize_result(tmp_path: Path, *, source_unchanged: bool) -> CeilingExper
             semantic_probe=tmp_path / "semantic.py",
             python=tmp_path / "python",
             minimum_headroom=REPORT_HEADROOM,
+            minimum_guarded_speedup=REPORT_GUARDED_SPEEDUP,
         ),
         source_unchanged,
         dict.fromkeys(ARMS, True),
@@ -133,7 +161,10 @@ def _summarize_result(tmp_path: Path, *, source_unchanged: bool) -> CeilingExper
             "baseline": [BASELINE_SAMPLE_SECONDS],
             "reflection": [REFLECTION_SAMPLE_SECONDS],
             "buffered": [BUFFERED_SAMPLE_SECONDS],
+            "immediate": [IMMEDIATE_SAMPLE_SECONDS],
+            "batch_drain": [BATCH_DRAIN_SAMPLE_SECONDS],
             "unsafe_ceiling": [UNSAFE_CEILING_SAMPLE_SECONDS],
+            "guarded_fusion": [guarded_sample_seconds],
         },
         [
             *(
@@ -145,7 +176,9 @@ def _summarize_result(tmp_path: Path, *, source_unchanged: bool) -> CeilingExper
                     stdout=json.dumps(
                         {
                             "arm": arm,
-                            "context_isolated": arm != "unsafe_ceiling",
+                            "context_isolated": arm
+                            not in {"immediate", "batch_drain", "unsafe_ceiling"},
+                            "optimized_route": arm in {"unsafe_ceiling", "guarded_fusion"},
                             "signature_guarded": True,
                         }
                     ),

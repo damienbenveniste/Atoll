@@ -11,10 +11,13 @@ from contextvars import ContextVar
 from pathlib import Path
 
 import pydantic_graph
+import pydantic_graph.graph_builder as graph_builder_module
 from pydantic_graph import GraphBuilder, StepContext
 from pydantic_graph.join import reduce_sum
 
 RUN_CONTEXT: ContextVar[str] = ContextVar("atoll_ceiling_context", default="missing")
+EXPECTED_GRAPH_TOTAL = 10
+EXPECTED_CONTEXT_TOTAL = 3
 
 
 async def verify_graph() -> None:
@@ -51,8 +54,8 @@ async def verify_graph() -> None:
         observed = await builder.build().run(infer_name=False)
     finally:
         RUN_CONTEXT.reset(token)
-    if observed != 10:
-        raise AssertionError(f"probe graph returned {observed}; expected 10")
+    if observed != EXPECTED_GRAPH_TOTAL:
+        raise AssertionError(f"probe graph returned {observed}; expected {EXPECTED_GRAPH_TOTAL}")
 
     failing = GraphBuilder(output_type=int)
 
@@ -133,40 +136,67 @@ def mutate_context_indirectly() -> None:
 
 
 async def context_remains_isolated() -> bool:
-    """Return whether a no-await child retains its independent task context."""
+    """Return whether a fused no-await map retains per-item task context."""
     builder = GraphBuilder(output_type=int)
+    initial_contexts: list[str] = []
+    child_contexts: list[str] = []
 
     @builder.step
-    async def step(ctx: StepContext[None, None, None]) -> int:
+    async def generate(ctx: StepContext[None, None, None]) -> list[int]:
         del ctx
-        mutate_context_indirectly()
-        return 1
+        return [1, 2]
 
+    @builder.step
+    async def transform(ctx: StepContext[None, None, int]) -> int:
+        initial_contexts.append(RUN_CONTEXT.get())
+        mutate_context_indirectly()
+        child_contexts.append(RUN_CONTEXT.get())
+        return ctx.inputs
+
+    collect = builder.join(reduce_sum, initial=0)
     builder.add(
-        builder.edge_from(builder.start_node).to(step),
-        builder.edge_from(step).to(builder.end_node),
+        builder.edge_from(builder.start_node).to(generate),
+        builder.edge_from(generate).map().to(transform),
+        builder.edge_from(transform).to(collect),
+        builder.edge_from(collect).to(builder.end_node),
     )
     token = RUN_CONTEXT.set("outer")
     try:
         observed = await builder.build().run(infer_name=False)
-        if observed != 1:
-            raise AssertionError(f"context graph returned {observed}; expected 1")
-        return RUN_CONTEXT.get() == "outer"
+        if observed != EXPECTED_CONTEXT_TOTAL:
+            raise AssertionError(
+                f"context graph returned {observed}; expected {EXPECTED_CONTEXT_TOTAL}"
+            )
+        return (
+            RUN_CONTEXT.get() == "outer"
+            and initial_contexts == ["outer", "outer"]
+            and child_contexts == ["child", "child"]
+        )
     finally:
         RUN_CONTEXT.reset(token)
 
 
 async def run_probe() -> dict[str, object]:
     """Run all probes and classify known unsafe-arm context divergence."""
+    before_fast_hits = getattr(graph_builder_module, "_ATOLL_FAST_HITS", 0)
     await verify_graph()
     await verify_signature_guards()
     context_isolated = await context_remains_isolated()
+    after_fast_hits = getattr(graph_builder_module, "_ATOLL_FAST_HITS", 0)
     arm = os.environ["ATOLL_CEILING_ARM"]
-    if arm != "unsafe_ceiling" and not context_isolated:
+    context_unsafe_arms = {"immediate", "batch_drain", "unsafe_ceiling"}
+    if arm not in context_unsafe_arms and not context_isolated:
         raise AssertionError(f"{arm} leaked child task context")
+    optimized_route = after_fast_hits > before_fast_hits
+    expected_optimized_route = arm in {"unsafe_ceiling", "guarded_fusion"}
+    if optimized_route != expected_optimized_route:
+        raise AssertionError(
+            f"{arm} optimized route was {optimized_route}; expected {expected_optimized_route}"
+        )
     return {
         "arm": arm,
         "context_isolated": context_isolated,
+        "optimized_route": optimized_route,
         "signature_guarded": True,
     }
 

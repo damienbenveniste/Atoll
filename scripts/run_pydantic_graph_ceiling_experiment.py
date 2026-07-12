@@ -51,6 +51,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
     print(
         "Pydantic Graph ceiling experiment completed: "
         f"{result.observed_headroom:.3f}x unsafe scheduler ceiling; "
+        f"{result.guarded_speedup:.3f}x guarded source speedup; "
         "recommendation="
         f"{'investigate-guarded-design' if result.promising_research_direction else 'stop'}."
     )
