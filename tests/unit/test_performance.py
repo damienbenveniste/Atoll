@@ -57,6 +57,7 @@ def test_run_performance_command_sets_child_env_without_mutating_parent(
     monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "parent-require")
     monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "parent-optimized")
     monkeypatch.setenv("ATOLL_REGION_ALLOWLIST", "parent-region")
+    monkeypatch.setenv("ATOLL_VARIANT_ALLOWLIST", "parent-variant")
     monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "parent-bytecode")
     monkeypatch.setattr(performance, "_perf_counter", _clock([1.5]))
 
@@ -101,10 +102,12 @@ def test_run_performance_command_sets_child_env_without_mutating_parent(
     assert "ATOLL_DISABLE" not in child_env
     assert "ATOLL_REQUIRE_OPTIMIZED" not in child_env
     assert "ATOLL_REGION_ALLOWLIST" not in child_env
+    assert "ATOLL_VARIANT_ALLOWLIST" not in child_env
     assert os.environ["ATOLL_DISABLE"] == "parent-disable"
     assert os.environ["ATOLL_REQUIRE_COMPILED"] == "parent-require"
     assert os.environ["ATOLL_REQUIRE_OPTIMIZED"] == "parent-optimized"
     assert os.environ["ATOLL_REGION_ALLOWLIST"] == "parent-region"
+    assert os.environ["ATOLL_VARIANT_ALLOWLIST"] == "parent-variant"
     assert os.environ["PYTHONDONTWRITEBYTECODE"] == "parent-bytecode"
     assert evidence.returncode == 0
     assert evidence.stdout == "out"
@@ -145,6 +148,40 @@ def test_run_performance_command_transports_sorted_region_allowlist(
     assert os.environ["ATOLL_DISABLE"] == "parent-disable"
     assert os.environ["ATOLL_REQUIRE_COMPILED"] == "parent-require"
     assert os.environ["ATOLL_REGION_ALLOWLIST"] == "parent-region"
+
+
+def test_run_performance_command_transports_variant_allowlist_independently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Variant trials route dispatch candidates without inventing region selection."""
+    captured_env: dict[str, str] = {}
+    monkeypatch.setenv("ATOLL_DISABLE", "parent-disable")
+    monkeypatch.setenv("ATOLL_REGION_ALLOWLIST", "parent-region")
+    monkeypatch.setenv("ATOLL_VARIANT_ALLOWLIST", "parent-variant")
+    monkeypatch.setattr(performance, "_perf_counter", _clock([0.5]))
+
+    def fake_run(
+        invocation: SubprocessInvocationView,
+    ) -> subprocess.CompletedProcess[str]:
+        captured_env.update(invocation.env)
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(performance, "_run_subprocess", fake_run)
+
+    run_performance_command(
+        ("python", "bench.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path / "payload",
+        mode="baseline",
+        variant_allowlist=frozenset(("variant-b", "variant-a")),
+    )
+
+    assert "ATOLL_DISABLE" not in captured_env
+    assert captured_env["ATOLL_REQUIRE_COMPILED"] == "1"
+    assert "ATOLL_REGION_ALLOWLIST" not in captured_env
+    assert captured_env["ATOLL_VARIANT_ALLOWLIST"] == "variant-a\nvariant-b"
+    assert os.environ["ATOLL_VARIANT_ALLOWLIST"] == "parent-variant"
 
 
 def test_run_performance_command_requires_source_optimization_without_parent_mutation(
@@ -351,6 +388,41 @@ def test_benchmark_gate_passes_distinct_region_allowlists_to_each_side(
         (str(tmp_path.resolve()), "1", "compiled-a"),
         (str(tmp_path.resolve()), "1", "baseline-a\nbaseline-b"),
     ]
+
+
+def test_benchmark_gate_passes_distinct_variant_allowlists_to_each_side(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Marginal gates independently select dispatcher variants on each arm."""
+    captured: list[str] = []
+    monkeypatch.setattr(performance, "_perf_counter", _clock([1.0, 1.0]))
+
+    def fake_run(
+        invocation: SubprocessInvocationView,
+    ) -> subprocess.CompletedProcess[str]:
+        captured.append(invocation.env["ATOLL_VARIANT_ALLOWLIST"])
+        assert "ATOLL_REGION_ALLOWLIST" not in invocation.env
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(performance, "_run_subprocess", fake_run)
+
+    result = run_benchmark_gate(
+        BenchmarkGateConfig(
+            command=("python", "bench.py"),
+            warmups=0,
+            samples=1,
+            minimum_speedup=1.0,
+        ),
+        project_root=tmp_path,
+        baseline_payload_root=tmp_path / "baseline",
+        compiled_payload_root=tmp_path / "compiled",
+        baseline_variant_allowlist=frozenset(("baseline-b", "baseline-a")),
+        compiled_variant_allowlist=frozenset(("compiled-a",)),
+    )
+
+    assert result.status == "passed"
+    assert captured == ["baseline-a\nbaseline-b", "compiled-a"]
 
 
 def test_benchmark_gate_runs_warmups_then_alternating_sample_pairs_and_medians(

@@ -159,6 +159,9 @@ class _FusionTrialOptions(TypedDict, total=False):
     baseline_region_allowlist: frozenset[str] | None
     unfused_region_allowlist: frozenset[str] | None
     fused_region_allowlist: frozenset[str] | None
+    baseline_variant_allowlist: frozenset[str] | None
+    unfused_variant_allowlist: frozenset[str] | None
+    fused_variant_allowlist: frozenset[str] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +175,9 @@ class _FusionExecutionContext:
     baseline_region_allowlist: frozenset[str] | None
     unfused_region_allowlist: frozenset[str] | None
     fused_region_allowlist: frozenset[str] | None
+    baseline_variant_allowlist: frozenset[str] | None
+    unfused_variant_allowlist: frozenset[str] | None
+    fused_variant_allowlist: frozenset[str] | None
 
 
 def run_fusion_trial(
@@ -223,6 +229,9 @@ def run_fusion_trial(
         baseline_region_allowlist=options.get("baseline_region_allowlist"),
         unfused_region_allowlist=options.get("unfused_region_allowlist"),
         fused_region_allowlist=options.get("fused_region_allowlist"),
+        baseline_variant_allowlist=options.get("baseline_variant_allowlist"),
+        unfused_variant_allowlist=options.get("unfused_variant_allowlist"),
+        fused_variant_allowlist=options.get("fused_variant_allowlist"),
     )
 
     semantic_runs, failure = _run_semantic_checks(context)
@@ -366,6 +375,9 @@ def _reject_unexpected_trial_options(options: _FusionTrialOptions) -> None:
         "baseline_region_allowlist",
         "unfused_region_allowlist",
         "fused_region_allowlist",
+        "baseline_variant_allowlist",
+        "unfused_variant_allowlist",
+        "fused_variant_allowlist",
     }
     unexpected_options = set(options) - allowed_options
     if unexpected_options:
@@ -419,6 +431,7 @@ def _run_arm_sequence(
                 payload_root=_payload_root(context, arm),
                 mode="baseline" if arm == "baseline" else "compiled",
                 region_allowlist=_region_allowlist(context, arm),
+                variant_allowlist=_variant_allowlist(context, arm),
             ),
         )
         runs.append(wrapped)
@@ -457,6 +470,17 @@ def _region_allowlist(
     if arm == "unfused":
         return context.unfused_region_allowlist
     return context.fused_region_allowlist
+
+
+def _variant_allowlist(
+    context: _FusionExecutionContext,
+    arm: FusionArm,
+) -> frozenset[str] | None:
+    if arm == "baseline":
+        return context.baseline_variant_allowlist
+    if arm == "unfused":
+        return context.unfused_variant_allowlist
+    return context.fused_variant_allowlist
 
 
 def _arm_median(samples: tuple[FusionArmRunEvidence, ...], arm: FusionArm) -> float:

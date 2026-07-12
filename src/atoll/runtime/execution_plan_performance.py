@@ -177,6 +177,9 @@ class _ExecutionPlanBenchmarkOptions(TypedDict, total=False):
     baseline_region_allowlist: frozenset[str] | None
     unplanned_region_allowlist: frozenset[str] | None
     planned_region_allowlist: frozenset[str] | None
+    baseline_variant_allowlist: frozenset[str] | None
+    unplanned_variant_allowlist: frozenset[str] | None
+    planned_variant_allowlist: frozenset[str] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +193,9 @@ class _ExecutionPlanBenchmarkContext:
     baseline_region_allowlist: frozenset[str] | None
     unplanned_region_allowlist: frozenset[str] | None
     planned_region_allowlist: frozenset[str] | None
+    baseline_variant_allowlist: frozenset[str] | None
+    unplanned_variant_allowlist: frozenset[str] | None
+    planned_variant_allowlist: frozenset[str] | None
 
 
 def run_execution_plan_benchmark(
@@ -237,6 +243,9 @@ def run_execution_plan_benchmark(
         baseline_region_allowlist=options.get("baseline_region_allowlist"),
         unplanned_region_allowlist=options.get("unplanned_region_allowlist"),
         planned_region_allowlist=options.get("planned_region_allowlist"),
+        baseline_variant_allowlist=options.get("baseline_variant_allowlist"),
+        unplanned_variant_allowlist=options.get("unplanned_variant_allowlist"),
+        planned_variant_allowlist=options.get("planned_variant_allowlist"),
     )
 
     warmups, failure = _run_trios(context, phase="warmup", count=1)
@@ -373,6 +382,9 @@ def _reject_unexpected_options(options: _ExecutionPlanBenchmarkOptions) -> None:
         "baseline_region_allowlist",
         "unplanned_region_allowlist",
         "planned_region_allowlist",
+        "baseline_variant_allowlist",
+        "unplanned_variant_allowlist",
+        "planned_variant_allowlist",
     }
     unexpected_options = set(options) - allowed_options
     if unexpected_options:
@@ -420,6 +432,7 @@ def _run_arm_sequence(
                 payload_root=_payload_root(context, arm),
                 mode="baseline" if arm == "baseline" else "compiled",
                 region_allowlist=_region_allowlist(context, arm),
+                variant_allowlist=_variant_allowlist(context, arm),
             ),
         )
         runs.append(wrapped)
@@ -476,6 +489,17 @@ def _region_allowlist(
     if arm == "unplanned":
         return context.unplanned_region_allowlist
     return context.planned_region_allowlist
+
+
+def _variant_allowlist(
+    context: _ExecutionPlanBenchmarkContext,
+    arm: ExecutionPlanBenchmarkArm,
+) -> frozenset[str] | None:
+    if arm == "baseline":
+        return context.baseline_variant_allowlist
+    if arm == "unplanned":
+        return context.unplanned_variant_allowlist
+    return context.planned_variant_allowlist
 
 
 def _arm_median(

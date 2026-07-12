@@ -2538,9 +2538,9 @@ minimum_speedup = 1.10
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        region_allowlist: frozenset[str] | None = None,
+        **options: object,
     ) -> CommandRunEvidence:
-        del region_allowlist
+        del options
         events.append(f"test:{mode}")
         return CommandRunEvidence(
             command=command,
@@ -3030,9 +3030,11 @@ minimum_speedup = 1.10
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        region_allowlist: frozenset[str] | None = None,
+        **options: object,
     ) -> CommandRunEvidence:
-        observed_allowlists.append(region_allowlist)
+        variant_allowlist = cast(frozenset[str] | None, options.get("variant_allowlist"))
+        region_allowlist = cast(frozenset[str] | None, options.get("region_allowlist"))
+        observed_allowlists.append(variant_allowlist or region_allowlist)
         return CommandRunEvidence(
             command=command,
             project_root=project_root,
@@ -3090,8 +3092,8 @@ minimum_speedup = 1.10
             speedup = 1.02 if candidate_index == 1 else 1.005
             status: BenchmarkStatus = "passed" if candidate_index == 1 else "not-profitable"
             assert kwargs["baseline_payload_root"] == kwargs["compiled_payload_root"]
-            assert "baseline_region_allowlist" in kwargs
-            assert "compiled_region_allowlist" in kwargs
+            assert "baseline_variant_allowlist" in kwargs
+            assert "compiled_variant_allowlist" in kwargs
         else:
             speedup = 1.12
             status = "passed"

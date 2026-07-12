@@ -2293,7 +2293,8 @@ def _prepare_outlined_backend_variant(
         shim=RegionShimConfig(
             source_module=staged.module.name,
             source_path=staged.module.path,
-            region_id=variant_id,
+            region_id=staged.region.id,
+            variant_id=variant_id,
             backend="cython",
             compiled_module=logical_module,
             artifact_dir=staged.staged_source_root / unit.install_relative_dir,
@@ -2447,7 +2448,8 @@ def _prepare_backend_variant(
         shim=RegionShimConfig(
             source_module=staged.module.name,
             source_path=staged.module.path,
-            region_id=selection.variant_id,
+            region_id=staged.region.id,
+            variant_id=selection.variant_id,
             backend=selection.backend,
             compiled_module=logical_module,
             artifact_dir=staged.staged_source_root / unit.install_relative_dir,
@@ -2811,10 +2813,11 @@ def _place_region_artifacts(
 ) -> None:
     source_by_digest = {_file_digest(path): path for path in artifact_paths}
     for config in configs:
+        variant_id = config.variant_id or config.region_id
         records = tuple(
             record
             for record in artifact_records
-            if record.region_id == config.region_id
+            if record.region_id == variant_id
             or (
                 record.region_id == "__shared__"
                 and PurePosixPath(record.install_relative_path).parent.name
@@ -2822,7 +2825,7 @@ def _place_region_artifacts(
             )
         )
         if not records:
-            raise ValueError(f"compiled region has no artifact records: {config.region_id}")
+            raise ValueError(f"compiled variant has no artifact records: {variant_id}")
         config.artifact_dir.mkdir(parents=True, exist_ok=True)
         for record in records:
             source = source_by_digest.get(record.digest)
@@ -2941,7 +2944,9 @@ def _rewrite_region_shims(
         by_path.setdefault(item.shim.source_path, []).append(item.shim)
     for source_path, configs in by_path.items():
         source_text = source_path.read_text(encoding="utf-8")
-        accepted = tuple(config for config in configs if config.region_id in accepted_ids)
+        accepted = tuple(
+            config for config in configs if (config.variant_id or config.region_id) in accepted_ids
+        )
         if accepted:
             updated = insert_or_replace_region_shim(source_text, accepted).new_text
         else:
@@ -3621,7 +3626,8 @@ def _typed_verification_plan(
 ) -> PackageVerificationPlan:
     regions_by_module: dict[str, list[str]] = {}
     for config in configs:
-        regions_by_module.setdefault(config.source_module, []).append(config.region_id)
+        variant_id = config.variant_id or config.region_id
+        regions_by_module.setdefault(config.source_module, []).append(variant_id)
     artifacts = {
         record.install_relative_path: VerificationArtifact(
             path=record.install_relative_path,
@@ -3629,17 +3635,24 @@ def _typed_verification_plan(
         )
         for record in records
     }
-    bindings = {
-        (config.source_module, _verification_binding_qualname(binding)): VerificationBinding(
-            module=config.source_module,
-            qualname=_verification_binding_qualname(binding),
-            kind=binding.kind,
-            execution_kind=binding.execution_kind,
+    binding_configs: dict[tuple[str, str], list[tuple[RegionShimConfig, BindingTarget]]] = {}
+    for config in configs:
+        for binding in config.bindings:
+            if binding.required:
+                key = (config.source_module, _verification_binding_qualname(binding))
+                binding_configs.setdefault(key, []).append((config, binding))
+    bindings: dict[tuple[str, str], VerificationBinding] = {}
+    for key, variants in binding_configs.items():
+        first_config, first_binding = variants[0]
+        bindings[key] = VerificationBinding(
+            module=first_config.source_module,
+            qualname=_verification_binding_qualname(first_binding),
+            kind=first_binding.kind,
+            execution_kind=first_binding.execution_kind,
+            variant_ids=tuple(
+                sorted(config.variant_id or config.region_id for config, _ in variants)
+            ),
         )
-        for config in configs
-        for binding in config.bindings
-        if binding.required
-    }
     return PackageVerificationPlan(
         modules=tuple(sorted(regions_by_module)),
         regions=tuple(
@@ -4212,7 +4225,7 @@ def _apply_execution_plan_trials_once(
             project_root=quality_root,
             payload_root=trial_root,
             mode="compiled",
-            region_allowlist=context.accepted_region_ids,
+            variant_allowlist=context.accepted_region_ids,
         )
         timings.append(
             CompilePhaseTiming(
@@ -4265,9 +4278,9 @@ def _apply_execution_plan_trials_once(
             baseline_payload_root=baseline_payload_root,
             unplanned_payload_root=context.install_root,
             planned_payload_root=trial_root,
-            baseline_region_allowlist=context.accepted_region_ids,
-            unplanned_region_allowlist=context.accepted_region_ids,
-            planned_region_allowlist=context.accepted_region_ids,
+            baseline_variant_allowlist=context.accepted_region_ids,
+            unplanned_variant_allowlist=context.accepted_region_ids,
+            planned_variant_allowlist=context.accepted_region_ids,
             progress=partial(_execution_plan_benchmark_progress, context.options.progress, plan.id),
         )
         timings.extend(_execution_plan_benchmark_timings(plan.id, benchmark))
@@ -4801,8 +4814,8 @@ def _run_conditional_task_fusion_research(
                 baseline_payload_root=context.baseline.baseline_install_root,
                 unfused_payload_root=context.install_root,
                 fused_payload_root=fused_root,
-                unfused_region_allowlist=accepted_ids,
-                fused_region_allowlist=accepted_ids,
+                unfused_variant_allowlist=accepted_ids,
+                fused_variant_allowlist=accepted_ids,
             )
         except (OSError, SyntaxError, ValueError) as error:
             trial = unavailable_fusion_trial(
@@ -5007,7 +5020,7 @@ def _select_profitable_candidates(
             project_root=quality_root,
             payload_root=context.payload_root,
             mode="compiled",
-            region_allowlist=frozenset(trial_ids),
+            variant_allowlist=frozenset(trial_ids),
         )
         timings.append(
             CompilePhaseTiming(
@@ -5040,8 +5053,8 @@ def _select_profitable_candidates(
                 project_root=quality_root,
                 baseline_payload_root=context.payload_root,
                 compiled_payload_root=context.payload_root,
-                baseline_region_allowlist=frozenset(baseline_ids),
-                compiled_region_allowlist=frozenset(trial_ids),
+                baseline_variant_allowlist=frozenset(baseline_ids),
+                compiled_variant_allowlist=frozenset(trial_ids),
                 progress=partial(_candidate_benchmark_progress, context.progress, variant_id),
             )
             timings.extend(_candidate_benchmark_timings(variant_id, benchmark))

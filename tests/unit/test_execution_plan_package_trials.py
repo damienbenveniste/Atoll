@@ -176,7 +176,7 @@ def test_passing_execution_plan_replaces_payload_after_disposable_trial(
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        region_allowlist: frozenset[str] | None = None,
+        variant_allowlist: frozenset[str] | None = None,
     ) -> CommandRunEvidence:
         events.append("semantic")
         return _passing_semantics(
@@ -184,7 +184,7 @@ def test_passing_execution_plan_replaces_payload_after_disposable_trial(
             project_root=project_root,
             payload_root=payload_root,
             mode=mode,
-            region_allowlist=region_allowlist,
+            variant_allowlist=variant_allowlist,
         )
 
     def benchmark(
@@ -471,7 +471,7 @@ def test_task_preserving_backend_follows_a_callback_semantic_failure(
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        region_allowlist: frozenset[str] | None = None,
+        variant_allowlist: frozenset[str] | None = None,
     ) -> CommandRunEvidence:
         nonlocal semantic_calls
         semantic_calls += 1
@@ -481,7 +481,7 @@ def test_task_preserving_backend_follows_a_callback_semantic_failure(
             project_root=project_root,
             payload_root=payload_root,
             mode=mode,
-            region_allowlist=region_allowlist,
+            variant_allowlist=variant_allowlist,
         )
 
     monkeypatch.setattr(
@@ -696,10 +696,10 @@ def _passing_semantics(
     project_root: Path,
     payload_root: Path,
     mode: RuntimeMode,
-    region_allowlist: frozenset[str] | None = None,
+    variant_allowlist: frozenset[str] | None = None,
 ) -> CommandRunEvidence:
     assert mode == "compiled"
-    assert region_allowlist == frozenset({"native-region"})
+    assert variant_allowlist == frozenset({"native-region"})
     return CommandRunEvidence(
         command=command,
         project_root=project_root,
@@ -718,9 +718,9 @@ def _failing_semantics(
     project_root: Path,
     payload_root: Path,
     mode: RuntimeMode,
-    region_allowlist: frozenset[str] | None = None,
+    variant_allowlist: frozenset[str] | None = None,
 ) -> CommandRunEvidence:
-    del region_allowlist
+    del variant_allowlist
     return CommandRunEvidence(
         command=command,
         project_root=project_root,

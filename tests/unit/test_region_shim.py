@@ -171,10 +171,113 @@ def test_region_shim_renders_descriptor_and_status_contract(tmp_path: Path) -> N
     assert "ATOLL_DISABLE" in rendered
     assert "ATOLL_REQUIRE_COMPILED" in rendered
     assert "ATOLL_REGION_ALLOWLIST" in rendered
+    assert "ATOLL_VARIANT_ALLOWLIST" in rendered
     assert "__atoll_compiled_target__" in rendered
     assert "__atoll_python_fallback__" in rendered
     assert "_atoll_guards_pass" in rendered
     assert "_atoll_name_to_remove.startswith" in rendered
+
+
+def test_region_shim_builds_one_signature_shaped_dispatcher_for_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple native variants merge into one ordered source-shaped dispatcher."""
+    source_path = tmp_path / "pkg" / "worker.py"
+    source_path.parent.mkdir(parents=True)
+    binding = BindingTarget(
+        source=SymbolId(module="pkg.worker", qualname="choose"),
+        compiled_name="choose",
+        kind="module",
+        owner_class=None,
+        execution_kind="sync",
+    )
+    safe_binding = replace(
+        binding,
+        guards=(
+            RuntimeTypeGuard(
+                parameter_name="value",
+                positional_index=0,
+                annotation="int",
+                nominal_type_paths=("int",),
+                allow_none=False,
+            ),
+        ),
+    )
+    generic = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=source_path,
+        region_id="semantic-region",
+        variant_id="generic-cython",
+        dispatch_rank=210,
+        backend="cython",
+        compiled_module="_atoll_generic",
+        artifact_dir=source_path.parent / "generic-artifacts",
+        bindings=(binding,),
+    )
+    safe = replace(
+        generic,
+        variant_id="safe-int32",
+        dispatch_rank=0,
+        compiled_module="_atoll_safe",
+        artifact_dir=source_path.parent / "safe-artifacts",
+        bindings=(safe_binding,),
+    )
+    source = """DEFAULT = object()
+
+def choose(value, /, scale=2, *, token=DEFAULT):
+    return ("source", value, scale, token)
+"""
+    for config, label in ((generic, "generic"), (safe, "safe")):
+        config.artifact_dir.mkdir(parents=True)
+        (config.artifact_dir / f"{config.compiled_module}.py").write_text(
+            "def choose(value, scale=2, *, token=None):\n"
+            f"    return ({label!r}, value, scale, token)\n",
+            encoding="utf-8",
+        )
+    source_path.write_text(
+        insert_or_replace_region_shim(source, (generic, safe)).new_text,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(importlib.machinery, "EXTENSION_SUFFIXES", (".py",))
+
+    spec = importlib.util.spec_from_file_location("shim_variants", source_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    signature = inspect.signature(module.choose, follow_wrapped=False)
+    assert module.choose(3)[0] == "safe"
+    assert module.choose("text")[0] == "generic"
+    assert signature.parameters["value"].kind is inspect.Parameter.POSITIONAL_ONLY
+    assert signature.parameters["token"].default is module.DEFAULT
+    assert module.choose.__defaults__ is module.choose.__atoll_python_fallback__.__defaults__
+    assert module.choose.__kwdefaults__ is module.choose.__atoll_python_fallback__.__kwdefaults__
+    assert module.choose(3)[3] is module.DEFAULT
+    with pytest.raises(TypeError):
+        module.choose(value=3)
+    variants = module.choose.__atoll_binding_variants__
+    assert tuple(item["variant_id"] for item in variants) == (
+        "safe-int32",
+        "generic-cython",
+    )
+    assert not hasattr(module.choose.__atoll_python_fallback__, "__atoll_binding_variants__")
+    assert set(module.__atoll_status__["regions"]) == {"safe-int32", "generic-cython"}
+
+    monkeypatch.setenv("ATOLL_VARIANT_ALLOWLIST", "generic-cython")
+    filtered_spec = importlib.util.spec_from_file_location("shim_variant_filtered", source_path)
+    assert filtered_spec is not None
+    assert filtered_spec.loader is not None
+    filtered = importlib.util.module_from_spec(filtered_spec)
+    sys.modules[filtered_spec.name] = filtered
+    filtered_spec.loader.exec_module(filtered)
+
+    assert filtered.choose(3)[0] == "generic"
+    filtered_status = filtered.__atoll_status__["regions"]
+    assert filtered_status["safe-int32"]["selected"] is False
+    assert filtered_status["generic-cython"]["selected"] is True
 
 
 def test_region_shim_activates_only_allowlisted_regions(
@@ -341,7 +444,7 @@ def test_region_shim_renders_subclass_target_and_constant_time_guard(tmp_path: P
     assert "'target_owner_class': 'IntPairer'" in rendered
     assert "'qualname': 'IntPairer.pair'" in rendered
     assert "'nominal_type_paths': ('int',)" in rendered
-    assert "if _atoll_guard_check(_atoll_guards, args, kwargs)" in rendered
+    assert "_atoll_guard_check(_atoll_candidate['guards'], _atoll_values)" in rendered
     assert "except Exception:" in rendered
 
 
@@ -868,7 +971,7 @@ def test_region_shim_config_rejects_invalid_promises(tmp_path: Path) -> None:
 
 
 def test_region_shim_rejects_ambiguous_config_sets_and_markers(tmp_path: Path) -> None:
-    """One staged module cannot contain duplicate regions or unbalanced blocks."""
+    """One staged module cannot contain duplicate variants or unbalanced blocks."""
     config = _config(tmp_path)
     other_path = replace(config, source_path=tmp_path / "other.py", region_id="other")
 
@@ -876,8 +979,15 @@ def test_region_shim_rejects_ambiguous_config_sets_and_markers(tmp_path: Path) -
         render_region_shim(())
     with pytest.raises(ValueError, match="one source module"):
         render_region_shim((config, other_path))
-    with pytest.raises(ValueError, match="unique region IDs"):
+    with pytest.raises(ValueError, match="unique variant IDs"):
         render_region_shim((config, config))
+    incompatible = replace(
+        config,
+        variant_id="other-variant",
+        bindings=(replace(config.bindings[0], execution_kind="coroutine"),),
+    )
+    with pytest.raises(ValueError, match="disagree about binding"):
+        render_region_shim((config, incompatible))
     with pytest.raises(ValueError, match="unbalanced"):
         remove_region_shim(
             "# BEGIN ATOLL TYPED REGIONS: pkg.worker\n",

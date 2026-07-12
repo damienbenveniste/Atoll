@@ -189,10 +189,13 @@ class _BenchmarkGateOptions(TypedDict, total=False):
     progress: ProgressCallback | None
     baseline_region_allowlist: frozenset[str] | None
     compiled_region_allowlist: frozenset[str] | None
+    baseline_variant_allowlist: frozenset[str] | None
+    compiled_variant_allowlist: frozenset[str] | None
 
 
 class _PerformanceCommandOptions(TypedDict, total=False):
     region_allowlist: frozenset[str] | None
+    variant_allowlist: frozenset[str] | None
     require_optimized: bool
 
 
@@ -208,12 +211,15 @@ class _RuntimeActivation:
         mode: Caller-visible runtime mode recorded in command evidence.
         compiled_region_allowlist: Region IDs enabled for compiled transport, or
             `None` when the child should not receive an allowlist.
+        compiled_variant_allowlist: Native variant IDs enabled for dispatcher routing, or
+            `None` when all loaded variants may participate.
         source_optimization_required: Whether the child must use generated source
             optimization instead of silently falling back.
     """
 
     mode: RuntimeMode
     compiled_region_allowlist: frozenset[str] | None
+    compiled_variant_allowlist: frozenset[str] | None
     source_optimization_required: bool
 
     @property
@@ -224,7 +230,11 @@ class _RuntimeActivation:
             bool: Whether compiled transport is required by either the runtime
                 mode or the presence of an explicit region allowlist.
         """
-        return self.mode == "compiled" or self.compiled_region_allowlist is not None
+        return (
+            self.mode == "compiled"
+            or self.compiled_region_allowlist is not None
+            or self.compiled_variant_allowlist is not None
+        )
 
     @classmethod
     def from_command_options(
@@ -232,6 +242,7 @@ class _RuntimeActivation:
         *,
         mode: RuntimeMode,
         region_allowlist: frozenset[str] | None,
+        variant_allowlist: frozenset[str] | None,
         require_optimized: bool,
     ) -> _RuntimeActivation:
         """Create an immutable activation from legacy command options.
@@ -239,6 +250,7 @@ class _RuntimeActivation:
         Args:
             mode: Baseline or compiled mode requested by the existing caller.
             region_allowlist: Optional compiled-region allowlist for the child.
+            variant_allowlist: Optional native dispatcher-variant allowlist for the child.
             require_optimized: Whether generated source optimization is required.
 
         Returns:
@@ -247,6 +259,7 @@ class _RuntimeActivation:
         return cls(
             mode=mode,
             compiled_region_allowlist=region_allowlist,
+            compiled_variant_allowlist=variant_allowlist,
             source_optimization_required=require_optimized,
         )
 
@@ -259,6 +272,8 @@ class _BenchmarkExecutionContext:
     compiled_payload_root: Path
     baseline_region_allowlist: frozenset[str] | None
     compiled_region_allowlist: frozenset[str] | None
+    baseline_variant_allowlist: frozenset[str] | None
+    compiled_variant_allowlist: frozenset[str] | None
     progress: ProgressCallback | None
 
 
@@ -297,12 +312,14 @@ def run_performance_command(
     resolved_project_root = project_root.resolve()
     resolved_payload_root = payload_root.resolve()
     region_allowlist = options.get("region_allowlist")
+    variant_allowlist = options.get("variant_allowlist")
     require_optimized = options.get("require_optimized", False)
     child_env = _runtime_environment(
         payload_root=resolved_payload_root,
         activation=_RuntimeActivation.from_command_options(
             mode=mode,
             region_allowlist=region_allowlist,
+            variant_allowlist=variant_allowlist,
             require_optimized=require_optimized,
         ),
     )
@@ -363,6 +380,8 @@ def run_benchmark_gate(
     progress = options.get("progress")
     baseline_region_allowlist = options.get("baseline_region_allowlist")
     compiled_region_allowlist = options.get("compiled_region_allowlist")
+    baseline_variant_allowlist = options.get("baseline_variant_allowlist")
+    compiled_variant_allowlist = options.get("compiled_variant_allowlist")
     if config.command is None:
         return BenchmarkGateResult(
             status="unbenchmarked",
@@ -381,6 +400,8 @@ def run_benchmark_gate(
         compiled_payload_root=compiled_payload_root,
         baseline_region_allowlist=baseline_region_allowlist,
         compiled_region_allowlist=compiled_region_allowlist,
+        baseline_variant_allowlist=baseline_variant_allowlist,
+        compiled_variant_allowlist=compiled_variant_allowlist,
         progress=progress,
     )
 
@@ -463,6 +484,8 @@ def _reject_unexpected_benchmark_options(options: _BenchmarkGateOptions) -> None
     allowed_options = {
         "baseline_region_allowlist",
         "compiled_region_allowlist",
+        "baseline_variant_allowlist",
+        "compiled_variant_allowlist",
         "progress",
     }
     unexpected_options = set(options) - allowed_options
@@ -485,6 +508,7 @@ def _runtime_environment(
     )
     child_env["PYTHONPATH"] = os.pathsep.join((str(payload_root), *existing_pythonpath))
     child_env.pop("ATOLL_REGION_ALLOWLIST", None)
+    child_env.pop("ATOLL_VARIANT_ALLOWLIST", None)
     child_env.pop("ATOLL_REQUIRE_OPTIMIZED", None)
     if activation.uses_compiled_transport:
         child_env.pop("ATOLL_DISABLE", None)
@@ -492,6 +516,10 @@ def _runtime_environment(
         if activation.compiled_region_allowlist is not None:
             child_env["ATOLL_REGION_ALLOWLIST"] = "\n".join(
                 sorted(activation.compiled_region_allowlist)
+            )
+        if activation.compiled_variant_allowlist is not None:
+            child_env["ATOLL_VARIANT_ALLOWLIST"] = "\n".join(
+                sorted(activation.compiled_variant_allowlist)
             )
     elif activation.mode == "baseline":
         child_env["ATOLL_DISABLE"] = "1"
@@ -538,6 +566,11 @@ def _run_phase(
                     context.baseline_region_allowlist
                     if mode == "baseline"
                     else context.compiled_region_allowlist
+                ),
+                variant_allowlist=(
+                    context.baseline_variant_allowlist
+                    if mode == "baseline"
+                    else context.compiled_variant_allowlist
                 ),
             )
             runs.append(run)

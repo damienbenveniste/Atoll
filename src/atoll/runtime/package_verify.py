@@ -122,6 +122,18 @@ for binding in plan["bindings"]:
     fallback = getattr(value, "__atoll_python_fallback__", None)
     if compiled_target is None or fallback is None:
         raise RuntimeError(f"Atoll binding lacks routing metadata: {binding['qualname']}")
+    expected_variants = binding.get("variant_ids", [])
+    if expected_variants and expected_kind != "class":
+        candidates = getattr(value, "__atoll_binding_variants__", None)
+        if not isinstance(candidates, tuple):
+            raise RuntimeError(f"Atoll binding lacks variant metadata: {binding['qualname']}")
+        actual_variants = sorted(
+            candidate.get("variant_id")
+            for candidate in candidates
+            if isinstance(candidate, dict)
+        )
+        if actual_variants != sorted(expected_variants):
+            raise RuntimeError(f"Atoll binding variant mismatch: {binding['qualname']}")
     try:
         if inspect.signature(value) != inspect.signature(fallback):
             raise RuntimeError(f"Atoll binding changed signature: {binding['qualname']}")
@@ -162,12 +174,14 @@ class VerificationBinding:
         qualname: Public runtime-qualified path within the module.
         kind: Module, class, or descriptor-aware binding category.
         execution_kind: Callable shape promised by the typed-region frontend.
+        variant_ids: Compiled dispatcher variants promised for this binding.
     """
 
     module: str
     qualname: str
     kind: BindingKind
     execution_kind: ExecutionKind
+    variant_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +257,7 @@ def verify_package_subprocess(
                     "qualname": binding.qualname,
                     "kind": binding.kind,
                     "execution_kind": binding.execution_kind,
+                    "variant_ids": list(binding.variant_ids),
                 }
                 for binding in plan.bindings
             ],

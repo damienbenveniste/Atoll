@@ -29,7 +29,7 @@ class PerformanceCommandRunner(Protocol):
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        region_allowlist: frozenset[str] | None = None,
+        **options: object,
     ) -> CommandRunEvidence: ...
 
 
@@ -172,6 +172,42 @@ def test_execution_plan_benchmark_runs_one_warmup_then_all_six_rotated_orders(
     assert result.planned_median_seconds == pytest.approx(1.0)
     assert result.marginal_speedup == pytest.approx(2.0)
     assert result.overall_speedup == pytest.approx(3.5)
+
+
+def test_execution_plan_benchmark_forwards_variant_allowlists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Composed plan arms retain independently selected native variants."""
+    calls: list[CallRecord] = []
+    monkeypatch.setattr(
+        execution_plan_performance,
+        "run_performance_command",
+        _fake_runner([1.0] * 6, calls),
+    )
+
+    run_execution_plan_benchmark(
+        ExecutionPlanBenchmarkConfig(
+            plan_id=PLAN_ID,
+            command=("python", "bench.py"),
+            samples=1,
+            minimum_marginal_speedup=1.0,
+            minimum_overall_speedup=1.0,
+        ),
+        project_root=tmp_path,
+        baseline_payload_root=tmp_path / "baseline",
+        unplanned_payload_root=tmp_path / "unplanned",
+        planned_payload_root=tmp_path / "planned",
+        baseline_variant_allowlist=frozenset(("base",)),
+        unplanned_variant_allowlist=frozenset(("native",)),
+        planned_variant_allowlist=frozenset(("native", "planned")),
+    )
+
+    assert [(call.arm, call.allowlist) for call in calls[:3]] == [
+        ("baseline", frozenset(("base",))),
+        ("unplanned", frozenset(("native",))),
+        ("planned", frozenset(("native", "planned"))),
+    ]
 
 
 def test_execution_plan_benchmark_marks_unavailable_without_command(tmp_path: Path) -> None:
@@ -437,16 +473,18 @@ def _fake_runner(
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        region_allowlist: frozenset[str] | None = None,
+        **options: object,
     ) -> CommandRunEvidence:
         arm = _arm_from_payload(payload_root)
+        variant_allowlist = cast(frozenset[str] | None, options.get("variant_allowlist"))
+        region_allowlist = cast(frozenset[str] | None, options.get("region_allowlist"))
         calls.append(
             CallRecord(
                 arm=arm,
                 command_name=command[-1],
                 mode=mode,
                 payload_name=payload_root.name,
-                allowlist=region_allowlist,
+                allowlist=variant_allowlist or region_allowlist,
             )
         )
         return CommandRunEvidence(

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 import pytest
 
@@ -29,7 +29,7 @@ class PerformanceCommandRunner(Protocol):
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        region_allowlist: frozenset[str] | None = None,
+        **options: object,
     ) -> CommandRunEvidence: ...
 
 
@@ -144,6 +144,44 @@ def test_fusion_trial_runs_semantic_first_then_rotated_warmups_and_samples(
     assert result.baseline_over_unfused == pytest.approx(1.5)
     assert result.baseline_over_fused == pytest.approx(3.0)
     assert result.unfused_over_fused == pytest.approx(2.0)
+
+
+def test_fusion_trial_forwards_variant_allowlists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fusion arms retain the native variants accepted before source staging."""
+    calls: list[CallRecord] = []
+    monkeypatch.setattr(
+        fusion_performance,
+        "run_performance_command",
+        _fake_runner([1.0] * 6, calls),
+    )
+
+    run_fusion_trial(
+        FusionBenchmarkConfig(
+            plan_id=PLAN_ID,
+            command=("python", "bench.py"),
+            semantic_command=("python", "verify.py"),
+            warmups=0,
+            samples=1,
+            minimum_over_unfused=1.0,
+            minimum_overall=1.0,
+        ),
+        project_root=tmp_path,
+        baseline_payload_root=tmp_path / "baseline",
+        unfused_payload_root=tmp_path / "unfused",
+        fused_payload_root=tmp_path / "fused",
+        baseline_variant_allowlist=frozenset(("base",)),
+        unfused_variant_allowlist=frozenset(("native",)),
+        fused_variant_allowlist=frozenset(("fused", "native")),
+    )
+
+    assert [(call.arm, call.allowlist) for call in calls[:3]] == [
+        ("baseline", frozenset(("base",))),
+        ("unfused", frozenset(("native",))),
+        ("fused", frozenset(("fused", "native"))),
+    ]
 
 
 def test_fusion_trial_marks_unavailable_without_command(tmp_path: Path) -> None:
@@ -414,16 +452,18 @@ def _fake_runner(
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        region_allowlist: frozenset[str] | None = None,
+        **options: object,
     ) -> CommandRunEvidence:
         arm = _arm_from_payload(payload_root)
+        variant_allowlist = cast(frozenset[str] | None, options.get("variant_allowlist"))
+        region_allowlist = cast(frozenset[str] | None, options.get("region_allowlist"))
         calls.append(
             CallRecord(
                 arm=arm,
                 command_name=command[-1],
                 mode=mode,
                 payload_name=payload_root.name,
-                allowlist=region_allowlist,
+                allowlist=variant_allowlist or region_allowlist,
             )
         )
         return CommandRunEvidence(
