@@ -498,7 +498,15 @@ def test_plan_identity_validators_reject_missing_or_changed_targets(tmp_path: Pa
     missing_node = PlanNode(missing.stable_id, missing, "worker", 1)
 
     with pytest.raises(ValueError, match="planned symbol is missing"):
-        _validate_source_hash(source_text, tree, replace(plan, nodes=(*plan.nodes, missing_node)))
+        _validate_source_hash(
+            source_text,
+            tree,
+            replace(
+                plan,
+                nodes=(*plan.nodes, missing_node),
+                source_members=(*plan.source_members, missing),
+            ),
+        )
     with pytest.raises(ValueError, match="plan owner is missing"):
         _validate_callsite_fingerprint(tree, replace(plan, owner=missing))
     with pytest.raises(ValueError, match="plan owner is missing"):
@@ -528,6 +536,9 @@ def test_generated_binding_collision_is_rejected(tmp_path: Path) -> None:
                 for node in plan.nodes
                 if node.symbol is not None and node.symbol.module == scan.module.name
             ),
+        ),
+        source_hashes=(
+            (scan.module.name, hashlib.sha256(changed_source.encode("utf-8")).hexdigest()),
         ),
     )
 

@@ -626,7 +626,12 @@ def _print_source_clean_success(
         result.compiled_bindings
     )
     print(
-        f"Atoll {label} built {len(compiled_modules)} module(s) and {compiled_symbols} symbol(s)."
+        _source_clean_success_message(
+            label=label,
+            compiled_module_count=len(compiled_modules),
+            compiled_symbol_count=compiled_symbols,
+            applied_plan_count=len(result.applied_execution_plans),
+        )
     )
     if result.skipped:
         print(f"Skipped {len(result.skipped)} module(s) that mypyc could not build.")
@@ -653,6 +658,7 @@ def _print_source_clean_success(
     if result.install_tree_kept:
         print(f"Install tree: {result.install_root}")
     _print_candidate_trial_summary(result)
+    _print_execution_plan_trial_summary(result)
     if result.performance is not None:
         if result.performance.status == "passed" and result.performance.speedup is not None:
             print(f"Performance: {result.performance.speedup:.3f}x median speedup (passed).")
@@ -660,6 +666,40 @@ def _print_source_clean_success(
             print(f"Performance: {result.performance.status}.")
     print(f"Wheel: {result.wheel_path}")
     _print_compile_report_paths(report_paths)
+
+
+def _source_clean_success_message(
+    *,
+    label: str,
+    compiled_module_count: int,
+    compiled_symbol_count: int,
+    applied_plan_count: int,
+) -> str:
+    """Describe native, scheduler-plan, or interpreted-only wheel work.
+
+    Args:
+        label: Human-readable operation label.
+        compiled_module_count: Number of modules with retained native bindings.
+        compiled_symbol_count: Number of retained native bindings.
+        applied_plan_count: Number of profitable scheduler plans in the payload.
+
+    Returns:
+        str: Single-line success summary that does not describe plan-only work as zero work.
+    """
+    if compiled_module_count or compiled_symbol_count:
+        message = (
+            f"Atoll {label} built {compiled_module_count} module(s) and "
+            f"{compiled_symbol_count} symbol(s)"
+        )
+        if applied_plan_count:
+            message += f", and applied {applied_plan_count} async execution plan(s)"
+        return f"{message}."
+    if applied_plan_count:
+        return (
+            f"Atoll {label} applied {applied_plan_count} async execution plan(s); "
+            "no native regions were retained."
+        )
+    return f"Atoll {label} produced a verified wheel with interpreted fallbacks only."
 
 
 def _print_candidate_trial_summary(result: PackageCommandResult) -> None:
@@ -675,6 +715,22 @@ def _print_candidate_trial_summary(result: PackageCommandResult) -> None:
     print(
         f"Candidate trials: {accepted_trials}/{len(result.candidate_trials)} accepted; "
         f"{accepted_coverage:.1%} mapped hot-path coverage."
+    )
+
+
+def _print_execution_plan_trial_summary(result: PackageCommandResult) -> None:
+    """Print applied scheduler-plan and helper-cache evidence.
+
+    Args:
+        result: Source-clean result containing scheduler-plan trials.
+    """
+    if not result.execution_plan_trials:
+        return
+    accepted = sum(trial.status == "accepted" for trial in result.execution_plan_trials)
+    cache_hits = sum(trial.cache_status == "hit" for trial in result.execution_plan_trials)
+    print(
+        f"Execution-plan trials: {accepted}/{len(result.execution_plan_trials)} accepted; "
+        f"{cache_hits} staging cache hit(s)."
     )
 
 

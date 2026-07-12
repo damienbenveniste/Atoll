@@ -17,6 +17,7 @@ import pytest
 from atoll import cli as cli_module
 from atoll.analysis.task_fusion import FusionPlan
 from atoll.commands import package as package_command
+from atoll.execution_plans.models import ExecutionPlanTrial
 from atoll.generation.region_shim import RegionShimConfig
 from atoll.models import (
     ArtifactRecord,
@@ -127,7 +128,14 @@ class _QualityGateOutcomeView(Protocol):
 class _PromotionResultView(Protocol):
     success: bool
     wheel_path: Path | None
+    cleanup_removed: tuple[Path, ...]
     error: str | None
+
+
+class _PromotionContextView(Protocol):
+    verification_plan: PackageVerificationPlan
+    requires_profitable_optimization: bool
+    profitable_optimization_applied: bool
 
 
 class _FusionResearchOutcomeView(Protocol):
@@ -386,6 +394,26 @@ _fusion_trial_timings = cast(
 _print_source_clean_success = cast(
     Callable[..., None],
     vars(cli_module)["_print_source_clean_success"],
+)
+_promotion_wheel_tag = cast(
+    Callable[[object, Path], str],
+    _package_attr("_promotion_wheel_tag"),
+)
+_ExecutionPlanOnlyContext = cast(
+    Callable[..., object],
+    _package_attr("_ExecutionPlanOnlyContext"),
+)
+_ExecutionPlanApplicationOutcome = cast(
+    Callable[..., object],
+    _package_attr("_ExecutionPlanApplicationOutcome"),
+)
+_SourceCleanPromotionResult = cast(
+    Callable[..., object],
+    _package_attr("_SourceCleanPromotionResult"),
+)
+_execute_execution_plan_only_package = cast(
+    Callable[[object], package_command.PackageCommandResult],
+    _package_attr("_execute_execution_plan_only_package"),
 )
 
 
@@ -650,8 +678,8 @@ def test_explicit_package_fails_when_one_requested_region_does_not_compile(
     assert result.error == (
         "requested member(s) did not compile successfully: app.extra::normalize_features"
     )
-    assert result.cleanup_removed == (output_dir / "install",)
-    assert result.cleanup_kept == (output_dir / "build",)
+    assert result.cleanup_removed == (output_dir / "build", output_dir / "install")
+    assert result.cleanup_kept == ()
 
 
 def test_function_with_same_region_class_dependency_uses_runtime_boundary(
@@ -868,12 +896,12 @@ def test_package_default_does_not_call_legacy_sidecar_backend(
 
 
 @pytest.mark.parametrize("failed_stage", ["payload", "wheel"])
-def test_package_preserves_payload_for_subprocess_verification_failure(
+def test_package_cleans_payload_after_subprocess_verification_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failed_stage: VerificationStage,
 ) -> None:
-    """Routing failures keep the exact payload and rejected wheel under diagnostics."""
+    """Routing failures retain report evidence without persistent scratch payloads."""
     project_root = tmp_path / "simple_project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -921,13 +949,13 @@ def test_package_preserves_payload_for_subprocess_verification_failure(
 
     assert result.success is False
     assert result.error == "routing failed"
-    assert result.cleanup_removed == ()
-    assert result.cleanup_kept == (output_dir / "build", output_dir / "install")
-    assert (output_dir / "install").exists()
+    assert result.cleanup_removed == (output_dir / "build", output_dir / "install")
+    assert result.cleanup_kept == ()
+    assert not (output_dir / "build").exists()
+    assert not (output_dir / "install").exists()
     assert not tuple(output_dir.glob("*.whl"))
     assert result.verification_steps[-1].stage == failed_stage
-    if failed_stage == "wheel":
-        assert result.verification_steps[-1].target.parent == output_dir / "build" / "diagnostics"
+    assert not result.verification_steps[-1].target.exists()
 
 
 def _prepare_outlined_coroutine_fixture(
@@ -2051,6 +2079,180 @@ def test_source_clean_success_summary_lists_every_fallback_kind(
     assert "Performance: 1.200x median speedup (passed)." in output
 
 
+def test_plan_only_success_output_names_applied_plan_and_cache_hit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pure Python plan overlay is not described as zero compiled work."""
+    result = package_command.PackageCommandResult(
+        success=True,
+        project_root=tmp_path,
+        output_dir=tmp_path / ".atoll" / "dist",
+        install_root=tmp_path / ".atoll" / "dist" / "install",
+        wheel_path=tmp_path / ".atoll" / "dist" / "fixture-0.1-py3-none-any.whl",
+        islands=(),
+        build=_successful_attempt(),
+        applied_execution_plans=("plan-a",),
+        execution_plan_trials=(
+            ExecutionPlanTrial(
+                plan_id="plan-a",
+                status="accepted",
+                command=("python", "verify.py"),
+                exit_code=0,
+                duration_seconds=0.1,
+                cache_status="hit",
+            ),
+        ),
+    )
+
+    _print_source_clean_success(
+        result,
+        label="source-clean compile",
+        report_paths=(tmp_path / "report.json", tmp_path / "report.md"),
+    )
+
+    output = capsys.readouterr().out
+    assert "applied 1 async execution plan(s); no native regions were retained" in output
+    assert "Execution-plan trials: 1/1 accepted; 1 staging cache hit(s)." in output
+
+
+def test_plan_only_promotion_preserves_the_baseline_pure_wheel_tag(tmp_path: Path) -> None:
+    """A Python-only overlay cannot acquire the current interpreter platform tag."""
+    project = _quality_gate_project(tmp_path, ())
+    context = _SourceCleanPromotionContext(
+        options=package_command.PackageOptions(root=project.config.root),
+        project=project,
+        output_dir=tmp_path / "dist",
+        build_root=tmp_path / "dist" / "build",
+        install_root=tmp_path / "dist" / "install",
+        baseline=_BaselineWheelPayload(
+            wheel_path=tmp_path / "fixture-0.1-py3-none-any.whl",
+            build=_successful_attempt(),
+        ),
+        verification_plan=PackageVerificationPlan(modules=(), regions=(), artifacts=()),
+        build=_successful_attempt(),
+        profitable_optimization_applied=True,
+    )
+
+    assert _promotion_wheel_tag(context, tmp_path / "fixture-0.1-py3-none-any.whl") == (
+        "py3-none-any"
+    )
+
+
+def test_plan_only_baseline_failure_cleans_scratch_and_returns_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed baseline leaves no plan-only scratch tree or misleading wheel."""
+    project = _quality_gate_project(tmp_path, ())
+    output_dir = project.config.root / ".atoll" / "dist"
+    build_root = output_dir / "build"
+    install_root = output_dir / "install"
+    build_root.mkdir(parents=True)
+    install_root.mkdir(parents=True)
+    failed_wheel = output_dir / "simple_project-0.1.0-py3-none-any.whl"
+    failed_wheel.write_text("stale", encoding="utf-8")
+    attempt = CompileAttempt(
+        success=False,
+        command=("python", "-m", "build"),
+        stdout="",
+        stderr="baseline failed",
+        artifact_paths=(),
+        duration_seconds=0.1,
+    )
+    baseline = _BaselineWheelPayload(wheel_path=None, build=attempt)
+
+    def package_baseline(*_args: object) -> object:
+        return baseline
+
+    monkeypatch.setattr(package_command, "_package_baseline", package_baseline)
+    context = _ExecutionPlanOnlyContext(
+        options=package_command.PackageOptions(root=project.config.root),
+        project=project,
+        typed_regions=(),
+        execution_plans=(),
+        prepared_baseline=None,
+        profile=None,
+    )
+
+    result = _execute_execution_plan_only_package(context)
+
+    assert result.success is False
+    assert result.error == "baseline failed"
+    assert result.build == attempt
+    assert result.cleanup_removed == (build_root, install_root)
+    assert not failed_wheel.exists()
+    assert not build_root.exists()
+    assert not install_root.exists()
+
+
+def test_plan_only_success_forwards_trial_and_promotion_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A profitable plan-only payload reaches promotion with no native verification promises."""
+    project = _quality_gate_project(tmp_path, ())
+    output_dir = tmp_path / "plan-output"
+    wheel_path = output_dir / "fixture-0.1-py3-none-any.whl"
+    attempt = _successful_attempt()
+    baseline = _BaselineWheelPayload(wheel_path=wheel_path, build=attempt)
+    trial = ExecutionPlanTrial(
+        plan_id="plan-a",
+        status="accepted",
+        command=("python", "verify.py"),
+        exit_code=0,
+        duration_seconds=0.1,
+    )
+    application = _ExecutionPlanApplicationOutcome(
+        applied_plan_ids=("plan-a",),
+        trials=(trial,),
+        timings=(CompilePhaseTiming("execution_plan_staging", 0.1),),
+    )
+    promotion = _SourceCleanPromotionResult(
+        success=True,
+        wheel_path=wheel_path,
+        build=attempt,
+        verification_steps=(),
+    )
+
+    def package_baseline(*_args: object) -> object:
+        return baseline
+
+    def apply_execution_plan_trials(_context: object) -> object:
+        return application
+
+    monkeypatch.setattr(package_command, "_package_baseline", package_baseline)
+    monkeypatch.setattr(
+        package_command, "_apply_execution_plan_trials", apply_execution_plan_trials
+    )
+
+    def promote(context: object) -> object:
+        view = cast(_PromotionContextView, context)
+        assert view.verification_plan.modules == ()
+        assert view.verification_plan.regions == ()
+        assert view.verification_plan.artifacts == ()
+        assert view.requires_profitable_optimization is True
+        assert view.profitable_optimization_applied is True
+        return promotion
+
+    monkeypatch.setattr(package_command, "_promote_source_clean_payload", promote)
+    context = _ExecutionPlanOnlyContext(
+        options=package_command.PackageOptions(root=project.config.root, output_dir=output_dir),
+        project=project,
+        typed_regions=(),
+        execution_plans=(),
+        prepared_baseline=baseline,
+        profile=None,
+    )
+
+    result = _execute_execution_plan_only_package(context)
+
+    assert result.success is True
+    assert result.wheel_path == wheel_path
+    assert result.applied_execution_plans == ("plan-a",)
+    assert result.execution_plan_trials == (trial,)
+
+
 def test_package_rejects_not_profitable_wheel_after_semantic_tests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2182,11 +2384,10 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
     assert result.error == result.performance.reason
     assert test_modes == ["baseline", "compiled"]
     assert not tuple(output_dir.glob("*.whl"))
-    assert (output_dir / "install").exists()
-    assert (output_dir / "build").exists()
-    diagnostic_wheels = tuple((output_dir / "build" / "diagnostics").glob("*.whl"))
-    assert diagnostic_wheels
-    assert result.verification_steps[-1].target == diagnostic_wheels[0]
+    assert not (output_dir / "install").exists()
+    assert not (output_dir / "build").exists()
+    assert result.cleanup_removed == (output_dir / "build", output_dir / "install")
+    assert not result.verification_steps[-1].target.exists()
 
 
 def test_profiled_promotion_rejects_a_wheel_without_profitable_regions(
@@ -2200,7 +2401,7 @@ def test_profiled_promotion_rejects_a_wheel_without_profitable_regions(
     install_root = output_dir / "install"
     build_root.mkdir(parents=True)
     install_root.mkdir(parents=True)
-    baseline_wheel = build_root / "baseline.whl"
+    baseline_wheel = build_root / "fixture-0.1-py3-none-any.whl"
     baseline_wheel.write_bytes(b"baseline")
     gate_calls = 0
 
@@ -2250,16 +2451,18 @@ def test_profiled_promotion_rejects_a_wheel_without_profitable_regions(
                 artifacts=(),
             ),
             build=_successful_attempt(),
-            requires_native_artifact=True,
+            requires_profitable_optimization=True,
         )
     )
 
     assert gate_calls == 1
     assert result.success is False
     assert result.wheel_path is None
-    assert result.error == "no profile-guided candidate met the 1.01x marginal speedup threshold"
+    assert result.error == "no profile-guided candidate met its marginal speedup threshold"
     assert not tuple(output_dir.glob("*.whl"))
-    assert tuple((build_root / "diagnostics").glob("*.whl"))
+    assert not build_root.exists()
+    assert not install_root.exists()
+    assert result.cleanup_removed == (build_root, install_root)
 
 
 def test_package_profiles_before_backend_selection_and_scopes_hot_members(

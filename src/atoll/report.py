@@ -1149,12 +1149,14 @@ class CompilationExecutionPlanReport(TypedDict):
         dialect: Recognized scheduler dialect, when available.
         lowering_version: Dialect lowering version included in the plan identity.
         source_hash: Digest of every source member required by the plan.
+        source_hashes: Complete per-module source digests covered by source_hash.
+        source_members: Exact module-qualified declarations covered by source_hash.
         callsite_fingerprint: Digest of scheduler coordinates and callees.
         topology_fingerprint: Digest of plan nodes, edges, and transport relations.
         completion_transport: Private result-delivery transport identity.
         consumer: Module-qualified result consumer.
         reducer: Module-qualified reduction owner.
-        transport_capacity: Statically known positive delivery capacity.
+        transport_capacity: Statically known dialect-defined delivery capacity.
         ordering_policy: Result ordering policy a lowering must preserve.
         task_ownership: Static proof category for task-handle ownership and joining.
         observed_invocations: Maximum exact invocation count among plan spawn sites.
@@ -1175,6 +1177,8 @@ class CompilationExecutionPlanReport(TypedDict):
     dialect: str | None
     lowering_version: str | None
     source_hash: str | None
+    source_hashes: dict[str, str]
+    source_members: list[str]
     callsite_fingerprint: str | None
     topology_fingerprint: str | None
     completion_transport: str | None
@@ -1241,9 +1245,13 @@ class CompilationExecutionPlanTrialReport(TypedDict):
         benchmark_command: Exact argv used for marginal measurement.
         benchmark_status: Marginal benchmark result, or `not-run`.
         minimum_speedup: Required speedup over the current accepted payload.
-        baseline_median_seconds: Current-payload median duration.
+        minimum_overall_speedup: Required speedup over the interpreted baseline.
+        baseline_median_seconds: Interpreted-baseline median duration.
+        unplanned_median_seconds: Current accepted-payload median duration.
         planned_median_seconds: Planned-payload median duration.
-        marginal_speedup: Current-payload median divided by planned-payload median.
+        marginal_speedup: Unplanned-payload median divided by planned-payload median.
+        overall_speedup: Baseline-payload median divided by planned-payload median.
+        cache_status: Whether staging restored or generated the plan payload.
         payload_files: Validated staged payload changes.
     """
 
@@ -1258,9 +1266,13 @@ class CompilationExecutionPlanTrialReport(TypedDict):
     benchmark_command: list[str]
     benchmark_status: str
     minimum_speedup: float | None
+    minimum_overall_speedup: float | None
     baseline_median_seconds: float | None
+    unplanned_median_seconds: float | None
     planned_median_seconds: float | None
     marginal_speedup: float | None
+    overall_speedup: float | None
+    cache_status: str
     payload_files: list[CompilationExecutionPlanPayloadFileReport]
 
 
@@ -2625,10 +2637,16 @@ def _append_execution_plans_markdown(
             f"{trial['exit_code'] if trial['exit_code'] is not None else 'not run'}; "
             f"marginal benchmark {trial['benchmark_status']}"
             + (
-                f" at {trial['marginal_speedup']:.3f}x"
+                f" at {trial['marginal_speedup']:.3f}x marginal"
                 if trial["marginal_speedup"] is not None
                 else ""
             )
+            + (
+                f", {trial['overall_speedup']:.3f}x overall"
+                if trial["overall_speedup"] is not None
+                else ""
+            )
+            + f"; staging cache {trial['cache_status']}"
             + (f"; {trial['reason']}" if trial["reason"] else "")
         )
         for trial in trials
@@ -3366,6 +3384,8 @@ def _execution_plan_reports(
                     "dialect": plan.dialect,
                     "lowering_version": None,
                     "source_hash": None,
+                    "source_hashes": {},
+                    "source_members": [],
                     "callsite_fingerprint": None,
                     "topology_fingerprint": None,
                     "completion_transport": None,
@@ -3395,6 +3415,8 @@ def _execution_plan_reports(
                 "dialect": plan.dialect,
                 "lowering_version": plan.lowering_version,
                 "source_hash": plan.source_hash,
+                "source_hashes": dict(plan.source_hashes),
+                "source_members": [member.stable_id for member in plan.source_members],
                 "callsite_fingerprint": plan.callsite_fingerprint,
                 "topology_fingerprint": plan.topology_fingerprint,
                 "completion_transport": plan.completion_transport,
@@ -3470,9 +3492,13 @@ def _execution_plan_trial_reports(
             "benchmark_command": list(trial.benchmark_command),
             "benchmark_status": trial.benchmark_status,
             "minimum_speedup": trial.minimum_speedup,
+            "minimum_overall_speedup": trial.minimum_overall_speedup,
             "baseline_median_seconds": trial.baseline_median_seconds,
+            "unplanned_median_seconds": trial.unplanned_median_seconds,
             "planned_median_seconds": trial.planned_median_seconds,
             "marginal_speedup": trial.marginal_speedup,
+            "overall_speedup": trial.overall_speedup,
+            "cache_status": trial.cache_status,
             "payload_files": [
                 {
                     "install_path": payload_file.install_path.as_posix(),

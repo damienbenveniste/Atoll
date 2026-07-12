@@ -123,6 +123,21 @@ def test_backend_assesses_and_stages_supported_payload(tmp_path: Path) -> None:
     assert Path(scan.module.path).read_text(encoding="utf-8") == _source_text()
 
 
+def test_producer_docstring_is_metadata_not_executable_work(tmp_path: Path) -> None:
+    """A leading producer docstring does not invalidate a strict publish body."""
+    shape = _SourceShape(producer_prefix=('    """Publish one item."""',))
+    source = _source_text(shape)
+    scan = _scan(tmp_path / "src" / "app" / "worker.py", source.splitlines())
+    plan = _manual_plan(scan, source)
+
+    assessment = CallbackBackedExecutionPlanBackend().assess(
+        plan,
+        ExecutionPlanAssessmentContext(tmp_path, tmp_path / "src", "profiled"),
+    )
+
+    assert assessment.status == "supported"
+
+
 def test_optimized_path_calls_soon_once_per_item_and_preserves_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -143,7 +158,7 @@ def test_optimized_path_calls_soon_once_per_item_and_preserves_order(
             context: contextvars.Context | None = None,
         ) -> asyncio.Handle:
             nonlocal call_soon_count
-            if args and getattr(args[0], "__name__", "") == "_atoll_callback_drive_once":
+            if getattr(callback, "__name__", "") == "_atoll_callback_drive_once":
                 call_soon_count += 1
             return original(callback, *args, context=context)
 
@@ -164,27 +179,34 @@ def test_optimized_path_uses_separate_copied_context_per_item(
     """Each scheduled logical item receives its own copied context object."""
     module = _stage_and_import(tmp_path, _source_text(), "payload_callback_context")
     _permit_optimized_runtime(module, monkeypatch)
-    contexts: list[_FakeContext] = []
-    used_contexts: list[_FakeContext] = []
+    contexts: list[contextvars.Context] = []
+    used_contexts: list[contextvars.Context] = []
+    original_copy_context = contextvars.copy_context
 
-    class _FakeContext:
-        def __init__(self) -> None:
-            self.runs = 0
-
-        def run(self, callback: Callable[..., object], *args: object) -> object:
-            self.runs += 1
-            if getattr(callback, "__name__", "") == "_atoll_callback_drive_once":
-                used_contexts.append(self)
-            return callback(*args)
-
-    def fake_copy_context() -> _FakeContext:
-        context = _FakeContext()
+    def fake_copy_context() -> contextvars.Context:
+        context = original_copy_context()
         contexts.append(context)
         return context
 
-    monkeypatch.setattr(contextvars, "copy_context", fake_copy_context)
+    async def run_with_context_capture() -> object:
+        loop = asyncio.get_running_loop()
+        original_call_soon = loop.call_soon
 
-    result = asyncio.run(module.run(_EXPECTED_VALUES))
+        def capture_call_soon(
+            callback: Callable[..., object],
+            *args: object,
+            context: contextvars.Context | None = None,
+        ) -> asyncio.Handle:
+            if getattr(callback, "__name__", "") == "_atoll_callback_drive_once":
+                assert context is not None
+                used_contexts.append(context)
+            return original_call_soon(callback, *args, context=context)
+
+        monkeypatch.setattr(contextvars, "copy_context", fake_copy_context)
+        monkeypatch.setattr(loop, "call_soon", capture_call_soon)
+        return await module.run(_EXPECTED_VALUES)
+
+    result = asyncio.run(run_with_context_capture())
 
     assert result == _EXPECTED_TOTAL
     assert len(used_contexts) == len(_EXPECTED_VALUES)

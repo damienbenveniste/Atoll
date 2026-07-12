@@ -13,7 +13,8 @@ where = ["src"]
 
 [tool.atoll.compile]
 test_command = ["python", "-m", "pytest", "tests", "-q"]
-benchmark_command = ["python", "benchmarks/run_workload.py", "--minimum-seconds", "0.25"]
+benchmark_command = ["python", "benchmarks/run_workload.py", "--iterations", "1024"]
+minimum_speedup = 1.50
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

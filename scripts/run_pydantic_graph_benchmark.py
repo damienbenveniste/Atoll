@@ -18,11 +18,10 @@ PYDANTIC_AI_REPOSITORY = "https://github.com/pydantic/pydantic-ai.git"
 PYDANTIC_AI_REVISION = "e6ff64409f74124de581068be644a3dbf8999e7d"
 COLD_MYPYC_BASELINE_SECONDS = 192.70191520900698
 COLD_MYPYC_TARGET_SECONDS = COLD_MYPYC_BASELINE_SECONDS / 2
-MINIMUM_MARGINAL_SPEEDUP = 1.01
+MINIMUM_MARGINAL_SPEEDUP = 1.05
 MINIMUM_FINAL_SPEEDUP = 1.10
-MINIMUM_FUSION_OVER_UNFUSED = 1.05
 BENCHMARK_SAMPLES = 7
-COMPILE_REPORT_VERSION = 3
+COMPILE_REPORT_VERSION = 4
 NATIVE_PHASES = frozenset({"mypycify", "cythonize", "build_ext"})
 
 
@@ -52,6 +51,10 @@ class BenchmarkEvaluation:
     warm_cache_status: str
     final_speedup: float | None
     accepted_candidates: int
+    execution_plan_count: int
+    applied_execution_plan_count: int
+    execution_plan_trial_count: int
+    accepted_execution_plan_trials: int
     fusion_plan_count: int
     eligible_fusion_plan_count: int
     fusion_trial_count: int
@@ -71,6 +74,10 @@ class BenchmarkEvaluation:
             "cold_native_phase_count": self.cold_native_phase_count,
             "cold_compiler_probe_count": self.cold_compiler_probe_count,
             "errors": list(self.errors),
+            "execution_plan_count": self.execution_plan_count,
+            "applied_execution_plan_count": self.applied_execution_plan_count,
+            "execution_plan_trial_count": self.execution_plan_trial_count,
+            "accepted_execution_plan_trials": self.accepted_execution_plan_trials,
             "final_speedup": self.final_speedup,
             "fusion_plan_count": self.fusion_plan_count,
             "eligible_fusion_plan_count": self.eligible_fusion_plan_count,
@@ -332,8 +339,14 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
         _mapping_field(inputs.warm_report, "performance"), "speedup"
     )
     accepted_speedups = _accepted_candidate_speedups(inputs.warm_report)
+    execution_plans = _execution_plans(inputs.warm_report)
+    applied_execution_plan_ids = _applied_execution_plan_ids(inputs.warm_report)
+    execution_plan_trials = _execution_plan_trials(inputs.warm_report)
     fusion_plans = _fusion_plans(inputs.warm_report)
     fusion_trials = _fusion_trials(inputs.warm_report)
+    accepted_execution_plan_trials = tuple(
+        trial for trial in execution_plan_trials if _string_field(trial, "status") == "accepted"
+    )
     errors = _evaluation_errors(
         _EvaluationInputs(
             cold_report=inputs.cold_report,
@@ -350,6 +363,13 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
             warm_cache_status=warm_cache_status,
             final_speedup=final_speedup,
             accepted_speedups=accepted_speedups,
+            native_evidence_present=_native_evidence_present(
+                inputs.cold_report, inputs.warm_report
+            ),
+            execution_plan_count=len(execution_plans),
+            applied_execution_plan_ids=applied_execution_plan_ids,
+            execution_plan_trial_count=len(execution_plan_trials),
+            accepted_execution_plan_trials=accepted_execution_plan_trials,
             fusion_plan_count=len(fusion_plans),
             eligible_fusion_plan_count=sum(
                 _boolean_field(plan, "eligible") for plan in fusion_plans
@@ -366,6 +386,10 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
         warm_cache_status=warm_cache_status,
         final_speedup=final_speedup,
         accepted_candidates=len(accepted_speedups),
+        execution_plan_count=len(execution_plans),
+        applied_execution_plan_count=len(applied_execution_plan_ids),
+        execution_plan_trial_count=len(execution_plan_trials),
+        accepted_execution_plan_trials=len(accepted_execution_plan_trials),
         fusion_plan_count=len(fusion_plans),
         eligible_fusion_plan_count=sum(_boolean_field(plan, "eligible") for plan in fusion_plans),
         fusion_trial_count=len(fusion_trials),
@@ -389,6 +413,11 @@ class _EvaluationInputs:
     warm_cache_status: str
     final_speedup: float | None
     accepted_speedups: tuple[float | None, ...]
+    native_evidence_present: bool
+    execution_plan_count: int
+    applied_execution_plan_ids: tuple[str, ...]
+    execution_plan_trial_count: int
+    accepted_execution_plan_trials: tuple[dict[str, object], ...]
     fusion_plan_count: int
     eligible_fusion_plan_count: int
     fusion_trial_count: int
@@ -399,7 +428,7 @@ def _evaluation_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
         *_report_errors(inputs),
         *_cache_errors(inputs),
         *_source_errors(inputs),
-        *_fusion_errors(inputs),
+        *_execution_plan_errors(inputs),
         *_profitability_errors(inputs),
     )
 
@@ -425,19 +454,20 @@ def _cache_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
     cold_cache = _string_field(_mapping_field(inputs.cold_report, "build"), "cache_status")
     if cold_cache != "miss":
         errors.append(f"cold cache status is {cold_cache}, expected miss")
-    if inputs.cold_mypyc_seconds > COLD_MYPYC_TARGET_SECONDS:
-        errors.append(
-            f"cold mypyc took {inputs.cold_mypyc_seconds:.3f}s, above "
-            f"{COLD_MYPYC_TARGET_SECONDS:.3f}s"
-        )
-    if inputs.cold_native_phase_count == 0:
-        errors.append("cold report contains no native compiler phase")
-    if inputs.cold_compiler_probe_count == 0:
-        errors.append("compiler probe observed no cold native invocation")
     if inputs.warm_cache_status != "hit":
         errors.append(f"warm cache status is {inputs.warm_cache_status}, expected hit")
-    if any(status != "hit" for status in _compiled_cache_statuses(inputs.warm_report)):
-        errors.append("one or more warm compiled regions were not cache hits")
+    if inputs.native_evidence_present:
+        if inputs.cold_mypyc_seconds > COLD_MYPYC_TARGET_SECONDS:
+            errors.append(
+                f"cold mypyc took {inputs.cold_mypyc_seconds:.3f}s, above "
+                f"{COLD_MYPYC_TARGET_SECONDS:.3f}s"
+            )
+        if inputs.cold_native_phase_count == 0:
+            errors.append("cold report contains no native compiler phase")
+        if inputs.cold_compiler_probe_count == 0:
+            errors.append("compiler probe observed no cold native invocation")
+        if any(status != "hit" for status in _compiled_cache_statuses(inputs.warm_report)):
+            errors.append("one or more warm compiled regions were not cache hits")
     if inputs.warm_native_phase_count:
         errors.append(
             f"warm report contains {inputs.warm_native_phase_count} native compiler phase(s)"
@@ -453,53 +483,112 @@ def _source_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
     errors: list[str] = []
     if not inputs.sources_unchanged:
         errors.append("pydantic_graph source hashes changed during compilation")
-    if _typed_region_hashes(inputs.cold_report) != _typed_region_hashes(inputs.warm_report):
+    cold_typed_hashes = _typed_region_hashes(inputs.cold_report)
+    warm_typed_hashes = _typed_region_hashes(inputs.warm_report)
+    if (cold_typed_hashes or warm_typed_hashes) and cold_typed_hashes != warm_typed_hashes:
         errors.append("typed-region source hashes changed between cold and warm reports")
-    if _fusion_plan_hashes(inputs.cold_report) != _fusion_plan_hashes(inputs.warm_report):
-        errors.append("task-fusion plan identities or source hashes changed between runs")
+    errors.extend(_execution_plan_source_hash_errors("cold", inputs.cold_report))
+    errors.extend(_execution_plan_source_hash_errors("warm", inputs.warm_report))
+    if _execution_plan_hashes(inputs.cold_report) != _execution_plan_hashes(inputs.warm_report):
+        errors.append("execution-plan identities or source hashes changed between runs")
     return tuple(errors)
 
 
-def _fusion_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+def _execution_plan_source_hash_errors(
+    label: str,
+    report: dict[str, object],
+) -> tuple[str, ...]:
     errors: list[str] = []
-    plans = _fusion_plans(inputs.warm_report)
-    trials = _fusion_trials(inputs.warm_report)
-    if not plans:
-        errors.append("warm report contains no task-fusion safety plan")
-    eligible_plan_ids = {
-        _string_field(plan, "id") for plan in plans if _boolean_field(plan, "eligible")
-    }
-    trials_by_plan: dict[str, list[dict[str, object]]] = {}
-    for trial in trials:
-        trials_by_plan.setdefault(_string_field(trial, "plan_id"), []).append(trial)
-    required_plan_ids = (
-        eligible_plan_ids
-        if inputs.final_speedup is None or inputs.final_speedup < MINIMUM_FINAL_SPEEDUP
-        else set()
-    )
-    for plan_id in sorted(required_plan_ids):
-        matching = trials_by_plan.get(plan_id, [])
-        if len(matching) != 1 or _string_field(matching[0], "status") != "passed":
-            errors.append(f"eligible task-fusion plan {plan_id} has no passed three-arm trial")
+    for plan in _execution_plans(report):
+        if _string_field(plan, "status") != "selected":
             continue
-        trial = matching[0]
-        over_unfused = _optional_number_field(trial, "unfused_over_fused")
-        overall = _optional_number_field(trial, "baseline_over_fused")
+        plan_id = _string_field(plan, "id")
+        source_hash = plan.get("source_hash")
+        if not isinstance(source_hash, str) or not source_hash:
+            errors.append(f"{label} selected execution plan {plan_id} has no source hash")
+        source_hashes = plan.get("source_hashes")
+        source_hash_items = (
+            cast(dict[object, object], source_hashes).items()
+            if isinstance(source_hashes, dict)
+            else ()
+        )
         if (
-            over_unfused is None
-            or over_unfused < MINIMUM_FUSION_OVER_UNFUSED
-            or overall is None
-            or overall < MINIMUM_FINAL_SPEEDUP
+            not isinstance(source_hashes, dict)
+            or not source_hashes
+            or any(
+                not isinstance(module, str)
+                or not module
+                or not isinstance(digest, str)
+                or not digest
+                for module, digest in source_hash_items
+            )
         ):
-            errors.append("a passed task-fusion trial is below its required speedup thresholds")
-    unmatched_passed = tuple(
-        plan_id
-        for plan_id, matching in trials_by_plan.items()
-        if plan_id not in required_plan_ids
-        and any(_string_field(trial, "status") == "passed" for trial in matching)
+            errors.append(
+                f"{label} selected execution plan {plan_id} has no per-module source hashes"
+            )
+    return tuple(errors)
+
+
+def _execution_plan_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+    return (
+        *_execution_plan_discovery_errors(inputs),
+        *_accepted_execution_plan_trial_errors(inputs),
+        *_cold_execution_plan_cache_errors(inputs),
     )
-    if unmatched_passed:
-        errors.append("a passed task-fusion trial does not match an eligible safety plan")
+
+
+def _execution_plan_discovery_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+    errors: list[str] = []
+    if inputs.execution_plan_count == 0:
+        errors.append("warm report contains no discovered execution plan")
+    if not inputs.applied_execution_plan_ids:
+        errors.append("warm report contains no applied execution plan")
+    selected_plan_ids = {
+        _string_field(plan, "id")
+        for plan in _execution_plans(inputs.warm_report)
+        if _string_field(plan, "status") == "selected"
+    }
+    errors.extend(
+        f"applied execution plan {plan_id} was not discovered as selected"
+        for plan_id in inputs.applied_execution_plan_ids
+        if plan_id not in selected_plan_ids
+    )
+    return tuple(errors)
+
+
+def _accepted_execution_plan_trial_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+    errors: list[str] = []
+    accepted_by_plan = {
+        _string_field(trial, "plan_id"): trial for trial in inputs.accepted_execution_plan_trials
+    }
+    for plan_id in inputs.applied_execution_plan_ids:
+        trial = accepted_by_plan.get(plan_id)
+        if trial is None:
+            errors.append(f"applied execution plan {plan_id} has no accepted trial")
+            continue
+        marginal = _optional_number_field(trial, "marginal_speedup")
+        overall = _optional_number_field(trial, "overall_speedup")
+        cache_status = _string_field(trial, "cache_status")
+        if marginal is None or marginal < MINIMUM_MARGINAL_SPEEDUP:
+            errors.append("an accepted execution-plan trial is below 1.05x marginal speedup")
+        if overall is None or overall < MINIMUM_FINAL_SPEEDUP:
+            errors.append("an accepted execution-plan trial is below 1.10x overall speedup")
+        if cache_status != "hit":
+            errors.append(f"warm execution-plan trial cache status is {cache_status}, expected hit")
+    return tuple(errors)
+
+
+def _cold_execution_plan_cache_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+    errors: list[str] = []
+    cold_trial_statuses = {
+        _string_field(trial, "plan_id"): _string_field(trial, "cache_status")
+        for trial in _execution_plan_trials(inputs.cold_report)
+        if _string_field(trial, "status") == "accepted"
+    }
+    for plan_id in inputs.applied_execution_plan_ids:
+        cache_status = cold_trial_statuses.get(plan_id)
+        if cache_status != "miss":
+            errors.append(f"cold execution-plan trial for {plan_id} was not a cache miss")
     return tuple(errors)
 
 
@@ -507,13 +596,11 @@ def _profitability_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
     errors: list[str] = []
     if not inputs.wheel_present:
         errors.append("warm compile did not leave a promoted wheel")
-    if not inputs.accepted_speedups:
-        errors.append("warm report contains no accepted profile-guided candidate")
     if any(
         speedup is None or speedup < MINIMUM_MARGINAL_SPEEDUP
         for speedup in inputs.accepted_speedups
     ):
-        errors.append("an accepted candidate is missing the required 1.01x marginal speedup")
+        errors.append("an accepted candidate is missing the required 1.05x marginal speedup")
     if inputs.final_speedup is None or inputs.final_speedup < MINIMUM_FINAL_SPEEDUP:
         errors.append("warm final speedup is below 1.10x")
     return tuple(errors)
@@ -558,31 +645,71 @@ def _accepted_candidate_speedups(report: dict[str, object]) -> tuple[float | Non
 def _compiled_cache_statuses(report: dict[str, object]) -> tuple[str, ...]:
     return tuple(
         _string_field(_mapping(item, "compiled_regions[]"), "cache_status")
-        for item in _list_field(report, "compiled_regions")
+        for item in _optional_list_field(report, "compiled_regions")
     )
 
 
 def _typed_region_hashes(report: dict[str, object]) -> dict[str, str]:
     return {
         _string_field(region, "id"): _string_field(region, "source_hash")
-        for item in _list_field(report, "typed_regions")
+        for item in _optional_list_field(report, "typed_regions")
         for region in (_mapping(item, "typed_regions[]"),)
     }
 
 
+def _execution_plans(report: dict[str, object]) -> tuple[dict[str, object], ...]:
+    return tuple(
+        _mapping(item, "execution_plans[]")
+        for item in _optional_list_field(report, "execution_plans")
+    )
+
+
+def _applied_execution_plan_ids(report: dict[str, object]) -> tuple[str, ...]:
+    return tuple(
+        str(item) if isinstance(item, str) else _raise_field_error("applied_execution_plans[]")
+        for item in _optional_list_field(report, "applied_execution_plans")
+    )
+
+
+def _execution_plan_trials(report: dict[str, object]) -> tuple[dict[str, object], ...]:
+    return tuple(
+        _mapping(item, "execution_plan_trials[]")
+        for item in _optional_list_field(report, "execution_plan_trials")
+    )
+
+
+def _execution_plan_hashes(report: dict[str, object]) -> dict[str, str]:
+    return {
+        _string_field(plan, "id"): source_hash
+        for plan in _execution_plans(report)
+        if _string_field(plan, "status") == "selected"
+        and isinstance((source_hash := plan.get("source_hash")), str)
+    }
+
+
+def _native_evidence_present(
+    cold_report: dict[str, object],
+    warm_report: dict[str, object],
+) -> bool:
+    return bool(
+        _typed_region_hashes(cold_report)
+        or _typed_region_hashes(warm_report)
+        or _compiled_cache_statuses(cold_report)
+        or _compiled_cache_statuses(warm_report)
+        or _accepted_candidate_speedups(warm_report)
+    )
+
+
 def _fusion_plans(report: dict[str, object]) -> tuple[dict[str, object], ...]:
-    return tuple(_mapping(item, "fusion_plans[]") for item in _list_field(report, "fusion_plans"))
+    return tuple(
+        _mapping(item, "fusion_plans[]") for item in _optional_list_field(report, "fusion_plans")
+    )
 
 
 def _fusion_trials(report: dict[str, object]) -> tuple[dict[str, object], ...]:
-    return tuple(_mapping(item, "fusion_trials[]") for item in _list_field(report, "fusion_trials"))
-
-
-def _fusion_plan_hashes(report: dict[str, object]) -> dict[str, str]:
-    return {
-        _string_field(plan, "id"): _string_field(plan, "source_hash")
-        for plan in _fusion_plans(report)
-    }
+    return tuple(
+        _mapping(item, "fusion_trials[]") for item in _optional_list_field(report, "fusion_trials")
+    )
 
 
 def _write_summary(
@@ -663,6 +790,13 @@ def _list_field(payload: dict[str, object], field: str) -> list[object]:
     return cast(list[object], value)
 
 
+def _optional_list_field(payload: dict[str, object], field: str) -> list[object]:
+    value = payload.get(field, [])
+    if not isinstance(value, list):
+        raise BenchmarkError(f"{field} must be an array")
+    return cast(list[object], value)
+
+
 def _string_field(payload: dict[str, object], field: str) -> str:
     value = payload.get(field)
     if not isinstance(value, str):
@@ -698,6 +832,10 @@ def _optional_number_field(payload: dict[str, object], field: str) -> float | No
     if not isinstance(value, int | float) or isinstance(value, bool):
         raise BenchmarkError(f"{field} must be a number or null")
     return float(value)
+
+
+def _raise_field_error(field: str) -> str:
+    raise BenchmarkError(f"{field} must be a string")
 
 
 if __name__ == "__main__":

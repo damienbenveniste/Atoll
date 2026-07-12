@@ -15,7 +15,8 @@ FIXTURE_ROOT = Path("tests/fixtures/async_execution_plan_project")
 SOURCE_ROOT = FIXTURE_ROOT / "src"
 WORKFLOW_SOURCE = SOURCE_ROOT / "execution_plan_fixture" / "workflow.py"
 EXPECTED_REPETITIONS = 32
-EXPECTED_TOTAL = 10
+EXPECTED_TOTAL = 32896
+EXPECTED_WORK_ITEM_COUNT = 256
 
 
 class FixtureModule(Protocol):
@@ -42,8 +43,8 @@ def test_fixture_project_has_configured_command_arrays() -> None:
     assert compile_config["benchmark_command"] == [
         "python",
         "benchmarks/run_workload.py",
-        "--minimum-seconds",
-        "0.25",
+        "--iterations",
+        "1024",
     ]
 
 
@@ -57,11 +58,11 @@ def test_repeated_baseline_semantic_matrix_is_canonical_and_stable() -> None:
     assert all(snapshot == matrix[0] for snapshot in matrix)
     assert matrix[0] == {
         "workflow": "taskgroup-queue-reduction",
-        "capacity": 4,
+        "capacity": EXPECTED_WORK_ITEM_COUNT,
         "total": EXPECTED_TOTAL,
-        "count": 3,
-        "first": "alpha",
-        "last": "gamma",
+        "count": EXPECTED_WORK_ITEM_COUNT,
+        "first": "item-0000",
+        "last": "item-0255",
         "exception_type": "ControlledImmediateError",
         "exception_message": "controlled:failure",
         "exception_frame_present": True,
@@ -88,7 +89,7 @@ def test_source_contains_supported_taskgroup_queue_candidate_shape() -> None:
     assert len(queue_calls) == 1
     assert not any(isinstance(node, ast.Await) for node in ast.walk(producer))
 
-    owner = functions["run_supported_workflow"]
+    owner = functions["run_supported_fanout"]
     assert any(isinstance(node, ast.AsyncWith) for node in ast.walk(owner))
     assert any(
         isinstance(node, ast.Attribute) and node.attr == "TaskGroup" for node in ast.walk(owner)

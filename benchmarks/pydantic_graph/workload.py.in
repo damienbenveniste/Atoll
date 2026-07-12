@@ -9,7 +9,7 @@ from itertools import pairwise
 from pydantic_graph import Graph, GraphBuilder, StepContext
 from pydantic_graph.join import reduce_sum
 
-DEFAULT_REPETITIONS = 5
+DEFAULT_REPETITIONS = 8
 DEFAULT_WIDTH = 5000
 DEFAULT_BUILD_REPETITIONS = 120
 DEFAULT_CHAIN_LENGTH = 400

@@ -35,11 +35,17 @@ from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
 from atoll.backends.mypyc import MYPYC_BACKEND
+from atoll.execution_plans.anyio_task_preserving import ANYIO_TASK_PRESERVING_BACKEND
 from atoll.execution_plans.base import ExecutionPlanBackend
+from atoll.execution_plans.cache import (
+    restore_execution_plan_cache,
+    store_execution_plan_cache,
+)
 from atoll.execution_plans.callback_backed import CALLBACK_BACKED_BACKEND
 from atoll.execution_plans.models import (
     ExecutionPlan,
     ExecutionPlanAssessmentContext,
+    ExecutionPlanCacheStatus,
     ExecutionPlanDiagnostic,
     ExecutionPlanDiagnosticSeverity,
     ExecutionPlanStageContext,
@@ -92,6 +98,12 @@ from atoll.models import (
 )
 from atoll.project import DiscoveredProject, discover_project
 from atoll.region_cache import compile_with_region_cache
+from atoll.runtime.execution_plan_performance import (
+    ExecutionPlanBenchmarkConfig,
+    ExecutionPlanBenchmarkProgress,
+    ExecutionPlanBenchmarkResult,
+    run_execution_plan_benchmark,
+)
 from atoll.runtime.fusion_performance import (
     FusionBenchmarkConfig,
     FusionTrial,
@@ -135,15 +147,16 @@ _COMPILER_BACKENDS: dict[Backend, CompilerBackend] = {
 }
 _EXECUTION_PLAN_BACKENDS: tuple[ExecutionPlanBackend, ...] = (
     CALLBACK_BACKED_BACKEND,
+    ANYIO_TASK_PRESERVING_BACKEND,
     TASK_PRESERVING_BACKEND,
 )
 
 _CANDIDATE_BENCHMARK_WARMUPS = 1
 _CANDIDATE_BENCHMARK_SAMPLES = 3
 _CANDIDATE_MINIMUM_SPEEDUP = 1.01
-_EXECUTION_PLAN_BENCHMARK_WARMUPS = 1
 _EXECUTION_PLAN_BENCHMARK_SAMPLES = 7
 _EXECUTION_PLAN_MINIMUM_SPEEDUP = 1.05
+_WHEEL_TAG_COMPONENT_COUNT = 3
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -551,7 +564,8 @@ class _SourceCleanPromotionContext:
         baseline: Baseline wheel build evidence.
         verification_plan: Expected modules, regions, and artifacts for isolated verification.
         build: Captured native compilation attempt.
-        requires_native_artifact: Whether profile-guided selection must retain at least one region.
+        requires_profitable_optimization: Whether profiling requires a retained optimization.
+        profitable_optimization_applied: Whether a native region or execution plan was retained.
     """
 
     options: PackageOptions
@@ -562,7 +576,8 @@ class _SourceCleanPromotionContext:
     baseline: _BaselineWheelPayload
     verification_plan: PackageVerificationPlan
     build: CompileAttempt
-    requires_native_artifact: bool = False
+    requires_profitable_optimization: bool = False
+    profitable_optimization_applied: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -795,6 +810,27 @@ class _ExecutionPlanApplicationContext:
 
 
 @dataclass(frozen=True, slots=True)
+class _ExecutionPlanOnlyContext:
+    """Baseline and profile state for a Python-overlay-only package.
+
+    Attributes:
+        options: Validated source-clean command options.
+        project: Discovered target project and compile policy.
+        typed_regions: Native regions retained for report compatibility only.
+        execution_plans: Selected and rejected scheduler plans from profiling.
+        prepared_baseline: Baseline wheel already built and profiled.
+        profile: Dynamic evidence that selected the scheduler plan.
+    """
+
+    options: PackageOptions
+    project: DiscoveredProject
+    typed_regions: tuple[TypedRegion, ...]
+    execution_plans: tuple[ExecutionPlan | PlanRejection, ...]
+    prepared_baseline: _BaselineWheelPayload | None
+    profile: ProfileResult | None
+
+
+@dataclass(frozen=True, slots=True)
 class _ExecutionPlanApplicationOutcome:
     """Applied plan IDs and trial evidence retained after disposable trials.
 
@@ -821,7 +857,8 @@ class _ExecutionPlanTrialRecord:
         status: Accepted, rejected, failed-semantics, or unavailable outcome.
         reason: Plain-language decision evidence.
         diagnostics: Ordered backend and trial diagnostics.
-        benchmark: Marginal benchmark evidence, when semantics passed.
+        benchmark: Three-arm benchmark evidence, when semantics passed.
+        cache_status: Whether staging restored or generated the payload changes.
     """
 
     plan: ExecutionPlan
@@ -831,7 +868,23 @@ class _ExecutionPlanTrialRecord:
     status: ExecutionPlanTrialStatus
     reason: str
     diagnostics: tuple[ExecutionPlanDiagnostic, ...]
-    benchmark: BenchmarkGateResult | None
+    benchmark: ExecutionPlanBenchmarkResult | None
+    cache_status: ExecutionPlanCacheStatus
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionPlanStagingResult:
+    """Staged payload plus cache evidence that must survive into reports.
+
+    Attributes:
+        staged: Backend payload changes restored or generated for the trial.
+        cache_status: Strict cache lookup decision.
+        diagnostics: Non-fatal cache corruption or write diagnostics.
+    """
+
+    staged: StagedExecutionPlan
+    cache_status: ExecutionPlanCacheStatus
+    diagnostics: tuple[ExecutionPlanDiagnostic, ...] = ()
 
 
 def execute_package(options: PackageOptions) -> PackageCommandResult:
@@ -871,6 +924,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         if project.config.compile.benchmark_command is not None and not options.selected_members
         else ()
     )
+    plan_profile_targets = execution_plan_profile_targets(scans)
     preflight_error = _region_selection_error(
         profile=None,
         selection_members=options.selected_members,
@@ -878,7 +932,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         selected=preflight_selected,
         missing=preflight_missing,
     )
-    if preflight_error is not None and not profile_candidates:
+    if preflight_error is not None and not profile_candidates and not plan_profile_targets:
         _remove_failed_wheels(
             project,
             _resolve_output_dir(project.config.root, options.output_dir),
@@ -908,13 +962,15 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             ),
         )
     execution_plans = build_execution_plans(scans, profile)
+    selected_execution_plans = tuple(
+        plan for plan in execution_plans if isinstance(plan, ExecutionPlan)
+    )
     if execution_plans:
-        selected_execution_plans = sum(isinstance(plan, ExecutionPlan) for plan in execution_plans)
         _progress(
             options.progress,
             (
                 f"execution-plan discovery produced {len(execution_plans)} candidate(s); "
-                f"{selected_execution_plans} selected for future backend assessment"
+                f"{len(selected_execution_plans)} selected for future backend assessment"
             ),
         )
     fusion_plans = build_fusion_plans(scans, profile) if profile is not None else ()
@@ -963,13 +1019,25 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         selected=selected_typed_regions,
         missing=missing_members,
     )
-    if selection_error is not None:
+    plan_only_allowed = bool(selected_execution_plans) and not options.selected_members
+    if selection_error is not None and not plan_only_allowed:
         return _failed_region_selection(
             options=options,
             project=project,
             preparation=preparation,
             error=selection_error,
             typed_regions=typed_regions,
+        )
+    if plan_only_allowed and (not profile_members or not selected_typed_regions):
+        return _execute_execution_plan_only_package(
+            _ExecutionPlanOnlyContext(
+                options=options,
+                project=project,
+                typed_regions=typed_regions,
+                execution_plans=execution_plans,
+                prepared_baseline=baseline,
+                profile=profile,
+            )
         )
     return _execute_typed_region_package(
         options=options,
@@ -984,6 +1052,100 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         ),
         prepared_baseline=baseline,
         profile=profile,
+    )
+
+
+def _execute_execution_plan_only_package(
+    context: _ExecutionPlanOnlyContext,
+) -> PackageCommandResult:
+    """Promote a profitable Python-overlay plan without a native region.
+
+    The normal PEP 517 wheel remains the base payload. Selected scheduler plans
+    stage only against its temporary unpacked copy, then pass the same isolated
+    payload/wheel verification and final semantic/performance gate as native
+    variants. A profile-selected plan that fails every backend trial cannot
+    publish an unchanged baseline wheel.
+
+    Args:
+        context: Baseline, profile, project, and selected plan state.
+
+    Returns:
+        PackageCommandResult: Plan trials, promotion evidence, and optional pure wheel.
+    """
+    options = context.options
+    project = context.project
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    build_root = output_dir / "build"
+    install_root = output_dir / "install"
+    baseline = _package_baseline(options, project, context.prepared_baseline)
+    if baseline.wheel_path is None:
+        _remove_failed_wheels(project, output_dir)
+        cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
+        return PackageCommandResult(
+            success=False,
+            project_root=project.config.root,
+            output_dir=output_dir,
+            install_root=install_root,
+            wheel_path=None,
+            islands=(),
+            build=baseline.build,
+            cleanup_removed=cleanup_removed,
+            cleanup_kept=(),
+            error=baseline.build.stderr,
+            typed_regions=context.typed_regions,
+            profile=context.profile,
+            execution_plans=context.execution_plans,
+        )
+
+    plan_application = _apply_execution_plan_trials(
+        _ExecutionPlanApplicationContext(
+            options=options,
+            project=project,
+            baseline=baseline,
+            build_root=build_root,
+            install_root=install_root,
+            plans=context.execution_plans,
+            accepted_region_ids=frozenset(),
+        )
+    )
+    promotion = _promote_source_clean_payload(
+        _SourceCleanPromotionContext(
+            options=options,
+            project=project,
+            output_dir=output_dir,
+            build_root=build_root,
+            install_root=install_root,
+            baseline=baseline,
+            verification_plan=PackageVerificationPlan(
+                modules=(),
+                regions=(),
+                artifacts=(),
+            ),
+            build=_append_phase_timings(baseline.build, plan_application.timings),
+            requires_profitable_optimization=True,
+            profitable_optimization_applied=bool(plan_application.applied_plan_ids),
+        )
+    )
+    return PackageCommandResult(
+        success=promotion.success,
+        project_root=project.config.root,
+        output_dir=output_dir,
+        install_root=install_root,
+        wheel_path=promotion.wheel_path,
+        islands=(),
+        build=promotion.build,
+        install_tree_kept=options.keep_install_tree and promotion.success,
+        cleanup_removed=promotion.cleanup_removed,
+        cleanup_kept=promotion.cleanup_kept,
+        error=promotion.error,
+        typed_regions=context.typed_regions,
+        verification_steps=promotion.verification_steps,
+        test_results=promotion.test_results,
+        performance=promotion.performance,
+        profile=context.profile,
+        execution_plans=context.execution_plans,
+        applied_execution_plans=plan_application.applied_plan_ids,
+        execution_plan_trials=plan_application.trials,
     )
 
 
@@ -1017,7 +1179,7 @@ def _execute_typed_region_package(
     baseline = _package_baseline(options, project, prepared_baseline)
     if baseline.wheel_path is None:
         _remove_failed_wheels(project, output_dir)
-        cleanup_removed = _remove_tree(install_root)
+        cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
         return PackageCommandResult(
             success=False,
             project_root=project.config.root,
@@ -1027,7 +1189,7 @@ def _execute_typed_region_package(
             islands=(),
             build=baseline.build,
             cleanup_removed=cleanup_removed,
-            cleanup_kept=(build_root,),
+            cleanup_kept=(),
             error=baseline.build.stderr,
             preflight_skipped=context.preflight_skipped,
             native_readiness=context.native_readiness,
@@ -1076,7 +1238,7 @@ def _execute_typed_region_package(
     if not prepared:
         result_error = "No selected typed regions could be lowered for a compiler backend."
         _remove_failed_wheels(project, output_dir)
-        cleanup_removed = _remove_tree(install_root)
+        cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
         return PackageCommandResult(
             success=False,
             project_root=project.config.root,
@@ -1086,7 +1248,7 @@ def _execute_typed_region_package(
             islands=(),
             build=_failed_region_attempt(result_error),
             cleanup_removed=cleanup_removed,
-            cleanup_kept=(build_root,),
+            cleanup_kept=(),
             error=result_error,
             preflight_skipped=context.preflight_skipped,
             native_readiness=context.native_readiness,
@@ -1116,9 +1278,9 @@ def _execute_typed_region_package(
     )
     outcome = replace(outcome, build=_combine_baseline_and_native(baseline.build, outcome.build))
     if not outcome.successful:
-        _progress(options.progress, "all typed-region builds failed; keeping diagnostics")
+        _progress(options.progress, "all typed-region builds failed; cleaning temporary outputs")
         _remove_failed_wheels(project, output_dir)
-        cleanup_removed = _remove_tree(install_root)
+        cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
         return PackageCommandResult(
             success=False,
             project_root=project.config.root,
@@ -1128,7 +1290,7 @@ def _execute_typed_region_package(
             islands=(),
             build=outcome.build,
             cleanup_removed=cleanup_removed,
-            cleanup_kept=(build_root,),
+            cleanup_kept=(),
             error=outcome.build.stderr,
             preflight_skipped=context.preflight_skipped,
             native_readiness=context.native_readiness,
@@ -1153,7 +1315,7 @@ def _execute_typed_region_package(
         error = f"requested member(s) did not compile successfully: {missing_text}"
         failed_build = replace(outcome.build, success=False, stderr=error)
         _remove_failed_wheels(project, output_dir)
-        cleanup_removed = _remove_tree(install_root)
+        cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
         return PackageCommandResult(
             success=False,
             project_root=project.config.root,
@@ -1163,7 +1325,7 @@ def _execute_typed_region_package(
             islands=(),
             build=failed_build,
             cleanup_removed=cleanup_removed,
-            cleanup_kept=(build_root,),
+            cleanup_kept=(),
             error=error,
             preflight_skipped=context.preflight_skipped,
             native_readiness=context.native_readiness,
@@ -1233,7 +1395,10 @@ def _execute_typed_region_package(
         baseline=baseline,
         verification_plan=verification_plan,
         build=_append_phase_timings(finalized.build, plan_application.timings),
-        requires_native_artifact=finalized.profitability_applied,
+        requires_profitable_optimization=finalized.profitability_applied,
+        profitable_optimization_applied=bool(
+            accepted_artifacts or plan_application.applied_plan_ids
+        ),
     )
     if finalized.overlay_error is None:
         _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
@@ -2342,10 +2507,8 @@ def _failed_before_region_selection(
 ) -> PackageCommandResult:
     """Return pre-compilation baseline, semantic, or profiling failure evidence.
 
-    A successfully unpacked baseline is retained with its source-clean build
-    tree because it contains the exact payload and profiling diagnostics that
-    caused compilation to stop. A failed baseline build removes an empty install
-    root while preserving backend diagnostics.
+    Captured command, profile, and benchmark evidence remains available to the
+    report writer, while copied payloads and build roots are always removed.
 
     Args:
         options: Validated command or generation options.
@@ -2367,10 +2530,7 @@ def _failed_before_region_selection(
     build_root = output_dir / "build"
     install_root = output_dir / "install"
     _remove_failed_wheels(project, output_dir)
-    cleanup_removed = _remove_tree(install_root) if baseline.wheel_path is None else ()
-    cleanup_kept = tuple(
-        path for path in (build_root, install_root) if path.exists() and path not in cleanup_removed
-    )
+    cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
     semantic_test = baseline.semantic_test_result
     test_results = (semantic_test,) if semantic_test is not None else ()
     return PackageCommandResult(
@@ -2382,7 +2542,7 @@ def _failed_before_region_selection(
         islands=(),
         build=replace(baseline.build, success=False, stderr=error),
         cleanup_removed=cleanup_removed,
-        cleanup_kept=cleanup_kept,
+        cleanup_kept=(),
         error=error,
         typed_regions=typed_regions,
         test_results=test_results,
@@ -2486,6 +2646,23 @@ def _remove_tree(path: Path) -> tuple[Path, ...]:
         return ()
     shutil.rmtree(path)
     return (path,)
+
+
+def _remove_source_clean_scratch(build_root: Path, install_root: Path) -> tuple[Path, ...]:
+    """Remove all disposable source-clean roots after a failed operation.
+
+    Failure diagnostics are already captured in command and report evidence.
+    Keeping copied payloads or rejected wheels would make a failed compile look
+    partially successful and violates the source-clean persistence contract.
+
+    Args:
+        build_root: Disposable build, trial, and candidate-wheel root.
+        install_root: Disposable unpacked install payload.
+
+    Returns:
+        Paths that existed and were removed, in build-then-install order.
+    """
+    return (*_remove_tree(build_root), *_remove_tree(install_root))
 
 
 def _progress(progress: PackageProgress | None, message: str) -> None:
@@ -2897,7 +3074,7 @@ def _promote_source_clean_payload(
             baseline_wheel_path=baseline_wheel_path,
             payload_dir=context.install_root,
             output_dir=candidate_output,
-            platform_tag=_wheel_tag(),
+            platform_tag=_promotion_wheel_tag(context, baseline_wheel_path),
         )
     except (OSError, WheelOverlayError, zipfile.BadZipFile) as error:
         return _failed_promotion(
@@ -3032,8 +3209,8 @@ def _quality_gate_promotion_failure(
     """
     if not quality_gate.success:
         error = quality_gate.error
-    elif context.requires_native_artifact and not context.verification_plan.artifacts:
-        error = "no profile-guided candidate met the 1.01x marginal speedup threshold"
+    elif context.requires_profitable_optimization and not context.profitable_optimization_applied:
+        error = "no profile-guided candidate met its marginal speedup threshold"
     else:
         return None
     return _SourceCleanPromotionFailure(
@@ -3049,53 +3226,21 @@ def _failed_promotion(
     context: _SourceCleanPromotionContext,
     failure: _SourceCleanPromotionFailure,
 ) -> _SourceCleanPromotionResult:
-    verification_steps = failure.verification_steps
     _remove_failed_wheels(context.project, context.output_dir)
-    if failure.wheel_path is not None:
-        retained_wheel = _retain_failed_wheel(context.build_root, failure.wheel_path)
-        if retained_wheel is not None:
-            verification_steps = tuple(
-                replace(step, target=retained_wheel)
-                if step.target.resolve() == failure.wheel_path.resolve()
-                else step
-                for step in verification_steps
-            )
+    cleanup_removed = _remove_source_clean_scratch(context.build_root, context.install_root)
     return _SourceCleanPromotionResult(
         success=False,
         wheel_path=None,
         build=failure.build,
-        verification_steps=verification_steps,
+        verification_steps=failure.verification_steps,
         test_results=failure.quality_gate.tests if failure.quality_gate is not None else (),
         performance=(
             failure.quality_gate.performance if failure.quality_gate is not None else None
         ),
-        cleanup_removed=(),
-        cleanup_kept=(context.build_root, context.install_root),
+        cleanup_removed=cleanup_removed,
+        cleanup_kept=(),
         error=failure.error,
     )
-
-
-def _retain_failed_wheel(build_root: Path, wheel_path: Path) -> Path | None:
-    """Move a rejected candidate under diagnostic scratch without exposing a wheel output.
-
-    Args:
-        build_root: Root of the temporary source-clean build tree.
-        wheel_path: Wheel archive being retained, overlaid, or reported.
-
-    Returns:
-        Path | None: Retained diagnostic wheel path, when one can be preserved.
-    """
-    if not wheel_path.exists():
-        return None
-    diagnostic_root = build_root / "diagnostics"
-    diagnostic_root.mkdir(parents=True, exist_ok=True)
-    retained = diagnostic_root / wheel_path.name
-    try:
-        shutil.move(wheel_path, retained)
-    except OSError:
-        wheel_path.unlink(missing_ok=True)
-        return None
-    return retained
 
 
 def _finalize_typed_payload(
@@ -3245,12 +3390,14 @@ def _apply_execution_plan_trials_once(
     config = context.project.config.compile
     selected = tuple(plan for plan in context.plans if isinstance(plan, ExecutionPlan))
     quality_root = context.baseline.quality_project_root
+    baseline_payload_root = context.baseline.baseline_install_root
     if (
         not selected
         or not context.options.run_quality_gates
         or config.test_command is None
         or config.benchmark_command is None
         or quality_root is None
+        or baseline_payload_root is None
     ):
         return _ExecutionPlanApplicationOutcome()
 
@@ -3283,14 +3430,16 @@ def _apply_execution_plan_trials_once(
         staging_started = time.perf_counter()
         try:
             shutil.copytree(context.install_root, trial_root)
-            staged = backend.stage(
-                plan,
-                ExecutionPlanStageContext(
+            staging = _stage_execution_plan_candidate(
+                backend=backend,
+                plan=plan,
+                context=ExecutionPlanStageContext(
                     project_root=context.project.config.root,
                     payload_root=trial_root,
                     cache_root=context.project.config.cache_dir / "execution-plans",
                 ),
             )
+            staged = staging.staged
             _validate_staged_execution_plan(
                 staged=staged,
                 backend=backend,
@@ -3332,7 +3481,10 @@ def _apply_execution_plan_trials_once(
             CompilePhaseTiming(
                 name="execution_plan_staging",
                 duration_seconds=staging_duration,
-                detail=f"{plan.id}; {backend.name}; {len(staged.payload_files)} file(s)",
+                detail=(
+                    f"{plan.id}; {backend.name}; cache {staging.cache_status}; "
+                    f"{len(staged.payload_files)} file(s)"
+                ),
             )
         )
         _progress(
@@ -3369,6 +3521,7 @@ def _apply_execution_plan_trials_once(
                         reason=reason,
                         diagnostics=(
                             *assessment_diagnostics,
+                            *staging.diagnostics,
                             ExecutionPlanDiagnostic(
                                 code="semantic-test-failed",
                                 severity="error",
@@ -3376,6 +3529,7 @@ def _apply_execution_plan_trials_once(
                             ),
                         ),
                         benchmark=None,
+                        cache_status=staging.cache_status,
                     )
                 )
             )
@@ -3386,25 +3540,28 @@ def _apply_execution_plan_trials_once(
             context.options.progress,
             f"execution plan {index}/{len(selected)} benchmarking {plan.id}",
         )
-        benchmark = run_benchmark_gate(
-            BenchmarkGateConfig(
+        benchmark = run_execution_plan_benchmark(
+            ExecutionPlanBenchmarkConfig(
+                plan_id=plan.id,
                 command=config.benchmark_command,
-                warmups=_EXECUTION_PLAN_BENCHMARK_WARMUPS,
                 samples=_EXECUTION_PLAN_BENCHMARK_SAMPLES,
-                minimum_speedup=_EXECUTION_PLAN_MINIMUM_SPEEDUP,
+                minimum_marginal_speedup=_EXECUTION_PLAN_MINIMUM_SPEEDUP,
+                minimum_overall_speedup=config.minimum_speedup,
             ),
             project_root=quality_root,
-            baseline_payload_root=context.install_root,
-            compiled_payload_root=trial_root,
+            baseline_payload_root=baseline_payload_root,
+            unplanned_payload_root=context.install_root,
+            planned_payload_root=trial_root,
             baseline_region_allowlist=context.accepted_region_ids,
-            compiled_region_allowlist=context.accepted_region_ids,
+            unplanned_region_allowlist=context.accepted_region_ids,
+            planned_region_allowlist=context.accepted_region_ids,
             progress=partial(_execution_plan_benchmark_progress, context.options.progress, plan.id),
         )
         timings.extend(_execution_plan_benchmark_timings(plan.id, benchmark))
         status: ExecutionPlanTrialStatus = (
             "accepted" if benchmark.status == "passed" else "rejected"
         )
-        if benchmark.status in {"invalid", "unbenchmarked"}:
+        if benchmark.status in {"invalid", "unavailable"}:
             status = "unavailable"
         diagnostic_severity: ExecutionPlanDiagnosticSeverity = (
             "note" if status == "accepted" else "warning"
@@ -3419,13 +3576,15 @@ def _apply_execution_plan_trials_once(
                 reason=benchmark.reason,
                 diagnostics=(
                     *assessment_diagnostics,
+                    *staging.diagnostics,
                     ExecutionPlanDiagnostic(
-                        code=f"marginal-benchmark-{benchmark.status}",
+                        code=f"execution-plan-benchmark-{benchmark.status}",
                         severity=diagnostic_severity,
                         message=benchmark.reason,
                     ),
                 ),
                 benchmark=benchmark,
+                cache_status=staging.cache_status,
             )
         )
         if status == "accepted":
@@ -3460,6 +3619,81 @@ def _apply_execution_plan_trials_once(
         applied_plan_ids=tuple(applied),
         trials=tuple(trials),
         timings=tuple(timings),
+    )
+
+
+def _stage_execution_plan_candidate(
+    *,
+    backend: ExecutionPlanBackend,
+    plan: ExecutionPlan,
+    context: ExecutionPlanStageContext,
+) -> _ExecutionPlanStagingResult:
+    """Restore a strict cached helper or generate and cache a fresh one.
+
+    Cache corruption never becomes runtime input: an invalid entry is ignored
+    and the backend regenerates the payload from the untouched disposable copy.
+    Cache write failures are diagnostic-only because the generated candidate is
+    still complete and must proceed through semantic and profitability gates.
+
+    Args:
+        backend: Selected execution-plan lowering backend.
+        plan: Complete source-hashed execution plan.
+        context: Disposable payload and persistent cache boundaries.
+
+    Returns:
+        _ExecutionPlanStagingResult: Staged payload and cache evidence.
+
+    Raises:
+        Exception: Propagates fingerprinting and backend staging failures for
+            normalization by the caller.
+    """
+    fingerprint = backend.fingerprint(plan, context)
+    cached = restore_execution_plan_cache(
+        context.cache_root,
+        context,
+        plan,
+        backend=backend.name,
+        fingerprint=fingerprint,
+    )
+    if cached.status == "hit":
+        if cached.staged is None:
+            raise ValueError("execution-plan cache hit did not restore staged payload metadata")
+        return _ExecutionPlanStagingResult(
+            staged=cached.staged,
+            cache_status="hit",
+        )
+
+    diagnostics: list[ExecutionPlanDiagnostic] = []
+    if cached.status == "invalid":
+        diagnostics.append(
+            ExecutionPlanDiagnostic(
+                code="execution-plan-cache-invalid",
+                severity="warning",
+                message="invalid execution-plan cache entry was ignored and regenerated",
+                details=((cached.reason,) if cached.reason else ()),
+            )
+        )
+    staged = backend.stage(plan, context)
+    try:
+        store_execution_plan_cache(
+            context.cache_root,
+            context,
+            staged,
+            fingerprint=fingerprint,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        diagnostics.append(
+            ExecutionPlanDiagnostic(
+                code="execution-plan-cache-store-failed",
+                severity="warning",
+                message="generated execution-plan payload could not be cached",
+                details=(str(error) or error.__class__.__name__,),
+            )
+        )
+    return _ExecutionPlanStagingResult(
+        staged=staged,
+        cache_status=cached.status,
+        diagnostics=tuple(diagnostics),
     )
 
 
@@ -3654,21 +3888,33 @@ def _execution_plan_trial(record: _ExecutionPlanTrialRecord) -> ExecutionPlanTri
         backend=record.backend.name,
         reason=record.reason,
         benchmark_command=(
-            record.benchmark.samples[0].command
+            record.benchmark.samples[0].run.command
             if record.benchmark and record.benchmark.samples
             else ()
         ),
         benchmark_status=(record.benchmark.status if record.benchmark is not None else "not-run"),
         minimum_speedup=(
-            record.benchmark.minimum_speedup if record.benchmark is not None else None
+            record.benchmark.minimum_marginal_speedup if record.benchmark is not None else None
+        ),
+        minimum_overall_speedup=(
+            record.benchmark.minimum_overall_speedup if record.benchmark is not None else None
         ),
         baseline_median_seconds=(
             record.benchmark.baseline_median_seconds if record.benchmark is not None else None
         ),
-        planned_median_seconds=(
-            record.benchmark.compiled_median_seconds if record.benchmark is not None else None
+        unplanned_median_seconds=(
+            record.benchmark.unplanned_median_seconds if record.benchmark is not None else None
         ),
-        marginal_speedup=(record.benchmark.speedup if record.benchmark is not None else None),
+        planned_median_seconds=(
+            record.benchmark.planned_median_seconds if record.benchmark is not None else None
+        ),
+        marginal_speedup=(
+            record.benchmark.marginal_speedup if record.benchmark is not None else None
+        ),
+        overall_speedup=(
+            record.benchmark.overall_speedup if record.benchmark is not None else None
+        ),
+        cache_status=record.cache_status,
         payload_files=record.staged.payload_files,
     )
 
@@ -3702,33 +3948,33 @@ def _replace_payload_transactionally(
 def _execution_plan_benchmark_progress(
     progress: PackageProgress | None,
     plan_id: str,
-    event: BenchmarkProgress,
+    event: ExecutionPlanBenchmarkProgress,
 ) -> None:
     """Render one marginal execution-plan benchmark event.
 
     Args:
         progress: Optional package progress callback.
         plan_id: Plan measured by the event.
-        event: Runtime benchmark phase notification.
+        event: Three-arm runtime benchmark phase notification.
     """
     _progress(
         progress,
         (
-            f"execution-plan benchmark {plan_id} {event.phase} pair {event.pair_index} "
-            f"{event.mode} completed in {event.duration_seconds:.2f}s"
+            f"execution-plan benchmark {plan_id} {event.phase} trio {event.trio_index} "
+            f"{event.arm} completed in {event.duration_seconds:.2f}s"
         ),
     )
 
 
 def _execution_plan_benchmark_timings(
     plan_id: str,
-    result: BenchmarkGateResult,
+    result: ExecutionPlanBenchmarkResult,
 ) -> tuple[CompilePhaseTiming, ...]:
     """Convert marginal execution-plan measurements into compile phase timings.
 
     Args:
         plan_id: Plan measured by the benchmark.
-        result: Marginal benchmark decision and child-process evidence.
+        result: Three-arm benchmark decision and child-process evidence.
 
     Returns:
         tuple[CompilePhaseTiming, ...]: Ordered warmup and sample timings.
@@ -3736,11 +3982,11 @@ def _execution_plan_benchmark_timings(
     return tuple(
         CompilePhaseTiming(
             name="execution_plan_benchmark",
-            duration_seconds=run.duration_seconds,
-            detail=f"{plan_id}; {phase}; {run.mode}; {result.status}",
+            duration_seconds=sample.run.duration_seconds,
+            detail=f"{plan_id}; {phase}; {sample.arm}; {result.status}",
         )
-        for phase, runs in (("warmup", result.warmups), ("sample", result.samples))
-        for run in runs
+        for phase, samples in (("warmup", result.warmups), ("sample", result.samples))
+        for sample in samples
     )
 
 
@@ -5280,6 +5526,33 @@ def _project_metadata(root: Path) -> _ProjectMetadata:
 
 def _wheel_tag() -> str:
     return str(next(tags.sys_tags()))
+
+
+def _promotion_wheel_tag(
+    context: _SourceCleanPromotionContext,
+    baseline_wheel_path: Path,
+) -> str:
+    """Choose a native tag only when the overlay contains native artifacts.
+
+    Args:
+        context: Promotion state containing verified artifact records.
+        baseline_wheel_path: Normal target wheel whose existing tag is preserved.
+
+    Returns:
+        str: Native interpreter tag or the baseline wheel's existing three-part tag.
+
+    Raises:
+        WheelOverlayError: If the baseline filename does not contain a valid wheel tag.
+    """
+    if context.verification_plan.artifacts:
+        return _wheel_tag()
+    name = baseline_wheel_path.name
+    if not name.endswith(".whl"):
+        raise WheelOverlayError(f"baseline wheel has an invalid filename: {name}")
+    parts = name.removesuffix(".whl").rsplit("-", maxsplit=3)
+    if len(parts) != _WHEEL_TAG_COMPONENT_COUNT + 1:
+        raise WheelOverlayError(f"baseline wheel tag is unavailable: {name}")
+    return "-".join(parts[-_WHEEL_TAG_COMPONENT_COUNT:])
 
 
 def _wheel_safe_name(value: str) -> str:

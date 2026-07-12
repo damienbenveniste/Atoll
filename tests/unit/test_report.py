@@ -1084,9 +1084,13 @@ def test_compilation_report_serializes_execution_plan_schema_v4(tmp_path: Path) 
         benchmark_command=("python", "benchmark.py"),
         benchmark_status="passed",
         minimum_speedup=1.05,
-        baseline_median_seconds=1.0,
+        minimum_overall_speedup=1.10,
+        baseline_median_seconds=1.2,
+        unplanned_median_seconds=1.0,
         planned_median_seconds=0.8,
         marginal_speedup=1.25,
+        overall_speedup=1.5,
+        cache_status="hit",
         payload_files=(
             ChangedPayloadFile(
                 install_path=PurePosixPath("app/scheduler.py"),
@@ -1137,6 +1141,8 @@ def test_compilation_report_serializes_execution_plan_schema_v4(tmp_path: Path) 
     assert report["execution_plan_trials"][0]["diagnostics"][0]["code"] == "verified"
     assert report["execution_plan_trials"][0]["backend"] == "task-preserving"
     assert report["execution_plan_trials"][0]["marginal_speedup"] == pytest.approx(1.25)
+    assert report["execution_plan_trials"][0]["overall_speedup"] == pytest.approx(1.5)
+    assert report["execution_plan_trials"][0]["cache_status"] == "hit"
     assert report["execution_plan_trials"][0]["payload_files"] == [
         {
             "install_path": "app/scheduler.py",

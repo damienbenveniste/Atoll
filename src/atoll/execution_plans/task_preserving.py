@@ -25,6 +25,7 @@ from atoll.execution_plans.models import (
     PlanGuard,
     StagedExecutionPlan,
 )
+from atoll.generation.region_shim import remove_region_shim
 
 _BACKEND_NAME: Final = "task-preserving"
 _LOWERING_VERSION: Final = "task-preserving-v1"
@@ -291,20 +292,62 @@ def _validate_source_hash(
     source_text: str,
     tree: ast.Module,
     plan: ExecutionPlan,
+    module_name: str | None = None,
 ) -> None:
-    digest = hashlib.sha256()
+    resolved_module = module_name or plan.source_module
     lines = source_text.splitlines()
-    for qualname in sorted(_planned_symbol_qualnames(plan)):
-        node = _function_node(tree, qualname)
+    for qualname in sorted(_planned_symbol_qualnames(plan, resolved_module)):
+        node = _source_declaration_node(tree, qualname)
+        if node is None:
+            raise ValueError(f"planned symbol is missing from payload source: {qualname}")
+    expected_hashes = dict(plan.source_hashes)
+    if expected_hashes:
+        expected = expected_hashes.get(resolved_module)
+        if expected is None:
+            raise ValueError(f"plan has no source hash for payload module: {resolved_module}")
+        canonical_source = _source_without_typed_region_shim(source_text, resolved_module)
+        if _sha256(canonical_source) != expected:
+            raise ValueError("payload source hash does not match the selected execution plan")
+        return
+    digest = hashlib.sha256()
+    for qualname in sorted(_planned_symbol_qualnames(plan, resolved_module)):
+        node = _source_declaration_node(tree, qualname)
         if node is None:
             raise ValueError(f"planned symbol is missing from payload source: {qualname}")
         start = _declaration_start(node)
-        digest.update(f"{plan.source_module}::{qualname}".encode())
+        digest.update(f"{resolved_module}::{qualname}".encode())
         digest.update(b"\0")
         digest.update("\n".join(lines[start - 1 : node.end_lineno]).encode())
         digest.update(b"\0")
     if digest.hexdigest() != plan.source_hash:
         raise ValueError("payload source hash does not match the selected execution plan")
+
+
+def _source_without_typed_region_shim(source_text: str, module_name: str) -> str:
+    """Remove a balanced Atoll-owned native shim before checkout-hash validation.
+
+    Execution plans are formed from checkout source before native candidate
+    selection. A profitable native region may therefore append Atoll's managed
+    runtime block before a plan is staged. Canonicalization permits that one
+    structured overlay while the subsequent complete hash comparison still
+    rejects every non-Atoll source change.
+
+    Args:
+        source_text: Current staged payload source.
+        module_name: Importable module whose marker identity must match.
+
+    Returns:
+        Source text with the module's managed typed-region block removed, or the
+        unchanged text when no block is present.
+
+    Raises:
+        ValueError: If managed markers are unbalanced or duplicated.
+    """
+    return remove_region_shim(
+        source_text,
+        source_module=module_name,
+        filename=f"{module_name.rsplit('.', maxsplit=1)[-1]}.py",
+    ).new_text
 
 
 def _validate_callsite_fingerprint(tree: ast.Module, plan: ExecutionPlan) -> None:
@@ -493,11 +536,13 @@ def _module_path(root: Path, module: str) -> Path | None:
     return None
 
 
-def _planned_symbol_qualnames(plan: ExecutionPlan) -> set[str]:
+def _planned_symbol_qualnames(plan: ExecutionPlan, module_name: str) -> set[str]:
+    if plan.source_members:
+        return {member.qualname for member in plan.source_members if member.module == module_name}
     return {
         node.symbol.qualname
         for node in plan.nodes
-        if node.symbol is not None and node.symbol.module == plan.source_module
+        if node.symbol is not None and node.symbol.module == module_name
     }
 
 
@@ -523,7 +568,27 @@ def _function_node(
     return None
 
 
-def _declaration_start(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+def _source_declaration_node(
+    tree: ast.Module,
+    qualname: str,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | None:
+    parts = qualname.split(".")
+    if len(parts) == 1:
+        return next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+                and node.name == qualname
+            ),
+            None,
+        )
+    return _function_node(tree, qualname)
+
+
+def _declaration_start(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> int:
     decorated_lines = [decorator.lineno for decorator in node.decorator_list]
     return min((*decorated_lines, node.lineno))
 

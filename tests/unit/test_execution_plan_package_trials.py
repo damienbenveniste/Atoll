@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import shutil
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
 
@@ -26,15 +27,20 @@ from atoll.execution_plans.models import (
 )
 from atoll.models import CompileAttempt, CompilePhaseTiming, SymbolId
 from atoll.project import discover_project
+from atoll.runtime.execution_plan_performance import (
+    ExecutionPlanBenchmarkArm,
+    ExecutionPlanBenchmarkConfig,
+    ExecutionPlanBenchmarkProgress,
+    ExecutionPlanBenchmarkResult,
+    ExecutionPlanBenchmarkSample,
+)
 from atoll.runtime.performance import (
-    BenchmarkGateConfig,
-    BenchmarkGateResult,
-    BenchmarkProgress,
     CommandRunEvidence,
     RuntimeMode,
 )
 
 _PLAN_BENCHMARK_SAMPLES = 7
+_COLD_AND_WARM_CALLS = 2
 
 
 class _FakeTaskPreservingBackend:
@@ -50,6 +56,7 @@ class _FakeTaskPreservingBackend:
     ) -> None:
         self._report_extra_change = report_extra_change
         self._assessment_status: ExecutionPlanAssessmentStatus = assessment_status
+        self.stage_calls = 0
 
     def assess(
         self,
@@ -72,6 +79,7 @@ class _FakeTaskPreservingBackend:
         plan: ExecutionPlan,
         context: ExecutionPlanStageContext,
     ) -> StagedExecutionPlan:
+        self.stage_calls += 1
         target = context.payload_root / "app" / "scheduler.py"
         before_hash = _digest(target)
         target.write_text(target.read_text(encoding="utf-8") + "# planned\n", encoding="utf-8")
@@ -146,6 +154,10 @@ _BaselineWheelPayload = cast(
     Callable[..., object],
     _package_attr("_BaselineWheelPayload"),
 )
+_validate_staged_execution_plan = cast(
+    Callable[..., None],
+    _package_attr("_validate_staged_execution_plan"),
+)
 
 
 def test_passing_execution_plan_replaces_payload_after_disposable_trial(
@@ -176,25 +188,28 @@ def test_passing_execution_plan_replaces_payload_after_disposable_trial(
         )
 
     def benchmark(
-        config: BenchmarkGateConfig,
+        config: ExecutionPlanBenchmarkConfig,
         **kwargs: object,
-    ) -> BenchmarkGateResult:
+    ) -> ExecutionPlanBenchmarkResult:
         assert events == ["semantic"]
-        assert config.warmups == 1
         assert config.samples == _PLAN_BENCHMARK_SAMPLES
-        assert config.minimum_speedup == pytest.approx(1.05)
-        progress = cast(Callable[[BenchmarkProgress], None], kwargs["progress"])
+        assert config.minimum_marginal_speedup == pytest.approx(1.05)
+        assert config.minimum_overall_speedup == pytest.approx(1.10)
+        progress = cast(
+            Callable[[ExecutionPlanBenchmarkProgress], None],
+            kwargs["progress"],
+        )
         progress(
-            BenchmarkProgress(
+            ExecutionPlanBenchmarkProgress(
                 phase="sample",
-                pair_index=1,
+                trio_index=1,
                 sample_index=1,
-                mode="compiled",
+                arm="planned",
                 duration_seconds=0.8,
             )
         )
         events.append("benchmark")
-        return _passing_benchmark()
+        return _passing_execution_plan_benchmark()
 
     monkeypatch.setattr(
         package_command,
@@ -202,13 +217,16 @@ def test_passing_execution_plan_replaces_payload_after_disposable_trial(
         (_FakeTaskPreservingBackend(),),
     )
     monkeypatch.setattr(package_command, "run_performance_command", semantics)
-    monkeypatch.setattr(package_command, "run_benchmark_gate", benchmark)
+    monkeypatch.setattr(package_command, "run_execution_plan_benchmark", benchmark)
 
     outcome = _apply_execution_plan_trials(context)
 
     assert outcome.applied_plan_ids == ("exec-plan-fixture",)
     assert outcome.trials[0].status == "accepted"
     assert outcome.trials[0].marginal_speedup == pytest.approx(1.25)
+    assert outcome.trials[0].overall_speedup == pytest.approx(1.5)
+    assert outcome.trials[0].unplanned_median_seconds == pytest.approx(1.0)
+    assert outcome.trials[0].cache_status == "miss"
     assert install_path.read_text(encoding="utf-8") == original_payload + "# planned\n"
     assert source_path.read_text(encoding="utf-8") == original_source
     assert events == ["semantic", "benchmark"]
@@ -217,6 +235,58 @@ def test_passing_execution_plan_replaces_payload_after_disposable_trial(
         "execution_plan_semantic_test",
         "execution_plan_benchmark",
     }
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("identity", "mismatched plan identity"),
+        ("empty", "did not change any payload files"),
+        ("escape", "path escapes the wheel"),
+        ("missing", "file is missing"),
+        ("digest", "digest mismatch"),
+        ("duplicate", "reported twice"),
+        ("incomplete", "report is incomplete"),
+    ],
+)
+def test_validate_staged_execution_plan_rejects_invalid_payload_contracts(
+    tmp_path: Path,
+    failure: str,
+    message: str,
+) -> None:
+    """A staged plan must report every changed wheel file with exact identity and digests."""
+    plan, backend, staged, baseline_root, trial_root = _staged_contract(tmp_path)
+    payload_file = staged.payload_files[0]
+    if failure == "identity":
+        staged = replace(staged, plan=replace(plan, id="other-plan"))
+    elif failure == "empty":
+        staged = replace(staged, payload_files=())
+    elif failure == "escape":
+        staged = replace(
+            staged,
+            payload_files=(replace(payload_file, install_path=PurePosixPath("../escape.py")),),
+        )
+    elif failure == "missing":
+        (trial_root / payload_file.install_path).unlink()
+    elif failure == "digest":
+        staged = replace(
+            staged,
+            payload_files=(replace(payload_file, after_hash="0" * 64),),
+        )
+    elif failure == "duplicate":
+        staged = replace(staged, payload_files=(payload_file, payload_file))
+    else:
+        extra = trial_root / "app" / "extra.py"
+        extra.write_text("extra\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        _validate_staged_execution_plan(
+            staged=staged,
+            backend=backend,
+            plan=plan,
+            baseline_root=baseline_root,
+            trial_root=trial_root,
+        )
 
 
 def test_rejected_execution_plan_leaves_current_payload_unchanged(
@@ -233,7 +303,11 @@ def test_rejected_execution_plan_leaves_current_payload_unchanged(
         (_FakeTaskPreservingBackend(),),
     )
     monkeypatch.setattr(package_command, "run_performance_command", _passing_semantics)
-    monkeypatch.setattr(package_command, "run_benchmark_gate", _rejected_benchmark)
+    monkeypatch.setattr(
+        package_command,
+        "run_execution_plan_benchmark",
+        _rejected_execution_plan_benchmark,
+    )
 
     outcome = _apply_execution_plan_trials(context)
 
@@ -241,6 +315,38 @@ def test_rejected_execution_plan_leaves_current_payload_unchanged(
     assert outcome.trials[0].status == "rejected"
     assert install_path.read_text(encoding="utf-8") == original_payload
     assert source_path.read_text(encoding="utf-8") == original_source
+
+
+def test_warm_execution_plan_trial_restores_cached_payload_without_restaging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged second compile reuses generated plan files but reruns gates."""
+    context, _source_path, install_path = _trial_context(tmp_path)
+    original_payload = install_path.read_text(encoding="utf-8")
+    backend = _FakeTaskPreservingBackend()
+    benchmark_calls = 0
+
+    def benchmark(*args: object, **kwargs: object) -> ExecutionPlanBenchmarkResult:
+        del args, kwargs
+        nonlocal benchmark_calls
+        benchmark_calls += 1
+        return _passing_execution_plan_benchmark()
+
+    monkeypatch.setattr(package_command, "_EXECUTION_PLAN_BACKENDS", (backend,))
+    monkeypatch.setattr(package_command, "run_performance_command", _passing_semantics)
+    monkeypatch.setattr(package_command, "run_execution_plan_benchmark", benchmark)
+
+    cold = _apply_execution_plan_trials(context)
+    install_path.write_text(original_payload, encoding="utf-8")
+    warm = _apply_execution_plan_trials(context)
+
+    assert cold.trials[0].cache_status == "miss"
+    assert warm.trials[0].cache_status == "hit"
+    assert backend.stage_calls == 1
+    assert benchmark_calls == _COLD_AND_WARM_CALLS
+    assert warm.applied_plan_ids == ("exec-plan-fixture",)
+    assert install_path.read_text(encoding="utf-8") == original_payload + "# planned\n"
 
 
 def test_semantic_failure_stops_before_execution_plan_benchmark(
@@ -252,7 +358,7 @@ def test_semantic_failure_stops_before_execution_plan_benchmark(
     original_payload = install_path.read_text(encoding="utf-8")
     benchmark_calls = 0
 
-    def benchmark(*args: object, **kwargs: object) -> BenchmarkGateResult:
+    def benchmark(*args: object, **kwargs: object) -> ExecutionPlanBenchmarkResult:
         del args, kwargs
         nonlocal benchmark_calls
         benchmark_calls += 1
@@ -264,7 +370,7 @@ def test_semantic_failure_stops_before_execution_plan_benchmark(
         (_FakeTaskPreservingBackend(),),
     )
     monkeypatch.setattr(package_command, "run_performance_command", _failing_semantics)
-    monkeypatch.setattr(package_command, "run_benchmark_gate", benchmark)
+    monkeypatch.setattr(package_command, "run_execution_plan_benchmark", benchmark)
 
     outcome = _apply_execution_plan_trials(context)
 
@@ -308,7 +414,11 @@ def test_callback_backend_is_preferred_when_both_backends_support_the_plan(
         (_FakeCallbackBackend(), _FakeTaskPreservingBackend()),
     )
     monkeypatch.setattr(package_command, "run_performance_command", _passing_semantics)
-    monkeypatch.setattr(package_command, "run_benchmark_gate", _passing_benchmark)
+    monkeypatch.setattr(
+        package_command,
+        "run_execution_plan_benchmark",
+        _passing_execution_plan_benchmark,
+    )
 
     outcome = _apply_execution_plan_trials(context)
 
@@ -331,7 +441,11 @@ def test_task_preserving_backend_follows_a_callback_capability_rejection(
         ),
     )
     monkeypatch.setattr(package_command, "run_performance_command", _passing_semantics)
-    monkeypatch.setattr(package_command, "run_benchmark_gate", _passing_benchmark)
+    monkeypatch.setattr(
+        package_command,
+        "run_execution_plan_benchmark",
+        _passing_execution_plan_benchmark,
+    )
 
     outcome = _apply_execution_plan_trials(context)
 
@@ -376,7 +490,11 @@ def test_task_preserving_backend_follows_a_callback_semantic_failure(
         (_FakeCallbackBackend(), _FakeTaskPreservingBackend()),
     )
     monkeypatch.setattr(package_command, "run_performance_command", semantics)
-    monkeypatch.setattr(package_command, "run_benchmark_gate", _passing_benchmark)
+    monkeypatch.setattr(
+        package_command,
+        "run_execution_plan_benchmark",
+        _passing_execution_plan_benchmark,
+    )
 
     outcome = _apply_execution_plan_trials(context)
 
@@ -443,7 +561,11 @@ def test_post_swap_backup_cleanup_cannot_invalidate_an_applied_plan(
         (_FakeTaskPreservingBackend(),),
     )
     monkeypatch.setattr(package_command, "run_performance_command", _passing_semantics)
-    monkeypatch.setattr(package_command, "run_benchmark_gate", _passing_benchmark)
+    monkeypatch.setattr(
+        package_command,
+        "run_execution_plan_benchmark",
+        _passing_execution_plan_benchmark,
+    )
     monkeypatch.setattr(shutil, "rmtree", rmtree)
 
     outcome = _apply_execution_plan_trials(context)
@@ -518,6 +640,56 @@ benchmark_command = ["python", "bench.py"]
     return context, source_path, install_path
 
 
+def _staged_contract(
+    tmp_path: Path,
+) -> tuple[
+    ExecutionPlan,
+    _FakeTaskPreservingBackend,
+    StagedExecutionPlan,
+    Path,
+    Path,
+]:
+    baseline_root = tmp_path / "baseline"
+    trial_root = tmp_path / "trial"
+    install_path = PurePosixPath("app/scheduler.py")
+    baseline_file = baseline_root / install_path
+    trial_file = trial_root / install_path
+    baseline_file.parent.mkdir(parents=True)
+    trial_file.parent.mkdir(parents=True)
+    baseline_file.write_text("baseline\n", encoding="utf-8")
+    trial_file.write_text("planned\n", encoding="utf-8")
+    owner = SymbolId("app.scheduler", "run")
+    plan = ExecutionPlan(
+        id="exec-plan-contract",
+        source_module=owner.module,
+        owner=owner,
+        dialect="asyncio",
+        lowering_version="test",
+        source_hash="a" * 64,
+        callsite_fingerprint="b" * 64,
+        topology_fingerprint="c" * 64,
+        nodes=(PlanNode(owner.stable_id, owner, "orchestrator", 1),),
+        edges=(),
+        guards=(),
+    )
+    backend = _FakeTaskPreservingBackend()
+    staged = StagedExecutionPlan(
+        plan=plan,
+        backend=backend.name,
+        payload_files=(
+            ChangedPayloadFile(
+                install_path=install_path,
+                before_hash=_digest(baseline_file),
+                after_hash=_digest(trial_file),
+                role="source-overlay",
+            ),
+        ),
+        required_imports=(),
+        guards=(),
+    )
+    return plan, backend, staged, baseline_root, trial_root
+
+
 def _passing_semantics(
     command: tuple[str, ...],
     *,
@@ -561,34 +733,59 @@ def _failing_semantics(
     )
 
 
-def _passing_benchmark(*args: object, **kwargs: object) -> BenchmarkGateResult:
+def _passing_execution_plan_benchmark(
+    *args: object,
+    **kwargs: object,
+) -> ExecutionPlanBenchmarkResult:
     del args, kwargs
-    return BenchmarkGateResult(
+    return ExecutionPlanBenchmarkResult(
+        plan_id="exec-plan-fixture",
         status="passed",
-        reason="planned payload met the marginal threshold",
-        minimum_speedup=1.05,
-        baseline_median_seconds=1.0,
-        compiled_median_seconds=0.8,
-        speedup=1.25,
+        reason="planned payload met the marginal and overall thresholds",
+        minimum_marginal_speedup=1.05,
+        minimum_overall_speedup=1.10,
+        baseline_median_seconds=1.2,
+        unplanned_median_seconds=1.0,
+        planned_median_seconds=0.8,
+        marginal_speedup=1.25,
+        overall_speedup=1.5,
         warmups=(),
         samples=(
-            _benchmark_sample("baseline", 1.0),
-            _benchmark_sample("compiled", 0.8),
+            _execution_plan_benchmark_sample("baseline", 1.2),
+            _execution_plan_benchmark_sample("unplanned", 1.0),
+            _execution_plan_benchmark_sample("planned", 0.8),
         ),
     )
 
 
-def _rejected_benchmark(*args: object, **kwargs: object) -> BenchmarkGateResult:
+def _rejected_execution_plan_benchmark(
+    *args: object,
+    **kwargs: object,
+) -> ExecutionPlanBenchmarkResult:
     del args, kwargs
-    return BenchmarkGateResult(
+    return ExecutionPlanBenchmarkResult(
+        plan_id="exec-plan-fixture",
         status="not-profitable",
         reason="planned payload missed the marginal threshold",
-        minimum_speedup=1.05,
-        baseline_median_seconds=1.0,
-        compiled_median_seconds=1.0,
-        speedup=1.0,
+        minimum_marginal_speedup=1.05,
+        minimum_overall_speedup=1.10,
+        baseline_median_seconds=1.2,
+        unplanned_median_seconds=1.0,
+        planned_median_seconds=1.0,
+        marginal_speedup=1.0,
+        overall_speedup=1.2,
         warmups=(),
         samples=(),
+    )
+
+
+def _execution_plan_benchmark_sample(
+    arm: str,
+    duration_seconds: float,
+) -> ExecutionPlanBenchmarkSample:
+    return ExecutionPlanBenchmarkSample(
+        arm=cast(ExecutionPlanBenchmarkArm, arm),
+        run=_benchmark_sample("baseline" if arm == "baseline" else "compiled", duration_seconds),
     )
 
 

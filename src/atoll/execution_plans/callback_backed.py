@@ -66,9 +66,9 @@ from atoll.execution_plans.task_preserving import (
 )
 
 _BACKEND_NAME: Final = "callback-backed"
-_LOWERING_VERSION: Final = "callback-backed-v1"
+_LOWERING_VERSION: Final = "callback-backed-v2"
 _SUPPORTED_DIALECT: Final = "asyncio"
-_SUPPORT_VERSION: Final = "support-v1"
+_SUPPORT_VERSION: Final = "support-v2"
 _PRODUCER_ARGUMENT_COUNT: Final = 2
 _QUALNAME_CLASS_METHOD_PARTS: Final = 2
 
@@ -512,10 +512,21 @@ def _validate_topology(tree: ast.Module, target: _RewriteTarget, plan: Execution
 
 def _validate_producer_body(producer: ast.AsyncFunctionDef) -> None:
     put_nowait_calls = 0
-    for statement in producer.body:
+    statements = producer.body
+    if statements and _is_docstring_statement(statements[0]):
+        statements = statements[1:]
+    for statement in statements:
         put_nowait_calls += _validate_producer_statement(statement, producer)
     if put_nowait_calls != 1:
         raise ValueError("producer must publish exactly once with queue.put_nowait")
+
+
+def _is_docstring_statement(statement: ast.stmt) -> bool:
+    return (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Constant)
+        and isinstance(statement.value.value, str)
+    )
 
 
 def _validate_producer_statement(
@@ -816,6 +827,7 @@ class _AtollCallbackFailure:
 def {names.items}(items, queue, create_task, producer, original_producer):
     global {names.last_mode}
     import asyncio
+    import contextvars
     import sys
 
     loop = asyncio.get_running_loop()
@@ -849,19 +861,24 @@ def {names.items}(items, queue, create_task, producer, original_producer):
         "remaining": len(items),
     }}
     {names.last_mode} = "optimized" if optimized else "fallback"
+    if optimized:
+        for item in items:
+            context = contextvars.copy_context()
+            loop.call_soon(
+                _atoll_callback_drive_once,
+                producer,
+                queue,
+                item,
+                context=context,
+            )
+        return ()
     return items
 
 
 def {names.spawn}(queue, create_task, producer, item):
-    import asyncio
-    import contextvars
-
     state = {names.state}.get(id(queue))
     if not state or not state["optimized"]:
         return create_task(producer(queue, item))
-    loop = asyncio.get_running_loop()
-    context = contextvars.copy_context()
-    loop.call_soon(context.run, _atoll_callback_drive_once, producer, queue, item)
     return None
 
 

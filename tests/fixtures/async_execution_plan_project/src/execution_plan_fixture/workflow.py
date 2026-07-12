@@ -17,7 +17,8 @@ from contextvars import ContextVar
 from typing import Literal, TypedDict
 
 MATRIX_REPETITIONS = 32
-QUEUE_CAPACITY = 4
+WORK_ITEM_COUNT = 256
+QUEUE_CAPACITY = 256
 
 _CONTEXT_LABEL: ContextVar[str] = ContextVar("_CONTEXT_LABEL", default="parent")
 
@@ -83,6 +84,11 @@ class WorkItem(TypedDict):
     value: int
 
 
+_SUCCESSFUL_ITEMS: tuple[WorkItem, ...] = tuple(
+    WorkItem(label=f"item-{index:04d}", value=index + 1) for index in range(WORK_ITEM_COUNT)
+)
+
+
 class ControlledImmediateError(RuntimeError):
     """Exception raised before the producer reaches any suspension point."""
 
@@ -119,19 +125,33 @@ async def run_supported_workflow() -> tuple[tuple[WorkItem, ...], TracebackEvide
         controlled immediate exception variant.
     """
 
-    queue: asyncio.Queue[WorkItem] = asyncio.Queue(maxsize=QUEUE_CAPACITY)
+    records = await run_supported_fanout()
     traceback_evidence = TracebackEvidence(
         type="missing",
         message="missing",
         producer_frame=False,
     )
-    async with asyncio.TaskGroup() as group:
-        for item in _successful_items():
-            group.create_task(publish_immediate(queue, item))
-        records = [await queue.get() for _ in range(len(_successful_items()))]
-
     await _capture_immediate_failure("failure", traceback_evidence)
-    return tuple(records), traceback_evidence
+    return records, traceback_evidence
+
+
+async def run_supported_fanout() -> tuple[WorkItem, ...]:
+    """Run only the hot, strictly eligible fan-out/fan-in path.
+
+    The semantic command covers exception, context, and fallback probes. The
+    configured benchmark calls this narrower workload so profitability measures
+    the scheduler site selected by profiling rather than unrelated test work.
+
+    Returns:
+        tuple[WorkItem, ...]: Queue records in deterministic completion order.
+    """
+    items = _successful_items()
+    queue: asyncio.Queue[WorkItem] = asyncio.Queue(maxsize=QUEUE_CAPACITY)
+    async with asyncio.TaskGroup() as group:
+        for item in items:
+            group.create_task(publish_immediate(queue, item))
+        records = [await queue.get() for _ in range(len(items))]
+    return tuple(records)
 
 
 async def _capture_immediate_failure(
@@ -191,11 +211,7 @@ async def _context_isolation_probe() -> dict[Literal["parent", "child", "sibling
 
 
 def _successful_items() -> tuple[WorkItem, ...]:
-    return (
-        WorkItem(label="alpha", value=2),
-        WorkItem(label="beta", value=3),
-        WorkItem(label="gamma", value=5),
-    )
+    return _SUCCESSFUL_ITEMS
 
 
 def _cold_decoy_names() -> tuple[str, ...]:

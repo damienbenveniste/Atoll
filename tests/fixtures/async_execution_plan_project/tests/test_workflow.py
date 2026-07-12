@@ -6,7 +6,7 @@ import asyncio
 
 from execution_plan_fixture import MATRIX_REPETITIONS, repeat_baseline_semantic_matrix
 
-EXPECTED_TOTAL = 10
+EXPECTED_TOTAL = 32896
 
 
 def test_repeated_matrix_is_stable() -> None:

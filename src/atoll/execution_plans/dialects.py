@@ -21,8 +21,10 @@ class SpawnCall:
         col_offset: Zero-based source column of the spawn call.
         end_lineno: One-based final source line of the spawn call.
         end_col_offset: Zero-based final source column of the spawn call.
-        scheduler_owner: Lexical task-group or scheduler receiver name.
-        transport_arguments: Lexical argument names passed to the spawned callee.
+        scheduler_owner: Stable task-group or scheduler receiver path.
+        transport_arguments: Stable positional argument paths passed to the spawned
+            callee. Unsupported expressions remain `None` so argument indexes do not
+            shift during parameter matching.
     """
 
     dialect: SchedulerDialectName
@@ -32,7 +34,7 @@ class SpawnCall:
     end_lineno: int
     end_col_offset: int
     scheduler_owner: str | None
-    transport_arguments: tuple[str, ...]
+    transport_arguments: tuple[str | None, ...]
 
 
 @runtime_checkable
@@ -109,7 +111,7 @@ class AsyncioDialect:
             end_lineno=getattr(node, "end_lineno", node.lineno),
             end_col_offset=getattr(node, "end_col_offset", node.col_offset),
             scheduler_owner=path[0] if len(path) == _ATTRIBUTE_CALL_LENGTH else None,
-            transport_arguments=_name_arguments(node.args[0].args),
+            transport_arguments=_argument_paths(node.args[0].args),
         )
 
 
@@ -135,12 +137,9 @@ class AnyioOnAsyncioDialect:
             SpawnCall | None: Spawn evidence when the first argument names a callable.
         """
         path = _attribute_path(node.func)
-        if (
-            path is None
-            or len(path) != _ATTRIBUTE_CALL_LENGTH
-            or path[1] != "start_soon"
-            or not node.args
-        ):
+        if path is None or len(path) < _ATTRIBUTE_CALL_LENGTH or path[-1] != "start_soon":
+            return None
+        if not node.args:
             return None
         callee_path = _attribute_path(node.args[0])
         callee_name = ".".join(callee_path) if callee_path is not None else None
@@ -151,8 +150,8 @@ class AnyioOnAsyncioDialect:
             col_offset=node.col_offset,
             end_lineno=getattr(node, "end_lineno", node.lineno),
             end_col_offset=getattr(node, "end_col_offset", node.col_offset),
-            scheduler_owner=path[0],
-            transport_arguments=_name_arguments(node.args[1:]),
+            scheduler_owner=".".join(path[:-1]),
+            transport_arguments=_argument_paths(node.args[1:]),
         )
 
 
@@ -176,5 +175,7 @@ def _attribute_path(node: ast.expr) -> tuple[str, ...] | None:
     return None
 
 
-def _name_arguments(nodes: list[ast.expr]) -> tuple[str, ...]:
-    return tuple(node.id for node in nodes if isinstance(node, ast.Name))
+def _argument_paths(nodes: list[ast.expr]) -> tuple[str | None, ...]:
+    return tuple(
+        ".".join(path) if (path := _attribute_path(node)) is not None else None for node in nodes
+    )

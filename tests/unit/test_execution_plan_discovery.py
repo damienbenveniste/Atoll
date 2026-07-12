@@ -2,9 +2,12 @@
 
 import ast
 import sys
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
+from atoll.analysis import execution_plans as plan_analysis
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.execution_plans import (
     build_execution_plans,
@@ -27,6 +30,71 @@ _HOT_PLAN_COUNT = 18_000
 _SELECTION_LIMIT = 4
 _LIVE_SPAWN_COUNT = 1_200
 _QUEUE_CAPACITY = 4
+_FIELD_PLAN_COUNT = 2_000
+_MANAGED_STREAM_CAPACITY = 2
+_EXPECTED_STATEMENT_BLOCKS = 11
+
+
+def _plan_attr(name: str) -> object:
+    return vars(plan_analysis)[name]
+
+
+_expression_exposes_names = cast(
+    Callable[[ast.expr | None, frozenset[str]], bool],
+    _plan_attr("_expression_exposes_names"),
+)
+_expression_exposes_references = cast(
+    Callable[[ast.expr | None, frozenset[str]], bool],
+    _plan_attr("_expression_exposes_references"),
+)
+_assignment_parts = cast(
+    Callable[[ast.AST], tuple[tuple[ast.expr, ...], ast.expr | None, int]],
+    _plan_attr("_assignment_parts"),
+)
+_parameter_annotation = cast(
+    Callable[[ast.FunctionDef | ast.AsyncFunctionDef, str], ast.expr | None],
+    _plan_attr("_parameter_annotation"),
+)
+_annotation_contains_task_group = cast(
+    Callable[[ast.expr | None], bool],
+    _plan_attr("_annotation_contains_task_group"),
+)
+_dataclass_field_is_init = cast(
+    Callable[[ast.expr | None], bool],
+    _plan_attr("_dataclass_field_is_init"),
+)
+_task_group_factory_dialect = cast(
+    Callable[[ast.expr | None], str | None],
+    _plan_attr("_task_group_factory_dialect"),
+)
+_imported_class_bindings = cast(
+    Callable[[ast.Module, str, set[SymbolId]], dict[str, SymbolId]],
+    _plan_attr("_imported_class_bindings"),
+)
+_narrowed_method_calls = cast(
+    Callable[[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, SymbolId]], tuple[SymbolId, ...]],
+    _plan_attr("_narrowed_method_calls"),
+)
+_isinstance_narrowing = cast(
+    Callable[[ast.stmt, dict[str, SymbolId]], tuple[str, SymbolId] | None],
+    _plan_attr("_isinstance_narrowing"),
+)
+_statement_expressions = cast(
+    Callable[[ast.stmt], tuple[ast.expr, ...]],
+    _plan_attr("_statement_expressions"),
+)
+_statement_blocks = cast(
+    Callable[[ast.stmt], tuple[list[ast.stmt], ...]],
+    _plan_attr("_statement_blocks"),
+)
+_walk_without_nested_declarations = cast(
+    Callable[[ast.AST], Iterable[ast.AST]],
+    _plan_attr("_walk_without_nested_declarations"),
+)
+_statement_assigned_names = cast(
+    Callable[[ast.stmt], frozenset[str]],
+    _plan_attr("_statement_assigned_names"),
+)
 
 
 def test_dialects_recognize_asyncio_and_anyio_spawn_shapes(tmp_path: Path) -> None:
@@ -68,6 +136,289 @@ def test_dialects_recognize_asyncio_and_anyio_spawn_shapes(tmp_path: Path) -> No
     assert AsyncioDialect().name == "asyncio"
     assert AnyioOnAsyncioDialect().name == "anyio-on-asyncio"
     assert "pydantic" not in source_text.lower()
+
+
+def test_anyio_dialect_preserves_stable_receiver_and_argument_paths() -> None:
+    """Dotted receivers and unsupported arguments retain stable positional evidence."""
+    expressions = ast.parse(
+        "\n".join(
+            [
+                "self.task_group.start_soon(self._produce, build(), self.send_stream)",
+                "factory().start_soon(self._produce, self.send_stream)",
+            ]
+        )
+    ).body
+    dialect = AnyioOnAsyncioDialect()
+
+    spawn = dialect.recognize_spawn(_call_expression(expressions[0]))
+
+    assert spawn is not None
+    assert spawn.scheduler_owner == "self.task_group"
+    assert spawn.callee_name == "self._produce"
+    assert spawn.transport_arguments == (None, "self.send_stream")
+    assert dialect.recognize_spawn(_call_expression(expressions[1])) is None
+
+
+def test_field_backed_anyio_rendezvous_resolves_cross_method_topology(
+    tmp_path: Path,
+) -> None:
+    """A delegated task group and instance streams form one cross-method plan."""
+    scan = _scan(
+        tmp_path / "field_topology.py",
+        [
+            "from dataclasses import dataclass, field",
+            "from anyio import create_memory_object_stream",
+            "from anyio.abc import TaskGroup",
+            "@dataclass",
+            "class ChannelRunner:",
+            "    task_group: TaskGroup",
+            "    send_stream: object = field(init=False)",
+            "    receive_stream: object = field(init=False)",
+            "    def __post_init__(self):",
+            ("        self.send_stream, self.receive_stream = create_memory_object_stream[int](0)"),
+            "    def schedule(self, value):",
+            "        self.task_group.start_soon(self._produce, value)",
+            "    async def _produce(self, value):",
+            "        await self.send_stream.send(value)",
+            "    async def results(self):",
+            "        async with self.receive_stream:",
+            "            async for value in self.receive_stream:",
+            "                yield value",
+        ],
+    )
+    profile = _profile(
+        scan,
+        (
+            ("field_topology", "ChannelRunner.schedule", 2_000, 2_000),
+            ("field_topology", "ChannelRunner._produce", 2_000, 2_000),
+            ("field_topology", "ChannelRunner.results", 2_000, 2_000),
+        ),
+    )
+
+    plan = next(
+        result
+        for result in build_execution_plans((scan,), profile)
+        if isinstance(result, ExecutionPlan)
+    )
+
+    assert plan.owner == SymbolId("field_topology", "ChannelRunner.schedule")
+    assert plan.consumer == SymbolId("field_topology", "ChannelRunner.results")
+    assert plan.transport_capacity == 0
+    assert plan.completion_transport == "self.send_stream|self.receive_stream"
+    assert plan.lifecycle_starts == _FIELD_PLAN_COUNT
+    assert not any(
+        edge.kind == "spawns" and edge.dst.endswith("ChannelRunner.results") for edge in plan.edges
+    )
+
+
+def test_factory_backed_task_group_field_requires_managed_lifecycle(tmp_path: Path) -> None:
+    """A factory alias is structured only when class lifecycle methods join it."""
+    scan = _scan(
+        tmp_path / "managed_field.py",
+        [
+            "import anyio",
+            "class ManagedRunner:",
+            "    def __init__(self):",
+            "        group = anyio.create_task_group()",
+            "        self.task_group = group",
+            (
+                "        self.send_stream, self.receive_stream = "
+                f"anyio.create_memory_object_stream({_MANAGED_STREAM_CAPACITY})"
+            ),
+            "    async def __aenter__(self):",
+            "        await self.task_group.__aenter__()",
+            "        return self",
+            "    async def __aexit__(self, exc_type, exc, traceback):",
+            "        await self.task_group.__aexit__(exc_type, exc, traceback)",
+            "    def schedule(self, value):",
+            "        self.task_group.start_soon(self._produce, value)",
+            "    async def _produce(self, value):",
+            "        await self.send_stream.send(value)",
+            "    async def results(self):",
+            "        async for value in self.receive_stream:",
+            "            yield value",
+        ],
+    )
+    profile = _profile(
+        scan,
+        (
+            ("managed_field", "ManagedRunner.schedule", 2_000, 2_000),
+            ("managed_field", "ManagedRunner._produce", 2_000, 2_000),
+        ),
+    )
+
+    plan = next(
+        result
+        for result in build_execution_plans((scan,), profile)
+        if isinstance(result, ExecutionPlan)
+    )
+
+    assert plan.owner.qualname == "ManagedRunner.schedule"
+    assert plan.transport_capacity == _MANAGED_STREAM_CAPACITY
+    assert plan.task_ownership == "structured"
+
+
+def test_field_backed_discovery_rejects_ambiguous_or_public_evidence(
+    tmp_path: Path,
+) -> None:
+    """Dynamic owners, mixed owners, public endpoints, and unknown capacity stay rejected."""
+    scan = _scan(
+        tmp_path / "field_rejections.py",
+        [
+            "from dataclasses import dataclass, field",
+            "import anyio",
+            "from anyio.abc import TaskGroup",
+            "class DynamicOwner:",
+            "    def __init__(self):",
+            "        self.task_group = scheduler_factory()",
+            (
+                "        self.send_stream, self.receive_stream = "
+                "anyio.create_memory_object_stream(0)"
+            ),
+            "    def schedule(self, value):",
+            "        self.task_group.start_soon(self._produce, value)",
+            "    async def _produce(self, value):",
+            "        await self.send_stream.send(value)",
+            "    async def results(self):",
+            "        async for value in self.receive_stream:",
+            "            yield value",
+            "@dataclass",
+            "class MixedOwner:",
+            "    primary_group: TaskGroup",
+            "    secondary_group: TaskGroup",
+            "    send_stream: object = field(init=False)",
+            "    receive_stream: object = field(init=False)",
+            "    def __post_init__(self):",
+            (
+                "        self.send_stream, self.receive_stream = "
+                "anyio.create_memory_object_stream(0)"
+            ),
+            "    def schedule(self, value):",
+            "        self.primary_group.start_soon(self._produce, value)",
+            "        self.secondary_group.start_soon(self._produce, value)",
+            "    async def _produce(self, value):",
+            "        await self.send_stream.send(value)",
+            "    async def results(self):",
+            "        async for value in self.receive_stream:",
+            "            yield value",
+            "@dataclass",
+            "class PublicEndpoint:",
+            "    task_group: TaskGroup",
+            "    send_stream: object = field(init=False)",
+            "    receive_stream: object = field(init=False)",
+            "    def __post_init__(self):",
+            (
+                "        self.send_stream, self.receive_stream = "
+                "anyio.create_memory_object_stream(0)"
+            ),
+            "    def expose(self):",
+            "        return self.receive_stream",
+            "    def schedule(self, value):",
+            "        self.task_group.start_soon(self._produce, value)",
+            "    async def _produce(self, value):",
+            "        await self.send_stream.send(value)",
+            "    async def results(self):",
+            "        async for value in self.receive_stream:",
+            "            yield value",
+            "@dataclass",
+            "class UnknownCapacity:",
+            "    task_group: TaskGroup",
+            "    capacity: int",
+            "    send_stream: object = field(init=False)",
+            "    receive_stream: object = field(init=False)",
+            "    def __post_init__(self):",
+            (
+                "        self.send_stream, self.receive_stream = "
+                "anyio.create_memory_object_stream(self.capacity)"
+            ),
+            "    def schedule(self, value):",
+            "        self.task_group.start_soon(self._produce, value)",
+            "    async def _produce(self, value):",
+            "        await self.send_stream.send(value)",
+            "    async def results(self):",
+            "        async for value in self.receive_stream:",
+            "            yield value",
+        ],
+    )
+
+    rejections = {
+        result.owner.qualname: result.reason
+        for result in build_execution_plans((scan,), None)
+        if isinstance(result, PlanRejection)
+    }
+
+    assert rejections == {
+        "DynamicOwner.schedule": "unstructured-task",
+        "MixedOwner.schedule": "ambiguous-spawn",
+        "PublicEndpoint.schedule": "public-transport",
+        "UnknownCapacity.schedule": "unknown-capacity",
+    }
+
+
+def test_annotated_scheduler_field_does_not_validate_a_dynamic_local_alias(
+    tmp_path: Path,
+) -> None:
+    """A target field annotation cannot prove the runtime origin of an assigned alias."""
+    scan = _scan(
+        tmp_path / "dynamic_annotated_scheduler.py",
+        [
+            "import anyio",
+            "from anyio.abc import TaskGroup",
+            "class Runner:",
+            "    task_group: TaskGroup",
+            "    def __init__(self):",
+            "        local_group = scheduler_factory()",
+            "        self.task_group = local_group",
+            "        self.send_stream, self.receive_stream = anyio.create_memory_object_stream(0)",
+            "    def schedule(self, value):",
+            "        self.task_group.start_soon(self._produce, value)",
+            "    async def _produce(self, value):",
+            "        await self.send_stream.send(value)",
+            "    async def results(self):",
+            "        async for value in self.receive_stream:",
+            "            yield value",
+        ],
+    )
+
+    rejection = next(
+        result
+        for result in build_execution_plans((scan,), None)
+        if isinstance(result, PlanRejection)
+    )
+
+    assert rejection.owner.qualname == "Runner.schedule"
+    assert rejection.reason == "unstructured-task"
+
+
+def test_spawned_worker_global_does_not_impersonate_a_passed_local_transport(
+    tmp_path: Path,
+) -> None:
+    """A same-named module global cannot establish the role of a positional argument."""
+    scan = _scan(
+        tmp_path / "global_transport_collision.py",
+        [
+            "import asyncio",
+            "queue = external_queue",
+            "async def produce(value, result_queue):",
+            "    await queue.put(value)",
+            "async def consume(result_queue):",
+            "    return await result_queue.get()",
+            "async def run(values):",
+            "    queue = asyncio.Queue(4)",
+            "    async with asyncio.TaskGroup() as group:",
+            "        for value in values:",
+            "            group.create_task(produce(value, queue))",
+            "        group.create_task(consume(queue))",
+        ],
+    )
+
+    rejection = next(
+        result
+        for result in build_execution_plans((scan,), None)
+        if isinstance(result, PlanRejection) and result.owner.qualname == "run"
+    )
+
+    assert rejection.reason == "unknown-transport"
 
 
 def test_build_execution_plans_selects_by_threshold_order_and_coverage(tmp_path: Path) -> None:
@@ -779,6 +1130,153 @@ def test_dialect_recognizers_reject_unknown_or_incomplete_calls() -> None:
     assert anyio_dialect.recognize_spawn(_call_expression(expressions[3])) is None
 
 
+def test_expression_escape_helpers_cover_nested_container_shapes() -> None:
+    """Task and transport escape proofs inspect starred and container expressions."""
+    names = frozenset({"task"})
+    references = frozenset({"self.queue"})
+
+    assert _expression_exposes_names(_expression("task"), names)
+    assert _expression_exposes_names(_expression("(*task,)"), names)
+    assert _expression_exposes_names(_expression("[task]"), names)
+    assert _expression_exposes_names(_expression("{task}"), names)
+    assert _expression_exposes_names(_expression("{'task': task}"), names)
+    assert not _expression_exposes_names(_expression("task + 1"), names)
+    assert _expression_exposes_references(_expression("self.queue"), references)
+    assert _expression_exposes_references(_expression("(*self.queue,)"), references)
+    assert _expression_exposes_references(_expression("[self.queue]"), references)
+    assert _expression_exposes_references(_expression("{'queue': self.queue}"), references)
+    assert not _expression_exposes_references(None, references)
+    assert not _expression_exposes_references(_expression("make()"), references)
+
+
+def test_assignment_and_annotation_helpers_cover_static_scheduler_forms() -> None:
+    """Scheduler ownership helpers classify every supported assignment and type form."""
+    function = ast.parse(
+        """
+def owner(value: TaskGroup | None, *args: object, **kwargs: object):
+    plain = value
+    annotated: TaskGroup = value
+    plain += value
+    del plain
+    return value
+"""
+    ).body[0]
+    assert isinstance(function, ast.FunctionDef)
+    assignment, annotated, augmented, deleted, returned = function.body
+    named = ast.parse("(bound := value)", mode="eval").body
+
+    assert _assignment_parts(assignment)[0]
+    assert _assignment_parts(annotated)[0]
+    assert _assignment_parts(augmented)[0]
+    assert _assignment_parts(named)[0]
+    assert _assignment_parts(deleted)[1] is None
+    assert _assignment_parts(returned) == ((), None, 0)
+    assert _parameter_annotation(function, "value") is not None
+    assert _parameter_annotation(function, "missing") is None
+
+    assert _annotation_contains_task_group(_expression("TaskGroup"))
+    assert _annotation_contains_task_group(_expression("list[TaskGroup]"))
+    assert _annotation_contains_task_group(_expression("TaskGroup | None"))
+    assert _annotation_contains_task_group(_expression("tuple[int, TaskGroup]"))
+    assert not _annotation_contains_task_group(None)
+    assert not _annotation_contains_task_group(_expression("int"))
+    assert _dataclass_field_is_init(None)
+    assert _dataclass_field_is_init(_expression("field()"))
+    assert not _dataclass_field_is_init(_expression("field(init=False)"))
+    assert not _dataclass_field_is_init(_expression("factory"))
+    assert not _dataclass_field_is_init(_expression("other()"))
+    assert _task_group_factory_dialect(_expression("asyncio.TaskGroup()")) == "asyncio"
+    assert _task_group_factory_dialect(_expression("create_task_group()")) == "anyio-on-asyncio"
+    assert _task_group_factory_dialect(_expression("factory()")) is None
+
+
+def test_relative_import_narrowing_finds_only_calls_before_reassignment() -> None:
+    """Reducer discovery follows proven class narrowing and stops after local rebinding."""
+    tree = ast.parse(
+        """
+from .reducers import Reducer as LocalReducer
+from external.types import Known
+from ignored import Missing
+
+def consume(candidate, other):
+    assert isinstance(candidate, LocalReducer)
+    if other:
+        candidate.reduce(other)
+    candidate = other
+    candidate.reduce(other)
+"""
+    )
+    local = SymbolId("pkg.reducers", "Reducer")
+    known = SymbolId("external.types", "Known")
+    bindings = _imported_class_bindings(
+        tree,
+        "pkg.consumer",
+        {local, known},
+    )
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
+
+    calls = _narrowed_method_calls(function, bindings)
+
+    assert bindings == {"LocalReducer": local, "Known": known}
+    assert calls == (SymbolId("pkg.reducers", "Reducer.reduce"),)
+    unknown_assert = ast.parse("assert isinstance(candidate, Unknown)").body[0]
+    assert _isinstance_narrowing(unknown_assert, bindings) is None
+
+
+def test_statement_walkers_cover_nested_blocks_and_skip_nested_declarations() -> None:
+    """Flow-sensitive discovery handles all compound statements without leaking scopes."""
+    function = ast.parse(
+        """
+async def owner(items, manager):
+    assigned = items
+    annotated: object = items
+    assigned += items
+    if items:
+        assigned = items
+    else:
+        assigned = []
+    for item in items:
+        pass
+    async for item in items:
+        pass
+    while items:
+        break
+    with manager:
+        pass
+    async with manager:
+        pass
+    try:
+        pass
+    except ValueError:
+        pass
+    finally:
+        pass
+    match items:
+        case []:
+            pass
+    def nested():
+        hidden = items
+    return assigned
+"""
+    ).body[0]
+    assert isinstance(function, ast.AsyncFunctionDef)
+
+    expressions = tuple(
+        expression
+        for statement in function.body
+        for expression in _statement_expressions(statement)
+    )
+    blocks = tuple(block for statement in function.body for block in _statement_blocks(statement))
+    walked = tuple(_walk_without_nested_declarations(function))
+
+    assert expressions
+    assert len(blocks) == _EXPECTED_STATEMENT_BLOCKS
+    assert _statement_assigned_names(function.body[0]) == frozenset({"assigned"})
+    assert _statement_assigned_names(function.body[1]) == frozenset({"annotated"})
+    assert _statement_assigned_names(function.body[2]) == frozenset({"assigned"})
+    assert all(not (isinstance(node, ast.Name) and node.id == "hidden") for node in walked)
+
+
 def _scan(path: Path, lines: list[str]) -> ModuleScan:
     resolved_path = path if path.is_absolute() else Path.cwd() / path
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
@@ -790,6 +1288,10 @@ def _call_expression(node: ast.stmt) -> ast.Call:
     assert isinstance(node, ast.Expr)
     assert isinstance(node.value, ast.Call)
     return node.value
+
+
+def _expression(source: str) -> ast.expr:
+    return ast.parse(source, mode="eval").body
 
 
 def _profile(

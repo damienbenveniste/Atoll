@@ -55,8 +55,10 @@ ExecutionPlanBenchmarkStatus = Literal[
     "passed",
     "not-profitable",
     "invalid",
+    "unavailable",
     "unbenchmarked",
 ]
+ExecutionPlanCacheStatus = Literal["not-run", "hit", "miss", "invalid"]
 
 _DIGEST_SIZE = 16
 
@@ -197,6 +199,8 @@ class ExecutionPlan:
         dialect: Scheduler dialect identifier.
         lowering_version: Dialect lowering version that affects generated code.
         source_hash: Digest of the relevant source text, not the runtime profile.
+        source_hashes: Complete per-module source digests covered by `source_hash`.
+        source_members: Exact declarations covered by source_hash.
         callsite_fingerprint: Stable call-site coordinate and target digest.
         topology_fingerprint: Stable node and edge digest for the plan graph.
         nodes: Plan nodes in deterministic order.
@@ -205,7 +209,7 @@ class ExecutionPlan:
         completion_transport: Private result-transport identity.
         consumer: Callable that owns result delivery.
         reducer: Callable that performs or owns final reduction.
-        transport_capacity: Statically known transport capacity, where zero is unbounded.
+        transport_capacity: Statically known dialect-defined transport capacity.
         ordering_policy: Statically preserved result-delivery ordering policy.
         task_ownership: Static task-handle ownership proof used by backend assessment.
         observed_invocations: Profiled spawned-callable invocations used for ranking.
@@ -237,6 +241,8 @@ class ExecutionPlan:
     lifecycle_starts: int = 0
     lifecycle_share: float = 0.0
     guarded_callable_identities: tuple[str, ...] = ()
+    source_members: tuple[SymbolId, ...] = ()
+    source_hashes: tuple[tuple[str, str], ...] = ()
     rejections: tuple[PlanRejection, ...] = ()
     hotness: int = 0
 
@@ -344,9 +350,13 @@ class ExecutionPlanTrial:
         benchmark_command: Exact benchmark argv used for marginal comparison.
         benchmark_status: Marginal benchmark decision, or `not-run`.
         minimum_speedup: Required speedup over the current unplanned payload.
-        baseline_median_seconds: Median duration of the current accepted payload.
+        minimum_overall_speedup: Required speedup over the interpreted baseline.
+        baseline_median_seconds: Median duration of the interpreted baseline payload.
+        unplanned_median_seconds: Median duration of the current accepted payload.
         planned_median_seconds: Median duration of the candidate planned payload.
-        marginal_speedup: Current-payload median divided by planned-payload median.
+        marginal_speedup: Unplanned-payload median divided by planned-payload median.
+        overall_speedup: Baseline-payload median divided by planned-payload median.
+        cache_status: Whether backend staging restored or generated the payload changes.
         payload_files: Staged payload changes validated before semantic testing.
     """
 
@@ -361,9 +371,13 @@ class ExecutionPlanTrial:
     benchmark_command: tuple[str, ...] = ()
     benchmark_status: ExecutionPlanBenchmarkStatus = "not-run"
     minimum_speedup: float | None = None
+    minimum_overall_speedup: float | None = None
     baseline_median_seconds: float | None = None
+    unplanned_median_seconds: float | None = None
     planned_median_seconds: float | None = None
     marginal_speedup: float | None = None
+    overall_speedup: float | None = None
+    cache_status: ExecutionPlanCacheStatus = "not-run"
     payload_files: tuple[ChangedPayloadFile, ...] = ()
 
 

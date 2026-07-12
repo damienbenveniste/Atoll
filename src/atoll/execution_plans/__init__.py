@@ -1,5 +1,9 @@
 """Execution-plan contracts and built-in scheduler dialects."""
 
+from atoll.execution_plans.anyio_task_preserving import (
+    ANYIO_TASK_PRESERVING_BACKEND,
+    AnyioTaskPreservingExecutionPlanBackend,
+)
 from atoll.execution_plans.base import ExecutionPlanBackend
 from atoll.execution_plans.callback_backed import (
     CALLBACK_BACKED_BACKEND,
@@ -33,9 +37,11 @@ from atoll.execution_plans.task_preserving import (
 )
 
 __all__ = (
+    "ANYIO_TASK_PRESERVING_BACKEND",
     "CALLBACK_BACKED_BACKEND",
     "TASK_PRESERVING_BACKEND",
     "AnyioOnAsyncioDialect",
+    "AnyioTaskPreservingExecutionPlanBackend",
     "AsyncioDialect",
     "CallbackBackedExecutionPlanBackend",
     "ChangedPayloadFile",

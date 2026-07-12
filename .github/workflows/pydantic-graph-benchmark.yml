@@ -36,11 +36,11 @@ jobs:
           --workspace "$RUNNER_TEMP/pydantic-ai"
           --evidence-root "$RUNNER_TEMP/pydantic-graph-evidence"
 
-      - name: Upload cold and warm evidence
+      - name: Upload schema v4 benchmark evidence
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: pydantic-graph-hard-benchmark
+          name: pydantic-graph-hard-benchmark-schema-v4
           path: ${{ runner.temp }}/pydantic-graph-evidence
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30

@@ -10,11 +10,13 @@ the fallback.
 ```bash
 uv run atoll scan .
 uv run atoll compile your_package.hot_path
+uv run atoll compile --root /path/to/project
 ```
 
 Run these commands from the Python project you want to analyze, with Atoll installed in that
 project's environment. Scanning writes human-readable and JSON reports under `.atoll/`; compiling
-produces a platform wheel under `.atoll/dist/` while leaving the source checkout untouched.
+produces a wheel under `.atoll/dist/` while leaving the source checkout untouched. `--root ROOT`
+selects the target checkout; it does not change the compile contract or make source edits.
 
 ## Scan Python modules
 
@@ -62,6 +64,7 @@ source files.
 ```bash
 uv run atoll compile app.ranking
 uv run atoll compile
+uv run atoll compile --root /path/to/project
 ```
 
 The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
@@ -83,9 +86,12 @@ substitutions, and concrete type bindings.
 Compile report schema v4 includes profile coverage, exact scheduler spawn-site invocation evidence,
 candidate decisions, backend decisions, suspension plans, candidate trials, execution-plan
 candidates and trials, task-fusion research, and accepted or rejected variants. Execution plans are
-reported separately from native regions. Until a report lists a plan in `applied_execution_plans`
-with passing trial evidence, the plan is discovery evidence only and does not change runtime
-behavior. The schema retains the v2
+reported separately from mypyc and Cython typed regions. It lists discovered and rejected plans,
+`applied_execution_plans`, three-arm execution-plan trials, staging cache status, payload-file
+evidence, marginal speedup over the unplanned payload, and overall speedup over the interpreted
+baseline. Until a report lists a plan in `applied_execution_plans` with passing semantic and
+benchmark evidence, the plan is discovery evidence only and does not change runtime behavior. The
+schema retains the v2
 compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
 are legacy views and normally remain empty with zero counts. Region members also expose ordered
 call sites, runtime imports, and suspension points; dependency records state the invocation mode
@@ -199,13 +205,33 @@ If every profiled candidate is rejected, Atoll still records the final full-gate
 not publish a wheel with zero native regions.
 
 Profile-selected async execution plans are trialed only when both `test_command` and
-`benchmark_command` are configured. The task-preserving backend stages each candidate in a
-disposable copy of the accepted native payload, keeps one real scheduler task per logical work
-item, and leaves the original staged implementation as a guard-selected fallback. Atoll rejects
-unreported payload changes before running project code, runs the semantic command once, then uses
-one warmup and seven alternating benchmark pairs. A plan replaces the unplanned payload only when
-its marginal median speedup is at least `1.05x`; the configured full benchmark still controls final
-wheel promotion. Without both commands, plans remain report-only.
+`benchmark_command` are configured. Discovery is automatic for the built-in `asyncio` and
+AnyIO-on-asyncio dialects, and execution plans are evaluated independently of mypyc and Cython typed
+regions. Plan staging happens in a disposable copy of the accepted payload, keeps the original
+implementation as a guarded fallback, and validates every reported payload change before project
+code runs. Atoll runs the semantic command once, then uses one warmup and seven alternating
+benchmark trios across interpreted baseline, unplanned compiled payload, and planned payload. A
+plan replaces the unplanned payload only when its marginal median speedup is at least `1.05x` and
+its overall speedup satisfies the configured `minimum_speedup`; the configured full benchmark still
+controls final wheel promotion. Without both commands, plans remain report-only and the staged wheel
+keeps the native-region behavior it already had. A plan-only overlay that contains no native
+artifacts preserves the baseline wheel's pure tag, such as `py3-none-any`.
+
+For field-backed AnyIO rendezvous workflows, the task-preserving backend leaves the original
+`start_soon` calls, task factory, task objects, stream sends, and stream receives in place. It can
+skip cancellation only after a source-hashed worker has made a tail-position terminal handoff on
+the plan's private stream; nonterminal sends, sibling cancellation, changed stream topology,
+debugging, tracing, and monitoring retain the original path. A linked hot reducer may replace
+`len(inspect.signature(function).parameters)` with an exact code-object parameter count only for an
+unwrapped Python function under the original `inspect` implementation. Every other callable uses
+the original reflection expression. Cross-module plan members and their complete source hashes are
+recorded in schema v4.
+
+Execution-plan staging cache entries live under `.atoll/cache/execution-plans/`. A cache hit restores
+the planned payload files but does not skip semantic or profitability gates: profile collection,
+the semantic command, three-arm execution-plan trials, and the final benchmark still run before a
+plan can be applied. Atoll does not report speedup unless the configured gates pass; failed,
+unavailable, or unprofitable plan trials remain report evidence only.
 
 Schema v3 also records deterministic, report-only task-fusion plans for recognized `start_soon`,
 `create_task`, and `ensure_future` sites reachable from selected hot roots. A plan is eligible for
@@ -232,9 +258,9 @@ invalid measurements, or speedup below `minimum_speedup` remove the candidate wh
 in `.atoll/compile-report.*`; only this full gate promotes the wheel into `.atoll/dist`. Commands run
 from a temporary copy that retains project tests and benchmark files but removes importable checkout
 modules, so a flat-layout checkout cannot shadow the baseline or compiled payload. On verification
-or gate failure, Atoll keeps
-`.atoll/dist/install` and moves the rejected wheel under `.atoll/dist/build/diagnostics/` for
-inspection; no candidate remains in `.atoll/dist/*.whl`.
+or gate failure, Atoll removes the disposable build tree, install payload, and rejected wheel. The
+JSON and Markdown reports retain the command, verification, and performance evidence; no candidate
+remains in `.atoll/dist/*.whl`.
 
 Compiled functions and methods retain their source name, qualified name, documentation,
 annotations, signature, and sync, coroutine, generator, or async-generator shape. Async-generator
@@ -268,9 +294,9 @@ compilation report. If `--test` fails, Atoll leaves the generated build inputs i
 debugging and marks the report failed. The older hidden `atoll package` command remains available
 as a compatibility alias for source-clean typed-region artifacts.
 
-Source-clean build failures print a concise summary, write `.atoll/compile-report.*`, and list any
-retained diagnostic scratch path in the report. Run compile commands inside the target project's
-Python environment, since native backends use the active interpreter and installed dependencies.
+Source-clean build failures print a concise summary, write `.atoll/compile-report.*`, and remove
+temporary build and install roots. Run compile commands inside the target project's Python
+environment, since native backends use the active interpreter and installed dependencies.
 
 Lower-level commands remain available when you need to inspect or repair one step:
 

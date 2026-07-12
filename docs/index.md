@@ -29,14 +29,16 @@ blockers because mypyc changes Python frame semantics.
 ```bash
 uv run atoll compile app.ranking
 uv run atoll compile
+uv run atoll compile --root /path/to/project
 ```
 
 `compile` scans the target package, forms typed regions, asks the configured backends to assess
 each region automatically, compiles and caches supported variants, overlays staged routing code and
 region-owned native artifacts onto the project's normal PEP 517 wheel, verifies the result, and
 removes temporary artifacts by default. Pass a module name to limit the operation to one source
-module. The hidden `package` command uses the same source-clean typed-region pipeline. The original
-source files are left untouched.
+module. `--root ROOT` selects the target checkout without changing the compile contract. The hidden
+`package` command uses the same source-clean typed-region pipeline. The original source files are
+left untouched.
 
 The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
@@ -55,9 +57,12 @@ declaration and list specialization origins, substitutions, and concrete type bi
 Compile report schema v4 includes profile coverage, exact scheduler spawn-site invocation evidence,
 candidate decisions, backend decisions, suspension plans, candidate trials, execution-plan
 candidates and trials, task-fusion research, and accepted or rejected variants. Execution plans are
-reported separately from native regions. Unless `applied_execution_plans` lists a plan with passing
-trial evidence, it is discovery evidence only and does not change runtime behavior. The schema
-retains the v2
+reported separately from mypyc and Cython typed regions. It lists discovered and rejected plans,
+`applied_execution_plans`, three-arm execution-plan trials, staging cache status, payload-file
+evidence, marginal speedup over the unplanned payload, and overall speedup over the interpreted
+baseline. Unless `applied_execution_plans` lists a plan with passing semantic and benchmark
+evidence, it is discovery evidence only and does not change runtime behavior. The schema retains the
+v2
 compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
 are legacy views and normally remain empty with zero counts. Region members expose ordered call
 sites, runtime imports, and suspension points, while dependency records identify invocation mode
@@ -166,14 +171,35 @@ hot coverage, accepted hot coverage, lowering mode, fallback reason, and margina
 When every profiled candidate is rejected, Atoll records the final full-gate evidence but does not
 publish a wheel containing no native regions.
 
-Profile-selected async execution plans are trialed only when both semantic and benchmark commands
-are configured. The task-preserving backend works in a disposable copy of the accepted native
-payload, keeps one real scheduler task per logical item, and preserves the staged source path as a
-guarded fallback. Atoll verifies that every payload change was reported before project code runs,
-executes the semantic command once, then compares one warmup and seven alternating timing pairs.
-The planned payload must be at least `1.05x` faster than the unplanned payload and must still pass
-the configured full benchmark before its wheel is promoted. Otherwise the plan remains report-only
-or is recorded as rejected without discarding an accepted native wheel.
+Profile-selected async execution plans are trialed only when both `test_command` and
+`benchmark_command` are configured. Discovery is automatic for the built-in `asyncio` and
+AnyIO-on-asyncio dialects, and execution plans are evaluated independently of mypyc and Cython typed
+regions. Plan staging works in a disposable copy of the accepted payload, keeps the original
+implementation as a guarded fallback, and verifies every reported payload change before project
+code runs. Atoll executes the semantic command once, then compares one warmup and seven alternating
+benchmark trios across interpreted baseline, unplanned compiled payload, and planned payload. The
+planned payload must be at least `1.05x` faster than the unplanned payload and its overall speedup
+must satisfy the configured `minimum_speedup`; the configured full benchmark still controls final
+wheel promotion. Otherwise the plan remains report-only or is recorded as rejected without
+discarding an accepted native wheel. Without both commands, plans remain report-only and native
+behavior remains unchanged. A plan-only overlay that contains no native artifacts preserves the
+baseline wheel's pure tag, such as `py3-none-any`.
+
+For field-backed AnyIO rendezvous workflows, the task-preserving backend leaves the original
+`start_soon` calls, task factory, task objects, stream sends, and stream receives in place. It can
+skip cancellation only after a source-hashed worker has made a tail-position terminal handoff on
+the plan's private stream; nonterminal sends, sibling cancellation, changed stream topology,
+debugging, tracing, and monitoring retain the original path. A linked hot reducer may replace
+`len(inspect.signature(function).parameters)` with an exact code-object parameter count only for an
+unwrapped Python function under the original `inspect` implementation. Every other callable uses
+the original reflection expression. Cross-module plan members and their complete source hashes are
+recorded in schema v4.
+
+Execution-plan staging cache entries live under `.atoll/cache/execution-plans/`. A cache hit restores
+the planned payload files but does not skip semantic or profitability gates: profile collection,
+the semantic command, three-arm execution-plan trials, and the final benchmark still run before a
+plan can be applied. Atoll does not report speedup unless the configured gates pass; failed,
+unavailable, or unprofitable plan trials remain report evidence only.
 
 Atoll also emits deterministic report-only task-fusion plans for recognized `start_soon`,
 `create_task`, and `ensure_future` sites reachable from selected hot roots. A plan cannot proceed
@@ -197,9 +223,10 @@ pairs. Medians below 0.25 seconds are too noisy. Test failure, invalid timing, o
 threshold removes the candidate wheel; the JSON and Markdown reports retain the command evidence and
 decision. The wheel remains under temporary build storage until this full gate passes. Commands run
 from a temporary project copy that retains tests and benchmark files but removes importable checkout
-modules, preventing flat-layout source from shadowing either payload. Verification and gate failures keep
-`.atoll/dist/install` and move the rejected wheel under `.atoll/dist/build/diagnostics/`; no failed
-candidate remains in the normal wheel output directory.
+modules, preventing flat-layout source from shadowing either payload. Verification and gate failures
+remove the disposable build tree, install payload, and rejected wheel while retaining command and
+decision evidence in the compile reports; no failed candidate remains in the normal wheel output
+directory.
 
 Compiled functions and methods retain their source name, qualified name, documentation, annotations,
 signature, and sync, coroutine, generator, or async-generator shape. Async-generator wrappers
@@ -208,10 +235,9 @@ descriptors on the original source class. Atomic classes preserve their public m
 name, documentation, annotations, constructor signature, bases, subclass behavior, and pickle
 identity. `ATOLL_DISABLE=1` keeps interpreted routing, while `ATOLL_REQUIRE_COMPILED=1` checks only
 promised bindings.
-Source-clean build failures keep terminal output short, write `.atoll/compile-report.*`, and list
-any retained diagnostic scratch path in the report. Run compile commands inside the target
-project's Python environment because native backends use the active interpreter and installed
-dependencies.
+Source-clean build failures keep terminal output short, write `.atoll/compile-report.*`, and remove
+temporary build and install roots. Run compile commands inside the target project's Python
+environment because native backends use the active interpreter and installed dependencies.
 
 ## In-Place Compile
 

@@ -353,7 +353,7 @@ def add_one(value: int) -> int:
 
 
 def test_compile_rejects_wheel_after_real_semantic_gate_failure(tmp_path: Path) -> None:
-    """A nonzero configured command retains diagnostics but exposes no candidate wheel."""
+    """A nonzero configured command reports failure and removes candidate scratch."""
     project_root = tmp_path / "failed_gate_project"
     shutil.copytree(FIXTURE_ROOT, project_root)
     pyproject = project_root / "pyproject.toml"
@@ -379,10 +379,11 @@ def test_compile_rejects_wheel_after_real_semantic_gate_failure(tmp_path: Path) 
     assert report["success"] is False
     assert report["test_results"][0]["returncode"] == GATE_FAILURE_CODE
     assert report["performance"]["status"] == "invalid"
-    assert report["cleanup"]["kept"] == [".atoll/dist/build", ".atoll/dist/install"]
+    assert report["cleanup"]["removed"] == [".atoll/dist/build", ".atoll/dist/install"]
+    assert report["cleanup"]["kept"] == []
     assert not tuple(output_dir.glob("*.whl"))
-    assert tuple((output_dir / "build" / "diagnostics").glob("*.whl"))
-    assert (output_dir / "install").exists()
+    assert not (output_dir / "build").exists()
+    assert not (output_dir / "install").exists()
 
 
 def test_compile_reports_backend_wheel_omission_without_traceback(
@@ -411,8 +412,8 @@ def test_compile_reports_backend_wheel_omission_without_traceback(
     assert "target PEP 517 wheel omitted" in report["build"]["stderr"]
     assert "Traceback" not in captured.err
     assert not tuple((project_root / ".atoll" / "dist").glob("*.whl"))
-    assert (project_root / ".atoll" / "dist" / "build").exists()
-    assert (project_root / ".atoll" / "dist" / "install").exists()
+    assert not (project_root / ".atoll" / "dist" / "build").exists()
+    assert not (project_root / ".atoll" / "dist" / "install").exists()
 
 
 def test_compile_rejects_invalid_compile_config_without_traceback(

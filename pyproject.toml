@@ -19,6 +19,7 @@ atoll = "atoll.cli:main"
 
 [dependency-groups]
 dev = [
+    "anyio>=4.10.0",
     "scaffold-guard>=0.1.3",
     "mkdocs>=1.6.0",
     "mkdocs-material>=9.6.0",
@@ -124,6 +125,7 @@ addopts = [
 [tool.coverage.run]
 branch = true
 source = ["atoll"]
+patch = ["subprocess"]
 
 [tool.coverage.report]
 fail_under = 95
