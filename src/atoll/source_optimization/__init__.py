@@ -22,8 +22,18 @@ from atoll.source_optimization.models import (
     TransformationStep,
     stable_source_optimization_plan_id,
 )
+from atoll.source_optimization.transforms import (
+    DeclarationKind,
+    GeneratedSourcePatch,
+    SourceTransformationRequest,
+    TransformedSourceFile,
+    build_source_transformation_patch,
+    materialize_transformed_files,
+)
 
 __all__ = (
+    "DeclarationKind",
+    "GeneratedSourcePatch",
     "SourceAccessKind",
     "SourceAccessSite",
     "SourceCallableEvidence",
@@ -39,7 +49,11 @@ __all__ = (
     "SourceOptimizationTrial",
     "SourceOptimizationTrialStatus",
     "SourceTransformationKind",
+    "SourceTransformationRequest",
     "TransformationStep",
+    "TransformedSourceFile",
     "build_source_optimization_plans",
+    "build_source_transformation_patch",
+    "materialize_transformed_files",
     "stable_source_optimization_plan_id",
 )

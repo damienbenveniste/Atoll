@@ -8,6 +8,7 @@ license = "Apache-2.0"
 dependencies = [
     "build>=1.2",
     "Cython>=3.1",
+    "libcst>=1.8",
     "mypy>=1.17.0",
     "packaging>=24",
     "setuptools>=69",
@@ -99,6 +100,7 @@ convention = "google"
 "scripts/run_pydantic_graph_ceiling_experiment.py" = ["S603"]
 "scripts/run_pydantic_graph_benchmark.py" = ["S603"]
 "tests/**/*.py" = ["D", "S101"]
+"tests/unit/test_source_optimization_transforms.py" = ["S603"]
 
 
 
