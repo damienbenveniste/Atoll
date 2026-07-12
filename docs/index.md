@@ -160,6 +160,12 @@ sources unchanged and writes an accepted patch to `.atoll/patches/<candidate-id>
 patch cache entries live under `.atoll/cache/source-optimization/`; failed candidates never emit a
 reviewable patch.
 
+Accepted source optimization remains available as the fallback baseline for later stages. Atoll
+recreates the patch under disposable build storage, rescans it, and can layer profitable native
+regions or execution plans onto the transformed wheel. If a later stage fails semantics or its
+performance gate, the accepted source-only wheel survives; the transformed project copy is always
+removed with build scratch.
+
 ```bash
 uv run atoll compile --root . --apply-source
 ```

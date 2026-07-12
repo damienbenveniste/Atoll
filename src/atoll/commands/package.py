@@ -6,6 +6,7 @@ import ast
 import hashlib
 import re
 import shutil
+import tempfile
 import textwrap
 import time
 import tomllib
@@ -138,6 +139,7 @@ from atoll.source_optimization import (
     SourceOptimizationPlanningResult,
     SourceOptimizationTrial,
     build_source_optimization_plans,
+    materialize_transformed_files,
     validate_source_application_root,
 )
 from atoll.source_optimization.search import (
@@ -554,6 +556,30 @@ class _BaselineWheelPayload:
     baseline_install_root: Path | None = None
     quality_project_root: Path | None = None
     semantic_test_result: CommandRunEvidence | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizationArm:
+    """One accepted source or native composition available to later stages.
+
+    The active project may be a disposable transformed copy, while
+    ``report_project`` always identifies the immutable checkout shown in user
+    reports. ``baseline`` is the accepted wheel/payload that the next stage
+    must improve; a failed later stage returns to that baseline rather than
+    invalidating earlier profitable work.
+
+    Attributes:
+        report_project: Original discovered checkout used for public paths.
+        active_project: Source tree scanned and compiled by the next stage.
+        baseline: Accepted wheel and unpacked payload for marginal trials.
+        source_search: Accepted source-optimization evidence, when this arm
+            materializes a transformed project.
+    """
+
+    report_project: DiscoveredProject
+    active_project: DiscoveredProject
+    baseline: _BaselineWheelPayload
+    source_search: SourceOptimizationSearchResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1041,7 +1067,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         execution_plans=execution_plans,
         fusion_plans=fusion_plans,
     )
-    source_terminal = _source_optimization_terminal_result(
+    source_terminal = _source_optimization_continuation_result(
         options=options,
         project=project,
         preparation=preparation,
@@ -1186,7 +1212,7 @@ def _source_optimization_terminal_result(
     planning: SourceOptimizationPlanningResult,
     search: SourceOptimizationSearchResult | None,
 ) -> PackageCommandResult | None:
-    """Return an accepted source wheel or explicit apply failure when terminal.
+    """Return only source-application failures that must stop composition.
 
     Args:
         options: Public package and source-application options.
@@ -1196,19 +1222,13 @@ def _source_optimization_terminal_result(
         search: Search result, or `None` when source trials were not configured.
 
     Returns:
-        PackageCommandResult | None: Terminal source result, or `None` to continue
-        through native and execution-plan packaging.
+        PackageCommandResult | None: Explicit source-application failure, or
+            `None` to continue through source/native composition.
     """
     if search is None:
         return None
     if search.accepted:
-        return _source_optimization_package_result(
-            options=options,
-            project=project,
-            preparation=preparation,
-            planning=planning,
-            search=search,
-        )
+        return None
     if search.error is None and not options.apply_source:
         return None
     error = search.error or "no source patch met the required 3.0x promotion floor"
@@ -1218,6 +1238,367 @@ def _source_optimization_terminal_result(
         preparation=preparation,
         planning=planning,
         search=replace(search, error=error),
+    )
+
+
+def _source_optimization_continuation_result(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    preparation: _ProfilePreparation,
+    planning: SourceOptimizationPlanningResult,
+    search: SourceOptimizationSearchResult | None,
+) -> PackageCommandResult | None:
+    """Return a source failure or execute an accepted composable source arm.
+
+    Args:
+        options: Original package options.
+        project: Immutable checkout discovery.
+        preparation: Baseline profile and semantic evidence.
+        planning: Source plans and assessments.
+        search: Optional source-search outcome.
+
+    Returns:
+        PackageCommandResult | None: Terminal failure, composed result, or
+            `None` when native packaging should continue normally.
+    """
+    terminal = _source_optimization_terminal_result(
+        options=options,
+        project=project,
+        preparation=preparation,
+        planning=planning,
+        search=search,
+    )
+    if terminal is not None:
+        return terminal
+    if search is None or not search.accepted:
+        return None
+    return _execute_composed_source_arm(
+        options=options,
+        project=project,
+        preparation=preparation,
+        planning=planning,
+        search=search,
+    )
+
+
+def _execute_composed_source_arm(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    preparation: _ProfilePreparation,
+    planning: SourceOptimizationPlanningResult,
+    search: SourceOptimizationSearchResult,
+) -> PackageCommandResult:
+    """Continue an accepted source transform through native and plan stages.
+
+    The accepted source wheel remains the fallback arm. The transformed project
+    is recreated under disposable build storage, rescanned, and offered to the
+    existing native/execution-plan pipeline. Any later rejection restores and
+    returns the already profitable source wheel.
+
+    Args:
+        options: Original source-clean package options.
+        project: Immutable checkout discovery shown in public reports.
+        preparation: Baseline profile and semantic evidence.
+        planning: Source plans whose accepted trial produced `search`.
+        search: Accepted source search with wheel and materialization evidence.
+
+    Returns:
+        PackageCommandResult: The composed wheel when profitable, otherwise the
+            accepted source-only wheel augmented with rejected-stage evidence.
+    """
+    if search.wheel_path is None or search.materialization_patch is None:
+        return _source_optimization_package_result(
+            options=options,
+            project=project,
+            preparation=preparation,
+            planning=planning,
+            search=search,
+        )
+    try:
+        arm = _materialize_source_optimization_arm(
+            options=options,
+            project=project,
+            preparation=preparation,
+            search=search,
+        )
+    except (OSError, ValueError, WheelOverlayError, zipfile.BadZipFile) as error:
+        _progress(options.progress, f"source composition skipped: {error}")
+        source_result = _source_optimization_package_result(
+            options=options,
+            project=project,
+            preparation=preparation,
+            planning=planning,
+            search=search,
+        )
+        return replace(
+            source_result,
+            build=_append_phase_timing(
+                source_result.build,
+                name="source_composition",
+                duration_seconds=0.0,
+                detail=f"fallback retained: {error}",
+            ),
+        )
+
+    active_scans = _selected_scans(
+        arm.active_project,
+        options.module_name,
+        options.selected_members,
+    )
+    active_profile = preparation.profile
+    if active_profile is not None:
+        active_profile = select_profile_candidates(
+            active_profile,
+            tuple(symbol for scan in active_scans for symbol in scan.symbols),
+        )
+    active_execution_plans = build_execution_plans(active_scans, active_profile)
+    active_fusion_plans = (
+        build_fusion_plans(active_scans, active_profile) if active_profile is not None else ()
+    )
+    typed_regions = tuple(region for scan in active_scans for region in scan.typed_regions)
+    profile_members = (
+        active_profile.selected_symbols
+        if active_profile is not None and active_profile.status == "profiled"
+        else ()
+    )
+    selection_members = options.selected_members or profile_members
+    selected = _selected_typed_regions(
+        active_scans,
+        arm.active_project.config.compile.backends,
+        selection_members,
+        hot_members=profile_members,
+    )
+    selected_plans = tuple(
+        plan for plan in active_execution_plans if isinstance(plan, ExecutionPlan)
+    )
+    _progress(
+        options.progress,
+        (
+            f"rescanned accepted source arm: {len(active_scans)} module(s), "
+            f"{len(selected)} native variant(s), {len(selected_plans)} execution plan(s)"
+        ),
+    )
+    if not selected and not selected_plans:
+        return _source_optimization_package_result(
+            options=options,
+            project=project,
+            preparation=preparation,
+            planning=planning,
+            search=search,
+        )
+
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    composed_options = replace(
+        options,
+        output_dir=output_dir,
+        cache_dir=options.cache_dir or project.config.cache_dir,
+        apply_source=False,
+    )
+    with tempfile.TemporaryDirectory(prefix="atoll-source-arm-") as backup_dir_text:
+        backup_path = Path(backup_dir_text) / search.wheel_path.name
+        shutil.copy2(search.wheel_path, backup_path)
+        if selected:
+            candidate = _execute_typed_region_package(
+                options=composed_options,
+                project=arm.active_project,
+                context=_TypedRegionPackageContext(
+                    selected=selected,
+                    typed_regions=typed_regions,
+                    preflight_skipped=(),
+                    native_readiness=(),
+                    execution_plans=active_execution_plans,
+                    fusion_plans=active_fusion_plans,
+                ),
+                prepared_baseline=arm.baseline,
+                profile=active_profile,
+            )
+        else:
+            candidate = _execute_execution_plan_only_package(
+                _ExecutionPlanOnlyContext(
+                    options=composed_options,
+                    project=arm.active_project,
+                    typed_regions=typed_regions,
+                    execution_plans=active_execution_plans,
+                    prepared_baseline=arm.baseline,
+                    profile=active_profile,
+                )
+            )
+        if candidate.success:
+            if search.wheel_path != candidate.wheel_path and search.wheel_path.exists():
+                search.wheel_path.unlink()
+            rebased = _rebase_composed_result(candidate, project)
+            return _with_source_optimization(
+                replace(
+                    rebased,
+                    test_results=(*search.test_results, *rebased.test_results),
+                ),
+                planning,
+                search.trials,
+            )
+
+        search.wheel_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(backup_path, search.wheel_path)
+        _progress(options.progress, "later optimization rejected; retained accepted source wheel")
+        source_result = _source_optimization_package_result(
+            options=options,
+            project=project,
+            preparation=preparation,
+            planning=planning,
+            search=search,
+        )
+        return _source_result_with_composition_fallback(source_result, candidate, project)
+
+
+def _materialize_source_optimization_arm(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    preparation: _ProfilePreparation,
+    search: SourceOptimizationSearchResult,
+) -> OptimizationArm:
+    """Recreate accepted transformed sources and unpack their wheel baseline.
+
+    Args:
+        options: Original package options and output override.
+        project: Immutable project checkout used to form the accepted patch.
+        preparation: Original baseline and quality-project evidence.
+        search: Accepted source search with wheel and generated patch payload.
+
+    Returns:
+        OptimizationArm: Disposable transformed project plus accepted baseline.
+
+    Raises:
+        ValueError: If accepted source evidence is incomplete.
+        OSError: If project materialization or wheel staging fails.
+        WheelOverlayError: If the accepted source wheel cannot be unpacked.
+    """
+    if search.wheel_path is None or search.materialization_patch is None:
+        raise ValueError("accepted source arm lacks wheel or materialization evidence")
+    original_baseline = preparation.baseline
+    if original_baseline is None:
+        raise ValueError("accepted source arm lacks original baseline evidence")
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    build_root = output_dir / "build"
+    transformed_root = build_root / "accepted-source-project"
+    shutil.rmtree(transformed_root, ignore_errors=True)
+    _copy_pep517_project(
+        project.config.root,
+        transformed_root,
+        excluded_output=output_dir,
+    )
+    materialize_transformed_files(
+        project.config.root,
+        transformed_root,
+        search.materialization_patch,
+    )
+    active_project = discover_project(transformed_root)
+
+    install_root = output_dir / "install"
+    _reset_dir(install_root)
+    unpack_wheel_payload(search.wheel_path, install_root)
+    baseline_install_root = build_root / "accepted-source-baseline"
+    _reset_dir(baseline_install_root)
+    _copytree_contents(install_root, baseline_install_root)
+    baseline = _BaselineWheelPayload(
+        wheel_path=search.wheel_path,
+        build=search.build,
+        baseline_install_root=baseline_install_root,
+        quality_project_root=original_baseline.quality_project_root,
+        semantic_test_result=original_baseline.semantic_test_result,
+    )
+    return OptimizationArm(
+        report_project=project,
+        active_project=active_project,
+        baseline=baseline,
+        source_search=search,
+    )
+
+
+def _rebase_composed_result(
+    result: PackageCommandResult,
+    report_project: DiscoveredProject,
+) -> PackageCommandResult:
+    """Replace disposable module paths with immutable checkout identities.
+
+    Args:
+        result: Successful result produced from a transformed project copy.
+        report_project: Original project whose paths belong in reports.
+
+    Returns:
+        PackageCommandResult: Result with typed-region source paths rebased.
+    """
+    modules = {module.name: module for module in report_project.modules}
+
+    def rebase_region(region: TypedRegion) -> TypedRegion:
+        module = modules.get(region.source_module.name)
+        return replace(region, source_module=module) if module is not None else region
+
+    return replace(
+        result,
+        project_root=report_project.config.root,
+        typed_regions=tuple(rebase_region(region) for region in result.typed_regions),
+        compiled_regions=tuple(rebase_region(region) for region in result.compiled_regions),
+        compiled_variants=tuple(
+            replace(variant, region=rebase_region(variant.region))
+            for variant in result.compiled_variants
+        ),
+        region_skipped=tuple(
+            replace(failure, region=rebase_region(failure.region))
+            for failure in result.region_skipped
+        ),
+    )
+
+
+def _source_result_with_composition_fallback(
+    source_result: PackageCommandResult,
+    rejected: PackageCommandResult,
+    report_project: DiscoveredProject,
+) -> PackageCommandResult:
+    """Attach rejected later-stage evidence to a successful source fallback.
+
+    Args:
+        source_result: Accepted source-only result retained for promotion.
+        rejected: Native or execution-plan result that failed later gates.
+        report_project: Original project used to rebase transformed paths.
+
+    Returns:
+        PackageCommandResult: Successful source result with auditable rejection evidence.
+    """
+    rebased = _rebase_composed_result(rejected, report_project)
+    rejected_detail = rejected.error or rejected.build.stderr or "later stage rejected"
+    build = replace(
+        source_result.build,
+        stdout="\n".join(
+            part
+            for part in (
+                source_result.build.stdout,
+                f"composition fallback retained: {rejected_detail}",
+                rejected.build.stdout,
+            )
+            if part
+        ),
+        duration_seconds=(source_result.build.duration_seconds + rejected.build.duration_seconds),
+        phase_timings=(*source_result.build.phase_timings, *rejected.build.phase_timings),
+    )
+    return replace(
+        source_result,
+        build=build,
+        typed_regions=rebased.typed_regions,
+        compiled_regions=rebased.compiled_regions,
+        compiled_bindings=rebased.compiled_bindings,
+        compiled_variants=rebased.compiled_variants,
+        backend_assessments=rebased.backend_assessments,
+        artifact_records=rebased.artifact_records,
+        region_skipped=rebased.region_skipped,
+        candidate_trials=rebased.candidate_trials,
+        execution_plans=rebased.execution_plans,
+        applied_execution_plans=rebased.applied_execution_plans,
+        execution_plan_trials=rebased.execution_plan_trials,
+        fusion_plans=rebased.fusion_plans,
+        fusion_trials=rebased.fusion_trials,
+        test_results=(*source_result.test_results, *rebased.test_results),
     )
 
 

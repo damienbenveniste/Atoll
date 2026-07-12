@@ -160,11 +160,18 @@ def test_search_promotes_only_source_and_wheel_results_above_three_x(
         assert result.patch_path.is_file()
         assert result.wheel_path is not None
         assert result.wheel_path.is_file()
+        assert result.materialization_patch is not None
+        assert result.materialization_patch.patch_text == result.patch_path.read_text(
+            encoding="utf-8"
+        )
+        assert tuple(file.path for file in result.materialization_patch.files) == (SOURCE_PATH,)
+        assert result.materialization_patch.files[0].after_source != source_before.decode()
         assert result.performance is not None
         assert result.performance.speedup == pytest.approx(8.0)
     else:
         assert result.patch_path is None
         assert result.wheel_path is None
+        assert result.materialization_patch is None
         assert not (project_root / ".atoll" / "patches").exists()
 
 
@@ -330,6 +337,7 @@ def test_failed_source_application_never_promotes_custom_output_wheel(
     assert result.wheel_path is None
     assert result.patch_path is not None
     assert result.patch_path.is_file()
+    assert result.materialization_patch is None
     assert result.error == "forced rollback"
     assert not output_dir.exists()
     assert (project_root / SOURCE_PATH).read_bytes() == source_before
@@ -356,8 +364,10 @@ def test_unconfigured_search_is_not_attempted_and_apply_reports_preflight(
 
     assert skipped.attempted is False
     assert skipped.accepted is False
+    assert skipped.materialization_patch is None
     assert skipped.error is None
     assert apply_skipped.attempted is False
+    assert apply_skipped.materialization_patch is None
     assert (
         apply_skipped.error
         == "--apply-source requires configured test_command and benchmark_command"

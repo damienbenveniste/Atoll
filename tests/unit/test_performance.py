@@ -180,6 +180,39 @@ def test_run_performance_command_requires_source_optimization_without_parent_mut
     assert os.environ["ATOLL_REQUIRE_OPTIMIZED"] == "parent-optimized"
 
 
+def test_run_performance_command_enables_source_without_regions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source activation does not require a compiled-region allowlist."""
+    captured_env: dict[str, str] = {}
+    monkeypatch.setenv("ATOLL_DISABLE", "parent-disable")
+    monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "parent-compiled")
+    monkeypatch.setenv("ATOLL_REGION_ALLOWLIST", "parent-region")
+    monkeypatch.setattr(performance, "_perf_counter", _clock([0.5]))
+
+    def fake_run(
+        invocation: SubprocessInvocationView,
+    ) -> subprocess.CompletedProcess[str]:
+        captured_env.update(invocation.env)
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(performance, "_run_subprocess", fake_run)
+
+    run_performance_command(
+        ("python", "bench.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path / "payload",
+        mode="baseline",
+        require_optimized=True,
+    )
+
+    assert captured_env["ATOLL_REQUIRE_OPTIMIZED"] == "1"
+    assert "ATOLL_REGION_ALLOWLIST" not in captured_env
+    assert "ATOLL_REQUIRE_COMPILED" not in captured_env
+    assert "ATOLL_DISABLE" not in captured_env
+
+
 def test_run_performance_command_transports_empty_region_allowlist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -209,6 +242,7 @@ def test_run_performance_command_transports_empty_region_allowlist(
     assert "ATOLL_DISABLE" not in captured_env
     assert captured_env["ATOLL_REQUIRE_COMPILED"] == "1"
     assert captured_env["ATOLL_REGION_ALLOWLIST"] == ""
+    assert "ATOLL_REQUIRE_OPTIMIZED" not in captured_env
 
 
 def test_baseline_command_sets_disable_and_clears_require_compiled(
@@ -238,6 +272,45 @@ def test_baseline_command_sets_disable_and_clears_require_compiled(
     assert captured_env["ATOLL_DISABLE"] == "1"
     assert "ATOLL_REQUIRE_COMPILED" not in captured_env
     assert "ATOLL_REQUIRE_OPTIMIZED" not in captured_env
+
+
+def test_run_performance_command_preserves_baseline_compiled_compatibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal baseline and compiled modes keep their legacy environment flags."""
+    captured_envs: list[dict[str, str]] = []
+    monkeypatch.setenv("ATOLL_DISABLE", "parent-disable")
+    monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "parent-compiled")
+    monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "parent-optimized")
+    monkeypatch.setenv("ATOLL_REGION_ALLOWLIST", "parent-region")
+    monkeypatch.setattr(performance, "_perf_counter", _clock([0.5, 0.5]))
+
+    def fake_run(
+        invocation: SubprocessInvocationView,
+    ) -> subprocess.CompletedProcess[str]:
+        captured_envs.append(dict(invocation.env))
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(performance, "_run_subprocess", fake_run)
+
+    for mode in ("baseline", "compiled"):
+        run_performance_command(
+            ("python", "bench.py"),
+            project_root=tmp_path,
+            payload_root=tmp_path / "payload",
+            mode=mode,
+        )
+
+    baseline_env, compiled_env = captured_envs
+    assert baseline_env["ATOLL_DISABLE"] == "1"
+    assert "ATOLL_REQUIRE_COMPILED" not in baseline_env
+    assert "ATOLL_REQUIRE_OPTIMIZED" not in baseline_env
+    assert "ATOLL_REGION_ALLOWLIST" not in baseline_env
+    assert "ATOLL_DISABLE" not in compiled_env
+    assert compiled_env["ATOLL_REQUIRE_COMPILED"] == "1"
+    assert "ATOLL_REQUIRE_OPTIMIZED" not in compiled_env
+    assert "ATOLL_REGION_ALLOWLIST" not in compiled_env
 
 
 def test_benchmark_gate_passes_distinct_region_allowlists_to_each_side(

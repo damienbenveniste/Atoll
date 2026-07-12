@@ -197,6 +197,61 @@ class _PerformanceCommandOptions(TypedDict, total=False):
 
 
 @dataclass(frozen=True, slots=True)
+class _RuntimeActivation:
+    """Resolved Atoll runtime switches for one child process.
+
+    The transport mode and source optimization requirement are intentionally
+    independent. A compiled-region allowlist always selects compiled transport,
+    but source optimization can be required with or without a region allowlist.
+
+    Attributes:
+        mode: Caller-visible runtime mode recorded in command evidence.
+        compiled_region_allowlist: Region IDs enabled for compiled transport, or
+            `None` when the child should not receive an allowlist.
+        source_optimization_required: Whether the child must use generated source
+            optimization instead of silently falling back.
+    """
+
+    mode: RuntimeMode
+    compiled_region_allowlist: frozenset[str] | None
+    source_optimization_required: bool
+
+    @property
+    def uses_compiled_transport(self) -> bool:
+        """Return whether the child should exercise compiled runtime routing.
+
+        Returns:
+            bool: Whether compiled transport is required by either the runtime
+                mode or the presence of an explicit region allowlist.
+        """
+        return self.mode == "compiled" or self.compiled_region_allowlist is not None
+
+    @classmethod
+    def from_command_options(
+        cls,
+        *,
+        mode: RuntimeMode,
+        region_allowlist: frozenset[str] | None,
+        require_optimized: bool,
+    ) -> _RuntimeActivation:
+        """Create an immutable activation from legacy command options.
+
+        Args:
+            mode: Baseline or compiled mode requested by the existing caller.
+            region_allowlist: Optional compiled-region allowlist for the child.
+            require_optimized: Whether generated source optimization is required.
+
+        Returns:
+            _RuntimeActivation: Resolved runtime switches for environment assembly.
+        """
+        return cls(
+            mode=mode,
+            compiled_region_allowlist=region_allowlist,
+            source_optimization_required=require_optimized,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _BenchmarkExecutionContext:
     command: tuple[str, ...]
     project_root: Path
@@ -245,9 +300,11 @@ def run_performance_command(
     require_optimized = options.get("require_optimized", False)
     child_env = _runtime_environment(
         payload_root=resolved_payload_root,
-        mode=mode,
-        region_allowlist=region_allowlist,
-        require_optimized=require_optimized,
+        activation=_RuntimeActivation.from_command_options(
+            mode=mode,
+            region_allowlist=region_allowlist,
+            require_optimized=require_optimized,
+        ),
     )
     started = _perf_counter()
     completed = _run_subprocess(
@@ -419,9 +476,7 @@ def _reject_unexpected_benchmark_options(options: _BenchmarkGateOptions) -> None
 def _runtime_environment(
     *,
     payload_root: Path,
-    mode: RuntimeMode,
-    region_allowlist: frozenset[str] | None,
-    require_optimized: bool,
+    activation: _RuntimeActivation,
 ) -> dict[str, str]:
     child_env = dict(os.environ)
     child_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -431,17 +486,19 @@ def _runtime_environment(
     child_env["PYTHONPATH"] = os.pathsep.join((str(payload_root), *existing_pythonpath))
     child_env.pop("ATOLL_REGION_ALLOWLIST", None)
     child_env.pop("ATOLL_REQUIRE_OPTIMIZED", None)
-    if region_allowlist is not None:
+    if activation.uses_compiled_transport:
         child_env.pop("ATOLL_DISABLE", None)
         child_env["ATOLL_REQUIRE_COMPILED"] = "1"
-        child_env["ATOLL_REGION_ALLOWLIST"] = "\n".join(sorted(region_allowlist))
-    elif mode == "baseline":
+        if activation.compiled_region_allowlist is not None:
+            child_env["ATOLL_REGION_ALLOWLIST"] = "\n".join(
+                sorted(activation.compiled_region_allowlist)
+            )
+    elif activation.mode == "baseline":
         child_env["ATOLL_DISABLE"] = "1"
         child_env.pop("ATOLL_REQUIRE_COMPILED", None)
     else:
-        child_env.pop("ATOLL_DISABLE", None)
-        child_env["ATOLL_REQUIRE_COMPILED"] = "1"
-    if require_optimized:
+        raise AssertionError(f"unhandled runtime activation mode: {activation.mode}")
+    if activation.source_optimization_required:
         child_env.pop("ATOLL_DISABLE", None)
         child_env["ATOLL_REQUIRE_OPTIMIZED"] = "1"
     return child_env

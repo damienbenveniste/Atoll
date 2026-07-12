@@ -9,7 +9,7 @@ import shutil
 import zipfile
 from collections.abc import Callable
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
 
 import pytest
@@ -67,9 +67,14 @@ from atoll.runtime.profiling import (
     ProfileResult,
     unconfigured_profile,
 )
+from atoll.source_optimization.analysis import SourceOptimizationPlanningResult
 from atoll.source_optimization.search import (
     SourceOptimizationSearchOptions,
     SourceOptimizationSearchResult,
+)
+from atoll.source_optimization.transforms import (
+    GeneratedSourcePatch,
+    TransformedSourceFile,
 )
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
@@ -120,6 +125,16 @@ class _BaselinePayloadFactory(Protocol):
         quality_project_root: Path | None = None,
         semantic_test_result: CommandRunEvidence | None = None,
     ) -> object: ...
+
+
+class _BaselinePayloadView(Protocol):
+    baseline_install_root: Path | None
+
+
+class _OptimizationArmView(Protocol):
+    active_project: DiscoveredProject
+    baseline: _BaselinePayloadView
+    source_search: SourceOptimizationSearchResult | None
 
 
 class _QualityGateOutcomeView(Protocol):
@@ -367,6 +382,26 @@ _BaselineWheelPayload = cast(
     _package_attr("_BaselineWheelPayload"),
 )
 _ProfilePreparation = cast(Callable[..., object], _package_attr("_ProfilePreparation"))
+_OptimizationArm = cast(Callable[..., object], _package_attr("OptimizationArm"))
+_execute_composed_source_arm = cast(
+    Callable[..., package_command.PackageCommandResult],
+    _package_attr("_execute_composed_source_arm"),
+)
+_materialize_source_optimization_arm = cast(
+    Callable[..., object],
+    _package_attr("_materialize_source_optimization_arm"),
+)
+_source_result_with_composition_fallback = cast(
+    Callable[
+        [
+            package_command.PackageCommandResult,
+            package_command.PackageCommandResult,
+            DiscoveredProject,
+        ],
+        package_command.PackageCommandResult,
+    ],
+    _package_attr("_source_result_with_composition_fallback"),
+)
 _run_configured_quality_gate = cast(
     Callable[..., _QualityGateOutcomeView],
     _package_attr("_run_configured_quality_gate"),
@@ -3245,12 +3280,13 @@ def test_apply_source_rejects_missing_quality_commands_before_git_preflight(
     assert not output_dir.exists()
 
 
-def test_package_returns_accepted_source_wheel_before_native_compilation(
+def test_package_routes_accepted_source_wheel_into_composition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An accepted source candidate is the terminal source-clean package result."""
+    """Accepted source materialization continues into later optimization stages."""
     project_root, output_dir, preparation = _prepared_source_search_project(tmp_path)
+    composed = False
 
     def prepare(*_args: object, **_kwargs: object) -> object:
         return preparation
@@ -3272,25 +3308,337 @@ def test_package_returns_accepted_source_wheel_before_native_compilation(
             test_results=(),
             performance=_benchmark_result("passed"),
             build=_successful_attempt(),
+            materialization_patch=GeneratedSourcePatch(
+                patch_text="",
+                source_edits=(),
+                files=(),
+            ),
         )
 
-    def forbidden(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("native compilation ran after source wheel acceptance")
+    def compose(**kwargs: object) -> package_command.PackageCommandResult:
+        nonlocal composed
+        composed = True
+        search = cast(SourceOptimizationSearchResult, kwargs["search"])
+        assert search.materialization_patch is not None
+        return package_command.PackageCommandResult(
+            success=True,
+            project_root=project_root,
+            output_dir=output_dir,
+            install_root=output_dir / "install",
+            wheel_path=search.wheel_path,
+            islands=(),
+            build=search.build,
+            performance=search.performance,
+        )
 
     monkeypatch.setattr(package_command, "_prepare_profile_guided_selection", prepare)
     monkeypatch.setattr(package_command, "run_source_optimization_search", source_search)
-    monkeypatch.setattr(package_command, "_build_typed_regions", forbidden)
+    monkeypatch.setattr(package_command, "_execute_composed_source_arm", compose)
 
     result = package_command.execute_package(
         package_command.PackageOptions(root=project_root, output_dir=output_dir)
     )
 
     assert result.success is True
+    assert composed is True
     assert result.wheel_path == output_dir / "fixture-0.1.0-py3-none-any.whl"
     assert result.compiled_bindings == ()
     assert result.performance is not None
     assert result.performance.status == "passed"
+
+
+def test_composition_fallback_preserves_source_success_and_rejection_evidence(
+    tmp_path: Path,
+) -> None:
+    """A rejected later arm cannot invalidate an accepted source optimization."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    project = discover_project(project_root)
+    source_result = package_command.PackageCommandResult(
+        success=True,
+        project_root=project_root,
+        output_dir=tmp_path / "out",
+        install_root=tmp_path / "install",
+        wheel_path=tmp_path / "source.whl",
+        islands=(),
+        build=_successful_attempt(),
+        performance=_benchmark_result("passed"),
+    )
+    rejected_attempt = CompileAttempt(
+        success=False,
+        command=("native",),
+        stdout="native output",
+        stderr="native benchmark rejected",
+        artifact_paths=(),
+        duration_seconds=2.5,
+        phase_timings=(
+            CompilePhaseTiming(
+                name="native_trial",
+                duration_seconds=2.5,
+                detail="not profitable",
+            ),
+        ),
+    )
+    rejected = replace(
+        source_result,
+        success=False,
+        wheel_path=None,
+        build=rejected_attempt,
+        error="native benchmark rejected",
+    )
+
+    recovered = _source_result_with_composition_fallback(
+        source_result,
+        rejected,
+        project,
+    )
+
+    assert recovered.success is True
+    assert recovered.wheel_path == source_result.wheel_path
+    assert recovered.performance == source_result.performance
+    assert "composition fallback retained: native benchmark rejected" in recovered.build.stdout
+    assert recovered.build.duration_seconds == pytest.approx(2.5)
+    assert recovered.build.phase_timings[-1].name == "native_trial"
+
+
+def test_materialize_source_optimization_arm_recreates_disposable_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted source evidence recreates a transformed copy and wheel baseline."""
+    project_root = tmp_path / "project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    source_path = project_root / "src" / "app" / "ranking.py"
+    before_source = source_path.read_text(encoding="utf-8")
+    after_source = before_source.replace("DEFAULT_WEIGHT = 1.5", "DEFAULT_WEIGHT = 2.0")
+    patch = GeneratedSourcePatch(
+        patch_text="fixture patch",
+        source_edits=(),
+        files=(
+            TransformedSourceFile(
+                path=PurePosixPath("src/app/ranking.py"),
+                before_source=before_source,
+                after_source=after_source,
+            ),
+        ),
+    )
+    output_dir.mkdir()
+    wheel_path = output_dir / "simple_project-0.1.0-py3-none-any.whl"
+    wheel_path.write_bytes(b"accepted wheel")
+
+    def unpack(_wheel_path: Path, install_root: Path) -> None:
+        package_root = install_root / "app"
+        package_root.mkdir(parents=True)
+        (package_root / "__init__.py").write_text("", encoding="utf-8")
+        (package_root / "ranking.py").write_text("WHEEL_VALUE = 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(package_command, "unpack_wheel_payload", unpack)
+    baseline_payload = tmp_path / "baseline-payload"
+    quality_project = tmp_path / "quality-project"
+    baseline_payload.mkdir()
+    quality_project.mkdir()
+    preparation = _ProfilePreparation(
+        baseline=_BaselineWheelPayload(
+            wheel_path=tmp_path / "baseline.whl",
+            build=_successful_attempt(),
+            baseline_install_root=baseline_payload,
+            quality_project_root=quality_project,
+        )
+    )
+    search = SourceOptimizationSearchResult(
+        attempted=True,
+        accepted=True,
+        wheel_path=wheel_path,
+        patch_path=tmp_path / "accepted.patch",
+        trials=(),
+        test_results=(),
+        performance=_benchmark_result("passed"),
+        build=_successful_attempt(),
+        materialization_patch=patch,
+    )
+
+    arm = cast(
+        _OptimizationArmView,
+        _materialize_source_optimization_arm(
+            options=package_command.PackageOptions(root=project_root, output_dir=output_dir),
+            project=project,
+            preparation=preparation,
+            search=search,
+        ),
+    )
+    active_project = arm.active_project
+    baseline = arm.baseline
+
+    assert source_path.read_text(encoding="utf-8") == before_source
+    assert (active_project.config.root / "src" / "app" / "ranking.py").read_text(
+        encoding="utf-8"
+    ) == after_source
+    assert (output_dir / "install" / "app" / "ranking.py").read_text(
+        encoding="utf-8"
+    ) == "WHEEL_VALUE = 1\n"
+    assert baseline.baseline_install_root is not None
+    assert (baseline.baseline_install_root / "app" / "ranking.py").exists()
+    assert arm.source_search is search
+
+
+def test_composed_source_arm_keeps_successful_native_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful later native stage replaces the source-only wheel arm."""
+    project_root = tmp_path / "project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    output_dir.mkdir()
+    project = discover_project(project_root)
+    wheel_path = output_dir / "source.whl"
+    wheel_path.write_bytes(b"source-wheel")
+    baseline = _BaselineWheelPayload(
+        wheel_path=wheel_path,
+        build=_successful_attempt(),
+        baseline_install_root=tmp_path / "payload",
+        quality_project_root=tmp_path / "quality",
+    )
+    preparation = _ProfilePreparation(baseline=baseline)
+    search = SourceOptimizationSearchResult(
+        attempted=True,
+        accepted=True,
+        wheel_path=wheel_path,
+        patch_path=tmp_path / "accepted.patch",
+        trials=(),
+        test_results=(),
+        performance=_benchmark_result("passed"),
+        build=_successful_attempt(),
+        materialization_patch=GeneratedSourcePatch("", (), ()),
+    )
+    planning = SourceOptimizationPlanningResult(plans=(), assessments=())
+    arm = _OptimizationArm(
+        report_project=project,
+        active_project=project,
+        baseline=baseline,
+        source_search=search,
+    )
+
+    def materialize(**_kwargs: object) -> object:
+        return arm
+
+    def selected_scans(*_args: object) -> tuple[ModuleScan, ...]:
+        return ()
+
+    def selected_regions(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        return (object(),)
+
+    monkeypatch.setattr(package_command, "_materialize_source_optimization_arm", materialize)
+    monkeypatch.setattr(package_command, "_selected_scans", selected_scans)
+    monkeypatch.setattr(package_command, "_selected_typed_regions", selected_regions)
+
+    def execute_native(**kwargs: object) -> package_command.PackageCommandResult:
+        assert kwargs["prepared_baseline"] is baseline
+        return package_command.PackageCommandResult(
+            success=True,
+            project_root=project_root,
+            output_dir=output_dir,
+            install_root=output_dir / "install",
+            wheel_path=wheel_path,
+            islands=(),
+            build=_successful_attempt(),
+        )
+
+    monkeypatch.setattr(package_command, "_execute_typed_region_package", execute_native)
+
+    result = _execute_composed_source_arm(
+        options=package_command.PackageOptions(root=project_root, output_dir=output_dir),
+        project=project,
+        preparation=preparation,
+        planning=planning,
+        search=search,
+    )
+
+    assert result.success is True
+    assert result.wheel_path == wheel_path
+    assert result.source_optimization_trials == ()
+
+
+def test_composed_source_arm_restores_source_wheel_after_native_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed later stage restores the previously accepted source wheel bytes."""
+    project_root = tmp_path / "project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    output_dir.mkdir()
+    project = discover_project(project_root)
+    wheel_path = output_dir / "source.whl"
+    wheel_path.write_bytes(b"accepted-source-wheel")
+    baseline = _BaselineWheelPayload(
+        wheel_path=wheel_path,
+        build=_successful_attempt(),
+        baseline_install_root=tmp_path / "payload",
+        quality_project_root=tmp_path / "quality",
+    )
+    preparation = _ProfilePreparation(baseline=baseline)
+    search = SourceOptimizationSearchResult(
+        attempted=True,
+        accepted=True,
+        wheel_path=wheel_path,
+        patch_path=tmp_path / "accepted.patch",
+        trials=(),
+        test_results=(),
+        performance=_benchmark_result("passed"),
+        build=_successful_attempt(),
+        materialization_patch=GeneratedSourcePatch("", (), ()),
+    )
+    planning = SourceOptimizationPlanningResult(plans=(), assessments=())
+    arm = _OptimizationArm(
+        report_project=project,
+        active_project=project,
+        baseline=baseline,
+        source_search=search,
+    )
+
+    def materialize(**_kwargs: object) -> object:
+        return arm
+
+    def selected_scans(*_args: object) -> tuple[ModuleScan, ...]:
+        return ()
+
+    def selected_regions(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        return (object(),)
+
+    monkeypatch.setattr(package_command, "_materialize_source_optimization_arm", materialize)
+    monkeypatch.setattr(package_command, "_selected_scans", selected_scans)
+    monkeypatch.setattr(package_command, "_selected_typed_regions", selected_regions)
+
+    def reject_native(**_kwargs: object) -> package_command.PackageCommandResult:
+        wheel_path.write_bytes(b"rejected-native-wheel")
+        return package_command.PackageCommandResult(
+            success=False,
+            project_root=project_root,
+            output_dir=output_dir,
+            install_root=output_dir / "install",
+            wheel_path=None,
+            islands=(),
+            build=replace(_successful_attempt(), success=False, stderr="not profitable"),
+            error="not profitable",
+        )
+
+    monkeypatch.setattr(package_command, "_execute_typed_region_package", reject_native)
+
+    result = _execute_composed_source_arm(
+        options=package_command.PackageOptions(root=project_root, output_dir=output_dir),
+        project=project,
+        preparation=preparation,
+        planning=planning,
+        search=search,
+    )
+
+    assert result.success is True
+    assert result.wheel_path == wheel_path
+    assert wheel_path.read_bytes() == b"accepted-source-wheel"
+    assert "composition fallback retained: not profitable" in result.build.stdout
 
 
 def test_package_returns_source_application_failure_before_native_fallback(

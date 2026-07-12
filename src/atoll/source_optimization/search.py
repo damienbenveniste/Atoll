@@ -129,6 +129,8 @@ class SourceOptimizationSearchResult:
         accepted: Whether source and wheel gates promoted a patch and wheel.
         wheel_path: Promoted normal PEP 517 wheel, when accepted.
         patch_path: Reviewable accepted patch under `.atoll/patches`, when accepted.
+        materialization_patch: Immutable accepted patch payload for recreating
+            transformed sources after scratch cleanup, when accepted.
         trials: Ordered candidate, final-gate, and application evidence.
         test_results: Semantic command evidence for the promoted source and wheel.
         performance: Authoritative final wheel performance result.
@@ -145,6 +147,7 @@ class SourceOptimizationSearchResult:
     performance: BenchmarkGateResult | None
     build: CompileAttempt
     error: str | None = None
+    materialization_patch: GeneratedSourcePatch | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -922,6 +925,7 @@ def _finalize_candidate(
         performance=wheel_gate,
         build=build,
         error=application_error,
+        materialization_patch=winner.patch if application_error is None else None,
     )
 
 

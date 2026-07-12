@@ -192,6 +192,12 @@ accepted default compile leaves the checkout unchanged and writes the reproducib
 `.atoll/patches/<candidate-id>.patch`; rejected candidates may remain only as cache evidence under
 `.atoll/cache/source-optimization/`. Below the floor, Atoll emits no source patch.
 
+An accepted source candidate is also an optimization baseline, not a terminal branch. Atoll
+recreates that patch in disposable build storage, rescans the transformed project, and may overlay
+profitable native regions or execution plans onto its wheel. A later semantic or performance
+rejection retains the already accepted source-only wheel. The temporary transformed project is
+removed with normal build scratch and never changes the checkout.
+
 Use `--apply-source` only after reviewing the accepted report and patch:
 
 ```bash
