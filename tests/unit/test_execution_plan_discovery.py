@@ -644,6 +644,39 @@ def test_module_integer_constant_resolves_private_queue_capacity(tmp_path: Path)
     assert plan.transport_capacity == _QUEUE_CAPACITY
 
 
+def test_work_count_capacity_remains_symbolic_for_source_lowering(tmp_path: Path) -> None:
+    """`len(items)` may form a plan without inventing a positive literal capacity."""
+    scan = _scan(
+        tmp_path / "symbolic_capacity.py",
+        [
+            "async def _worker(q, value):",
+            "    q.put_nowait(value)",
+            "async def run(values):",
+            "    q: asyncio.Queue[int] = asyncio.Queue(maxsize=len(values))",
+            "    async with asyncio.TaskGroup() as tg:",
+            "        for value in values:",
+            "            tg.create_task(_worker(q, value))",
+            "        records = [await q.get() for _ in range(len(values))]",
+            "    return records",
+        ],
+    )
+    profile = _profile(
+        scan,
+        (
+            ("symbolic_capacity", "run", 2_000, 2_000),
+            ("symbolic_capacity", "_worker", 2_000, 2_000),
+        ),
+    )
+
+    plan = next(
+        result
+        for result in build_execution_plans((scan,), profile)
+        if isinstance(result, ExecutionPlan)
+    )
+
+    assert plan.transport_capacity is None
+
+
 def test_unjoined_create_task_site_is_rejected_as_unstructured(tmp_path: Path) -> None:
     """Bare task creation cannot claim task-handle ownership or joined scope."""
     scan = _scan(

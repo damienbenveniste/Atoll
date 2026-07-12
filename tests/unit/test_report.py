@@ -1431,7 +1431,9 @@ def test_compilation_report_serializes_source_optimization_schema_v5(
     assert unbenchmarked_report["source_optimization"]["status"] == "unbenchmarked"
     assert rejected_report["source_optimization"]["status"] == "rejected"
     assert "- No patch was emitted." in report_only_markdown
-    assert "report-only in this milestone" in report_only_markdown
+    assert "only an accepted trial contributes a transformed wheel or patch" in (
+        report_only_markdown
+    )
     assert report["version"] == REPORT_SCHEMA_VERSION
     assert report["execution_plans"] == []
     assert report["fusion_plans"] == []

@@ -14,6 +14,7 @@ import base64
 import csv
 import hashlib
 import io
+import os
 import shutil
 import subprocess
 import sys
@@ -306,9 +307,12 @@ def validate_dist_info_dir(payload_root: Path) -> Path:
 
 
 def _run_build_command(command: tuple[str, ...], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    child_env = dict(os.environ)
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
     return subprocess.run(
         command,
         cwd=cwd,
+        env=child_env,
         check=False,
         shell=False,
         capture_output=True,

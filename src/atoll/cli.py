@@ -238,6 +238,11 @@ def _add_compile_parser(subparsers: _Subparsers) -> None:
         action="store_true",
         help="keep the temporary source-clean install tree for debugging",
     )
+    compile_cmd.add_argument(
+        "--apply-source",
+        action="store_true",
+        help="apply an accepted 3x source patch after semantic and benchmark gates",
+    )
 
 
 def _add_package_parser(subparsers: _Subparsers) -> None:
@@ -262,6 +267,11 @@ def _add_package_parser(subparsers: _Subparsers) -> None:
         "--keep-install-tree",
         action="store_true",
         help="keep the temporary source-clean install tree for debugging",
+    )
+    package.add_argument(
+        "--apply-source",
+        action="store_true",
+        help="apply an accepted 3x source patch after semantic and benchmark gates",
     )
 
 
@@ -405,7 +415,7 @@ def _run_compile(args: argparse.Namespace) -> int:
             module_name=args.module,
             output_dir=args.output,
             keep_install_tree=args.keep_install_tree,
-            label="source-clean compile",
+            apply_source=args.apply_source,
         )
     return _run_inplace_compile(args)
 
@@ -486,10 +496,15 @@ def _run_inplace_compile(args: argparse.Namespace) -> int:
 def _compile_option_error(args: argparse.Namespace) -> str | None:
     if not args.in_place and args.test is not None:
         return "--test requires --in-place"
-    if args.in_place and args.output is not None:
-        return "--output cannot be used with --in-place"
-    if args.in_place and args.keep_install_tree:
-        return "--keep-install-tree cannot be used with --in-place"
+    incompatible = (
+        (args.output is not None, "--output cannot be used with --in-place"),
+        (args.keep_install_tree, "--keep-install-tree cannot be used with --in-place"),
+        (args.apply_source, "--apply-source cannot be used with --in-place"),
+    )
+    if args.in_place:
+        error = next((message for blocked, message in incompatible if blocked), None)
+        if error is not None:
+            return error
     if args.test is None:
         return None
     try:
@@ -570,7 +585,7 @@ def _run_package(args: argparse.Namespace) -> int:
         module_name=args.module,
         output_dir=args.output,
         keep_install_tree=args.keep_install_tree,
-        label="source-clean compile",
+        apply_source=args.apply_source,
     )
 
 
@@ -580,7 +595,7 @@ def _run_source_clean_artifact_build(
     module_name: str | None,
     output_dir: Path | None,
     keep_install_tree: bool,
-    label: str,
+    apply_source: bool,
 ) -> int:
     progress = _source_clean_progress_reporter()
     try:
@@ -590,6 +605,7 @@ def _run_source_clean_artifact_build(
                 module_name=module_name,
                 output_dir=output_dir,
                 keep_install_tree=keep_install_tree,
+                apply_source=apply_source,
                 progress=progress,
             )
         )
@@ -601,7 +617,11 @@ def _run_source_clean_artifact_build(
         _print_compile_report_paths(report_paths)
         print(result.error or result.build.stderr)
         return 1
-    _print_source_clean_success(result, label=label, report_paths=report_paths)
+    _print_source_clean_success(
+        result,
+        label="source-clean compile",
+        report_paths=report_paths,
+    )
     return 0
 
 
@@ -625,12 +645,16 @@ def _print_source_clean_success(
     compiled_symbols = sum(len(island.symbols) for island in result.islands) + len(
         result.compiled_bindings
     )
+    accepted_source_count = sum(
+        trial.status == "accepted" for trial in result.source_optimization_trials
+    )
     print(
         _source_clean_success_message(
             label=label,
             compiled_module_count=len(compiled_modules),
             compiled_symbol_count=compiled_symbols,
             applied_plan_count=len(result.applied_execution_plans),
+            accepted_source_count=accepted_source_count,
         )
     )
     if result.skipped:
@@ -659,6 +683,7 @@ def _print_source_clean_success(
         print(f"Install tree: {result.install_root}")
     _print_candidate_trial_summary(result)
     _print_execution_plan_trial_summary(result)
+    _print_source_optimization_trial_summary(result)
     if result.performance is not None:
         if result.performance.status == "passed" and result.performance.speedup is not None:
             print(f"Performance: {result.performance.speedup:.3f}x median speedup (passed).")
@@ -668,12 +693,31 @@ def _print_source_clean_success(
     _print_compile_report_paths(report_paths)
 
 
+def _print_source_optimization_trial_summary(result: PackageCommandResult) -> None:
+    """Print the accepted source patch and application state when present.
+
+    Args:
+        result: Source-clean result containing source candidate trial evidence.
+    """
+    accepted = next(
+        (trial for trial in result.source_optimization_trials if trial.status == "accepted"),
+        None,
+    )
+    if accepted is None or accepted.patch_path is None:
+        return
+    print(f"Source optimization: accepted {accepted.candidate_id}.")
+    print(f"Patch: {accepted.patch_path}")
+    if accepted.application_status == "applied":
+        print("Source application: applied and revalidated.")
+
+
 def _source_clean_success_message(
     *,
     label: str,
     compiled_module_count: int,
     compiled_symbol_count: int,
     applied_plan_count: int,
+    accepted_source_count: int,
 ) -> str:
     """Describe native, scheduler-plan, or interpreted-only wheel work.
 
@@ -682,6 +726,7 @@ def _source_clean_success_message(
         compiled_module_count: Number of modules with retained native bindings.
         compiled_symbol_count: Number of retained native bindings.
         applied_plan_count: Number of profitable scheduler plans in the payload.
+        accepted_source_count: Number of source candidates that passed both 3x gates.
 
     Returns:
         str: Single-line success summary that does not describe plan-only work as zero work.
@@ -694,6 +739,11 @@ def _source_clean_success_message(
         if applied_plan_count:
             message += f", and applied {applied_plan_count} async execution plan(s)"
         return f"{message}."
+    if accepted_source_count:
+        return (
+            f"Atoll {label} built a verified project wheel from "
+            f"{accepted_source_count} accepted source optimization(s)."
+        )
     if applied_plan_count:
         return (
             f"Atoll {label} applied {applied_plan_count} async execution plan(s); "

@@ -643,6 +643,7 @@ def _bootstrap_config(request: _BootstrapRequest, *, result_path: Path) -> JsonO
 
 def _profile_environment(*, payload_root: Path) -> dict[str, str]:
     child_env = dict(os.environ)
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
     existing_pythonpath = tuple(
         path for path in child_env.get("PYTHONPATH", "").split(os.pathsep) if path
     )

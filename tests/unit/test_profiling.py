@@ -50,6 +50,7 @@ BOOTSTRAP_STRING_EXIT_CODE = 1
 
 class SubprocessInvocationView(Protocol):
     command: tuple[str, ...]
+    env: dict[str, str]
 
 
 class ProfileBootstrapModule(Protocol):
@@ -579,6 +580,7 @@ def test_bootstrap_launch_uses_absolute_file_path(
 
     def fake_run(invocation: SubprocessInvocationView) -> subprocess.CompletedProcess[str]:
         captured.append(invocation.command)
+        assert invocation.env["PYTHONDONTWRITEBYTECODE"] == "1"
         config_path = Path(invocation.command[-1])
         payload = cast(dict[str, object], json.loads(config_path.read_text(encoding="utf-8")))
         result_path = payload["result_path"]

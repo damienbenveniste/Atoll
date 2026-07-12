@@ -191,6 +191,11 @@ class _BenchmarkGateOptions(TypedDict, total=False):
     compiled_region_allowlist: frozenset[str] | None
 
 
+class _PerformanceCommandOptions(TypedDict, total=False):
+    region_allowlist: frozenset[str] | None
+    require_optimized: bool
+
+
 @dataclass(frozen=True, slots=True)
 class _BenchmarkExecutionContext:
     command: tuple[str, ...]
@@ -208,7 +213,7 @@ def run_performance_command(
     project_root: Path,
     payload_root: Path,
     mode: RuntimeMode,
-    region_allowlist: frozenset[str] | None = None,
+    **options: Unpack[_PerformanceCommandOptions],
 ) -> CommandRunEvidence:
     """Execute one argv command under a controlled Atoll runtime mode.
 
@@ -221,23 +226,28 @@ def run_performance_command(
     deterministic newline-separated `ATOLL_REGION_ALLOWLIST`, and treats an
     empty allowlist as an explicit request to allow no regions. When no
     allowlist is provided, inherited region allowlist state is cleared.
+    `require_optimized=True` independently requires a generated source fast
+    path and clears inherited source-optimization state for all other runs.
 
     Args:
         command: Command to validate, execute, or benchmark.
         project_root: Root directory of the target Python project.
         payload_root: Wheel payload root placed first on the child process import path.
         mode: Runtime mode selecting interpreted or compiled import behavior.
-        region_allowlist: Optional compiled-region identifiers available to the child process.
+        **options: Optional compiled-region allowlist and source fast-path requirement.
 
     Returns:
         CommandRunEvidence: Captured process output, status, mode, and elapsed duration.
     """
     resolved_project_root = project_root.resolve()
     resolved_payload_root = payload_root.resolve()
+    region_allowlist = options.get("region_allowlist")
+    require_optimized = options.get("require_optimized", False)
     child_env = _runtime_environment(
         payload_root=resolved_payload_root,
         mode=mode,
         region_allowlist=region_allowlist,
+        require_optimized=require_optimized,
     )
     started = _perf_counter()
     completed = _run_subprocess(
@@ -411,13 +421,16 @@ def _runtime_environment(
     payload_root: Path,
     mode: RuntimeMode,
     region_allowlist: frozenset[str] | None,
+    require_optimized: bool,
 ) -> dict[str, str]:
     child_env = dict(os.environ)
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
     existing_pythonpath = tuple(
         path for path in child_env.get("PYTHONPATH", "").split(os.pathsep) if path
     )
     child_env["PYTHONPATH"] = os.pathsep.join((str(payload_root), *existing_pythonpath))
     child_env.pop("ATOLL_REGION_ALLOWLIST", None)
+    child_env.pop("ATOLL_REQUIRE_OPTIMIZED", None)
     if region_allowlist is not None:
         child_env.pop("ATOLL_DISABLE", None)
         child_env["ATOLL_REQUIRE_COMPILED"] = "1"
@@ -428,6 +441,9 @@ def _runtime_environment(
     else:
         child_env.pop("ATOLL_DISABLE", None)
         child_env["ATOLL_REQUIRE_COMPILED"] = "1"
+    if require_optimized:
+        child_env.pop("ATOLL_DISABLE", None)
+        child_env["ATOLL_REQUIRE_OPTIMIZED"] = "1"
     return child_env
 
 

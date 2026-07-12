@@ -291,8 +291,8 @@ def _assessment(context: _AssessmentContext) -> SourceOptimizationAssessment:
         scheduler_overhead_evidence=(
             f"{scheduler_overhead_samples} nested sample(s) attributed to active plan callables",
             (
-                f"{attributed_hot_share:.1%} of sampled wall time maps to the execution-plan "
-                "boundary"
+                f"{attributed_hot_share:.1%} of attributable project and scheduler samples "
+                "map to the execution-plan boundary"
             ),
         ),
         callable_evidence=evidence,
@@ -385,21 +385,29 @@ def _callable_evidence(
     profiled_members: dict[tuple[str, str], ProfiledMember],
 ) -> tuple[SourceCallableEvidence, ...]:
     records = {symbol.id: symbol for symbol in scan.symbols}
+    attributable_samples = (
+        profile.mapped_project_samples + profile.scheduler_overhead_samples
+        if profile is not None
+        else 0
+    )
     return tuple(
         _callable_evidence_item(
             symbol_id,
             role=role,
             record=records.get(symbol_id),
             member=profiled_members.get((symbol_id.module, symbol_id.qualname)),
-            total_samples=profile.total_samples if profile is not None else 0,
+            total_samples=attributable_samples,
         )
         for symbol_id, role in sorted(
-            _callable_roles(execution_plan).items(), key=lambda item: item[0].stable_id
+            _callable_roles(execution_plan, records).items(), key=lambda item: item[0].stable_id
         )
     )
 
 
-def _callable_roles(execution_plan: ExecutionPlan) -> dict[SymbolId, str]:
+def _callable_roles(
+    execution_plan: ExecutionPlan,
+    records: dict[SymbolId, SymbolRecord],
+) -> dict[SymbolId, str]:
     roles: dict[SymbolId, str] = {execution_plan.owner: "owner"}
     for node in execution_plan.nodes:
         if node.symbol is not None:
@@ -410,6 +418,19 @@ def _callable_roles(execution_plan: ExecutionPlan) -> dict[SymbolId, str]:
         roles[execution_plan.reducer] = "reducer"
     for source_member in execution_plan.source_members:
         roles.setdefault(source_member, "dependency")
+    pending = list(roles)
+    records_by_qualname = {symbol.id.qualname: symbol for symbol in records.values()}
+    while pending:
+        symbol_id = pending.pop()
+        record = records_by_qualname.get(symbol_id.qualname)
+        if record is None:
+            continue
+        for path in record.called_paths:
+            dependency = records_by_qualname.get(path)
+            if dependency is None or dependency.kind == "class" or dependency.id in roles:
+                continue
+            roles[dependency.id] = "dependency"
+            pending.append(dependency.id)
     return roles
 
 

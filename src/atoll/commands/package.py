@@ -138,6 +138,12 @@ from atoll.source_optimization import (
     SourceOptimizationPlanningResult,
     SourceOptimizationTrial,
     build_source_optimization_plans,
+    validate_source_application_root,
+)
+from atoll.source_optimization.search import (
+    SourceOptimizationSearchOptions,
+    SourceOptimizationSearchResult,
+    run_source_optimization_search,
 )
 from atoll.wheel_overlay import (
     WheelBuildEvidence,
@@ -215,6 +221,7 @@ class PackageOptions:
         selected_members: Explicit members to compile; empty selects every supported region.
         cache_dir: Optional cache override used by isolated callers such as trial mode.
         run_quality_gates: Whether package verification, tests, and benchmarks should run.
+        apply_source: Whether an accepted source patch should be applied transactionally.
     """
 
     root: Path
@@ -225,6 +232,7 @@ class PackageOptions:
     selected_members: tuple[SymbolId, ...] = ()
     cache_dir: Path | None = None
     run_quality_gates: bool = True
+    apply_source: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1018,15 +1026,31 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             options.progress,
             (
                 f"source-optimization planning produced "
-                f"{len(source_optimization.plans)} plan(s); {trial_ready} passed report-only gates"
+                f"{len(source_optimization.plans)} plan(s); {trial_ready} ready for bounded trials"
             ),
         )
+    source_search = _run_source_optimization_trials(
+        options=options,
+        project=project,
+        baseline=baseline,
+        planning=source_optimization,
+    )
     preparation = replace(
         preparation,
         profile=profile,
         execution_plans=execution_plans,
         fusion_plans=fusion_plans,
     )
+    source_terminal = _source_optimization_terminal_result(
+        options=options,
+        project=project,
+        preparation=preparation,
+        planning=source_optimization,
+        search=source_search,
+    )
+    if source_terminal is not None:
+        return source_terminal
+    source_trials = source_search.trials if source_search is not None else ()
     profile_members = (
         profile.selected_symbols if profile is not None and profile.status == "profiled" else ()
     )
@@ -1059,32 +1083,26 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     )
     plan_only_allowed = bool(selected_execution_plans) and not options.selected_members
     if selection_error is not None and not plan_only_allowed:
-        return _with_source_optimization(
-            _failed_region_selection(
+        package_result = _failed_region_selection(
+            options=options,
+            project=project,
+            preparation=preparation,
+            error=selection_error,
+            typed_regions=typed_regions,
+        )
+    elif plan_only_allowed and (not profile_members or not selected_typed_regions):
+        package_result = _execute_execution_plan_only_package(
+            _ExecutionPlanOnlyContext(
                 options=options,
                 project=project,
-                preparation=preparation,
-                error=selection_error,
                 typed_regions=typed_regions,
-            ),
-            source_optimization,
+                execution_plans=execution_plans,
+                prepared_baseline=baseline,
+                profile=profile,
+            )
         )
-    if plan_only_allowed and (not profile_members or not selected_typed_regions):
-        return _with_source_optimization(
-            _execute_execution_plan_only_package(
-                _ExecutionPlanOnlyContext(
-                    options=options,
-                    project=project,
-                    typed_regions=typed_regions,
-                    execution_plans=execution_plans,
-                    prepared_baseline=baseline,
-                    profile=profile,
-                )
-            ),
-            source_optimization,
-        )
-    return _with_source_optimization(
-        _execute_typed_region_package(
+    else:
+        package_result = _execute_typed_region_package(
             options=options,
             project=project,
             context=_TypedRegionPackageContext(
@@ -1097,8 +1115,221 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             ),
             prepared_baseline=baseline,
             profile=profile,
-        ),
+        )
+    return _with_source_optimization(
+        package_result,
         source_optimization,
+        source_trials,
+    )
+
+
+def _run_source_optimization_trials(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    baseline: _BaselineWheelPayload | None,
+    planning: SourceOptimizationPlanningResult,
+) -> SourceOptimizationSearchResult | None:
+    """Run source trials only when profiling prepared every required root.
+
+    Args:
+        options: Public package options and progress callback.
+        project: Discovered target project and compile policy.
+        baseline: Prepared baseline wheel payload from profile setup.
+        planning: Ranked source plans and current-invocation assessments.
+
+    Returns:
+        SourceOptimizationSearchResult | None: Search evidence, or `None` when
+        source optimization is not configured for this package invocation.
+    """
+    config = project.config.compile
+    if (
+        options.selected_members
+        or not options.run_quality_gates
+        or config.test_command is None
+        or config.benchmark_command is None
+    ):
+        return None
+    if (
+        baseline is None
+        or baseline.baseline_install_root is None
+        or baseline.quality_project_root is None
+    ):
+        return None
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    cache_root = options.cache_dir or project.config.cache_dir
+    return run_source_optimization_search(
+        planning.plans,
+        planning.assessments,
+        SourceOptimizationSearchOptions(
+            project_root=project.config.root,
+            source_roots=project.config.source_roots,
+            module_paths=_project_relative_module_paths(project),
+            output_dir=output_dir,
+            scratch_root=output_dir / "build" / "source-optimization-search",
+            cache_root=cache_root / "source-optimization",
+            baseline_payload_root=baseline.baseline_install_root,
+            quality_project_root=baseline.quality_project_root,
+            compile_config=config,
+            baseline_build=baseline.build,
+            apply_source=options.apply_source,
+            progress=options.progress,
+        ),
+    )
+
+
+def _source_optimization_terminal_result(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    preparation: _ProfilePreparation,
+    planning: SourceOptimizationPlanningResult,
+    search: SourceOptimizationSearchResult | None,
+) -> PackageCommandResult | None:
+    """Return an accepted source wheel or explicit apply failure when terminal.
+
+    Args:
+        options: Public package and source-application options.
+        project: Discovered target project.
+        preparation: Baseline profile and scheduler planning evidence.
+        planning: Source plans and assessments used by the search.
+        search: Search result, or `None` when source trials were not configured.
+
+    Returns:
+        PackageCommandResult | None: Terminal source result, or `None` to continue
+        through native and execution-plan packaging.
+    """
+    if search is None:
+        return None
+    if search.accepted:
+        return _source_optimization_package_result(
+            options=options,
+            project=project,
+            preparation=preparation,
+            planning=planning,
+            search=search,
+        )
+    if search.error is None and not options.apply_source:
+        return None
+    error = search.error or "no source patch met the required 3.0x promotion floor"
+    return _source_optimization_package_failure(
+        options=options,
+        project=project,
+        preparation=preparation,
+        planning=planning,
+        search=replace(search, error=error),
+    )
+
+
+def _project_relative_module_paths(project: DiscoveredProject) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for module in project.modules:
+        try:
+            paths.append(module.path.relative_to(project.config.root))
+        except ValueError:
+            continue
+    return tuple(paths)
+
+
+def _source_optimization_package_result(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    preparation: _ProfilePreparation,
+    planning: SourceOptimizationPlanningResult,
+    search: SourceOptimizationSearchResult,
+) -> PackageCommandResult:
+    """Normalize an accepted transformed source wheel into package evidence.
+
+    Args:
+        options: Package output and debug retention policy.
+        project: Discovered target project.
+        preparation: Baseline profile, execution-plan, and fusion evidence.
+        planning: Source plans and assessments used by the search.
+        search: Accepted source and wheel gate result.
+
+    Returns:
+        PackageCommandResult: Successful pure or project-native normal wheel result.
+    """
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    build_root = output_dir / "build"
+    install_root = output_dir / "install"
+    cleanup_removed: list[Path] = []
+    cleanup_kept: tuple[Path, ...] = ()
+    if options.keep_install_tree and search.wheel_path is not None:
+        _reset_dir(install_root)
+        unpack_wheel_payload(search.wheel_path, install_root)
+        cleanup_removed.extend(_remove_tree(build_root))
+        cleanup_kept = (install_root,)
+    else:
+        cleanup_removed.extend(_remove_source_clean_scratch(build_root, install_root))
+    return PackageCommandResult(
+        success=True,
+        project_root=project.config.root,
+        output_dir=output_dir,
+        install_root=install_root,
+        wheel_path=search.wheel_path,
+        islands=(),
+        build=search.build,
+        install_tree_kept=bool(cleanup_kept),
+        cleanup_removed=tuple(cleanup_removed),
+        cleanup_kept=cleanup_kept,
+        test_results=search.test_results,
+        performance=search.performance,
+        profile=preparation.profile,
+        execution_plans=preparation.execution_plans,
+        fusion_plans=preparation.fusion_plans,
+        source_optimization_plans=planning.plans,
+        source_optimization_assessments=planning.assessments,
+        source_optimization_trials=search.trials,
+    )
+
+
+def _source_optimization_package_failure(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    preparation: _ProfilePreparation,
+    planning: SourceOptimizationPlanningResult,
+    search: SourceOptimizationSearchResult,
+) -> PackageCommandResult:
+    """Return a failed requested application without leaving wheel scratch.
+
+    Args:
+        options: Package output policy.
+        project: Discovered target project.
+        preparation: Baseline profile and scheduler evidence.
+        planning: Source plans and assessments used by the search.
+        search: Rejected or transactionally rolled-back source search.
+
+    Returns:
+        PackageCommandResult: Failed result retaining source trial evidence.
+    """
+    error = search.error or "source optimization failed"
+    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
+    _remove_failed_wheels(project, output_dir)
+    cleanup_removed = _remove_source_clean_scratch(
+        output_dir / "build",
+        output_dir / "install",
+    )
+    return PackageCommandResult(
+        success=False,
+        project_root=project.config.root,
+        output_dir=output_dir,
+        install_root=output_dir / "install",
+        wheel_path=None,
+        islands=(),
+        build=replace(search.build, success=False, stderr=error),
+        cleanup_removed=cleanup_removed,
+        error=error,
+        test_results=search.test_results,
+        performance=search.performance,
+        profile=preparation.profile,
+        execution_plans=preparation.execution_plans,
+        fusion_plans=preparation.fusion_plans,
+        source_optimization_plans=planning.plans,
+        source_optimization_assessments=planning.assessments,
+        source_optimization_trials=search.trials,
     )
 
 
@@ -1199,12 +1430,14 @@ def _execute_execution_plan_only_package(
 def _with_source_optimization(
     result: PackageCommandResult,
     planning: SourceOptimizationPlanningResult,
+    trials: tuple[SourceOptimizationTrial, ...] = (),
 ) -> PackageCommandResult:
-    """Attach report-only source plans without changing package success semantics.
+    """Attach source plans and disposable trials without changing package success.
 
     Args:
         result: Existing native or execution-plan package result.
         planning: Source plans and 3x gate assessments derived before packaging.
+        trials: Bounded source candidate search evidence.
 
     Returns:
         PackageCommandResult: Result augmented only with source-optimization report evidence.
@@ -1213,6 +1446,7 @@ def _with_source_optimization(
         result,
         source_optimization_plans=planning.plans,
         source_optimization_assessments=planning.assessments,
+        source_optimization_trials=trials,
     )
 
 
@@ -2421,9 +2655,37 @@ def _prepare_profile_guided_selection(
         _ProfilePreparation: Prepared baseline/profile evidence or an early failure.
     """
     benchmark = project.config.compile.benchmark_command
+    test_command = project.config.compile.test_command
     static_execution_plans = build_execution_plans(scans, None)
-    if not options.run_quality_gates or benchmark is None:
-        return _ProfilePreparation(execution_plans=static_execution_plans)
+    application_config_error = (
+        "--apply-source requires configured test_command and benchmark_command"
+        if options.apply_source
+        and (not options.run_quality_gates or test_command is None or benchmark is None)
+        else None
+    )
+    application_root_error = (
+        validate_source_application_root(project.config.root)
+        if options.apply_source and application_config_error is None
+        else None
+    )
+    if (
+        not options.run_quality_gates
+        or benchmark is None
+        or application_config_error is not None
+        or application_root_error is not None
+    ):
+        preparation = _ProfilePreparation(execution_plans=static_execution_plans)
+        if options.apply_source:
+            preparation = replace(
+                preparation,
+                failure=_failed_result(
+                    project.config.root,
+                    options.output_dir,
+                    application_config_error or application_root_error or "source apply failed",
+                    execution_plans=static_execution_plans,
+                ),
+            )
+        return preparation
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
     build_root = output_dir / "build"
     install_root = output_dir / "install"

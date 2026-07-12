@@ -67,6 +67,10 @@ from atoll.runtime.profiling import (
     ProfileResult,
     unconfigured_profile,
 )
+from atoll.source_optimization.search import (
+    SourceOptimizationSearchOptions,
+    SourceOptimizationSearchResult,
+)
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 TYPED_FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
@@ -362,6 +366,7 @@ _BaselineWheelPayload = cast(
     _BaselinePayloadFactory,
     _package_attr("_BaselineWheelPayload"),
 )
+_ProfilePreparation = cast(Callable[..., object], _package_attr("_ProfilePreparation"))
 _run_configured_quality_gate = cast(
     Callable[..., _QualityGateOutcomeView],
     _package_attr("_run_configured_quality_gate"),
@@ -3171,6 +3176,172 @@ benchmark_command = ["python", "bench.py"]
     assert not tuple(output_dir.glob("*.whl"))
 
 
+def test_apply_source_rejects_non_git_root_before_baseline_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit source application rejects a non-Git root before expensive setup."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + """
+
+[tool.atoll.compile]
+test_command = ["python", "-c", "pass"]
+benchmark_command = ["python", "bench.py"]
+""",
+        encoding="utf-8",
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("baseline setup ran before source application preflight")
+
+    monkeypatch.setattr(package_command, "_prepare_baseline_wheel_payload", forbidden)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+            apply_source=True,
+        )
+    )
+
+    assert result.success is False
+    assert result.error == f"source application root is not a Git work tree: {project_root}"
+    assert not output_dir.exists()
+
+
+def test_apply_source_rejects_missing_quality_commands_before_git_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing quality commands cannot authorize source mutation or baseline setup."""
+    project_root = tmp_path / "simple_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("baseline setup ran without a configured semantic command")
+
+    monkeypatch.setattr(package_command, "_prepare_baseline_wheel_payload", forbidden)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="app.ranking",
+            output_dir=output_dir,
+            apply_source=True,
+        )
+    )
+
+    assert result.success is False
+    assert result.error == "--apply-source requires configured test_command and benchmark_command"
+    assert not output_dir.exists()
+
+
+def test_package_returns_accepted_source_wheel_before_native_compilation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An accepted source candidate is the terminal source-clean package result."""
+    project_root, output_dir, preparation = _prepared_source_search_project(tmp_path)
+
+    def prepare(*_args: object, **_kwargs: object) -> object:
+        return preparation
+
+    def source_search(
+        _plans: tuple[object, ...],
+        _assessments: tuple[object, ...],
+        options: SourceOptimizationSearchOptions,
+    ) -> SourceOptimizationSearchResult:
+        options.output_dir.mkdir(parents=True)
+        wheel_path = options.output_dir / "fixture-0.1.0-py3-none-any.whl"
+        wheel_path.write_bytes(b"wheel")
+        return SourceOptimizationSearchResult(
+            attempted=True,
+            accepted=True,
+            wheel_path=wheel_path,
+            patch_path=project_root / ".atoll" / "patches" / "accepted.patch",
+            trials=(),
+            test_results=(),
+            performance=_benchmark_result("passed"),
+            build=_successful_attempt(),
+        )
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("native compilation ran after source wheel acceptance")
+
+    monkeypatch.setattr(package_command, "_prepare_profile_guided_selection", prepare)
+    monkeypatch.setattr(package_command, "run_source_optimization_search", source_search)
+    monkeypatch.setattr(package_command, "_build_typed_regions", forbidden)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(root=project_root, output_dir=output_dir)
+    )
+
+    assert result.success is True
+    assert result.wheel_path == output_dir / "fixture-0.1.0-py3-none-any.whl"
+    assert result.compiled_bindings == ()
+    assert result.performance is not None
+    assert result.performance.status == "passed"
+
+
+def test_package_returns_source_application_failure_before_native_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit source application failure cannot fall through to native packaging."""
+    project_root, output_dir, preparation = _prepared_source_search_project(tmp_path)
+
+    def prepare(*_args: object, **_kwargs: object) -> object:
+        return preparation
+
+    def source_search(
+        _plans: tuple[object, ...],
+        _assessments: tuple[object, ...],
+        _options: SourceOptimizationSearchOptions,
+    ) -> SourceOptimizationSearchResult:
+        return SourceOptimizationSearchResult(
+            attempted=True,
+            accepted=False,
+            wheel_path=None,
+            patch_path=project_root / ".atoll" / "patches" / "accepted.patch",
+            trials=(),
+            test_results=(),
+            performance=_benchmark_result("passed"),
+            build=_successful_attempt(),
+            error="forced source application failure",
+        )
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("native compilation ran after explicit source application failure")
+
+    monkeypatch.setattr(package_command, "_prepare_profile_guided_selection", prepare)
+    monkeypatch.setattr(package_command, "run_source_optimization_search", source_search)
+    monkeypatch.setattr(package_command, "_build_typed_regions", forbidden)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            output_dir=output_dir,
+            apply_source=True,
+        )
+    )
+
+    assert result.success is False
+    assert result.wheel_path is None
+    assert result.error == "forced source application failure"
+    assert result.build.success is False
+
+
 def test_package_rejects_invalid_member_before_baseline_commands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3763,6 +3934,38 @@ def _quality_gate_project(
         encoding="utf-8",
     )
     return discover_project(project_root)
+
+
+def _prepared_source_search_project(tmp_path: Path) -> tuple[Path, Path, object]:
+    project_root = tmp_path / "source-search-project"
+    output_dir = tmp_path / "source-search-output"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + """
+
+[tool.atoll.compile]
+test_command = ["python", "-c", "pass"]
+benchmark_command = ["python", "bench.py"]
+""",
+        encoding="utf-8",
+    )
+    baseline_payload = tmp_path / "baseline-payload"
+    quality_project = tmp_path / "quality-project"
+    baseline_payload.mkdir()
+    quality_project.mkdir()
+    baseline_wheel = tmp_path / "baseline-py3-none-any.whl"
+    baseline_wheel.write_bytes(b"wheel")
+    preparation = _ProfilePreparation(
+        baseline=_BaselineWheelPayload(
+            wheel_path=baseline_wheel,
+            build=_successful_attempt(),
+            baseline_install_root=baseline_payload,
+            quality_project_root=quality_project,
+        )
+    )
+    return project_root, output_dir, preparation
 
 
 def _successful_attempt() -> CompileAttempt:

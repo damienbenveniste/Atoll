@@ -20,7 +20,7 @@ OBSERVED_WORK_ITEMS = 12_000
 LOW_OBSERVED_WORK_ITEMS = 9_999
 TOTAL_SAMPLES = 100
 MINIMUM_SPEEDUP = 3.0
-EXPECTED_HOT_SHARE = 0.9
+EXPECTED_HOT_SHARE = 1.0
 EXPECTED_OVERHEAD_SAMPLES = 30
 EXPECTED_PLAN_LIMIT = 2
 
@@ -88,7 +88,7 @@ def test_source_planner_rejects_low_volume_share_and_suspension(tmp_path: Path) 
         (_execution_plan(scan, observed_work_items=LOW_OBSERVED_WORK_ITEMS),),
         _planning_options(
             tmp_path,
-            profile=_profile(immediate=False, attributed_samples=60),
+            profile=_profile(immediate=False, attributed_samples=60, background_samples=40),
         ),
     )
 
@@ -440,11 +440,16 @@ def _execution_plan(scan: ModuleScan, *, observed_work_items: int) -> ExecutionP
     )
 
 
-def _profile(*, immediate: bool, attributed_samples: int = 90) -> ProfileResult:
+def _profile(
+    *,
+    immediate: bool,
+    attributed_samples: int = 90,
+    background_samples: int = 0,
+) -> ProfileResult:
     owner_samples = attributed_samples * 4 // 9
     producer_samples = attributed_samples // 3
     consumer_samples = attributed_samples - owner_samples - producer_samples
-    members = (
+    plan_members = (
         _member("run", owner_samples, 0, 0),
         _member(
             "_producer",
@@ -453,6 +458,10 @@ def _profile(*, immediate: bool, attributed_samples: int = 90) -> ProfileResult:
             0 if immediate else OBSERVED_WORK_ITEMS,
         ),
         _member("_consume", consumer_samples, OBSERVED_WORK_ITEMS, 0),
+    )
+    members = (
+        *plan_members,
+        *((_member("cold_background", background_samples, 0, 0),) if background_samples else ()),
     )
     return ProfileResult(
         status="profiled",

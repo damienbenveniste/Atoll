@@ -12,7 +12,7 @@ import pytest
 
 from atoll.cli import main
 from atoll.commands import package as package_command
-from atoll.commands.package import PackageCommandResult, PackagePreflightFailure
+from atoll.commands.package import PackageCommandResult, PackageOptions, PackagePreflightFailure
 from atoll.models import Blocker, CompileAttempt, ModuleId, ModuleScan
 from atoll.runtime.performance import run_performance_command
 
@@ -663,6 +663,53 @@ def test_compile_in_place_rejects_keep_install_tree(
     captured = capsys.readouterr()
     assert exit_code == EXIT_USAGE
     assert "--keep-install-tree cannot be used with --in-place" in captured.out
+
+
+def test_compile_in_place_rejects_apply_source(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Source patch application is incompatible with the legacy in-place workflow."""
+    exit_code = main(["compile", "--root", str(tmp_path), "--in-place", "--apply-source"])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE
+    assert "--apply-source cannot be used with --in-place" in captured.out
+
+
+def test_compile_forwards_apply_source_to_source_clean_packaging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public compile flag reaches source-clean package orchestration unchanged."""
+    observed: list[bool] = []
+
+    def fake_execute(options: PackageOptions) -> PackageCommandResult:
+        observed.append(options.apply_source)
+        return PackageCommandResult(
+            success=False,
+            project_root=tmp_path,
+            output_dir=tmp_path / ".atoll" / "dist",
+            install_root=tmp_path / ".atoll" / "dist" / "install",
+            wheel_path=None,
+            islands=(),
+            build=CompileAttempt(
+                success=False,
+                command=(),
+                stdout="",
+                stderr="fixture stopped after option forwarding",
+                artifact_paths=(),
+                duration_seconds=0.0,
+            ),
+            error="fixture stopped after option forwarding",
+        )
+
+    monkeypatch.setattr("atoll.cli.execute_package", fake_execute)
+
+    exit_code = main(["compile", "--root", str(tmp_path), "--apply-source"])
+
+    assert exit_code == 1
+    assert observed == [True]
 
 
 def test_compile_source_clean_default_rejects_test_gate(

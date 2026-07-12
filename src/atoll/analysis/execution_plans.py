@@ -75,7 +75,13 @@ class _ReflectionCandidate:
     lineno: int
 
 
-_TransportCapacityKind = Literal["bounded", "rendezvous", "unbounded", "unknown"]
+_TransportCapacityKind = Literal[
+    "bounded",
+    "rendezvous",
+    "work-count",
+    "unbounded",
+    "unknown",
+]
 _TransportScope = Literal["local", "instance"]
 
 
@@ -85,7 +91,8 @@ class _TransportCapacity:
 
     Attributes:
         value: Literal capacity when known, including zero for rendezvous streams.
-        kind: Bounded, rendezvous, unbounded, or statically unknown semantics.
+        kind: Literal bounded, rendezvous, symbolic work-count, unbounded, or
+            statically unknown semantics.
     """
 
     value: int | None
@@ -535,7 +542,7 @@ def _transport_preflight_rejection(
         )
     if _transport_escapes(scope_nodes, transport.endpoints, spawns):
         return "public-transport", "result transport escapes the orchestration callable"
-    if transport.capacity.kind not in {"bounded", "rendezvous"}:
+    if transport.capacity.kind not in {"bounded", "rendezvous", "work-count"}:
         return (
             "unknown-capacity",
             "result transport capacity must be statically bounded or rendezvous",
@@ -874,6 +881,8 @@ def _queue_capacity(
     node: ast.expr | None,
     integer_constants: Mapping[str, int],
 ) -> _TransportCapacity:
+    if _is_work_count_capacity(_capacity_node(node)):
+        return _TransportCapacity(value=None, kind="work-count")
     value = _literal_capacity(node, default=0, integer_constants=integer_constants)
     if value is None:
         return _TransportCapacity(value=None, kind="unknown")
@@ -886,6 +895,8 @@ def _memory_stream_capacity(
     node: ast.expr | None,
     integer_constants: Mapping[str, int],
 ) -> _TransportCapacity:
+    if _is_work_count_capacity(_capacity_node(node)):
+        return _TransportCapacity(value=None, kind="work-count")
     value = _literal_capacity(node, default=0, integer_constants=integer_constants)
     if value is None or value < 0:
         return _TransportCapacity(value=value, kind="unknown")
@@ -900,14 +911,7 @@ def _literal_capacity(
     default: int | None,
     integer_constants: Mapping[str, int],
 ) -> int | None:
-    if not isinstance(node, ast.Call):
-        return None
-    capacity_node: ast.expr | None = node.args[0] if node.args else None
-    if capacity_node is None:
-        for keyword in node.keywords:
-            if keyword.arg in {"maxsize", "max_buffer_size"}:
-                capacity_node = keyword.value
-                break
+    capacity_node = _capacity_node(node)
     if capacity_node is None:
         return default
     if isinstance(capacity_node, ast.Constant) and type(capacity_node.value) is int:
@@ -915,6 +919,31 @@ def _literal_capacity(
     if isinstance(capacity_node, ast.Name):
         return integer_constants.get(capacity_node.id)
     return None
+
+
+def _capacity_node(node: ast.expr | None) -> ast.expr | None:
+    if not isinstance(node, ast.Call):
+        return None
+    if node.args:
+        return node.args[0]
+    return next(
+        (
+            keyword.value
+            for keyword in node.keywords
+            if keyword.arg in {"maxsize", "max_buffer_size"}
+        ),
+        None,
+    )
+
+
+def _is_work_count_capacity(node: ast.expr | None) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "len"
+        and len(node.args) == 1
+        and not node.keywords
+    )
 
 
 def _module_integer_constants(tree: ast.Module) -> dict[str, int]:

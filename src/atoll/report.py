@@ -3073,7 +3073,7 @@ def _append_source_optimization_markdown(
     lines: list[str],
     source_optimization: CompilationSourceOptimizationReport,
 ) -> None:
-    """Render source optimization milestone evidence without implying application.
+    """Render source optimization planning, trial, patch, and application evidence.
 
     Args:
         lines: Mutable Markdown line buffer receiving the section.
@@ -3088,10 +3088,7 @@ def _append_source_optimization_markdown(
             f"- Attributed hot share: {source_optimization['attributed_hot_share']:.1%}",
             f"- Patch: {_optional_path(source_optimization['patch_path'])}",
             f"- Application status: {source_optimization['application_status']}",
-            (
-                "- Runtime status: report-only in this milestone; source optimization "
-                "does not emit or apply a patch unless a source-optimization trial lists one."
-            ),
+            "- Runtime status: only an accepted trial contributes a transformed wheel or patch.",
         ]
     )
     if source_optimization["patch_path"] is None:
@@ -4017,10 +4014,9 @@ def _source_optimization_report(
 ) -> CompilationSourceOptimizationReport:
     """Serialize source-optimization milestone evidence for schema v5.
 
-    Source optimization remains report-only in this milestone unless callers pass
-    explicit trial or application evidence. The aggregate status is derived from
-    that evidence so command success remains governed by the existing compile,
-    verification, semantic-test, and performance gates.
+    The aggregate status is derived from planning, trial, and application
+    evidence. Only an accepted trial has a patch path, and command success
+    remains governed by compile, semantic, source-performance, and wheel gates.
 
     Args:
         root: Root directory used to normalize patch paths.

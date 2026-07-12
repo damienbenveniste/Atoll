@@ -40,6 +40,7 @@ def test_build_baseline_wheel_captures_command_output_and_duration(
             {
                 "command": command,
                 "cwd": cwd,
+                "env": kwargs["env"],
                 "check": kwargs["check"],
                 "shell": kwargs["shell"],
                 "capture_output": kwargs["capture_output"],
@@ -71,11 +72,13 @@ def test_build_baseline_wheel_captures_command_output_and_duration(
     assert captured == {
         "command": evidence.command,
         "cwd": tmp_path.resolve(),
+        "env": cast(dict[str, str], captured["env"]),
         "check": False,
         "shell": False,
         "capture_output": True,
         "text": True,
     }
+    assert cast(dict[str, str], captured["env"])["PYTHONDONTWRITEBYTECODE"] == "1"
     assert not evidence.succeeded
     assert evidence.returncode == BACKEND_FAILURE_RETURNCODE
     assert evidence.stdout == "stdout text"
