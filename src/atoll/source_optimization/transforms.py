@@ -42,6 +42,8 @@ class SourceTransformationRequest:
         replacement_body: Python statements that become the selected declaration body.
         helper_statements: Module-level Python statements inserted before ordinary
             imports, constants, classes, and functions.
+        trailing_statements: Module-level helpers appended after existing declarations.
+            Use these for identity captures that require source callables to exist first.
         summary: Stable human-readable summary recorded on the generated `SourceEdit`.
         transformation_id: Stable transformation step identifier recorded on the edit.
     """
@@ -52,6 +54,7 @@ class SourceTransformationRequest:
     declaration_kind: DeclarationKind
     replacement_body: str
     helper_statements: tuple[str, ...] = ()
+    trailing_statements: tuple[str, ...] = ()
     summary: str = "rewrite source-optimization declaration body"
     transformation_id: str | None = None
 
@@ -382,10 +385,21 @@ def _transform_source(source: str, request: SourceTransformationRequest) -> str:
         )
 
     body = _parse_replacement_body(request.replacement_body, request)
-    helper_statements = _parse_helper_statements(request)
+    helper_statements = _parse_generated_statements(
+        request.helper_statements,
+        request=request,
+        label="helper statements",
+    )
+    trailing_statements = _parse_generated_statements(
+        request.trailing_statements,
+        request=request,
+        label="trailing statements",
+    )
     replaced = module.visit(_BodyReplacementTransformer(request.target.qualname, body))
     if helper_statements:
         replaced = _insert_module_helpers(replaced, helper_statements)
+    if trailing_statements:
+        replaced = replaced.with_changes(body=(*replaced.body, *trailing_statements))
     after_source = replaced.code
     try:
         ast.parse(after_source, filename=request.path.as_posix())
@@ -446,20 +460,23 @@ def _parse_replacement_body(
     return cast(cst.IndentedBlock, statement.body)
 
 
-def _parse_helper_statements(
+def _parse_generated_statements(
+    statements: tuple[str, ...],
+    *,
     request: SourceTransformationRequest,
+    label: str,
 ) -> tuple[cst.BaseStatement, ...]:
-    if not request.helper_statements:
+    if not statements:
         return ()
-    helper_source = "\n".join(statement.rstrip("\n") for statement in request.helper_statements)
+    helper_source = "\n".join(statement.rstrip("\n") for statement in statements)
     if helper_source:
         helper_source = f"{helper_source}\n"
     try:
         helper_module = cst.parse_module(helper_source)
     except cst.ParserSyntaxError as exc:
-        raise ValueError(f"invalid helper statements for {request.path.as_posix()}: {exc}") from exc
+        raise ValueError(f"invalid {label} for {request.path.as_posix()}: {exc}") from exc
     if not helper_module.body:
-        raise ValueError(f"invalid helper statements for {request.path.as_posix()}: empty helpers")
+        raise ValueError(f"invalid {label} for {request.path.as_posix()}: empty statements")
     return tuple(helper_module.body)
 
 

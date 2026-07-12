@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.execution_plans.models import ExecutionPlan, PlanEdge, PlanNode, PlanRejection
@@ -120,7 +121,7 @@ def test_source_planner_rejects_indirect_context_mutation(tmp_path: Path) -> Non
         tmp_path,
         introspection=False,
         forwarding=False,
-        context_mutation=True,
+        context_mutation="indirect",
     )
 
     result = build_source_optimization_plans(
@@ -137,6 +138,27 @@ def test_source_planner_rejects_indirect_context_mutation(tmp_path: Path) -> Non
     assert dependency.static_role == "dependency"
     assert dependency.context_mutation == ("_CONTEXT_LABEL.set",)
     assert any("context mutation" in reason for reason in assessment.rejections)
+
+
+def test_source_planner_allows_direct_worker_context_mutation(tmp_path: Path) -> None:
+    """Copied-context lowering can isolate mutation performed directly by the worker."""
+    scan = _scan(
+        tmp_path,
+        introspection=False,
+        forwarding=False,
+        context_mutation="direct",
+    )
+
+    result = build_source_optimization_plans(
+        (scan,),
+        (_execution_plan(scan, observed_work_items=OBSERVED_WORK_ITEMS),),
+        _planning_options(tmp_path, profile=_profile(immediate=True)),
+    )
+
+    assessment = result.assessments[0]
+    producer = next(item for item in assessment.callable_evidence if item.static_role == "producer")
+    assert producer.context_mutation == ("_CONTEXT_LABEL.set",)
+    assert assessment.status == "trial-ready"
 
 
 def test_source_planner_reports_missing_profile_and_ignores_unusable_plans(tmp_path: Path) -> None:
@@ -287,17 +309,22 @@ def _scan(
     *,
     introspection: bool,
     forwarding: bool,
-    context_mutation: bool = False,
+    context_mutation: Literal["none", "direct", "indirect"] = "none",
     unsafe_worker: bool = False,
 ) -> ModuleScan:
     source = [
         "import asyncio",
     ]
-    if context_mutation:
+    if context_mutation != "none":
         source.extend(
             [
                 "from contextvars import ContextVar",
                 "_CONTEXT_LABEL = ContextVar('_CONTEXT_LABEL', default='parent')",
+            ]
+        )
+    if context_mutation == "indirect":
+        source.extend(
+            [
                 "",
                 "def _mutate_context():",
                 "    _CONTEXT_LABEL.set('child')",
@@ -306,8 +333,10 @@ def _scan(
     source.extend(["", "async def _producer(queue, value):"])
     if introspection:
         source.append("    asyncio.current_task()")
-    if context_mutation:
+    if context_mutation == "indirect":
         source.append("    _mutate_context()")
+    if context_mutation == "direct":
+        source.append("    _CONTEXT_LABEL.set('child')")
     if unsafe_worker:
         source.extend(
             [

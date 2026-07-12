@@ -369,6 +369,8 @@ def _source_safety_rejections(
             ("context mutation", item.context_mutation),
             ("dynamic calls", item.unknown_dynamic_calls),
         ):
+            if label == "context mutation" and item.symbol == source_plan.worker:
+                continue
             if values:
                 rejections.append(
                     f"{item.symbol.stable_id} references {label}: {', '.join(values)}"

@@ -5,6 +5,11 @@ from atoll.source_optimization.analysis import (
     SourceOptimizationPlanningResult,
     build_source_optimization_plans,
 )
+from atoll.source_optimization.lowering import (
+    SourceLoweringResult,
+    SourceLoweringStatus,
+    lower_batch_quiescent_plan,
+)
 from atoll.source_optimization.models import (
     SourceAccessKind,
     SourceAccessSite,
@@ -38,6 +43,8 @@ __all__ = (
     "SourceAccessSite",
     "SourceCallableEvidence",
     "SourceEdit",
+    "SourceLoweringResult",
+    "SourceLoweringStatus",
     "SourceOptimizationApplicationStatus",
     "SourceOptimizationAssessment",
     "SourceOptimizationAssessmentStatus",
@@ -54,6 +61,7 @@ __all__ = (
     "TransformedSourceFile",
     "build_source_optimization_plans",
     "build_source_transformation_patch",
+    "lower_batch_quiescent_plan",
     "materialize_transformed_files",
     "stable_source_optimization_plan_id",
 )

@@ -32,6 +32,7 @@ class _RequestSpec:
         replacement_body: Replacement body statements.
         declaration_kind: Expected declaration kind for the target.
         helpers: Optional helper statement snippets.
+        trailing: Optional helper snippets appended after existing declarations.
     """
 
     path: PurePosixPath
@@ -40,6 +41,7 @@ class _RequestSpec:
     replacement_body: str
     declaration_kind: DeclarationKind = "function"
     helpers: tuple[str, ...] = ()
+    trailing: tuple[str, ...] = ()
 
 
 def _sha256(source: str) -> str:
@@ -88,6 +90,7 @@ def _request(spec: _RequestSpec) -> SourceTransformationRequest:
         declaration_kind=spec.declaration_kind,
         replacement_body=spec.replacement_body,
         helper_statements=spec.helpers,
+        trailing_statements=spec.trailing,
         summary=f"rewrite {spec.qualname}",
         transformation_id=f"step:{spec.qualname}",
     )
@@ -279,6 +282,30 @@ def test_helper_insertion_after_docstring_and_future_imports(tmp_path: Path) -> 
     after = patch.files[0].after_source
     assert after.index("from __future__ import generator_stop") < after.index("def _helper")
     assert after.index("_HELPER_FLAG = True") < after.index("import os")
+
+
+def test_trailing_helpers_follow_existing_declarations(tmp_path: Path) -> None:
+    """Identity captures can be appended after the source callables they reference."""
+    source = "def worker():\n    return 1\n\ndef run():\n    return worker()\n"
+    path = _write(tmp_path, "pkg/mod.py", source)
+
+    patch = build_source_transformation_patch(
+        tmp_path,
+        (
+            _request(
+                _RequestSpec(
+                    path=path,
+                    source=source,
+                    qualname="run",
+                    replacement_body="return _EXPECTED_WORKER()\n",
+                    trailing=("_EXPECTED_WORKER = worker\n",),
+                )
+            ),
+        ),
+    )
+
+    after = patch.files[0].after_source
+    assert after.index("def run") < after.index("_EXPECTED_WORKER = worker")
 
 
 def test_patch_output_is_stable_regardless_of_request_order(tmp_path: Path) -> None:

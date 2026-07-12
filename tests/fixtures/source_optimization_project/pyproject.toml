@@ -1,0 +1,20 @@
+[project]
+name = "source-optimization-project"
+version = "0.1.0"
+description = "Generic source-optimization acceptance fixture."
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["setuptools>=69", "wheel>=0.43"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.atoll.compile]
+test_command = ["python", "-m", "pytest", "tests", "-q"]
+benchmark_command = ["python", "benchmarks/run_workload.py", "--iterations", "1024"]
+minimum_speedup = 3.0
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
