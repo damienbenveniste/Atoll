@@ -352,6 +352,26 @@ async def public_incremental_inspection() -> IteratorSummary:
     )
 
 
+async def forwarded_events(values: tuple[int, ...]) -> AsyncIterator[int]:
+    """Publicly forward private events without changing their protocol.
+
+    Args:
+        values: Stable event values forwarded one at a time.
+
+    Yields:
+        int: Each private event unchanged and in source order.
+    """
+
+    async for event in _private_events(values):
+        yield event
+
+
+async def _private_events(values: tuple[int, ...]) -> AsyncIterator[int]:
+    for value in values:
+        await asyncio.sleep(0)
+        yield value
+
+
 async def cold_suspending_worker(queue: asyncio.Queue[WorkerRecord], item: WorkItem) -> None:
     """Unsupported worker because it suspends before publishing.
 

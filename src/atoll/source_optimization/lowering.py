@@ -27,8 +27,11 @@ from atoll.source_optimization.models import (
 from atoll.source_optimization.transforms import SourceTransformationRequest
 
 SourceLoweringStatus = Literal["lowered", "unsupported"]
+SourceLoweringMode = Literal["batch-quiescent", "state-machine"]
 _PIPELINE_STATEMENT_COUNT = 2
 _WORKER_ARGUMENT_COUNT = 2
+_STATE_OWNER_QUEUE_REFERENCE_COUNT = 3
+_STATE_OWNER_QUEUE_LOAD_COUNT = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +44,7 @@ class SourceLoweringResult:
         request: LibCST transformation request for a supported plan.
         helper_names: Generated private helpers available to strict routing tests.
         rejections: Deterministic reasons that kept the plan interpreted.
+        mode: Lowering variant attempted for this result.
     """
 
     plan_id: str
@@ -48,6 +52,7 @@ class SourceLoweringResult:
     request: SourceTransformationRequest | None
     helper_names: tuple[str, ...] = ()
     rejections: tuple[str, ...] = ()
+    mode: SourceLoweringMode = "batch-quiescent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +86,12 @@ class _GuardInputs:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProtocolLowering:
+    declaration: cst.FunctionDef
+    guarded_globals: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _HelperNames:
     prefix: str
     original: str
@@ -98,6 +109,8 @@ class _HelperNames:
     expected_task_group: str
     expected_get_running_loop: str
     expected_copy_context: str
+    step: str
+    protocol: str
 
     @property
     def public_tuple(self) -> tuple[str, ...]:
@@ -130,30 +143,80 @@ def lower_batch_quiescent_plan(
     Returns:
         SourceLoweringResult: A deterministic request or conservative rejection reasons.
     """
-    preflight = _preflight_rejections(plan, assessment)
+    return _lower_source_plan(
+        project_root,
+        plan,
+        assessment,
+        mode="batch-quiescent",
+    )
+
+
+def lower_state_machine_plan(
+    project_root: Path,
+    plan: SourceOptimizationPlan,
+    assessment: SourceOptimizationAssessment,
+) -> SourceLoweringResult:
+    """Lower a quiescent private queue pipeline into local state transitions.
+
+    Args:
+        project_root: Target project root containing the plan source path.
+        plan: Static source-optimization plan containing the state-machine step.
+        assessment: Current-invocation profile and safety assessment for `plan`.
+
+    Returns:
+        SourceLoweringResult: State-machine request or conservative rejection reasons.
+    """
+    return _lower_source_plan(
+        project_root,
+        plan,
+        assessment,
+        mode="state-machine",
+    )
+
+
+def _lower_source_plan(
+    project_root: Path,
+    plan: SourceOptimizationPlan,
+    assessment: SourceOptimizationAssessment,
+    *,
+    mode: SourceLoweringMode,
+) -> SourceLoweringResult:
+    preflight = _preflight_rejections(plan, assessment, mode=mode)
     if preflight:
-        return _unsupported(plan, preflight)
+        return _unsupported(plan, preflight, mode=mode)
     try:
         source_path = _source_path(project_root, plan)
         source = source_path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(source_path))
         shape = _analyze_pipeline(tree, plan)
+        if mode == "state-machine":
+            _validate_state_owner(shape.owner, queue_name=shape.queue_name)
+            _validate_state_worker(shape.worker, queue_name=shape.queue_name)
         module = cst.parse_module(source)
         names = _helper_names(plan.id)
-        request = _build_request(plan, assessment, module, shape, names)
+        request = _build_request(plan, assessment, module, shape, mode=mode)
     except (OSError, SyntaxError, TypeError, ValueError, cst.ParserSyntaxError) as error:
-        return _unsupported(plan, (str(error),))
+        return _unsupported(plan, (str(error),), mode=mode)
     return SourceLoweringResult(
         plan_id=plan.id,
         status="lowered",
         request=request,
-        helper_names=names.public_tuple,
+        helper_names=(
+            (
+                *names.public_tuple,
+                *((names.step,) if mode == "state-machine" else ()),
+                *((names.protocol,) if _has_protocol_step(plan) else ()),
+            )
+        ),
+        mode=mode,
     )
 
 
 def _preflight_rejections(
     plan: SourceOptimizationPlan,
     assessment: SourceOptimizationAssessment,
+    *,
+    mode: SourceLoweringMode,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     if assessment.plan_id != plan.id:
@@ -169,6 +232,8 @@ def _preflight_rejections(
     available_steps = {step.kind for step in plan.steps}
     if not required_steps.issubset(available_steps):
         reasons.append("source plan lacks batch-drain and quiescent-execution steps")
+    if mode == "state-machine" and "local-state-machine-fusion" not in available_steps:
+        reasons.append("source plan lacks local-state-machine-fusion step")
     if assessment.immediate_result_ratio != 1.0:
         reasons.append("quiescent lowering requires a 100% immediate-result ratio")
     reasons.extend(_evidence_rejections(plan, assessment.callable_evidence))
@@ -471,13 +536,57 @@ def _writes_attribute_or_subscript(node: ast.AST) -> bool:
     return any(isinstance(target, ast.Attribute | ast.Subscript) for target in targets)
 
 
+def _validate_state_worker(worker: ast.AsyncFunctionDef, *, queue_name: str) -> None:
+    blocked = (
+        ast.AsyncFor,
+        ast.AsyncFunctionDef,
+        ast.AsyncWith,
+        ast.For,
+        ast.FunctionDef,
+        ast.Lambda,
+        ast.Match,
+        ast.Return,
+        ast.Try,
+        ast.TryStar,
+        ast.While,
+        ast.With,
+    )
+    if any(node is not worker and isinstance(node, blocked) for node in ast.walk(worker)):
+        raise ValueError("state-machine worker contains unsupported control flow")
+    queue_loads = [
+        node
+        for node in ast.walk(worker)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == queue_name
+    ]
+    if len(queue_loads) != 1:
+        raise ValueError("state-machine worker reads its transport outside final publication")
+
+
+def _validate_state_owner(owner: ast.AsyncFunctionDef, *, queue_name: str) -> None:
+    references = [
+        node for node in ast.walk(owner) if isinstance(node, ast.Name) and node.id == queue_name
+    ]
+    stores = sum(isinstance(node.ctx, ast.Store) for node in references)
+    loads = sum(isinstance(node.ctx, ast.Load) for node in references)
+    if (
+        len(references) != _STATE_OWNER_QUEUE_REFERENCE_COUNT
+        or stores != 1
+        or loads != _STATE_OWNER_QUEUE_LOAD_COUNT
+    ):
+        raise ValueError(
+            "state-machine owner uses its transport outside constructor, spawn, and receive"
+        )
+
+
 def _build_request(
     plan: SourceOptimizationPlan,
     assessment: SourceOptimizationAssessment,
     module: cst.Module,
     shape: _PipelineShape,
-    names: _HelperNames,
+    *,
+    mode: SourceLoweringMode,
 ) -> SourceTransformationRequest:
+    names = _helper_names(plan.id)
     owner = _top_level_function(module, plan.owner)
     call_arguments = _call_arguments(owner.params)
     docstring = ast.get_docstring(shape.owner, clean=False)
@@ -498,18 +607,31 @@ def _build_request(
         returns=None,
         type_parameters=None,
     )
-    fast = _replace_task_group(fast, shape, names)
+    fast = _replace_task_group(fast, shape, names, mode=mode)
+    declarations: tuple[cst.FunctionDef, ...] = (original, fast)
+    if mode == "state-machine":
+        worker = _top_level_function(module, plan.worker)
+        declarations = (*declarations, _state_step(worker, shape, names))
+    protocol = _protocol_lowering(module, plan, names)
+    if protocol is not None:
+        declarations = (*declarations, protocol.declaration)
+    protocol_globals = protocol.guarded_globals if protocol is not None else ()
     guard_inputs = _GuardInputs(
-        global_names=_guarded_globals(shape.worker),
+        global_names=tuple(sorted({*_guarded_globals(shape.worker), *protocol_globals})),
         callable_globals=frozenset(
-            item.symbol.qualname
-            for item in assessment.callable_evidence
-            if item.symbol.module == plan.worker.module and "." not in item.symbol.qualname
+            {
+                *(
+                    item.symbol.qualname
+                    for item in assessment.callable_evidence
+                    if item.symbol.module == plan.worker.module and "." not in item.symbol.qualname
+                ),
+                *protocol_globals,
+            }
         ),
     )
     trailing = _trailing_helpers(
         module,
-        (original, fast),
+        declarations,
         shape,
         names,
         guard_inputs,
@@ -522,8 +644,12 @@ def _build_request(
         declaration_kind="async_function",
         replacement_body=wrapper_body,
         trailing_statements=trailing,
-        summary="add guarded private batch drain and copied-context quiescent execution",
-        transformation_id=f"{plan.id}:batch-quiescent-v1",
+        summary=(
+            "add guarded local state-machine fusion"
+            if mode == "state-machine"
+            else "add guarded private batch drain and copied-context quiescent execution"
+        ),
+        transformation_id=f"{plan.id}:{mode}-v1",
     )
 
 
@@ -583,17 +709,205 @@ def _call_arguments(parameters: cst.Parameters) -> str:
     return ", ".join(arguments)
 
 
+class _WorkerPublicationTransformer(cst.CSTTransformer):
+    """Turn one private queue publication into a synchronous return value."""
+
+    def __init__(self, queue_name: str) -> None:
+        self._queue_name = queue_name
+        self.replacements = 0
+
+    @override
+    def leave_SimpleStatementLine(
+        self,
+        original_node: cst.SimpleStatementLine,
+        updated_node: cst.SimpleStatementLine,
+    ) -> cst.SimpleStatementLine:
+        """Replace the final `queue.put_nowait(value)` statement.
+
+        Args:
+            original_node: Original worker statement.
+            updated_node: Child-transformed worker statement.
+
+        Returns:
+            Statement returning the published value, or the untouched statement.
+        """
+        value = _publication_value(original_node, self._queue_name)
+        if value is None:
+            return updated_node
+        self.replacements += 1
+        return updated_node.with_changes(body=(cst.Return(value=value),))
+
+
+def _state_step(
+    worker: cst.FunctionDef,
+    shape: _PipelineShape,
+    names: _HelperNames,
+) -> cst.FunctionDef:
+    positional = (*worker.params.posonly_params, *worker.params.params)
+    if len(positional) != _WORKER_ARGUMENT_COUNT:
+        raise ValueError("LibCST worker parameters do not match validated state shape")
+    item_parameter = _required_parameter(positional[1])
+    step = worker.with_changes(
+        name=cst.Name(names.step),
+        asynchronous=None,
+        decorators=(),
+        params=cst.Parameters(params=(item_parameter,)),
+        returns=None,
+        type_parameters=None,
+    )
+    transformer = _WorkerPublicationTransformer(shape.queue_name)
+    transformed_module = cst.Module(body=(step,)).visit(transformer)
+    if transformer.replacements != 1:
+        raise ValueError("LibCST could not replace one private worker publication")
+    transformed = transformed_module.body[0]
+    if not isinstance(transformed, cst.FunctionDef):
+        raise TypeError("LibCST state step is not a function declaration")
+    return transformed
+
+
+def _publication_value(
+    statement: cst.SimpleStatementLine,
+    queue_name: str,
+) -> cst.BaseExpression | None:
+    if len(statement.body) != 1 or not isinstance(statement.body[0], cst.Expr):
+        return None
+    expression = statement.body[0].value
+    if not (
+        isinstance(expression, cst.Call)
+        and len(expression.args) == 1
+        and expression.args[0].keyword is None
+        and expression.args[0].star == ""
+        and isinstance(expression.func, cst.Attribute)
+        and isinstance(expression.func.value, cst.Name)
+        and expression.func.value.value == queue_name
+        and expression.func.attr.value == "put_nowait"
+    ):
+        return None
+    return expression.args[0].value
+
+
+def _protocol_lowering(
+    module: cst.Module,
+    plan: SourceOptimizationPlan,
+    names: _HelperNames,
+) -> _ProtocolLowering | None:
+    if not _has_protocol_step(plan):
+        return None
+    tree = ast.parse(module.code)
+    forwarder = _top_level_async_function(tree, plan.entrypoint, role="protocol entrypoint")
+    statements = _without_docstring(forwarder.body)
+    if len(statements) != 1 or not isinstance(statements[0], ast.AsyncFor):
+        raise ValueError("private protocol entrypoint must contain one async forwarding loop")
+    loop = statements[0]
+    if loop.orelse or not isinstance(loop.target, ast.Name) or len(loop.body) != 1:
+        raise ValueError("private protocol forwarding loop must be a complete simple echo")
+    forwarded = loop.body[0]
+    if not (
+        isinstance(forwarded, ast.Expr)
+        and isinstance(forwarded.value, ast.Yield)
+        and isinstance(forwarded.value.value, ast.Name)
+        and forwarded.value.value.id == loop.target.id
+    ):
+        raise ValueError("private protocol entrypoint must yield each source event unchanged")
+    if not isinstance(loop.iter, ast.Call) or not isinstance(loop.iter.func, ast.Name):
+        raise TypeError("private protocol source must be one module-level async callable")
+    source_name = loop.iter.func.id
+    declaration = _top_level_function(module, plan.entrypoint)
+    arguments = _call_arguments(declaration.params)
+    direct_iter = ast.unparse(loop.iter)
+    fallback_call = f"{plan.entrypoint.qualname}({arguments})"
+    body_source = (
+        f"if {names.guard}():\n"
+        f"    return tuple([{loop.target.id} async for {loop.target.id} in {direct_iter}])\n"
+        f"if {names.require}():\n"
+        "    raise RuntimeError('ATOLL_REQUIRE_OPTIMIZED=1 but protocol guards failed')\n"
+        f"return tuple([{loop.target.id} async for {loop.target.id} in {fallback_call}])\n"
+    )
+    helper = declaration.with_changes(
+        name=cst.Name(names.protocol),
+        decorators=(),
+        params=_required_parameters(declaration.params),
+        returns=None,
+        type_parameters=None,
+        body=_parse_async_body(body_source),
+    )
+    return _ProtocolLowering(
+        declaration=helper,
+        guarded_globals=tuple(sorted((plan.entrypoint.qualname, source_name))),
+    )
+
+
+def _without_docstring(statements: list[ast.stmt]) -> list[ast.stmt]:
+    if (
+        statements
+        and isinstance(statements[0], ast.Expr)
+        and isinstance(statements[0].value, ast.Constant)
+        and isinstance(statements[0].value.value, str)
+    ):
+        return statements[1:]
+    return statements
+
+
+def _parse_async_body(source: str) -> cst.IndentedBlock:
+    indented = "".join(
+        f"    {line}" if line.strip() else line for line in source.splitlines(keepends=True)
+    )
+    wrapper = cst.parse_module(f"async def _atoll_protocol():\n{indented}")
+    declaration = wrapper.body[0]
+    if not isinstance(declaration, cst.FunctionDef) or not isinstance(
+        declaration.body, cst.IndentedBlock
+    ):
+        raise TypeError("generated private protocol body is not an indented async function")
+    return declaration.body
+
+
+def _has_protocol_step(plan: SourceOptimizationPlan) -> bool:
+    return plan.entrypoint != plan.owner and any(
+        step.kind == "private-protocol-auto-forwarding" for step in plan.steps
+    )
+
+
 class _TaskGroupTransformer(cst.CSTTransformer):
     """Replace the one validated TaskGroup with generated synchronous statements."""
 
     def __init__(
         self,
         scheduler_name: str,
+        queue_name: str,
         replacement: tuple[cst.BaseStatement, ...],
+        *,
+        remove_queue: bool,
     ) -> None:
         self._scheduler_name = scheduler_name
+        self._queue_name = queue_name
         self._replacement = replacement
+        self._remove_queue = remove_queue
         self.replacements = 0
+        self.queue_removals = 0
+
+    @override
+    def leave_SimpleStatementLine(
+        self,
+        original_node: cst.SimpleStatementLine,
+        updated_node: cst.SimpleStatementLine,
+    ) -> cst.BaseStatement | cst.RemovalSentinel:
+        """Remove the validated private queue constructor for state fusion.
+
+        Args:
+            original_node: Original simple statement line.
+            updated_node: Child-transformed simple statement line.
+
+        Returns:
+            The untouched statement or a removal sentinel for the queue assignment.
+        """
+        if self._remove_queue and _is_cst_queue_assignment(
+            original_node,
+            scheduler_name=self._scheduler_name,
+            queue_name=self._queue_name,
+        ):
+            self.queue_removals += 1
+            return cst.RemoveFromParent()
+        return updated_node
 
     @override
     def leave_With(
@@ -620,13 +934,26 @@ def _replace_task_group(
     fast: cst.FunctionDef,
     shape: _PipelineShape,
     names: _HelperNames,
+    *,
+    mode: SourceLoweringMode,
 ) -> cst.FunctionDef:
-    generated = _fast_task_group_source(shape, names)
+    generated = (
+        _state_machine_source(shape, names)
+        if mode == "state-machine"
+        else _fast_task_group_source(shape, names)
+    )
     replacement = tuple(cst.parse_module(generated).body)
-    transformer = _TaskGroupTransformer(shape.scheduler_name, replacement)
+    transformer = _TaskGroupTransformer(
+        shape.scheduler_name,
+        shape.queue_name,
+        replacement,
+        remove_queue=mode == "state-machine",
+    )
     transformed_module = cst.Module(body=(fast,)).visit(transformer)
     if transformer.replacements != 1:
         raise ValueError("LibCST could not replace exactly one validated TaskGroup")
+    if mode == "state-machine" and transformer.queue_removals != 1:
+        raise ValueError("LibCST could not remove exactly one validated private queue")
     transformed = transformed_module.body[0]
     if not isinstance(transformed, cst.FunctionDef):
         raise TypeError("LibCST fast helper is not a function declaration")
@@ -657,6 +984,56 @@ def _fast_task_group_source(shape: _PipelineShape, names: _HelperNames) -> str:
     )
 
 
+def _state_machine_source(shape: _PipelineShape, names: _HelperNames) -> str:
+    return (
+        f"{shape.receive_target} = []\n"
+        f"{names.prefix}_errors = []\n"
+        f"for {shape.item_name} in {shape.iterable_name}:\n"
+        f"    {names.prefix}_context = {names.context_module}.copy_context()\n"
+        "    try:\n"
+        f"        {shape.receive_target}.append(\n"
+        f"            {names.prefix}_context.run({names.step}, {shape.item_name})\n"
+        "        )\n"
+        "    except (KeyboardInterrupt, SystemExit):\n"
+        "        raise\n"
+        f"    except BaseException as {names.prefix}_error:\n"
+        f"        {names.prefix}_errors.append({names.prefix}_error)\n"
+        f"if {names.prefix}_errors:\n"
+        "    raise BaseExceptionGroup(\n"
+        "        'unhandled errors in a TaskGroup',\n"
+        f"        {names.prefix}_errors,\n"
+        "    )\n"
+    )
+
+
+def _is_cst_queue_assignment(
+    statement: cst.SimpleStatementLine,
+    *,
+    scheduler_name: str,
+    queue_name: str,
+) -> bool:
+    if len(statement.body) != 1:
+        return False
+    small = statement.body[0]
+    target: cst.BaseAssignTargetExpression | None = None
+    value: cst.BaseExpression | None = None
+    if isinstance(small, cst.AnnAssign):
+        target = small.target
+        value = small.value
+    elif isinstance(small, cst.Assign) and len(small.targets) == 1:
+        target = small.targets[0].target
+        value = small.value
+    return (
+        isinstance(target, cst.Name)
+        and target.value == queue_name
+        and isinstance(value, cst.Call)
+        and isinstance(value.func, cst.Attribute)
+        and isinstance(value.func.value, cst.Name)
+        and value.func.value.value == scheduler_name
+        and value.func.attr.value == "Queue"
+    )
+
+
 def _is_cst_task_group(node: cst.With, scheduler_name: str) -> bool:
     if node.asynchronous is None or len(node.items) != 1:
         return False
@@ -673,21 +1050,18 @@ def _is_cst_task_group(node: cst.With, scheduler_name: str) -> bool:
 
 def _trailing_helpers(
     module: cst.Module,
-    declarations: tuple[cst.FunctionDef, cst.FunctionDef],
+    declarations: tuple[cst.FunctionDef, ...],
     shape: _PipelineShape,
     names: _HelperNames,
     guard_inputs: _GuardInputs,
 ) -> tuple[str, ...]:
-    original, fast = declarations
     captures, guards = _global_guards(
         names,
         guard_inputs.global_names,
         guard_inputs.callable_globals,
     )
     support = _support_source(shape, names, captures, guards)
-    original_source = module.code_for_node(original)
-    fast_source = module.code_for_node(fast)
-    return (support, original_source, fast_source)
+    return (support, *(module.code_for_node(declaration) for declaration in declarations))
 
 
 def _support_source(
@@ -847,6 +1221,8 @@ def _helper_names(plan_id: str) -> _HelperNames:
         expected_task_group=f"{prefix}_expected_task_group",
         expected_get_running_loop=f"{prefix}_expected_get_running_loop",
         expected_copy_context=f"{prefix}_expected_copy_context",
+        step=f"{prefix}_step",
+        protocol=f"{prefix}_run_to_completion",
     )
 
 
@@ -868,10 +1244,13 @@ def _name(node: ast.expr, *, label: str) -> str:
 def _unsupported(
     plan: SourceOptimizationPlan,
     reasons: tuple[str, ...],
+    *,
+    mode: SourceLoweringMode,
 ) -> SourceLoweringResult:
     return SourceLoweringResult(
         plan_id=plan.id,
         status="unsupported",
         request=None,
         rejections=reasons,
+        mode=mode,
     )

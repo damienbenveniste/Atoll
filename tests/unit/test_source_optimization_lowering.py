@@ -8,7 +8,7 @@ import importlib.util
 import inspect
 import shutil
 import sys
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from types import ModuleType
@@ -25,7 +25,12 @@ from atoll.source_optimization import (
     TransformationStep,
     stable_source_optimization_plan_id,
 )
-from atoll.source_optimization.lowering import SourceLoweringResult, lower_batch_quiescent_plan
+from atoll.source_optimization.lowering import (
+    SourceLoweringMode,
+    SourceLoweringResult,
+    lower_batch_quiescent_plan,
+    lower_state_machine_plan,
+)
 from atoll.source_optimization.transforms import (
     build_source_transformation_patch,
     materialize_transformed_files,
@@ -36,6 +41,8 @@ SOURCE_PATH = PurePosixPath("src/source_optimization_fixture/workflow.py")
 OWNER = SymbolId("source_optimization_fixture.workflow", "_run_hot_private_pipeline")
 WORKER = SymbolId("source_optimization_fixture.workflow", "_immediate_worker")
 DEPENDENCY = SymbolId("source_optimization_fixture.workflow", "_make_record")
+EVENT_SOURCE = SymbolId("source_optimization_fixture.workflow", "_private_events")
+EVENT_FORWARDER = SymbolId("source_optimization_fixture.workflow", "forwarded_events")
 
 
 def test_lowering_builds_reproducible_patch_without_mutating_checkout() -> None:
@@ -82,6 +89,231 @@ def test_strict_transformed_pipeline_matches_baseline_and_reflection(
     assert transformed_callable.__annotations__ == baseline_callable.__annotations__
     assert transformed_callable.__doc__ == baseline_callable.__doc__
     assert all(name in vars(transformed) for name in helper_names)
+
+
+def test_state_machine_fusion_eliminates_private_queue_and_coroutine_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cumulative state variant preserves semantics without queue or coroutine work."""
+    baseline = _load_workflow(FIXTURE_ROOT / SOURCE_PATH, "atoll_state_baseline")
+    transformed, helper_names = _transformed_workflow(tmp_path, mode="state-machine")
+    monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+
+    observed = asyncio.run(_hot_pipeline(transformed)())
+    expected = asyncio.run(_hot_pipeline(baseline)())
+    baseline_snapshot = asyncio.run(_async_mapping(baseline, "canonical_semantic_snapshot")())
+    transformed_snapshot = asyncio.run(_async_mapping(transformed, "canonical_semantic_snapshot")())
+    fast = cast(Callable[..., object], vars(transformed)[helper_names[1]])
+    step = cast(Callable[..., object], vars(transformed)[helper_names[-1]])
+
+    assert observed == expected
+    assert transformed_snapshot == baseline_snapshot
+    assert "Queue(" not in inspect.getsource(fast)
+    assert "coroutine.send" not in inspect.getsource(fast)
+    assert "return _make_record(item)" in inspect.getsource(step)
+
+
+def test_private_protocol_helper_bypasses_forwarder_without_rebinding_public_iterator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Private run-to-completion skips one echo layer while public iteration stays intact."""
+    plan, assessment = _protocol_plan_and_assessment()
+    lowering = lower_state_machine_plan(FIXTURE_ROOT, plan, assessment)
+    assert lowering.request is not None
+    patch = build_source_transformation_patch(FIXTURE_ROOT, (lowering.request,))
+    copied_root = tmp_path / "protocol-project"
+    shutil.copytree(FIXTURE_ROOT, copied_root)
+    materialize_transformed_files(FIXTURE_ROOT, copied_root, patch)
+    baseline = _load_workflow(FIXTURE_ROOT / SOURCE_PATH, "atoll_protocol_baseline")
+    transformed = _load_workflow(copied_root / SOURCE_PATH, "atoll_protocol_transformed")
+    values = (2, 3, 5, 8)
+    public_before = cast(
+        Callable[[tuple[int, ...]], AsyncIterator[int]],
+        vars(baseline)[EVENT_FORWARDER.qualname],
+    )
+    public_after = cast(
+        Callable[[tuple[int, ...]], AsyncIterator[int]],
+        vars(transformed)[EVENT_FORWARDER.qualname],
+    )
+    protocol = cast(
+        Callable[[tuple[int, ...]], Coroutine[object, object, tuple[int, ...]]],
+        vars(transformed)[lowering.helper_names[-1]],
+    )
+    monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+
+    expected = asyncio.run(_collect_events(public_before, values))
+    public_observed = asyncio.run(_collect_events(public_after, values))
+    private_observed = asyncio.run(protocol(values))
+
+    assert private_observed == public_observed == expected
+    assert inspect.signature(public_after) == inspect.signature(public_before)
+    assert "async for event in _private_events(values)" in inspect.getsource(public_after)
+
+
+def test_private_protocol_helper_falls_back_before_entry_when_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabled protocol routing consumes the current public forwarder implementation."""
+    plan, assessment = _protocol_plan_and_assessment()
+    lowering = lower_state_machine_plan(FIXTURE_ROOT, plan, assessment)
+    assert lowering.request is not None
+    patch = build_source_transformation_patch(FIXTURE_ROOT, (lowering.request,))
+    copied_root = tmp_path / "protocol-disabled"
+    shutil.copytree(FIXTURE_ROOT, copied_root)
+    materialize_transformed_files(FIXTURE_ROOT, copied_root, patch)
+    transformed = _load_workflow(copied_root / SOURCE_PATH, "atoll_protocol_disabled")
+
+    async def replacement(_values: tuple[int, ...]) -> AsyncIterator[int]:
+        yield 99
+
+    monkeypatch.setitem(vars(transformed), EVENT_FORWARDER.qualname, replacement)
+    monkeypatch.setenv("ATOLL_DISABLE", "1")
+    protocol = cast(
+        Callable[[tuple[int, ...]], Coroutine[object, object, tuple[int, ...]]],
+        vars(transformed)[lowering.helper_names[-1]],
+    )
+
+    assert asyncio.run(protocol((1, 2, 3))) == (99,)
+
+
+def test_private_protocol_strict_guard_failure_consumes_no_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict routing rejects stale callables before entering either protocol path."""
+    plan, assessment = _protocol_plan_and_assessment()
+    lowering = lower_state_machine_plan(FIXTURE_ROOT, plan, assessment)
+    assert lowering.request is not None
+    patch = build_source_transformation_patch(FIXTURE_ROOT, (lowering.request,))
+    copied_root = tmp_path / "protocol-strict"
+    shutil.copytree(FIXTURE_ROOT, copied_root)
+    materialize_transformed_files(FIXTURE_ROOT, copied_root, patch)
+    transformed = _load_workflow(copied_root / SOURCE_PATH, "atoll_protocol_strict")
+    entered = 0
+
+    async def replacement(values: tuple[int, ...]) -> AsyncIterator[int]:
+        nonlocal entered
+        entered += 1
+        for value in values:
+            yield value
+
+    monkeypatch.setitem(vars(transformed), EVENT_SOURCE.qualname, replacement)
+    monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+    protocol = cast(
+        Callable[[tuple[int, ...]], Coroutine[object, object, tuple[int, ...]]],
+        vars(transformed)[lowering.helper_names[-1]],
+    )
+
+    with pytest.raises(RuntimeError, match="protocol guards failed"):
+        asyncio.run(protocol((1, 2, 3)))
+
+    assert entered == 0
+
+
+def test_private_protocol_failure_after_entry_never_retries_public_path(tmp_path: Path) -> None:
+    """A direct source failure propagates without restarting through the forwarder."""
+    source = (FIXTURE_ROOT / SOURCE_PATH).read_text(encoding="utf-8")
+    source = source.replace(
+        "async def _private_events(values: tuple[int, ...]) -> AsyncIterator[int]:\n"
+        "    for value in values:\n"
+        "        await asyncio.sleep(0)\n"
+        "        yield value\n",
+        "_PROTOCOL_ENTRIES = 0\n\n\n"
+        "async def _private_events(values: tuple[int, ...]) -> AsyncIterator[int]:\n"
+        "    global _PROTOCOL_ENTRIES\n"
+        "    _PROTOCOL_ENTRIES += 1\n"
+        "    raise RuntimeError('protocol failed after entry')\n"
+        "    for value in values:\n"
+        "        yield value\n",
+        1,
+    )
+    lowering = _lower_protocol_source(tmp_path, source)
+    assert lowering.request is not None
+    source_root = tmp_path / "protocol-source-project"
+    transformed_root = tmp_path / "protocol-failure"
+    patch = build_source_transformation_patch(source_root, (lowering.request,))
+    shutil.copytree(source_root, transformed_root)
+    materialize_transformed_files(source_root, transformed_root, patch)
+    transformed = _load_workflow(
+        transformed_root / SOURCE_PATH,
+        "atoll_protocol_failure",
+    )
+    protocol = cast(
+        Callable[[tuple[int, ...]], Coroutine[object, object, tuple[int, ...]]],
+        vars(transformed)[lowering.helper_names[-1]],
+    )
+
+    with pytest.raises(RuntimeError, match="protocol failed after entry"):
+        asyncio.run(protocol((1, 2, 3)))
+
+    assert vars(transformed)["_PROTOCOL_ENTRIES"] == 1
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected_rejection"),
+    [
+        (
+            "    async for event in _private_events(values):\n        yield event\n",
+            "    if values:\n        yield values[0]\n",
+            "must contain one async forwarding loop",
+        ),
+        (
+            "        yield event\n",
+            "        yield event + 1\n",
+            "must yield each source event unchanged",
+        ),
+        (
+            "_private_events(values)",
+            "event_source.iter_events(values)",
+            "source must be one module-level async callable",
+        ),
+    ],
+)
+def test_private_protocol_rejects_nontransparent_shapes(
+    tmp_path: Path,
+    old: str,
+    new: str,
+    expected_rejection: str,
+) -> None:
+    """Auto-forwarding accepts only a complete module-level identity echo."""
+    source = (FIXTURE_ROOT / SOURCE_PATH).read_text(encoding="utf-8")
+    changed_source = source.replace(old, new, 1)
+    assert changed_source != source
+
+    result = _lower_protocol_source(tmp_path, changed_source)
+
+    assert any(expected_rejection in reason for reason in result.rejections)
+
+
+def test_state_machine_failure_never_retries_original_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local transition failure cannot restart the original TaskGroup pipeline."""
+    transformed, helper_names = _transformed_workflow(tmp_path, mode="state-machine")
+    original_name = helper_names[0]
+    step_name = helper_names[-1]
+    fallback_calls = 0
+
+    async def counted_original() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    def failed_step(_item: object) -> object:
+        raise RuntimeError("forced state transition failure")
+
+    monkeypatch.setitem(vars(transformed), original_name, counted_original)
+    monkeypatch.setitem(vars(transformed), step_name, failed_step)
+    monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+
+    with pytest.raises(ExceptionGroup, match="unhandled errors in a TaskGroup"):
+        asyncio.run(_hot_pipeline(transformed)())
+
+    assert fallback_calls == 0
 
 
 def test_disable_uses_original_fallback(
@@ -544,6 +776,63 @@ def test_lowering_rejects_missing_plan_source_hash() -> None:
     assert any("does not contain one hash" in reason for reason in result.rejections)
 
 
+def test_state_machine_requires_step_and_rejects_unsafe_worker_control_flow(
+    tmp_path: Path,
+) -> None:
+    """Local fusion needs its explicit plan step and a straight-line worker body."""
+    plan, assessment = _plan_and_assessment()
+    without_step = replace(
+        plan,
+        steps=tuple(step for step in plan.steps if step.kind != "local-state-machine-fusion"),
+    )
+    source = (FIXTURE_ROOT / SOURCE_PATH).read_text(encoding="utf-8")
+    source = source.replace(
+        "    _WORKER_CONTEXT.set(f\"worker:{item['label']}\")",
+        "    if item['ordinal'] < 0:\n"
+        "        return None\n"
+        "    _WORKER_CONTEXT.set(f\"worker:{item['label']}\")",
+    )
+
+    missing = lower_state_machine_plan(FIXTURE_ROOT, without_step, assessment)
+    unsafe = _lower_source(tmp_path, source, mode="state-machine")
+
+    assert any("lacks local-state-machine-fusion" in reason for reason in missing.rejections)
+    assert any("unsupported control flow" in reason for reason in unsafe.rejections)
+
+
+def test_state_machine_rejects_worker_transport_reads(tmp_path: Path) -> None:
+    """The queue parameter may appear only in the removed final publication."""
+    source = (FIXTURE_ROOT / SOURCE_PATH).read_text(encoding="utf-8")
+    source = source.replace(
+        "    _WORKER_CONTEXT.set(f\"worker:{item['label']}\")",
+        "    queue.qsize()\n    _WORKER_CONTEXT.set(f\"worker:{item['label']}\")",
+    )
+
+    result = _lower_source(tmp_path, source, mode="state-machine")
+
+    assert any(
+        "reads its transport outside final publication" in reason for reason in result.rejections
+    )
+
+
+def test_state_machine_rejects_owner_transport_reads_after_receive(tmp_path: Path) -> None:
+    """Removing the queue requires proving the owner has no other transport reads."""
+    source = (FIXTURE_ROOT / SOURCE_PATH).read_text(encoding="utf-8")
+    source = source.replace(
+        '    ordered = tuple(sorted(records, key=lambda record: record["ordinal"]))',
+        "    queue.qsize()\n"
+        '    ordered = tuple(sorted(records, key=lambda record: record["ordinal"]))',
+        1,
+    )
+
+    result = _lower_source(tmp_path, source, mode="state-machine")
+
+    assert any(
+        "uses its transport outside constructor, spawn, and receive" in reason
+        for reason in result.rejections
+    )
+
+
 def _plan_and_assessment() -> tuple[SourceOptimizationPlan, SourceOptimizationAssessment]:
     source = (FIXTURE_ROOT / SOURCE_PATH).read_text(encoding="utf-8")
     source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
@@ -557,6 +846,7 @@ def _plan_and_assessment() -> tuple[SourceOptimizationPlan, SourceOptimizationAs
         transformation_versions=(
             ("private-transport-batch-drain", "batch-drain-v1"),
             ("quiescent-callable-execution", "quiescent-callable-v1"),
+            ("local-state-machine-fusion", "state-machine-v1"),
         ),
     )
     plan_id = stable_source_optimization_plan_id(identity)
@@ -578,6 +868,15 @@ def _plan_and_assessment() -> tuple[SourceOptimizationPlan, SourceOptimizationAs
             access_sites=(),
             semantic_boundary="copied Context and fallback before entry",
             description="Drive exact non-suspending workers in copied contexts.",
+        ),
+        TransformationStep(
+            kind="local-state-machine-fusion",
+            version="state-machine-v1",
+            source_symbol=OWNER,
+            target_symbol=None,
+            access_sites=(),
+            semantic_boundary="local transitions and no retry after entry",
+            description="Replace private queue and coroutine transitions with local values.",
         ),
     )
     plan = SourceOptimizationPlan(
@@ -629,7 +928,45 @@ def _plan_and_assessment() -> tuple[SourceOptimizationPlan, SourceOptimizationAs
     return plan, assessment
 
 
-def _lower_source(tmp_path: Path, source: str) -> SourceLoweringResult:
+def _protocol_plan_and_assessment() -> tuple[
+    SourceOptimizationPlan,
+    SourceOptimizationAssessment,
+]:
+    plan, assessment = _plan_and_assessment()
+    protocol_step = TransformationStep(
+        kind="private-protocol-auto-forwarding",
+        version="protocol-forward-v1",
+        source_symbol=EVENT_FORWARDER,
+        target_symbol=None,
+        access_sites=(),
+        semantic_boundary="public async iterator remains unchanged",
+        description="Add a private direct run-to-completion event path.",
+    )
+    identity = replace(
+        plan.identity,
+        transformation_versions=(
+            *plan.identity.transformation_versions,
+            ("private-protocol-auto-forwarding", "protocol-forward-v1"),
+        ),
+    )
+    plan_id = stable_source_optimization_plan_id(identity)
+    changed_plan = replace(
+        plan,
+        id=plan_id,
+        identity=identity,
+        consumer=EVENT_SOURCE,
+        entrypoint=EVENT_FORWARDER,
+        steps=(*plan.steps, protocol_step),
+    )
+    return changed_plan, replace(assessment, plan_id=plan_id)
+
+
+def _lower_source(
+    tmp_path: Path,
+    source: str,
+    *,
+    mode: SourceLoweringMode = "batch-quiescent",
+) -> SourceLoweringResult:
     root = tmp_path / "source-project"
     source_path = root / SOURCE_PATH
     source_path.parent.mkdir(parents=True)
@@ -643,12 +980,36 @@ def _lower_source(tmp_path: Path, source: str) -> SourceLoweringResult:
     plan_id = stable_source_optimization_plan_id(identity)
     changed_plan = replace(plan, id=plan_id, identity=identity)
     changed_assessment = replace(assessment, plan_id=plan_id)
+    if mode == "state-machine":
+        return lower_state_machine_plan(root, changed_plan, changed_assessment)
     return lower_batch_quiescent_plan(root, changed_plan, changed_assessment)
 
 
-def _transformed_workflow(tmp_path: Path) -> tuple[ModuleType, tuple[str, ...]]:
+def _lower_protocol_source(tmp_path: Path, source: str) -> SourceLoweringResult:
+    root = tmp_path / "protocol-source-project"
+    source_path = root / SOURCE_PATH
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source, encoding="utf-8")
+    plan, assessment = _protocol_plan_and_assessment()
+    source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    identity = replace(plan.identity, source_hashes=((SOURCE_PATH, source_hash),))
+    plan_id = stable_source_optimization_plan_id(identity)
+    changed_plan = replace(plan, id=plan_id, identity=identity)
+    changed_assessment = replace(assessment, plan_id=plan_id)
+    return lower_state_machine_plan(root, changed_plan, changed_assessment)
+
+
+def _transformed_workflow(
+    tmp_path: Path,
+    *,
+    mode: SourceLoweringMode = "batch-quiescent",
+) -> tuple[ModuleType, tuple[str, ...]]:
     plan, assessment = _plan_and_assessment()
-    lowering = lower_batch_quiescent_plan(FIXTURE_ROOT, plan, assessment)
+    lowering = (
+        lower_state_machine_plan(FIXTURE_ROOT, plan, assessment)
+        if mode == "state-machine"
+        else lower_batch_quiescent_plan(FIXTURE_ROOT, plan, assessment)
+    )
     assert lowering.request is not None
     patch = build_source_transformation_patch(FIXTURE_ROOT, (lowering.request,))
     copied_root = tmp_path / "project"
@@ -685,3 +1046,10 @@ def _async_mapping(
         Callable[[], Coroutine[object, object, Mapping[str, object]]],
         vars(module)[name],
     )
+
+
+async def _collect_events(
+    factory: Callable[[tuple[int, ...]], AsyncIterator[int]],
+    values: tuple[int, ...],
+) -> tuple[int, ...]:
+    return tuple([event async for event in factory(values)])

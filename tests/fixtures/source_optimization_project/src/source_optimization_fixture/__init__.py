@@ -5,6 +5,7 @@ from source_optimization_fixture.workflow import (
     WORK_ITEM_COUNT,
     IncrementalInspector,
     canonical_semantic_snapshot,
+    forwarded_events,
     public_incremental_inspection,
     repeat_baseline_semantic_matrix,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "WORK_ITEM_COUNT",
     "IncrementalInspector",
     "canonical_semantic_snapshot",
+    "forwarded_events",
     "public_incremental_inspection",
     "repeat_baseline_semantic_matrix",
 ]

@@ -6,9 +6,11 @@ from atoll.source_optimization.analysis import (
     build_source_optimization_plans,
 )
 from atoll.source_optimization.lowering import (
+    SourceLoweringMode,
     SourceLoweringResult,
     SourceLoweringStatus,
     lower_batch_quiescent_plan,
+    lower_state_machine_plan,
 )
 from atoll.source_optimization.models import (
     SourceAccessKind,
@@ -28,6 +30,7 @@ from atoll.source_optimization.models import (
     stable_source_optimization_plan_id,
 )
 from atoll.source_optimization.transforms import (
+    CallableBodyReplacement,
     DeclarationKind,
     GeneratedSourcePatch,
     SourceTransformationRequest,
@@ -37,12 +40,14 @@ from atoll.source_optimization.transforms import (
 )
 
 __all__ = (
+    "CallableBodyReplacement",
     "DeclarationKind",
     "GeneratedSourcePatch",
     "SourceAccessKind",
     "SourceAccessSite",
     "SourceCallableEvidence",
     "SourceEdit",
+    "SourceLoweringMode",
     "SourceLoweringResult",
     "SourceLoweringStatus",
     "SourceOptimizationApplicationStatus",
@@ -62,6 +67,7 @@ __all__ = (
     "build_source_optimization_plans",
     "build_source_transformation_patch",
     "lower_batch_quiescent_plan",
+    "lower_state_machine_plan",
     "materialize_transformed_files",
     "stable_source_optimization_plan_id",
 )

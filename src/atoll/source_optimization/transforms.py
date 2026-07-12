@@ -44,6 +44,7 @@ class SourceTransformationRequest:
             imports, constants, classes, and functions.
         trailing_statements: Module-level helpers appended after existing declarations.
             Use these for identity captures that require source callables to exist first.
+        additional_replacements: Extra callable bodies rewritten in the same source file.
         summary: Stable human-readable summary recorded on the generated `SourceEdit`.
         transformation_id: Stable transformation step identifier recorded on the edit.
     """
@@ -55,6 +56,7 @@ class SourceTransformationRequest:
     replacement_body: str
     helper_statements: tuple[str, ...] = ()
     trailing_statements: tuple[str, ...] = ()
+    additional_replacements: tuple[CallableBodyReplacement, ...] = ()
     summary: str = "rewrite source-optimization declaration body"
     transformation_id: str | None = None
 
@@ -72,6 +74,21 @@ class TransformedSourceFile:
     path: PurePosixPath
     before_source: str
     after_source: str
+
+
+@dataclass(frozen=True, slots=True)
+class CallableBodyReplacement:
+    """One additional callable body replacement in a source file request.
+
+    Attributes:
+        target: Exact module-local callable selected by qualname.
+        declaration_kind: Expected sync, async, function, or method shape.
+        replacement_body: Python statements replacing the declaration body.
+    """
+
+    target: SymbolId
+    declaration_kind: DeclarationKind
+    replacement_body: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +310,9 @@ def build_source_transformation_patch(
                 before_hash=before_hash,
                 after_hash=after_hash,
                 summary=request.summary,
-                touched_symbols=(request.target,),
+                touched_symbols=tuple(
+                    replacement.target for replacement in _body_replacements(request)
+                ),
                 transformation_id=request.transformation_id,
                 start_line=start_line,
                 end_line=end_line,
@@ -364,27 +383,18 @@ def materialize_transformed_files(
 def _transform_source(source: str, request: SourceTransformationRequest) -> str:
     module = _parse_module(source, request.path)
     declarations = _supported_declarations(module)
-    matching = [
-        declaration
-        for declaration in declarations
-        if declaration.qualname == request.target.qualname
-    ]
-    if not matching:
-        raise ValueError(
-            f"missing target symbol {request.target.stable_id} in {request.path.as_posix()}"
+    replacements = _body_replacements(request)
+    target_qualnames = [replacement.target.qualname for replacement in replacements]
+    if len(target_qualnames) != len(set(target_qualnames)):
+        raise ValueError(f"duplicate replacement target in {request.path.as_posix()}")
+    replaced = module
+    for replacement in replacements:
+        replaced = _replace_callable_body(
+            replaced,
+            declarations,
+            replacement,
+            request.path,
         )
-    if len(matching) > 1:
-        raise ValueError(
-            f"duplicate target symbol {request.target.stable_id} in {request.path.as_posix()}"
-        )
-    declaration = matching[0]
-    if declaration.kind != request.declaration_kind:
-        raise ValueError(
-            f"declaration kind mismatch for {request.target.stable_id}: "
-            f"expected {request.declaration_kind}, found {declaration.kind}"
-        )
-
-    body = _parse_replacement_body(request.replacement_body, request)
     helper_statements = _parse_generated_statements(
         request.helper_statements,
         request=request,
@@ -395,7 +405,6 @@ def _transform_source(source: str, request: SourceTransformationRequest) -> str:
         request=request,
         label="trailing statements",
     )
-    replaced = module.visit(_BodyReplacementTransformer(request.target.qualname, body))
     if helper_statements:
         replaced = _insert_module_helpers(replaced, helper_statements)
     if trailing_statements:
@@ -408,6 +417,48 @@ def _transform_source(source: str, request: SourceTransformationRequest) -> str:
             f"transformed source is invalid for {request.path.as_posix()}: {exc.msg}"
         ) from exc
     return after_source
+
+
+def _body_replacements(
+    request: SourceTransformationRequest,
+) -> tuple[CallableBodyReplacement, ...]:
+    return (
+        CallableBodyReplacement(
+            target=request.target,
+            declaration_kind=request.declaration_kind,
+            replacement_body=request.replacement_body,
+        ),
+        *request.additional_replacements,
+    )
+
+
+def _replace_callable_body(
+    module: cst.Module,
+    declarations: tuple[_Declaration, ...],
+    replacement: CallableBodyReplacement,
+    path: PurePosixPath,
+) -> cst.Module:
+    matching = [
+        declaration
+        for declaration in declarations
+        if declaration.qualname == replacement.target.qualname
+    ]
+    if not matching:
+        raise ValueError(
+            f"missing target symbol {replacement.target.stable_id} in {path.as_posix()}"
+        )
+    if len(matching) > 1:
+        raise ValueError(
+            f"duplicate target symbol {replacement.target.stable_id} in {path.as_posix()}"
+        )
+    declaration = matching[0]
+    if declaration.kind != replacement.declaration_kind:
+        raise ValueError(
+            f"declaration kind mismatch for {replacement.target.stable_id}: "
+            f"expected {replacement.declaration_kind}, found {declaration.kind}"
+        )
+    body = _parse_replacement_body(replacement.replacement_body, replacement.target)
+    return module.visit(_BodyReplacementTransformer(replacement.target.qualname, body))
 
 
 def _parse_module(source: str, path: PurePosixPath) -> cst.Module:
@@ -444,10 +495,10 @@ def _declaration_for(
 
 def _parse_replacement_body(
     body_source: str,
-    request: SourceTransformationRequest,
+    target: SymbolId,
 ) -> cst.IndentedBlock:
     if not body_source.strip():
-        raise ValueError(f"invalid replacement body for {request.target.stable_id}: empty body")
+        raise ValueError(f"invalid replacement body for {target.stable_id}: empty body")
     normalized = body_source if body_source.endswith("\n") else f"{body_source}\n"
     indented = "".join(
         f"    {line}" if line.strip() else line for line in normalized.splitlines(True)
@@ -455,7 +506,7 @@ def _parse_replacement_body(
     try:
         wrapper = cst.parse_module(f"def _atoll_replacement_body():\n{indented}")
     except cst.ParserSyntaxError as exc:
-        raise ValueError(f"invalid replacement body for {request.target.stable_id}: {exc}") from exc
+        raise ValueError(f"invalid replacement body for {target.stable_id}: {exc}") from exc
     statement = cast(cst.FunctionDef, wrapper.body[0])
     return cast(cst.IndentedBlock, statement.body)
 

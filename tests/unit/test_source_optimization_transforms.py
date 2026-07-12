@@ -12,6 +12,7 @@ import pytest
 
 from atoll.models import SymbolId
 from atoll.source_optimization.transforms import (
+    CallableBodyReplacement,
     DeclarationKind,
     SourceTransformationRequest,
     build_source_transformation_patch,
@@ -336,6 +337,62 @@ def test_patch_output_is_stable_regardless_of_request_order(tmp_path: Path) -> N
 
     assert forward == reversed_patch
     assert forward.patch_text.index("a/pkg/a.py") < forward.patch_text.index("a/pkg/b.py")
+
+
+def test_one_file_request_replaces_multiple_callable_bodies(tmp_path: Path) -> None:
+    """Cumulative candidates can rewrite an owner and private consumer atomically."""
+    source = (
+        "async def owner():\n    return 'owner-old'\n\n"
+        "async def consume():\n    return 'consume-old'\n"
+    )
+    path = _write(tmp_path, "pkg/mod.py", source)
+    request = SourceTransformationRequest(
+        path=path,
+        expected_sha256=_sha256(source),
+        target=SymbolId("pkg.mod", "owner"),
+        declaration_kind="async_function",
+        replacement_body="return 'owner-new'\n",
+        additional_replacements=(
+            CallableBodyReplacement(
+                target=SymbolId("pkg.mod", "consume"),
+                declaration_kind="async_function",
+                replacement_body="return 'consume-new'\n",
+            ),
+        ),
+    )
+
+    patch = build_source_transformation_patch(tmp_path, (request,))
+
+    assert "return 'owner-new'" in patch.files[0].after_source
+    assert "return 'consume-new'" in patch.files[0].after_source
+    assert patch.source_edits[0].touched_symbols == (
+        SymbolId("pkg.mod", "owner"),
+        SymbolId("pkg.mod", "consume"),
+    )
+
+
+def test_one_file_request_rejects_duplicate_callable_targets(tmp_path: Path) -> None:
+    """One declaration cannot receive two ambiguous replacement bodies."""
+    source = "async def owner():\n    return 'old'\n"
+    path = _write(tmp_path, "pkg/mod.py", source)
+    target = SymbolId("pkg.mod", "owner")
+    request = SourceTransformationRequest(
+        path=path,
+        expected_sha256=_sha256(source),
+        target=target,
+        declaration_kind="async_function",
+        replacement_body="return 'first'\n",
+        additional_replacements=(
+            CallableBodyReplacement(
+                target=target,
+                declaration_kind="async_function",
+                replacement_body="return 'second'\n",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="duplicate replacement target"):
+        build_source_transformation_patch(tmp_path, (request,))
 
 
 def test_rejects_stale_hash_without_mutating_source(tmp_path: Path) -> None:
