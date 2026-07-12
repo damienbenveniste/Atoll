@@ -1835,8 +1835,11 @@ def test_package_reports_progress_for_expensive_phases(
     )
 
     assert result.success is True
+    assert result.scalar_analyses
+    assert any(analysis.plans or analysis.rejections for analysis in result.scalar_analyses)
     assert any(message.startswith("discovered ") for message in messages)
     assert any(message.startswith("scanned ") for message in messages)
+    assert any(message.startswith("scalar analysis proved ") for message in messages)
     assert any(message.startswith("compiling typed region variant") for message in messages)
     assert any(message.startswith("compile cache miss") for message in messages)
     assert any(message.startswith("writing wheel") for message in messages)

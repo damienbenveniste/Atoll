@@ -1,4 +1,4 @@
-"""Native optimization model contracts for guarded binding dispatch."""
+"""Native optimization contracts for guarded dispatch and scalar proofs."""
 
 from atoll.native_optimization.models import (
     BindingDispatchPlan,
@@ -17,6 +17,17 @@ from atoll.native_optimization.models import (
     NativeVariantPlan,
     stable_native_variant_plan_id,
 )
+from atoll.native_optimization.scalar_analysis import (
+    ScalarAnalysisResult,
+    ScalarKernelPlan,
+    ScalarMemberAnalysisOptions,
+    ScalarOperationRecord,
+    ScalarParameterDomain,
+    ScalarRejection,
+    ScalarWidthProof,
+    analyze_scalar_member,
+    analyze_scalar_scan,
+)
 
 __all__ = (
     "BindingDispatchPlan",
@@ -33,5 +44,14 @@ __all__ = (
     "IntegerBitWidth",
     "IntegerDomainGuardPayload",
     "NativeVariantPlan",
+    "ScalarAnalysisResult",
+    "ScalarKernelPlan",
+    "ScalarMemberAnalysisOptions",
+    "ScalarOperationRecord",
+    "ScalarParameterDomain",
+    "ScalarRejection",
+    "ScalarWidthProof",
+    "analyze_scalar_member",
+    "analyze_scalar_scan",
     "stable_native_variant_plan_id",
 )

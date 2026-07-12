@@ -97,6 +97,7 @@ from atoll.models import (
     SymbolId,
     TypedRegion,
 )
+from atoll.native_optimization.scalar_analysis import ScalarAnalysisResult, analyze_scalar_scan
 from atoll.project import DiscoveredProject, discover_project
 from atoll.region_cache import compile_with_region_cache
 from atoll.runtime.execution_plan_performance import (
@@ -258,6 +259,7 @@ class PackageCommandResult:
         preflight_skipped: Modules skipped before compilation because of known blockers.
         native_readiness: Post-generation native-readiness evidence.
         typed_regions: Backend-neutral typed regions discovered or reported.
+        scalar_analyses: Fixed-width scalar plans and explicit frontend fallbacks.
         compiled_regions: Typed regions successfully compiled into the wheel.
         compiled_bindings: Source bindings successfully provided by compiled regions.
         compiled_variants: Backend and specialization variants successfully compiled.
@@ -295,6 +297,7 @@ class PackageCommandResult:
     preflight_skipped: tuple[PackagePreflightFailure, ...] = ()
     native_readiness: tuple[NativeReadiness, ...] = ()
     typed_regions: tuple[TypedRegion, ...] = ()
+    scalar_analyses: tuple[ScalarAnalysisResult, ...] = ()
     compiled_regions: tuple[TypedRegion, ...] = ()
     compiled_bindings: tuple[BindingTarget, ...] = ()
     compiled_variants: tuple[CompiledRegionVariant, ...] = ()
@@ -529,6 +532,7 @@ class _TypedRegionPackageContext:
         native_readiness: Post-generation native-readiness evidence.
         execution_plans: Scheduler execution-plan candidates retained for reporting.
         fusion_plans: Deterministic task-fusion safety evidence for profiled scheduler sites.
+        scalar_analyses: Fixed-width scalar proofs and explicit fallbacks for selected scans.
     """
 
     selected: tuple[_SelectedTypedRegion, ...]
@@ -537,6 +541,7 @@ class _TypedRegionPackageContext:
     native_readiness: tuple[NativeReadiness, ...]
     execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = ()
     fusion_plans: tuple[FusionPlan, ...] = ()
+    scalar_analyses: tuple[ScalarAnalysisResult, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -959,6 +964,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     scan_started = time.perf_counter()
     scans = _selected_scans(project, options.module_name, options.selected_members)
     typed_regions = tuple(region for scan in scans for region in scan.typed_regions)
+    scalar_analyses = _scalar_analyses(scans, options.progress)
     execution_plans = build_execution_plans(scans, None)
     _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
     preflight_selected = _selected_typed_regions(
@@ -1138,12 +1144,13 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
                 native_readiness=(),
                 execution_plans=execution_plans,
                 fusion_plans=fusion_plans,
+                scalar_analyses=scalar_analyses,
             ),
             prepared_baseline=baseline,
             profile=profile,
         )
     return _with_source_optimization(
-        package_result,
+        replace(package_result, scalar_analyses=scalar_analyses),
         source_optimization,
         source_trials,
     )
@@ -1347,6 +1354,7 @@ def _execute_composed_source_arm(
         options.module_name,
         options.selected_members,
     )
+    scalar_analyses = _scalar_analyses(active_scans, options.progress)
     active_profile = preparation.profile
     if active_profile is not None:
         active_profile = select_profile_candidates(
@@ -1381,12 +1389,15 @@ def _execute_composed_source_arm(
         ),
     )
     if not selected and not selected_plans:
-        return _source_optimization_package_result(
-            options=options,
-            project=project,
-            preparation=preparation,
-            planning=planning,
-            search=search,
+        return replace(
+            _source_optimization_package_result(
+                options=options,
+                project=project,
+                preparation=preparation,
+                planning=planning,
+                search=search,
+            ),
+            scalar_analyses=scalar_analyses,
         )
 
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
@@ -1410,6 +1421,7 @@ def _execute_composed_source_arm(
                     native_readiness=(),
                     execution_plans=active_execution_plans,
                     fusion_plans=active_fusion_plans,
+                    scalar_analyses=scalar_analyses,
                 ),
                 prepared_baseline=arm.baseline,
                 profile=active_profile,
@@ -1433,6 +1445,7 @@ def _execute_composed_source_arm(
                 replace(
                     rebased,
                     test_results=(*search.test_results, *rebased.test_results),
+                    scalar_analyses=scalar_analyses,
                 ),
                 planning,
                 search.trials,
@@ -1448,7 +1461,10 @@ def _execute_composed_source_arm(
             planning=planning,
             search=search,
         )
-        return _source_result_with_composition_fallback(source_result, candidate, project)
+        return replace(
+            _source_result_with_composition_fallback(source_result, candidate, project),
+            scalar_analyses=scalar_analyses,
+        )
 
 
 def _materialize_source_optimization_arm(
@@ -5560,6 +5576,36 @@ def _selected_scans(
     else:
         modules = project.modules
     return tuple(enrich_island_analysis(scan_module(module)) for module in modules)
+
+
+def _scalar_analyses(
+    scans: tuple[ModuleScan, ...],
+    progress: PackageProgress | None,
+) -> tuple[ScalarAnalysisResult, ...]:
+    """Derive fixed-width proof candidates without changing generic selection.
+
+    The proof frontend runs before backend selection and again after an accepted
+    source patch is materialized. Milestone-specific native lowering consumes
+    this evidence later; ordinary typed-region selection remains independent.
+
+    Args:
+        scans: Enriched module scans in compile order.
+        progress: Optional CLI progress callback.
+
+    Returns:
+        tuple[ScalarAnalysisResult, ...]: Per-module scalar plans and explicit fallbacks.
+    """
+    analyses = tuple(analyze_scalar_scan(scan) for scan in scans)
+    plan_count = sum(len(analysis.plans) for analysis in analyses)
+    rejection_count = sum(len(analysis.rejections) for analysis in analyses)
+    _progress(
+        progress,
+        (
+            f"scalar analysis proved {plan_count} callable(s); "
+            f"{rejection_count} callable(s) retained Python fallback"
+        ),
+    )
+    return analyses
 
 
 def _profile_candidate_members(
