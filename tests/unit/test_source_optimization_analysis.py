@@ -99,6 +99,28 @@ def test_source_planner_rejects_low_volume_share_and_suspension(tmp_path: Path) 
     assert any("immediate-result ratio" in reason for reason in assessment.rejections)
 
 
+def test_anyio_source_planner_defers_transport_suspension_to_runtime_guards(
+    tmp_path: Path,
+) -> None:
+    """AnyIO producer send suspension does not poison a guarded source trial."""
+    scan = _scan(tmp_path, introspection=False, forwarding=False)
+    execution_plan = replace(
+        _execution_plan(scan, observed_work_items=OBSERVED_WORK_ITEMS),
+        dialect="anyio-on-asyncio",
+    )
+
+    result = build_source_optimization_plans(
+        (scan,),
+        (execution_plan,),
+        _planning_options(tmp_path, profile=_profile(immediate=False)),
+    )
+
+    assessment = result.assessments[0]
+    assert assessment.immediate_result_ratio == 0.0
+    assert assessment.status == "trial-ready"
+    assert not any("zero observed suspension" in reason for reason in assessment.rejections)
+
+
 def test_source_planner_rejects_task_introspection(tmp_path: Path) -> None:
     scan = _scan(tmp_path, introspection=True, forwarding=False)
 

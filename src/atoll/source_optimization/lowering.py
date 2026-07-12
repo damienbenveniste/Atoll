@@ -19,6 +19,7 @@ from typing import Literal, cast, override
 import libcst as cst
 
 from atoll.models import SymbolId
+from atoll.source_optimization.anyio_stream_lowering import lower_anyio_stream_plan
 from atoll.source_optimization.models import (
     SourceCallableEvidence,
     SourceOptimizationAssessment,
@@ -181,6 +182,13 @@ def _lower_source_plan(
     *,
     mode: SourceLoweringMode,
 ) -> SourceLoweringResult:
+    if plan.identity.dialect == "anyio-on-asyncio":
+        return _lower_anyio_source_plan(
+            project_root,
+            plan,
+            assessment,
+            mode=mode,
+        )
     preflight = _preflight_rejections(plan, assessment, mode=mode)
     if preflight:
         return _unsupported(plan, preflight, mode=mode)
@@ -208,6 +216,54 @@ def _lower_source_plan(
                 *((names.protocol,) if _has_protocol_step(plan) else ()),
             )
         ),
+        mode=mode,
+    )
+
+
+def _lower_anyio_source_plan(
+    project_root: Path,
+    plan: SourceOptimizationPlan,
+    assessment: SourceOptimizationAssessment,
+    *,
+    mode: SourceLoweringMode,
+) -> SourceLoweringResult:
+    """Lower the state-machine variant of a guarded AnyIO stream plan.
+
+    Args:
+        project_root: Target project root containing the source plan.
+        plan: AnyIO-on-asyncio plan selected from current profile evidence.
+        assessment: Trial-readiness assessment for the exact plan.
+        mode: Candidate lowering mode requested by bounded search.
+
+    Returns:
+        SourceLoweringResult: Transformation request or deterministic rejection.
+    """
+    reasons: list[str] = []
+    if assessment.plan_id != plan.id:
+        reasons.append("source assessment belongs to a different plan")
+    if assessment.status != "trial-ready":
+        reasons.append(f"source assessment is {assessment.status}, not trial-ready")
+    if mode != "state-machine":
+        reasons.append("AnyIO stream lowering is available only as a state-machine candidate")
+    available_steps = {step.kind for step in plan.steps}
+    required_steps = {
+        "private-transport-batch-drain",
+        "quiescent-callable-execution",
+        "local-state-machine-fusion",
+    }
+    if not required_steps.issubset(available_steps):
+        reasons.append("source plan lacks the complete AnyIO state-machine step set")
+    if reasons:
+        return _unsupported(plan, tuple(reasons), mode=mode)
+    try:
+        lowered = lower_anyio_stream_plan(project_root, plan)
+    except (OSError, SyntaxError, TypeError, ValueError, cst.ParserSyntaxError) as error:
+        return _unsupported(plan, (str(error),), mode=mode)
+    return SourceLoweringResult(
+        plan_id=plan.id,
+        status="lowered",
+        request=lowered.request,
+        helper_names=lowered.helper_names,
         mode=mode,
     )
 

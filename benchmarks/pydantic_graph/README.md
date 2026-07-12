@@ -17,45 +17,38 @@ The runner clones the pinned revision, materializes the workload outside the tar
 adds benchmark policy only to the disposable `pydantic_graph/pyproject.toml`, and invokes the same
 source-clean compile twice. It never edits `pydantic_graph/*.py`.
 
-Each measured sample runs eight executions of the 5,000-item fan-out. This keeps interpreter
-startup and the separate graph-construction checksum from dominating the async scheduling ratio.
+Each measured sample runs eight executions of the 5,000-item fan-out and sets
+`--build-repetitions 0`. The semantic command still verifies graph construction, but the hard
+performance gate isolates the async execution pipeline that the source plan transforms.
 
-Evidence includes cold and warm JSON/Markdown reports, compiler logs, compiler-probe events, and
-source hash manifests. The run fails unless:
+Evidence includes cold and warm schema-v5 JSON/Markdown reports, compile logs, compiler-probe
+events, source manifests, the accepted patch, and an acceptance summary. The run fails unless:
 
-- both reports are schema version 5 and profile-guided, proving the profile pass ran on both cold
-  and warm compiles;
-- at least one execution plan is discovered, applied, and accepted by an execution-plan trial;
-- each applied execution-plan trial records a cold staging-cache miss, a warm staging-cache hit, at
-  least `1.05x` marginal speedup, and at least `1.10x` overall speedup;
-- every accepted native candidate, when native typed-region evidence exists, measures at least
-  `1.05x` marginal speedup;
-- the final payload measures at least `1.10x` end-to-end speedup;
-- execution-plan IDs, aggregate source hashes, and nonempty per-module source hashes remain stable
-  between cold and warm reports;
-- checkout source hashes remain unchanged;
-- typed-region source hashes remain stable when typed-region evidence is present;
-- the warm compile performs no native compiler phases or compiler-probe invocations;
-- when native typed-region evidence exists, cold mypyc time is at most 50% of the recorded
-  `192.701915s` reference, the cold run records native compiler phases and independent
-  compiler-probe events, and the warm compile restores every native region from cache;
-- the warm compile promotes a verified wheel.
+- both compiles rerun profile collection and report a selected source plan with valid per-file
+  source hashes;
+- the accepted plan represents at least 10,000 work items and 70% of the attributable hot path;
+- one accepted trial contains private transport draining, copied-context quiescent execution,
+  local state-machine fusion, and private protocol forwarding;
+- both transformed source and its normal PEP 517 wheel measure at least `3.0x` over baseline;
+- cold and warm runs each contain seven fresh baseline/optimized timing pairs;
+- source-plan identity, source hashes, candidate ID, transformation IDs, and patch path remain
+  identical between runs;
+- patch generation reports a cold cache miss and a warm cache hit while profitability is still
+  remeasured on both invocations;
+- the patch remains under `.atoll/patches/`, is not applied by default, and exists beside the
+  promoted wheel;
+- checkout Python source hashes remain unchanged;
+- the warm run invokes no native compiler and contains no native compiler phase.
 
-The fixed cold-time reference came from the Apple Silicon environment described in
-`baseline.json`. Its absolute comparison is useful regression evidence but is not a substitute for
-same-machine timing. The end-to-end speedup and candidate decisions are paired within each run.
-Zero cold native phases and compiler-probe calls are valid only for plan-only success, where the
-accepted payload comes from execution-plan staging and the report contains no typed/native region
-evidence. If native regions are present, the cold compiler and warm region-cache checks remain hard
-requirements.
-
-Task-fusion fields, when present, are compatibility and research evidence only. They are not a
-promotion requirement for this benchmark. Pydantic Graph's scheduler now promotes through the
-generic execution-plan path, so acceptance depends on applied execution-plan trials rather than
-fusion-specific safety plans.
+The July 11, 2026 Apple Silicon acceptance run measured `4.982x` for the cold final wheel and
+`5.008x` for the warm final wheel; the warm transformed-source ratio was `5.001x`. These ratios are
+paired same-machine evidence for the pinned workload, not a universal Python or Pydantic claim.
+`baseline.json` retains the older native-compiler reference only as historical regression data.
+Task-fusion and execution-plan fields remain compatibility and research evidence; schema-v5 source
+trial evidence controls this benchmark's promotion.
 
 The GitHub workflow **Pydantic Graph Hard Benchmark** exposes the same gate through
-`workflow_dispatch` and uploads schema-v4 cold/warm reports, logs, source manifests, compiler-probe
+`workflow_dispatch` and uploads schema-v5 cold/warm reports, logs, source manifests, compiler-probe
 events, and the acceptance summary even when an acceptance condition fails.
 
 ## Optimization ceiling experiment

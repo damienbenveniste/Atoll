@@ -274,6 +274,7 @@ class SourceOptimizationPlan:
         entrypoint: Callable used to enter the optimized source path.
         steps: Ordered transformations that make up the source patch.
         semantic_boundaries: Named invariants the plan must preserve.
+        transport_capacity: Statically known private transport capacity, when available.
     """
 
     id: str
@@ -288,6 +289,7 @@ class SourceOptimizationPlan:
     entrypoint: SymbolId
     steps: tuple[TransformationStep, ...]
     semantic_boundaries: tuple[str, ...]
+    transport_capacity: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

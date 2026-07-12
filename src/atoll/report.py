@@ -1447,6 +1447,7 @@ class CompilationSourceOptimizationPlanReport(TypedDict):
         entrypoint: Callable used to enter the optimized path.
         steps: Ordered transformations that make up the source patch.
         semantic_boundaries: Named invariants the plan preserves.
+        transport_capacity: Statically known private transport capacity, when available.
     """
 
     id: str
@@ -1461,6 +1462,7 @@ class CompilationSourceOptimizationPlanReport(TypedDict):
     entrypoint: str
     steps: list[CompilationSourceOptimizationStepReport]
     semantic_boundaries: list[str]
+    transport_capacity: int | None
 
 
 class CompilationSourceOptimizationCallableEvidenceReport(TypedDict):
@@ -4164,6 +4166,7 @@ def _source_optimization_plan_report(
         "entrypoint": plan.entrypoint.stable_id,
         "steps": [_source_optimization_step_report(step) for step in plan.steps],
         "semantic_boundaries": list(plan.semantic_boundaries),
+        "transport_capacity": plan.transport_capacity,
     }
 
 

@@ -1,4 +1,4 @@
-"""Deterministic checks for the manual Pydantic Graph hard-benchmark harness."""
+"""Deterministic checks for the schema-v5 Pydantic Graph hard-benchmark gate."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from scripts.run_pydantic_graph_benchmark import (
     COLD_MYPYC_BASELINE_SECONDS,
     COLD_MYPYC_TARGET_SECONDS,
     MINIMUM_FINAL_SPEEDUP,
-    MINIMUM_MARGINAL_SPEEDUP,
+    MINIMUM_SOURCE_SPEEDUP,
     BenchmarkEvidenceInputs,
     append_compile_policy,
     evaluate_reports,
@@ -21,113 +21,85 @@ from scripts.run_pydantic_graph_benchmark import (
 )
 
 TEMPLATE_ROOT = Path("benchmarks/pydantic_graph")
-COLD_TEST_SECONDS = 90.0
-FINAL_TEST_SPEEDUP = 1.12
-PROBE_TEST_COUNT = 2
-PLAN_ID = "exec-plan:fixture"
+PLAN_ID = "source-opt-fixture"
+CANDIDATE_ID = "source-candidate-fixture"
+PATCH_PATH = f".atoll/patches/{CANDIDATE_ID}.patch"
+SOURCE_SPEEDUP = 3.6
+WHEEL_SPEEDUP = 3.5
+TRANSFORMATION_IDS = [
+    "private-transport-batch-drain:batch-drain-v1:fixture.Owner.consume",
+    "quiescent-callable-execution:quiescent-callable-v1:fixture.Owner.worker",
+    "local-state-machine-fusion:state-machine-v1:fixture.Owner.dispatch",
+    "private-protocol-auto-forwarding:protocol-forward-v1:fixture.run",
+]
 
 
-def test_evaluate_reports_accepts_profiled_cold_and_cache_only_warm_builds() -> None:
-    cold = _report(cache_status="miss", mypyc_seconds=COLD_TEST_SECONDS)
-    warm = _report(cache_status="hit", mypyc_seconds=0.0)
-
+def test_evaluate_reports_accepts_reproducible_3x_source_patch() -> None:
     evaluation = evaluate_reports(
-        BenchmarkEvidenceInputs(
-            cold_report=cold,
-            warm_report=warm,
-            sources_unchanged=True,
-            cold_exit_code=0,
-            warm_exit_code=0,
-            wheel_present=True,
-            cold_compiler_probe_count=PROBE_TEST_COUNT,
-            warm_compiler_probe_count=0,
+        _inputs(
+            cold=_report(cache_status="miss"),
+            warm=_report(cache_status="hit"),
         )
     )
 
     assert evaluation.succeeded is True
     assert evaluation.errors == ()
-    assert evaluation.cold_mypyc_seconds == COLD_TEST_SECONDS
-    assert evaluation.cold_native_phase_count == 1
-    assert evaluation.cold_compiler_probe_count == PROBE_TEST_COUNT
-    assert evaluation.warm_native_phase_count == 0
-    assert evaluation.warm_compiler_probe_count == 0
-    assert evaluation.final_speedup == FINAL_TEST_SPEEDUP
-    assert evaluation.accepted_candidates == 1
-    assert evaluation.execution_plan_count == 1
-    assert evaluation.applied_execution_plan_count == 1
-    assert evaluation.execution_plan_trial_count == 1
-    assert evaluation.accepted_execution_plan_trials == 1
-    assert evaluation.fusion_plan_count == 1
-    assert evaluation.eligible_fusion_plan_count == 0
-    assert evaluation.fusion_trial_count == 0
-
-
-def test_evaluate_reports_accepts_plan_only_success_without_native_invocations() -> None:
-    cold = _report(
-        cache_status="miss",
-        mypyc_seconds=0.0,
-        native_evidence=False,
-        options=_ReportOptions(execution_plan_cache_status="miss"),
-    )
-    warm = _report(
-        cache_status="hit",
-        mypyc_seconds=0.0,
-        native_evidence=False,
-        options=_ReportOptions(execution_plan_cache_status="hit"),
-    )
-
-    evaluation = evaluate_reports(
-        BenchmarkEvidenceInputs(
-            cold_report=cold,
-            warm_report=warm,
-            sources_unchanged=True,
-            cold_exit_code=0,
-            warm_exit_code=0,
-            wheel_present=True,
-            cold_compiler_probe_count=0,
-            warm_compiler_probe_count=0,
-        )
-    )
-
-    assert evaluation.succeeded is True
-    assert evaluation.errors == ()
-    assert evaluation.accepted_candidates == 0
+    assert evaluation.cold_patch_cache_status == "miss"
+    assert evaluation.warm_patch_cache_status == "hit"
+    assert evaluation.final_speedup == WHEEL_SPEEDUP
+    assert evaluation.source_speedup == SOURCE_SPEEDUP
+    assert evaluation.wheel_speedup == WHEEL_SPEEDUP
+    assert evaluation.source_plan_count == 1
+    assert evaluation.trial_ready_source_plan_count == 1
+    assert evaluation.source_trial_count == 1
+    assert evaluation.accepted_source_trials == 1
+    assert evaluation.patch_path == PATCH_PATH
+    assert evaluation.application_status == "not-applied"
     assert evaluation.cold_native_phase_count == 0
-    assert evaluation.cold_compiler_probe_count == 0
-    assert evaluation.accepted_execution_plan_trials == 1
+    assert evaluation.warm_native_phase_count == 0
 
 
-def test_evaluate_reports_explains_every_hard_gate_failure() -> None:
-    cold = _report(cache_status="partial", mypyc_seconds=COLD_MYPYC_TARGET_SECONDS + 1)
+def test_evaluate_reports_rejects_every_source_promotion_boundary() -> None:
+    cold = _report(cache_status="hit")
     warm = _report(
-        cache_status="partial",
-        mypyc_seconds=1.0,
-        final_speedup=MINIMUM_FINAL_SPEEDUP - 0.01,
-        options=_ReportOptions(
-            marginal_speedup=MINIMUM_MARGINAL_SPEEDUP - 0.01,
-            region_cache_status="miss",
-            execution_plan_cache_status="miss",
-            execution_plan_marginal_speedup=MINIMUM_MARGINAL_SPEEDUP - 0.01,
-            execution_plan_overall_speedup=MINIMUM_FINAL_SPEEDUP - 0.01,
-        ),
+        cache_status="miss",
+        source_speedup=MINIMUM_SOURCE_SPEEDUP - 0.01,
+        wheel_speedup=MINIMUM_FINAL_SPEEDUP - 0.01,
     )
-    warm["version"] = 2
+    warm["version"] = 4
     cast(dict[str, object], warm["profile"])["status"] = "static-fallback"
-    cast(dict[str, object], cast(list[object], warm["execution_plans"])[0])["source_hash"] = (
-        "changed-plan-source-hash"
-    )
-    warm["applied_execution_plans"] = [PLAN_ID, "exec-plan:unselected"]
+    cast(dict[str, object], warm["performance"])["status"] = "not-profitable"
+    cast(dict[str, object], warm["performance"])["samples"] = []
+    source = cast(dict[str, object], warm["source_optimization"])
+    source["status"] = "not-profitable"
+    source["minimum_speedup"] = 2.9
+    source["application_status"] = "applied"
+    source["patch_path"] = "outside.patch"
+    plan = cast(dict[str, object], cast(list[object], source["plans"])[0])
+    identity = cast(dict[str, object], plan["identity"])
+    identity["source_hashes"] = {}
+    assessment = cast(dict[str, object], cast(list[object], source["assessments"])[0])
+    assessment["observed_work_items"] = 999
+    assessment["attributed_hot_share"] = 0.2
+    trial = cast(dict[str, object], cast(list[object], source["trials"])[0])
+    trial["candidate_id"] = "changed-candidate"
+    trial["patch_path"] = "outside.patch"
+    trial["semantic_exit_code"] = 1
+    trial["source_edits"] = []
+    trial["transformation_ids"] = TRANSFORMATION_IDS[:-1]
 
     evaluation = evaluate_reports(
-        BenchmarkEvidenceInputs(
-            cold_report=cold,
-            warm_report=warm,
-            sources_unchanged=False,
-            cold_exit_code=1,
-            warm_exit_code=1,
-            wheel_present=False,
-            cold_compiler_probe_count=0,
-            warm_compiler_probe_count=PROBE_TEST_COUNT,
+        _inputs(
+            cold=cold,
+            warm=warm,
+            options=_InputOptions(
+                sources_unchanged=False,
+                cold_exit_code=1,
+                warm_exit_code=1,
+                wheel_present=False,
+                patch_present=False,
+                warm_compiler_probe_count=2,
+            ),
         )
     )
 
@@ -136,26 +108,66 @@ def test_evaluate_reports_explains_every_hard_gate_failure() -> None:
     assert "cold compile did not succeed" in message
     assert "warm report is not schema version 5" in message
     assert "warm profile status is static-fallback" in message
-    assert "cold cache status is partial" in message
-    assert "cold mypyc took" in message
-    assert "compiler probe observed no cold native invocation" in message
-    assert "warm cache status is partial" in message
-    assert "warm compiled regions were not cache hits" in message
-    assert "warm report contains" in message
+    assert "warm performance status is not-profitable" in message
+    assert "warm source-optimization status is not-profitable" in message
+    assert "below 3.000x" in message
+    assert "cold source-patch cache status is hit" in message
+    assert "warm source-patch cache status is miss" in message
     assert "compiler probe observed 2 warm invocation" in message
     assert "source hashes changed" in message
-    assert "execution-plan identities or source hashes changed" in message
-    assert "was not discovered as selected" in message
-    assert "has no accepted trial" in message
-    assert "below 1.05x marginal" in message
-    assert "below 1.10x overall" not in message
-    assert "warm execution-plan trial cache status is miss" in message
+    assert "source-plan identities or source hashes changed" in message
+    assert "accepted source candidate or patch identity changed" in message
+    assert "outside .atoll/patches" in message
+    assert "application status is applied" in message
+    assert "no valid per-file source hashes" in message
+    assert "no safe .atoll patch path" in message
+    assert "contains no source edits" in message
+    assert "did not pass semantic tests" in message
+    assert "private-protocol-auto-forwarding" in message
+    assert "fewer than 10,000 work items" in message
+    assert "less than 70%" in message
+    assert "did not rerun 7 baseline/compiled timing pairs" in message
     assert "did not leave a promoted wheel" in message
-    assert "missing the required 1.05x" in message
-    assert "final speedup is below 1.10x" in message
+    assert "did not leave the accepted source patch" in message
+    assert "transformed source speedup is below 3.00x" in message
+    assert "normal wheel speedup is below 3.00x" in message
+    assert "final speedup is below 3.00x" in message
 
 
-def test_append_compile_policy_uses_external_profiled_workload(tmp_path: Path) -> None:
+def test_evaluate_reports_requires_source_plan_and_accepted_trial() -> None:
+    cold = _report(cache_status="miss")
+    warm = _report(cache_status="hit")
+    for report in (cold, warm):
+        source = cast(dict[str, object], report["source_optimization"])
+        source["plans"] = []
+        source["assessments"] = []
+        source["trials"] = []
+        source["patch_path"] = None
+
+    evaluation = evaluate_reports(
+        _inputs(cold=cold, warm=warm, options=_InputOptions(patch_present=False))
+    )
+
+    message = "\n".join(evaluation.errors)
+    assert "contains no source-optimization plan" in message
+    assert "contains no trial-ready source plan" in message
+    assert "contains 0 accepted source trials" in message
+
+
+def test_evaluate_reports_rejects_stale_source_identity() -> None:
+    cold = _report(cache_status="miss")
+    warm = _report(cache_status="hit")
+    source = cast(dict[str, object], warm["source_optimization"])
+    plan = cast(dict[str, object], cast(list[object], source["plans"])[0])
+    identity = cast(dict[str, object], plan["identity"])
+    identity["source_hashes"] = {"fixture/workflow.py": "changed"}
+
+    evaluation = evaluate_reports(_inputs(cold=cold, warm=warm))
+
+    assert "source-plan identities or source hashes changed" in "\n".join(evaluation.errors)
+
+
+def test_append_compile_policy_profiles_only_the_async_pipeline(tmp_path: Path) -> None:
     pyproject = tmp_path / "pyproject.toml"
     workload = tmp_path / "evidence" / "workload.py"
     pyproject.write_text(
@@ -171,113 +183,20 @@ def test_append_compile_policy_uses_external_profiled_workload(tmp_path: Path) -
         cast(dict[str, object], cast(dict[str, object], parsed["tool"])["atoll"])["compile"],
     )
     assert compile_config["backends"] == ["mypyc", "cython"]
-    assert compile_config["test_command"] == ["python", str(workload.resolve()), "--verify"]
-    assert compile_config["benchmark_command"] == ["python", str(workload.resolve())]
+    assert compile_config["test_command"] == [
+        "python",
+        str(workload.resolve()),
+        "--verify",
+    ]
+    assert compile_config["benchmark_command"] == [
+        "python",
+        str(workload.resolve()),
+        "--build-repetitions",
+        "0",
+    ]
     assert compile_config["benchmark_warmups"] == 1
     assert compile_config["benchmark_samples"] == BENCHMARK_SAMPLES
     assert compile_config["minimum_speedup"] == MINIMUM_FINAL_SPEEDUP
-
-
-def test_evaluate_reports_requires_discovered_execution_plans() -> None:
-    cold = _report(cache_status="miss", mypyc_seconds=COLD_TEST_SECONDS)
-    warm = _report(cache_status="hit", mypyc_seconds=0.0)
-    cold["execution_plans"] = []
-    warm["execution_plans"] = []
-
-    evaluation = evaluate_reports(
-        BenchmarkEvidenceInputs(
-            cold_report=cold,
-            warm_report=warm,
-            sources_unchanged=True,
-            cold_exit_code=0,
-            warm_exit_code=0,
-            wheel_present=True,
-            cold_compiler_probe_count=PROBE_TEST_COUNT,
-            warm_compiler_probe_count=0,
-        )
-    )
-
-    assert "warm report contains no discovered execution plan" in "\n".join(evaluation.errors)
-
-
-def test_evaluate_reports_requires_applied_execution_plans() -> None:
-    cold = _report(cache_status="miss", mypyc_seconds=COLD_TEST_SECONDS)
-    warm = _report(cache_status="hit", mypyc_seconds=0.0)
-    warm["applied_execution_plans"] = []
-
-    evaluation = evaluate_reports(
-        BenchmarkEvidenceInputs(
-            cold_report=cold,
-            warm_report=warm,
-            sources_unchanged=True,
-            cold_exit_code=0,
-            warm_exit_code=0,
-            wheel_present=True,
-            cold_compiler_probe_count=PROBE_TEST_COUNT,
-            warm_compiler_probe_count=0,
-        )
-    )
-
-    assert "warm report contains no applied execution plan" in "\n".join(evaluation.errors)
-
-
-def test_evaluate_reports_rejects_missing_execution_plan_source_hashes() -> None:
-    cold = _report(cache_status="miss", mypyc_seconds=0.0, native_evidence=False)
-    warm = _report(cache_status="hit", mypyc_seconds=0.0, native_evidence=False)
-    cold_plan = cast(dict[str, object], cast(list[object], cold["execution_plans"])[0])
-    warm_plan = cast(dict[str, object], cast(list[object], warm["execution_plans"])[0])
-    cold_plan["source_hash"] = None
-    warm_plan["source_hash"] = None
-    cold_plan["source_hashes"] = {}
-    warm_plan["source_hashes"] = {}
-
-    evaluation = evaluate_reports(
-        BenchmarkEvidenceInputs(
-            cold_report=cold,
-            warm_report=warm,
-            sources_unchanged=True,
-            cold_exit_code=0,
-            warm_exit_code=0,
-            wheel_present=True,
-            cold_compiler_probe_count=0,
-            warm_compiler_probe_count=0,
-        )
-    )
-
-    assert evaluation.succeeded is False
-    message = "\n".join(evaluation.errors)
-    assert "cold selected execution plan" in message
-    assert "has no source hash" in message
-    assert "has no per-module source hashes" in message
-
-
-def test_evaluate_reports_rejects_subthreshold_execution_plan_margin() -> None:
-    cold = _report(cache_status="miss", mypyc_seconds=COLD_TEST_SECONDS)
-    warm = _report(
-        cache_status="hit",
-        mypyc_seconds=0.0,
-        options=_ReportOptions(
-            execution_plan_marginal_speedup=1.04,
-            execution_plan_overall_speedup=1.09,
-        ),
-    )
-
-    evaluation = evaluate_reports(
-        BenchmarkEvidenceInputs(
-            cold_report=cold,
-            warm_report=warm,
-            sources_unchanged=True,
-            cold_exit_code=0,
-            warm_exit_code=0,
-            wheel_present=True,
-            cold_compiler_probe_count=PROBE_TEST_COUNT,
-            warm_compiler_probe_count=0,
-        )
-    )
-
-    message = "\n".join(evaluation.errors)
-    assert "below 1.05x marginal" in message
-    assert "below 1.10x overall" not in message
 
 
 def test_source_manifest_detects_only_python_source_changes(tmp_path: Path) -> None:
@@ -294,7 +213,7 @@ def test_source_manifest_detects_only_python_source_changes(tmp_path: Path) -> N
     assert source_manifest(package) != before
 
 
-def test_benchmark_templates_and_baseline_are_well_formed() -> None:
+def test_benchmark_templates_and_legacy_baseline_are_well_formed() -> None:
     workload = TEMPLATE_ROOT / "workload.py.in"
     compile(workload.read_text(encoding="utf-8"), str(workload), "exec")
     semantic_probe = TEMPLATE_ROOT / "ceiling_semantics.py.in"
@@ -311,73 +230,103 @@ def test_benchmark_templates_and_baseline_are_well_formed() -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class _ReportOptions:
-    marginal_speedup: float = 1.06
-    region_cache_status: str = "hit"
-    execution_plan_cache_status: str | None = None
-    execution_plan_marginal_speedup: float = 1.25
-    execution_plan_overall_speedup: float = 1.50
+class _InputOptions:
+    sources_unchanged: bool = True
+    cold_exit_code: int = 0
+    warm_exit_code: int = 0
+    wheel_present: bool = True
+    patch_present: bool = True
+    warm_compiler_probe_count: int = 0
 
 
-DEFAULT_REPORT_OPTIONS = _ReportOptions()
+DEFAULT_INPUT_OPTIONS = _InputOptions()
+
+
+def _inputs(
+    *,
+    cold: dict[str, object],
+    warm: dict[str, object],
+    options: _InputOptions = DEFAULT_INPUT_OPTIONS,
+) -> BenchmarkEvidenceInputs:
+    return BenchmarkEvidenceInputs(
+        cold_report=cold,
+        warm_report=warm,
+        sources_unchanged=options.sources_unchanged,
+        cold_exit_code=options.cold_exit_code,
+        warm_exit_code=options.warm_exit_code,
+        wheel_present=options.wheel_present,
+        patch_present=options.patch_present,
+        cold_compiler_probe_count=0,
+        warm_compiler_probe_count=options.warm_compiler_probe_count,
+    )
 
 
 def _report(
     *,
     cache_status: str,
-    mypyc_seconds: float,
-    final_speedup: float = FINAL_TEST_SPEEDUP,
-    native_evidence: bool = True,
-    options: _ReportOptions = DEFAULT_REPORT_OPTIONS,
+    source_speedup: float = SOURCE_SPEEDUP,
+    wheel_speedup: float = WHEEL_SPEEDUP,
 ) -> dict[str, object]:
-    timings: list[dict[str, object]] = []
-    if mypyc_seconds:
-        timings.append({"name": "mypycify", "duration_seconds": mypyc_seconds})
-    candidate_trials: list[dict[str, object]] = []
-    compiled_regions: list[dict[str, object]] = []
-    typed_regions: list[dict[str, object]] = []
-    if native_evidence:
-        candidate_trials.append(
-            {"status": "accepted", "marginal_speedup": options.marginal_speedup}
-        )
-        compiled_regions.append({"cache_status": options.region_cache_status})
-        typed_regions.append({"id": "fixture::hot", "source_hash": "source-hash"})
-    plan_cache_status = options.execution_plan_cache_status or (
-        "miss" if cache_status == "miss" else "hit"
-    )
+    samples = [
+        {"mode": mode, "duration_seconds": 1.0}
+        for _ in range(BENCHMARK_SAMPLES)
+        for mode in ("baseline", "compiled")
+    ]
     return {
         "version": 5,
         "success": True,
-        "build": {"cache_status": cache_status, "phase_timings": timings},
+        "build": {"cache_status": "disabled", "phase_timings": []},
         "profile": {"status": "profiled"},
-        "performance": {"speedup": final_speedup},
-        "candidate_trials": candidate_trials,
-        "compiled_regions": compiled_regions,
-        "typed_regions": typed_regions,
-        "execution_plans": [
-            {
-                "id": PLAN_ID,
-                "status": "selected",
-                "source_hash": "plan-source-hash",
-                "source_hashes": {"fixture.scheduler": "plan-module-source-hash"},
-            }
-        ],
-        "applied_execution_plans": [PLAN_ID],
-        "execution_plan_trials": [
-            {
-                "plan_id": PLAN_ID,
-                "status": "accepted",
-                "marginal_speedup": options.execution_plan_marginal_speedup,
-                "overall_speedup": options.execution_plan_overall_speedup,
-                "cache_status": plan_cache_status,
-            }
-        ],
-        "fusion_plans": [
-            {
-                "id": "task-fusion:fixture",
-                "source_hash": "fusion-source-hash",
-                "eligible": False,
-            }
-        ],
-        "fusion_trials": [],
+        "performance": {
+            "status": "passed",
+            "speedup": wheel_speedup,
+            "samples": samples,
+        },
+        "source_optimization": {
+            "status": "accepted",
+            "minimum_speedup": 3.0,
+            "patch_path": PATCH_PATH,
+            "application_status": "not-applied",
+            "plans": [
+                {
+                    "id": PLAN_ID,
+                    "identity": {
+                        "dialect": "anyio-on-asyncio",
+                        "python_abi": "cpython-312",
+                        "source_hashes": {
+                            "fixture/workflow.py": "source-hash",
+                        },
+                    },
+                }
+            ],
+            "assessments": [
+                {
+                    "plan_id": PLAN_ID,
+                    "status": "trial-ready",
+                    "observed_work_items": 20_000,
+                    "attributed_hot_share": 0.8,
+                }
+            ],
+            "trials": [
+                {
+                    "plan_id": PLAN_ID,
+                    "status": "accepted",
+                    "candidate_id": CANDIDATE_ID,
+                    "source_speedup": source_speedup,
+                    "wheel_speedup": wheel_speedup,
+                    "patch_path": PATCH_PATH,
+                    "source_edits": [
+                        {
+                            "path": "fixture/workflow.py",
+                            "before_hash": "source-hash",
+                            "after_hash": "optimized-hash",
+                        }
+                    ],
+                    "application_status": "not-applied",
+                    "diagnostics": [f"cache {cache_status}"],
+                    "transformation_ids": TRANSFORMATION_IDS,
+                    "semantic_exit_code": 0,
+                }
+            ],
+        },
     }

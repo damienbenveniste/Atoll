@@ -11,18 +11,29 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 PYDANTIC_AI_REPOSITORY = "https://github.com/pydantic/pydantic-ai.git"
 PYDANTIC_AI_REVISION = "e6ff64409f74124de581068be644a3dbf8999e7d"
 COLD_MYPYC_BASELINE_SECONDS = 192.70191520900698
 COLD_MYPYC_TARGET_SECONDS = COLD_MYPYC_BASELINE_SECONDS / 2
-MINIMUM_MARGINAL_SPEEDUP = 1.05
-MINIMUM_FINAL_SPEEDUP = 1.10
+MINIMUM_SOURCE_SPEEDUP = 3.0
+MINIMUM_FINAL_SPEEDUP = 3.0
 BENCHMARK_SAMPLES = 7
 COMPILE_REPORT_VERSION = 5
+MINIMUM_OBSERVED_WORK_ITEMS = 10_000
+MINIMUM_ATTRIBUTED_HOT_SHARE = 0.70
+ATOLL_PATCH_PATH_PARTS = 3
 NATIVE_PHASES = frozenset({"mypycify", "cythonize", "build_ext"})
+REQUIRED_SOURCE_TRANSFORMATION_KINDS = frozenset(
+    {
+        "local-state-machine-fusion",
+        "private-protocol-auto-forwarding",
+        "private-transport-batch-drain",
+        "quiescent-callable-execution",
+    }
+)
 
 
 class BenchmarkError(RuntimeError):
@@ -43,21 +54,21 @@ class BenchmarkOptions:
 class BenchmarkEvaluation:
     """Normalized hard-gate metrics and every failed acceptance condition."""
 
-    cold_mypyc_seconds: float
     cold_native_phase_count: int
     cold_compiler_probe_count: int
     warm_native_phase_count: int
     warm_compiler_probe_count: int
-    warm_cache_status: str
+    cold_patch_cache_status: str
+    warm_patch_cache_status: str
     final_speedup: float | None
-    accepted_candidates: int
-    execution_plan_count: int
-    applied_execution_plan_count: int
-    execution_plan_trial_count: int
-    accepted_execution_plan_trials: int
-    fusion_plan_count: int
-    eligible_fusion_plan_count: int
-    fusion_trial_count: int
+    source_speedup: float | None
+    wheel_speedup: float | None
+    source_plan_count: int
+    trial_ready_source_plan_count: int
+    source_trial_count: int
+    accepted_source_trials: int
+    patch_path: str | None
+    application_status: str
     errors: tuple[str, ...]
 
     @property
@@ -68,24 +79,23 @@ class BenchmarkEvaluation:
     def as_json(self) -> dict[str, object]:
         """Return stable JSON evidence for workflow artifacts."""
         return {
-            "accepted_candidates": self.accepted_candidates,
-            "cold_mypyc_seconds": self.cold_mypyc_seconds,
-            "cold_mypyc_target_seconds": COLD_MYPYC_TARGET_SECONDS,
+            "accepted_source_trials": self.accepted_source_trials,
             "cold_native_phase_count": self.cold_native_phase_count,
             "cold_compiler_probe_count": self.cold_compiler_probe_count,
+            "cold_patch_cache_status": self.cold_patch_cache_status,
             "errors": list(self.errors),
-            "execution_plan_count": self.execution_plan_count,
-            "applied_execution_plan_count": self.applied_execution_plan_count,
-            "execution_plan_trial_count": self.execution_plan_trial_count,
-            "accepted_execution_plan_trials": self.accepted_execution_plan_trials,
             "final_speedup": self.final_speedup,
-            "fusion_plan_count": self.fusion_plan_count,
-            "eligible_fusion_plan_count": self.eligible_fusion_plan_count,
-            "fusion_trial_count": self.fusion_trial_count,
+            "source_speedup": self.source_speedup,
+            "wheel_speedup": self.wheel_speedup,
+            "source_plan_count": self.source_plan_count,
+            "trial_ready_source_plan_count": self.trial_ready_source_plan_count,
+            "source_trial_count": self.source_trial_count,
+            "patch_path": self.patch_path,
+            "application_status": self.application_status,
             "minimum_final_speedup": MINIMUM_FINAL_SPEEDUP,
-            "minimum_marginal_speedup": MINIMUM_MARGINAL_SPEEDUP,
+            "minimum_source_speedup": MINIMUM_SOURCE_SPEEDUP,
             "succeeded": self.succeeded,
-            "warm_cache_status": self.warm_cache_status,
+            "warm_patch_cache_status": self.warm_patch_cache_status,
             "warm_compiler_probe_count": self.warm_compiler_probe_count,
             "warm_native_phase_count": self.warm_native_phase_count,
         }
@@ -101,12 +111,13 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         return 1
     if evaluation.succeeded:
         final_speedup = evaluation.final_speedup
-        if final_speedup is None:
-            raise BenchmarkError("successful evaluation did not retain final speedup")
+        source_speedup = evaluation.source_speedup
+        if final_speedup is None or source_speedup is None:
+            raise BenchmarkError("successful evaluation did not retain source and wheel speedups")
         print(
             "Pydantic Graph hard benchmark passed: "
-            f"{final_speedup:.3f}x final speedup, "
-            f"{evaluation.cold_mypyc_seconds:.3f}s cold mypyc."
+            f"{source_speedup:.3f}x transformed source and "
+            f"{final_speedup:.3f}x final wheel speedup."
         )
         return 0
     print("Pydantic Graph hard benchmark failed:", file=sys.stderr)
@@ -142,6 +153,8 @@ def run_benchmark(options: BenchmarkOptions) -> BenchmarkEvaluation:
     cold_report = _read_json_object(options.evidence_root / "cold.compile-report.json")
     warm_report = _read_json_object(options.evidence_root / "warm.compile-report.json")
     wheel_present = any((target_root / ".atoll" / "dist").glob("*.whl"))
+    reported_patch = _reported_patch_path(warm_report)
+    patch_present = reported_patch is not None and (target_root / reported_patch).is_file()
     evaluation = evaluate_reports(
         BenchmarkEvidenceInputs(
             cold_report=cold_report,
@@ -150,6 +163,7 @@ def run_benchmark(options: BenchmarkOptions) -> BenchmarkEvaluation:
             cold_exit_code=cold_exit,
             warm_exit_code=warm_exit,
             wheel_present=wheel_present,
+            patch_present=patch_present,
             cold_compiler_probe_count=cold_probe_count,
             warm_compiler_probe_count=warm_probe_count,
         )
@@ -248,7 +262,7 @@ def append_compile_policy(pyproject: Path, workload_path: Path) -> None:
             "[tool.atoll.compile]",
             'backends = ["mypyc", "cython"]',
             f'test_command = ["python", {workload}, "--verify"]',
-            f'benchmark_command = ["python", {workload}]',
+            f'benchmark_command = ["python", {workload}, "--build-repetitions", "0"]',
             "benchmark_warmups = 1",
             f"benchmark_samples = {BENCHMARK_SAMPLES}",
             f"minimum_speedup = {MINIMUM_FINAL_SPEEDUP:.2f}",
@@ -321,32 +335,40 @@ class BenchmarkEvidenceInputs:
     cold_exit_code: int
     warm_exit_code: int
     wheel_present: bool
+    patch_present: bool
     cold_compiler_probe_count: int
     warm_compiler_probe_count: int
 
 
 def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
-    """Evaluate fixed cold-build, cache, semantics, and profitability gates."""
-    cold_mypyc_seconds = _phase_duration(inputs.cold_report, "mypycify")
+    """Evaluate schema-v5 source-patch reproducibility and 3x profitability gates."""
     cold_native_phase_count = sum(
         _phase_count(inputs.cold_report, phase) for phase in NATIVE_PHASES
     )
     warm_native_phase_count = sum(
         _phase_count(inputs.warm_report, phase) for phase in NATIVE_PHASES
     )
-    warm_cache_status = _string_field(_mapping_field(inputs.warm_report, "build"), "cache_status")
+    cold_source = _source_optimization(inputs.cold_report)
+    warm_source = _source_optimization(inputs.warm_report)
+    warm_trials = _source_optimization_trials(inputs.warm_report)
+    cold_accepted = _accepted_source_optimization_trials(inputs.cold_report)
+    warm_accepted = _accepted_source_optimization_trials(inputs.warm_report)
+    accepted_trial = _final_accepted_source_trial(inputs.warm_report)
     final_speedup = _optional_number_field(
         _mapping_field(inputs.warm_report, "performance"), "speedup"
     )
-    accepted_speedups = _accepted_candidate_speedups(inputs.warm_report)
-    execution_plans = _execution_plans(inputs.warm_report)
-    applied_execution_plan_ids = _applied_execution_plan_ids(inputs.warm_report)
-    execution_plan_trials = _execution_plan_trials(inputs.warm_report)
-    fusion_plans = _fusion_plans(inputs.warm_report)
-    fusion_trials = _fusion_trials(inputs.warm_report)
-    accepted_execution_plan_trials = tuple(
-        trial for trial in execution_plan_trials if _string_field(trial, "status") == "accepted"
+    source_speedup = (
+        _optional_number_field(accepted_trial, "source_speedup")
+        if accepted_trial is not None
+        else None
     )
+    wheel_speedup = (
+        _optional_number_field(accepted_trial, "wheel_speedup")
+        if accepted_trial is not None
+        else None
+    )
+    patch_path = _reported_patch_path(inputs.warm_report)
+    application_status = _string_field(warm_source, "application_status")
     errors = _evaluation_errors(
         _EvaluationInputs(
             cold_report=inputs.cold_report,
@@ -355,44 +377,39 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
             cold_exit_code=inputs.cold_exit_code,
             warm_exit_code=inputs.warm_exit_code,
             wheel_present=inputs.wheel_present,
-            cold_mypyc_seconds=cold_mypyc_seconds,
+            patch_present=inputs.patch_present,
             cold_native_phase_count=cold_native_phase_count,
             cold_compiler_probe_count=inputs.cold_compiler_probe_count,
             warm_native_phase_count=warm_native_phase_count,
             warm_compiler_probe_count=inputs.warm_compiler_probe_count,
-            warm_cache_status=warm_cache_status,
             final_speedup=final_speedup,
-            accepted_speedups=accepted_speedups,
-            native_evidence_present=_native_evidence_present(
-                inputs.cold_report, inputs.warm_report
-            ),
-            execution_plan_count=len(execution_plans),
-            applied_execution_plan_ids=applied_execution_plan_ids,
-            execution_plan_trial_count=len(execution_plan_trials),
-            accepted_execution_plan_trials=accepted_execution_plan_trials,
-            fusion_plan_count=len(fusion_plans),
-            eligible_fusion_plan_count=sum(
-                _boolean_field(plan, "eligible") for plan in fusion_plans
-            ),
-            fusion_trial_count=len(fusion_trials),
+            source_speedup=source_speedup,
+            wheel_speedup=wheel_speedup,
+            cold_source=cold_source,
+            warm_source=warm_source,
+            cold_accepted_trials=cold_accepted,
+            warm_accepted_trials=warm_accepted,
         )
     )
     return BenchmarkEvaluation(
-        cold_mypyc_seconds=cold_mypyc_seconds,
         cold_native_phase_count=cold_native_phase_count,
         cold_compiler_probe_count=inputs.cold_compiler_probe_count,
         warm_native_phase_count=warm_native_phase_count,
         warm_compiler_probe_count=inputs.warm_compiler_probe_count,
-        warm_cache_status=warm_cache_status,
+        cold_patch_cache_status=_source_patch_cache_status(cold_accepted),
+        warm_patch_cache_status=_source_patch_cache_status(warm_accepted),
         final_speedup=final_speedup,
-        accepted_candidates=len(accepted_speedups),
-        execution_plan_count=len(execution_plans),
-        applied_execution_plan_count=len(applied_execution_plan_ids),
-        execution_plan_trial_count=len(execution_plan_trials),
-        accepted_execution_plan_trials=len(accepted_execution_plan_trials),
-        fusion_plan_count=len(fusion_plans),
-        eligible_fusion_plan_count=sum(_boolean_field(plan, "eligible") for plan in fusion_plans),
-        fusion_trial_count=len(fusion_trials),
+        source_speedup=source_speedup,
+        wheel_speedup=wheel_speedup,
+        source_plan_count=len(_source_optimization_plans(inputs.warm_report)),
+        trial_ready_source_plan_count=sum(
+            _string_field(assessment, "status") == "trial-ready"
+            for assessment in _source_optimization_assessments(inputs.warm_report)
+        ),
+        source_trial_count=len(warm_trials),
+        accepted_source_trials=len(warm_accepted),
+        patch_path=patch_path,
+        application_status=application_status,
         errors=errors,
     )
 
@@ -405,22 +422,18 @@ class _EvaluationInputs:
     cold_exit_code: int
     warm_exit_code: int
     wheel_present: bool
-    cold_mypyc_seconds: float
+    patch_present: bool
     cold_native_phase_count: int
     cold_compiler_probe_count: int
     warm_native_phase_count: int
     warm_compiler_probe_count: int
-    warm_cache_status: str
     final_speedup: float | None
-    accepted_speedups: tuple[float | None, ...]
-    native_evidence_present: bool
-    execution_plan_count: int
-    applied_execution_plan_ids: tuple[str, ...]
-    execution_plan_trial_count: int
-    accepted_execution_plan_trials: tuple[dict[str, object], ...]
-    fusion_plan_count: int
-    eligible_fusion_plan_count: int
-    fusion_trial_count: int
+    source_speedup: float | None
+    wheel_speedup: float | None
+    cold_source: dict[str, object]
+    warm_source: dict[str, object]
+    cold_accepted_trials: tuple[dict[str, object], ...]
+    warm_accepted_trials: tuple[dict[str, object], ...]
 
 
 def _evaluation_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
@@ -428,7 +441,7 @@ def _evaluation_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
         *_report_errors(inputs),
         *_cache_errors(inputs),
         *_source_errors(inputs),
-        *_execution_plan_errors(inputs),
+        *_source_optimization_errors(inputs),
         *_profitability_errors(inputs),
     )
 
@@ -446,28 +459,32 @@ def _report_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
         profile_status = _string_field(_mapping_field(report, "profile"), "status")
         if profile_status != "profiled":
             errors.append(f"{label} profile status is {profile_status}, expected profiled")
+        performance_status = _string_field(_mapping_field(report, "performance"), "status")
+        if performance_status != "passed":
+            errors.append(f"{label} performance status is {performance_status}, expected passed")
+        source = _source_optimization(report)
+        source_status = _string_field(source, "status")
+        if source_status != "accepted":
+            errors.append(
+                f"{label} source-optimization status is {source_status}, expected accepted"
+            )
+        minimum_speedup = _number_field(source, "minimum_speedup")
+        if minimum_speedup < MINIMUM_SOURCE_SPEEDUP:
+            errors.append(
+                f"{label} source-optimization floor is {minimum_speedup:.3f}x, "
+                f"below {MINIMUM_SOURCE_SPEEDUP:.3f}x"
+            )
     return tuple(errors)
 
 
 def _cache_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
     errors: list[str] = []
-    cold_cache = _string_field(_mapping_field(inputs.cold_report, "build"), "cache_status")
-    if cold_cache != "miss":
-        errors.append(f"cold cache status is {cold_cache}, expected miss")
-    if inputs.warm_cache_status != "hit":
-        errors.append(f"warm cache status is {inputs.warm_cache_status}, expected hit")
-    if inputs.native_evidence_present:
-        if inputs.cold_mypyc_seconds > COLD_MYPYC_TARGET_SECONDS:
-            errors.append(
-                f"cold mypyc took {inputs.cold_mypyc_seconds:.3f}s, above "
-                f"{COLD_MYPYC_TARGET_SECONDS:.3f}s"
-            )
-        if inputs.cold_native_phase_count == 0:
-            errors.append("cold report contains no native compiler phase")
-        if inputs.cold_compiler_probe_count == 0:
-            errors.append("compiler probe observed no cold native invocation")
-        if any(status != "hit" for status in _compiled_cache_statuses(inputs.warm_report)):
-            errors.append("one or more warm compiled regions were not cache hits")
+    cold_patch_cache = _source_patch_cache_status(inputs.cold_accepted_trials)
+    warm_patch_cache = _source_patch_cache_status(inputs.warm_accepted_trials)
+    if cold_patch_cache != "miss":
+        errors.append(f"cold source-patch cache status is {cold_patch_cache}, expected miss")
+    if warm_patch_cache != "hit":
+        errors.append(f"warm source-patch cache status is {warm_patch_cache}, expected hit")
     if inputs.warm_native_phase_count:
         errors.append(
             f"warm report contains {inputs.warm_native_phase_count} native compiler phase(s)"
@@ -483,30 +500,39 @@ def _source_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
     errors: list[str] = []
     if not inputs.sources_unchanged:
         errors.append("pydantic_graph source hashes changed during compilation")
-    cold_typed_hashes = _typed_region_hashes(inputs.cold_report)
-    warm_typed_hashes = _typed_region_hashes(inputs.warm_report)
-    if (cold_typed_hashes or warm_typed_hashes) and cold_typed_hashes != warm_typed_hashes:
-        errors.append("typed-region source hashes changed between cold and warm reports")
-    errors.extend(_execution_plan_source_hash_errors("cold", inputs.cold_report))
-    errors.extend(_execution_plan_source_hash_errors("warm", inputs.warm_report))
-    if _execution_plan_hashes(inputs.cold_report) != _execution_plan_hashes(inputs.warm_report):
-        errors.append("execution-plan identities or source hashes changed between runs")
+    errors.extend(_source_plan_identity_errors("cold", inputs.cold_report))
+    errors.extend(_source_plan_identity_errors("warm", inputs.warm_report))
+    if _source_plan_identities(inputs.cold_report) != _source_plan_identities(inputs.warm_report):
+        errors.append("source-plan identities or source hashes changed between runs")
+    if _accepted_source_trial_identities(inputs.cold_report) != _accepted_source_trial_identities(
+        inputs.warm_report
+    ):
+        errors.append("accepted source candidate or patch identity changed between runs")
+    cold_patch = _reported_patch_path(inputs.cold_report)
+    warm_patch = _reported_patch_path(inputs.warm_report)
+    if cold_patch != warm_patch:
+        errors.append("reported source patch path changed between cold and warm runs")
+    if warm_patch is not None and not _is_atoll_patch_path(warm_patch):
+        errors.append(f"source patch is outside .atoll/patches: {warm_patch}")
+    for label, source in (("cold", inputs.cold_source), ("warm", inputs.warm_source)):
+        application_status = _string_field(source, "application_status")
+        if application_status != "not-applied":
+            errors.append(
+                f"{label} source patch application status is {application_status}, "
+                "expected not-applied"
+            )
     return tuple(errors)
 
 
-def _execution_plan_source_hash_errors(
+def _source_plan_identity_errors(
     label: str,
     report: dict[str, object],
 ) -> tuple[str, ...]:
     errors: list[str] = []
-    for plan in _execution_plans(report):
-        if _string_field(plan, "status") != "selected":
-            continue
+    for plan in _source_optimization_plans(report):
         plan_id = _string_field(plan, "id")
-        source_hash = plan.get("source_hash")
-        if not isinstance(source_hash, str) or not source_hash:
-            errors.append(f"{label} selected execution plan {plan_id} has no source hash")
-        source_hashes = plan.get("source_hashes")
+        identity = _mapping_field(plan, "identity")
+        source_hashes = identity.get("source_hashes")
         source_hash_items = (
             cast(dict[object, object], source_hashes).items()
             if isinstance(source_hashes, dict)
@@ -523,69 +549,95 @@ def _execution_plan_source_hash_errors(
                 for module, digest in source_hash_items
             )
         ):
-            errors.append(
-                f"{label} selected execution plan {plan_id} has no per-module source hashes"
-            )
+            errors.append(f"{label} source plan {plan_id} has no valid per-file source hashes")
     return tuple(errors)
 
 
-def _execution_plan_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+def _source_optimization_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
     return (
-        *_execution_plan_discovery_errors(inputs),
-        *_accepted_execution_plan_trial_errors(inputs),
-        *_cold_execution_plan_cache_errors(inputs),
+        *_source_optimization_report_errors("cold", inputs.cold_report),
+        *_source_optimization_report_errors("warm", inputs.warm_report),
     )
 
 
-def _execution_plan_discovery_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+def _source_optimization_report_errors(
+    label: str,
+    report: dict[str, object],
+) -> tuple[str, ...]:
     errors: list[str] = []
-    if inputs.execution_plan_count == 0:
-        errors.append("warm report contains no discovered execution plan")
-    if not inputs.applied_execution_plan_ids:
-        errors.append("warm report contains no applied execution plan")
-    selected_plan_ids = {
-        _string_field(plan, "id")
-        for plan in _execution_plans(inputs.warm_report)
-        if _string_field(plan, "status") == "selected"
+    plans = _source_optimization_plans(report)
+    assessments = _source_optimization_assessments(report)
+    accepted = _accepted_source_optimization_trials(report)
+    if not plans:
+        errors.append(f"{label} report contains no source-optimization plan")
+    if not any(_string_field(assessment, "status") == "trial-ready" for assessment in assessments):
+        errors.append(f"{label} report contains no trial-ready source plan")
+    if len(accepted) != 1:
+        errors.append(f"{label} report contains {len(accepted)} accepted source trials, expected 1")
+        return tuple(errors)
+    trial = accepted[0]
+    errors.extend(_accepted_source_trial_errors(label, report, trial))
+    errors.extend(_source_assessment_errors(label, assessments, trial))
+    baseline_samples, compiled_samples = _performance_sample_counts(report)
+    if baseline_samples < BENCHMARK_SAMPLES or compiled_samples < BENCHMARK_SAMPLES:
+        errors.append(
+            f"{label} profitability gate did not rerun {BENCHMARK_SAMPLES} "
+            "baseline/compiled timing pairs"
+        )
+    return tuple(errors)
+
+
+def _accepted_source_trial_errors(
+    label: str,
+    report: dict[str, object],
+    trial: dict[str, object],
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    patch_path = trial.get("patch_path")
+    if not isinstance(patch_path, str) or not _is_atoll_patch_path(patch_path):
+        errors.append(f"{label} accepted source trial has no safe .atoll patch path")
+    if patch_path != _reported_patch_path(report):
+        errors.append(f"{label} accepted trial patch differs from aggregate patch path")
+    if not _optional_list_field(trial, "source_edits"):
+        errors.append(f"{label} accepted source trial contains no source edits")
+    if trial.get("semantic_exit_code") != 0:
+        errors.append(f"{label} accepted source trial did not pass semantic tests")
+    transformation_kinds = {
+        _transformation_kind(value)
+        for value in _optional_list_field(trial, "transformation_ids")
+        if isinstance(value, str)
     }
-    errors.extend(
-        f"applied execution plan {plan_id} was not discovered as selected"
-        for plan_id in inputs.applied_execution_plan_ids
-        if plan_id not in selected_plan_ids
+    missing = REQUIRED_SOURCE_TRANSFORMATION_KINDS - transformation_kinds
+    if missing:
+        errors.append(
+            f"{label} accepted source trial is missing transformation(s): "
+            f"{', '.join(sorted(missing))}"
+        )
+    return tuple(errors)
+
+
+def _source_assessment_errors(
+    label: str,
+    assessments: tuple[dict[str, object], ...],
+    trial: dict[str, object],
+) -> tuple[str, ...]:
+    plan_id = _string_field(trial, "plan_id")
+    assessment = next(
+        (
+            item
+            for item in assessments
+            if _string_field(item, "plan_id") == plan_id
+            and _string_field(item, "status") == "trial-ready"
+        ),
+        None,
     )
-    return tuple(errors)
-
-
-def _accepted_execution_plan_trial_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+    if assessment is None:
+        return (f"{label} accepted source trial has no trial-ready assessment",)
     errors: list[str] = []
-    accepted_by_plan = {
-        _string_field(trial, "plan_id"): trial for trial in inputs.accepted_execution_plan_trials
-    }
-    for plan_id in inputs.applied_execution_plan_ids:
-        trial = accepted_by_plan.get(plan_id)
-        if trial is None:
-            errors.append(f"applied execution plan {plan_id} has no accepted trial")
-            continue
-        marginal = _optional_number_field(trial, "marginal_speedup")
-        cache_status = _string_field(trial, "cache_status")
-        if marginal is None or marginal < MINIMUM_MARGINAL_SPEEDUP:
-            errors.append("an accepted execution-plan trial is below 1.05x marginal speedup")
-        if cache_status != "hit":
-            errors.append(f"warm execution-plan trial cache status is {cache_status}, expected hit")
-    return tuple(errors)
-
-
-def _cold_execution_plan_cache_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
-    errors: list[str] = []
-    cold_trial_statuses = {
-        _string_field(trial, "plan_id"): _string_field(trial, "cache_status")
-        for trial in _execution_plan_trials(inputs.cold_report)
-        if _string_field(trial, "status") == "accepted"
-    }
-    for plan_id in inputs.applied_execution_plan_ids:
-        cache_status = cold_trial_statuses.get(plan_id)
-        if cache_status != "miss":
-            errors.append(f"cold execution-plan trial for {plan_id} was not a cache miss")
+    if _integer_field(assessment, "observed_work_items") < MINIMUM_OBSERVED_WORK_ITEMS:
+        errors.append(f"{label} source plan observed fewer than 10,000 work items")
+    if _number_field(assessment, "attributed_hot_share") < MINIMUM_ATTRIBUTED_HOT_SHARE:
+        errors.append(f"{label} source plan covers less than 70% of the hot path")
     return tuple(errors)
 
 
@@ -593,13 +645,25 @@ def _profitability_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
     errors: list[str] = []
     if not inputs.wheel_present:
         errors.append("warm compile did not leave a promoted wheel")
-    if any(
-        speedup is None or speedup < MINIMUM_MARGINAL_SPEEDUP
-        for speedup in inputs.accepted_speedups
+    if not inputs.patch_present:
+        errors.append("warm compile did not leave the accepted source patch")
+    for label, trials in (
+        ("cold", inputs.cold_accepted_trials),
+        ("warm", inputs.warm_accepted_trials),
     ):
-        errors.append("an accepted candidate is missing the required 1.05x marginal speedup")
+        for trial in trials:
+            source_speedup = _optional_number_field(trial, "source_speedup")
+            wheel_speedup = _optional_number_field(trial, "wheel_speedup")
+            if source_speedup is None or source_speedup < MINIMUM_SOURCE_SPEEDUP:
+                errors.append(f"{label} transformed source speedup is below 3.00x")
+            if wheel_speedup is None or wheel_speedup < MINIMUM_FINAL_SPEEDUP:
+                errors.append(f"{label} normal wheel speedup is below 3.00x")
     if inputs.final_speedup is None or inputs.final_speedup < MINIMUM_FINAL_SPEEDUP:
-        errors.append("warm final speedup is below 1.10x")
+        errors.append("warm final speedup is below 3.00x")
+    if inputs.source_speedup is None or inputs.source_speedup < MINIMUM_SOURCE_SPEEDUP:
+        errors.append("warm accepted source speedup is below 3.00x")
+    if inputs.wheel_speedup is None or inputs.wheel_speedup < MINIMUM_FINAL_SPEEDUP:
+        errors.append("warm accepted wheel speedup is below 3.00x")
     return tuple(errors)
 
 
@@ -609,14 +673,6 @@ def source_manifest(source_root: Path) -> dict[str, str]:
         path.relative_to(source_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(source_root.rglob("*.py"))
     }
-
-
-def _phase_duration(report: dict[str, object], name: str) -> float:
-    return sum(
-        _number_field(timing, "duration_seconds")
-        for timing in _phase_timings(report)
-        if _string_field(timing, "name") == name
-    )
 
 
 def _phase_count(report: dict[str, object], name: str) -> int:
@@ -630,83 +686,136 @@ def _phase_timings(report: dict[str, object]) -> tuple[dict[str, object], ...]:
     )
 
 
-def _accepted_candidate_speedups(report: dict[str, object]) -> tuple[float | None, ...]:
-    trials = _list_field(report, "candidate_trials")
+def _source_optimization(report: dict[str, object]) -> dict[str, object]:
+    return _mapping_field(report, "source_optimization")
+
+
+def _source_optimization_plans(
+    report: dict[str, object],
+) -> tuple[dict[str, object], ...]:
     return tuple(
-        _optional_number_field(trial, "marginal_speedup")
-        for item in trials
-        if _string_field((trial := _mapping(item, "candidate_trials[]")), "status") == "accepted"
+        _mapping(item, "source_optimization.plans[]")
+        for item in _optional_list_field(_source_optimization(report), "plans")
     )
 
 
-def _compiled_cache_statuses(report: dict[str, object]) -> tuple[str, ...]:
+def _source_optimization_assessments(
+    report: dict[str, object],
+) -> tuple[dict[str, object], ...]:
     return tuple(
-        _string_field(_mapping(item, "compiled_regions[]"), "cache_status")
-        for item in _optional_list_field(report, "compiled_regions")
+        _mapping(item, "source_optimization.assessments[]")
+        for item in _optional_list_field(_source_optimization(report), "assessments")
     )
 
 
-def _typed_region_hashes(report: dict[str, object]) -> dict[str, str]:
+def _source_optimization_trials(
+    report: dict[str, object],
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        _mapping(item, "source_optimization.trials[]")
+        for item in _optional_list_field(_source_optimization(report), "trials")
+    )
+
+
+def _accepted_source_optimization_trials(
+    report: dict[str, object],
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        trial
+        for trial in _source_optimization_trials(report)
+        if _string_field(trial, "status") == "accepted"
+    )
+
+
+def _final_accepted_source_trial(
+    report: dict[str, object],
+) -> dict[str, object] | None:
+    patch_path = _reported_patch_path(report)
+    return next(
+        (
+            trial
+            for trial in _accepted_source_optimization_trials(report)
+            if trial.get("patch_path") == patch_path
+        ),
+        None,
+    )
+
+
+def _source_plan_identities(report: dict[str, object]) -> dict[str, str]:
     return {
-        _string_field(region, "id"): _string_field(region, "source_hash")
-        for item in _optional_list_field(report, "typed_regions")
-        for region in (_mapping(item, "typed_regions[]"),)
+        _string_field(plan, "id"): json.dumps(
+            _mapping_field(plan, "identity"),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for plan in _source_optimization_plans(report)
     }
 
 
-def _execution_plans(report: dict[str, object]) -> tuple[dict[str, object], ...]:
-    return tuple(
-        _mapping(item, "execution_plans[]")
-        for item in _optional_list_field(report, "execution_plans")
+def _accepted_source_trial_identities(
+    report: dict[str, object],
+) -> tuple[tuple[str, str, str, tuple[str, ...]], ...]:
+    identities = (
+        (
+            _string_field(trial, "plan_id"),
+            _string_field(trial, "candidate_id"),
+            _string_field(trial, "patch_path"),
+            tuple(
+                value
+                if isinstance(value, str)
+                else _raise_field_error("source_optimization.trials[].transformation_ids[]")
+                for value in _optional_list_field(trial, "transformation_ids")
+            ),
+        )
+        for trial in _accepted_source_optimization_trials(report)
+    )
+    return tuple(sorted(identities))
+
+
+def _source_patch_cache_status(trials: tuple[dict[str, object], ...]) -> str:
+    statuses: set[str] = set()
+    for trial in trials:
+        diagnostics = _optional_list_field(trial, "diagnostics")
+        statuses.update(
+            value.removeprefix("cache ")
+            for value in diagnostics
+            if isinstance(value, str) and value in {"cache hit", "cache miss"}
+        )
+    if len(statuses) == 1:
+        return next(iter(statuses))
+    return "mixed" if statuses else "unknown"
+
+
+def _reported_patch_path(report: dict[str, object]) -> str | None:
+    patch_path = _source_optimization(report).get("patch_path")
+    if patch_path is None:
+        return None
+    if not isinstance(patch_path, str):
+        _raise_field_error("source_optimization.patch_path")
+    return cast(str, patch_path)
+
+
+def _is_atoll_patch_path(path: str) -> bool:
+    candidate = PurePosixPath(path)
+    return (
+        not candidate.is_absolute()
+        and len(candidate.parts) == ATOLL_PATCH_PATH_PARTS
+        and candidate.parts[:2] == (".atoll", "patches")
+        and candidate.suffix == ".patch"
+        and ".." not in candidate.parts
     )
 
 
-def _applied_execution_plan_ids(report: dict[str, object]) -> tuple[str, ...]:
-    return tuple(
-        str(item) if isinstance(item, str) else _raise_field_error("applied_execution_plans[]")
-        for item in _optional_list_field(report, "applied_execution_plans")
+def _performance_sample_counts(report: dict[str, object]) -> tuple[int, int]:
+    samples = _optional_list_field(_mapping_field(report, "performance"), "samples")
+    modes = tuple(
+        _string_field(_mapping(sample, "performance.samples[]"), "mode") for sample in samples
     )
+    return modes.count("baseline"), modes.count("compiled")
 
 
-def _execution_plan_trials(report: dict[str, object]) -> tuple[dict[str, object], ...]:
-    return tuple(
-        _mapping(item, "execution_plan_trials[]")
-        for item in _optional_list_field(report, "execution_plan_trials")
-    )
-
-
-def _execution_plan_hashes(report: dict[str, object]) -> dict[str, str]:
-    return {
-        _string_field(plan, "id"): source_hash
-        for plan in _execution_plans(report)
-        if _string_field(plan, "status") == "selected"
-        and isinstance((source_hash := plan.get("source_hash")), str)
-    }
-
-
-def _native_evidence_present(
-    cold_report: dict[str, object],
-    warm_report: dict[str, object],
-) -> bool:
-    return bool(
-        _typed_region_hashes(cold_report)
-        or _typed_region_hashes(warm_report)
-        or _compiled_cache_statuses(cold_report)
-        or _compiled_cache_statuses(warm_report)
-        or _accepted_candidate_speedups(warm_report)
-    )
-
-
-def _fusion_plans(report: dict[str, object]) -> tuple[dict[str, object], ...]:
-    return tuple(
-        _mapping(item, "fusion_plans[]") for item in _optional_list_field(report, "fusion_plans")
-    )
-
-
-def _fusion_trials(report: dict[str, object]) -> tuple[dict[str, object], ...]:
-    return tuple(
-        _mapping(item, "fusion_trials[]") for item in _optional_list_field(report, "fusion_trials")
-    )
+def _transformation_kind(transformation_id: str) -> str:
+    return transformation_id.partition(":")[0]
 
 
 def _write_summary(

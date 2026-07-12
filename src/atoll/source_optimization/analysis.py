@@ -36,6 +36,7 @@ MINIMUM_SOURCE_OPTIMIZATION_SPEEDUP = 3.0
 MINIMUM_OBSERVED_WORK_ITEMS = 10_000
 MINIMUM_ATTRIBUTED_HOT_SHARE = 0.70
 MAX_SOURCE_OPTIMIZATION_PLANS = 2
+_TRANSPORT_PAIR_SIZE = 2
 
 _TRANSFORMATION_VERSIONS: tuple[tuple[SourceTransformationKind, str], ...] = (
     ("private-transport-batch-drain", "batch-drain-v1"),
@@ -224,6 +225,7 @@ def _source_plan(
         entrypoint=entrypoint,
         steps=steps,
         semantic_boundaries=_SEMANTIC_BOUNDARIES,
+        transport_capacity=execution_plan.transport_capacity,
     )
 
 
@@ -310,7 +312,10 @@ def _assessment_rejections(
 ) -> tuple[str, ...]:
     rejections = [
         *_configuration_rejections(profile, compile_config),
-        *_scale_rejections(evidence),
+        *_scale_rejections(
+            evidence,
+            guarded_suspension=source_plan.identity.dialect == "anyio-on-asyncio",
+        ),
         *_source_safety_rejections(source_plan, evidence.work_evidence),
     ]
     return tuple(dict.fromkeys(rejections))
@@ -328,7 +333,11 @@ def _configuration_rejections(
     return tuple(rejections)
 
 
-def _scale_rejections(evidence: _AssessmentEvidence) -> tuple[str, ...]:
+def _scale_rejections(
+    evidence: _AssessmentEvidence,
+    *,
+    guarded_suspension: bool,
+) -> tuple[str, ...]:
     rejections: list[str] = []
     if evidence.observed_work_items < MINIMUM_OBSERVED_WORK_ITEMS:
         rejections.append(
@@ -340,7 +349,7 @@ def _scale_rejections(evidence: _AssessmentEvidence) -> tuple[str, ...]:
             f"attributed hot share {evidence.attributed_hot_share:.1%}; "
             f"{MINIMUM_ATTRIBUTED_HOT_SHARE:.0%} required"
         )
-    if evidence.immediate_result_ratio < 1.0:
+    if not guarded_suspension and evidence.immediate_result_ratio < 1.0:
         rejections.append(
             f"immediate-result ratio {evidence.immediate_result_ratio:.1%}; "
             "zero observed suspension required"
@@ -357,6 +366,8 @@ def _source_safety_rejections(
         rejections.append("execution plan has no statically owned private completion transport")
     if not any(site.kind == "transport-receive" for site in source_plan.access_sites):
         rejections.append("no private consumer receive site was found")
+    if source_plan.identity.dialect == "anyio-on-asyncio":
+        return (*rejections, *_guarded_anyio_rejections(source_plan, work_evidence))
     for item in work_evidence:
         if item.static_suspension_points:
             rejections.append(
@@ -375,6 +386,38 @@ def _source_safety_rejections(
                 rejections.append(
                     f"{item.symbol.stable_id} references {label}: {', '.join(values)}"
                 )
+    return tuple(rejections)
+
+
+def _guarded_anyio_rejections(
+    source_plan: SourceOptimizationPlan,
+    work_evidence: tuple[SourceCallableEvidence, ...],
+) -> tuple[str, ...]:
+    """Reject hazards that cannot be checked before guarded AnyIO fast-path entry.
+
+    The AnyIO lowering deliberately bypasses a suspending producer wrapper only
+    after it proves every item in the current batch can complete synchronously.
+    Cancellation and transport suspension inside that wrapper therefore remain
+    fallback behavior rather than plan-wide blockers. Task introspection and
+    dynamic dispatch in the spawn owner or producer cannot be recovered this way
+    and remain conservative blockers.
+
+    Args:
+        source_plan: Candidate source plan whose owner and worker define the boundary.
+        work_evidence: Profile and scanner evidence for members attributed to the plan.
+
+    Returns:
+        tuple[str, ...]: Deterministic hazards that prevent a guarded trial.
+    """
+    boundary = {source_plan.owner, source_plan.worker}
+    rejections: list[str] = []
+    for item in work_evidence:
+        if item.symbol not in boundary:
+            continue
+        if item.task_introspection:
+            rejections.append(f"{item.symbol.stable_id} observes task state")
+        if item.unknown_dynamic_calls:
+            rejections.append(f"{item.symbol.stable_id} has unknown dynamic calls")
     return tuple(rejections)
 
 
@@ -536,6 +579,7 @@ def _access_sites(
         *(node.symbol for node in execution_plan.nodes if node.symbol is not None),
     }
     records = {symbol.id: symbol for symbol in scan.symbols}
+    send_endpoints, receive_endpoints = _transport_endpoints(execution_plan)
     sites: list[SourceAccessSite] = []
     for symbol_id in sorted(plan_symbols, key=lambda item: item.stable_id):
         record = records.get(symbol_id)
@@ -543,13 +587,14 @@ def _access_sites(
             continue
         for call in record.call_sites:
             tail = _tail(call.target)
+            parent = call.target.rsplit(".", maxsplit=1)[0] if "." in call.target else ""
             kind: SourceAccessKind | None = (
                 "transport-receive"
-                if tail in _RECEIVE_METHODS
+                if tail in _RECEIVE_METHODS and parent in receive_endpoints
                 else "transport-drain"
-                if tail in _DRAIN_METHODS
+                if tail in _DRAIN_METHODS and parent in receive_endpoints
                 else "transport-send"
-                if tail in _SEND_METHODS
+                if tail in _SEND_METHODS and parent in send_endpoints
                 else None
             )
             if kind is None:
@@ -563,9 +608,95 @@ def _access_sites(
                     expression=call.target,
                 )
             )
+    sites.extend(
+        _async_iteration_access_sites(
+            execution_plan,
+            scan,
+            source_path,
+            receive_endpoints=receive_endpoints,
+        )
+    )
     return tuple(
         sorted(sites, key=lambda item: (item.path.as_posix(), item.lineno, item.expression))
     )
+
+
+def _transport_endpoints(plan: ExecutionPlan) -> tuple[frozenset[str], frozenset[str]]:
+    """Return sender and receiver expressions encoded by an execution plan.
+
+    Args:
+        plan: Scheduler plan whose private transport may contain one queue name
+            or a ``sender|receiver`` pair.
+
+    Returns:
+        tuple[frozenset[str], frozenset[str]]: Exact source expressions accepted
+        for send and receive access attribution.
+    """
+    transport = plan.completion_transport
+    if transport is None:
+        return frozenset(), frozenset()
+    parts = tuple(part.strip() for part in transport.split("|") if part.strip())
+    if len(parts) == 1:
+        endpoint = frozenset(parts)
+        return endpoint, endpoint
+    if len(parts) == _TRANSPORT_PAIR_SIZE:
+        return frozenset((parts[0],)), frozenset((parts[1],))
+    return frozenset(), frozenset()
+
+
+def _async_iteration_access_sites(
+    plan: ExecutionPlan,
+    scan: ModuleScan,
+    source_path: PurePosixPath,
+    *,
+    receive_endpoints: frozenset[str],
+) -> tuple[SourceAccessSite, ...]:
+    """Attribute private ``async for`` consumption missing from call-site facts.
+
+    Args:
+        plan: Execution plan containing the consumer symbol.
+        scan: Module scan owning the plan source.
+        source_path: Report-facing path for access-site records.
+        receive_endpoints: Exact private receiver expressions from the plan.
+
+    Returns:
+        tuple[SourceAccessSite, ...]: Exact async-iteration receive sites.
+    """
+    if plan.consumer is None or not receive_endpoints:
+        return ()
+    try:
+        module = ast.parse(
+            scan.module.path.read_text(encoding="utf-8"), filename=str(scan.module.path)
+        )
+    except (OSError, SyntaxError, UnicodeError):
+        return ()
+    function = next(
+        (
+            node
+            for symbol, node in _function_nodes(scan.module.name, module)
+            if symbol == plan.consumer
+        ),
+        None,
+    )
+    if function is None:
+        return ()
+    sites: list[SourceAccessSite] = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.AsyncFor):
+            continue
+        expression = _expression_path(node.iter)
+        if expression not in receive_endpoints:
+            continue
+        sites.append(
+            SourceAccessSite(
+                path=source_path,
+                symbol=plan.consumer,
+                kind="transport-receive",
+                lineno=node.lineno,
+                expression=expression,
+            )
+        )
+    return tuple(sites)
 
 
 def _transformation_steps(
@@ -677,7 +808,66 @@ def _forwarding_entrypoint(scan: ModuleScan, plan: ExecutionPlan) -> SymbolId | 
             target = _call_target(statement.iter)
             if target is not None and _resolved_target_qualname(symbol_id, target) in targets:
                 return symbol_id
-    return None
+    return _echo_protocol_entrypoint(scan.module.name, module)
+
+
+def _echo_protocol_entrypoint(module_name: str, module: ast.Module) -> SymbolId | None:
+    """Find one private run-to-completion loop that echoes iterator events.
+
+    Args:
+        module_name: Importable module name used to construct the returned symbol.
+        module: Parsed module containing candidate methods.
+
+    Returns:
+        SymbolId | None: Unique echo-loop entrypoint, or ``None`` when absent or
+        ambiguous. Runtime lowering separately proves iterator ownership.
+    """
+    candidates: list[SymbolId] = []
+    for symbol_id, function in _function_nodes(module_name, module):
+        if not isinstance(function, ast.AsyncFunctionDef):
+            continue
+        if any(isinstance(node, ast.Yield) for node in ast.walk(function)):
+            continue
+        bound_runners = {
+            item.optional_vars.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.AsyncWith)
+            for item in node.items
+            if isinstance(item.optional_vars, ast.Name)
+        }
+        echoed_events = {
+            node.targets[0].id
+            for node in ast.walk(function)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Await)
+            and isinstance(node.value.value, ast.Call)
+            and isinstance(node.value.value.func, ast.Attribute)
+            and isinstance(node.value.value.func.value, ast.Name)
+            and node.value.value.func.value.id in bound_runners
+            and len(node.value.value.args) == 1
+            and isinstance(node.value.value.args[0], ast.Name)
+            and node.value.value.args[0].id == node.targets[0].id
+        }
+        catches_completion = any(
+            isinstance(node, ast.ExceptHandler)
+            and node.type is not None
+            and _expression_path(node.type) == "StopAsyncIteration"
+            and any(
+                isinstance(child, ast.Return)
+                and child.value is not None
+                and any(
+                    isinstance(reference, ast.Name) and reference.id in echoed_events
+                    for reference in ast.walk(child.value)
+                )
+                for child in ast.walk(node)
+            )
+            for node in ast.walk(function)
+        )
+        if len(echoed_events) == 1 and catches_completion:
+            candidates.append(symbol_id)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _function_nodes(

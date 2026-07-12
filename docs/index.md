@@ -57,8 +57,9 @@ declaration and list specialization origins, substitutions, and concrete type bi
 Compile report schema v5 includes profile coverage, exact scheduler spawn-site invocation evidence,
 candidate decisions, backend decisions, suspension plans, candidate trials, execution-plan
 candidates and trials, task-fusion research, source-optimization plans and assessments, and accepted
-or rejected variants. Source optimization is report-only until a trial emits a patch with passing
-semantic and 3x performance evidence. Execution plans are
+or rejected variants. Source optimization remains report-only without configured semantic and
+benchmark commands. With both commands, Atoll may emit a patch only after the transformed source
+and its normally built PEP 517 wheel pass the hard source-optimization gate. Execution plans are
 reported separately from mypyc and Cython typed regions. It lists discovered and rejected plans,
 `applied_execution_plans`, three-arm execution-plan trials, staging cache status, payload-file
 evidence, marginal speedup over the unplanned payload, and overall speedup over the interpreted
@@ -135,6 +136,37 @@ specializations. Dynamic, unresolved generic, runtime-incomplete, and identity-s
 remain Python, and Atoll does not treat object-rich orchestration as one native unit. Large gains
 are expected only when meaningful application time is spent inside accepted CPU-bound code;
 successful compilation is not a speedup claim.
+
+### Profile-guided source optimization
+
+With both `test_command` and `benchmark_command`, `atoll compile` evaluates source rewrites for hot
+async fan-out and fan-in pipelines. Trial eligibility requires 10,000 observed work items, no
+observed suspension for the fused callable shape, and at least 70% mapped hot-path coverage. Atoll
+ranks at most two plans and tests no more than eight cumulative candidates with beam width two and
+depth four.
+
+LibCST applies each candidate only in a temporary project copy. The guarded path can drain a private
+transport in batches, execute proven quiescent coroutine work in one copied `Context` per logical
+item, fuse local producer/transport/consumer state, and auto-forward a private run-to-completion
+protocol. Every source, callable, scheduler, stream, descriptor, and code identity guard runs before
+the first transformed side effect. Suspension, task or cancellation introspection, context mutation,
+dynamic scheduling, changed descriptors, tracing, profiling, and monitoring use the original path.
+After optimized entry, Atoll never retries the operation in Python. `ATOLL_DISABLE=1` forces the
+original path; `ATOLL_REQUIRE_OPTIMIZED=1` exposes guard failure to strict tests.
+
+Source-patch promotion requires `max(3.0, minimum_speedup)` for both the transformed source tree and
+its normally built PEP 517 wheel over seven alternating pairs. Default compile leaves checkout
+sources unchanged and writes an accepted patch to `.atoll/patches/<candidate-id>.patch`. Generated
+patch cache entries live under `.atoll/cache/source-optimization/`; failed candidates never emit a
+reviewable patch.
+
+```bash
+uv run atoll compile --root . --apply-source
+```
+
+`--apply-source` requires Git, rejects `--in-place`, stale hashes, and files changed after profiling,
+runs `git apply --check`, then reruns tests and the full benchmark after applying the accepted patch.
+Atoll reverses the patch when either post-apply gate fails.
 
 ### Semantic and performance gates
 
@@ -216,11 +248,15 @@ eligible plan in a disposable payload, compares baseline, unfused, and fused arm
 least `1.05x` over unfused plus `1.10x` overall. Normal compile never enables task fusion, and no
 `experimental_task_fusion` setting is public unless the pinned hard benchmark passes those gates.
 
+The manual generic source-optimizer benchmark runs the copied-context semantic matrix and enforces
+the `3.0x` guarded feasibility floor without target-project rules.
+
 The repository also contains a manual Pydantic Graph hard benchmark. It pins one external revision,
 uses a deterministic async graph workload, compiles cold and warm, and verifies source hashes,
-region-cache restoration, compiler invocations, marginal candidate gains, and the `1.10x` final
-gate. It runs only through an explicit GitHub workflow dispatch or the repository script; normal CI
-does not enforce host-dependent wall-clock ratios.
+stable source-plan and patch identities, a cold patch-cache miss, a warm patch-cache hit, and at
+least `3.0x` for both transformed source and the normal wheel. It runs only through explicit GitHub
+workflow dispatch or the repository script; normal CI does not enforce host-dependent wall-clock
+ratios.
 
 Profiling and candidate trials are excluded from the final benchmark medians. The accepted payload
 must pass the test command before Atoll runs the configured alternating baseline/compiled subprocess
@@ -239,7 +275,7 @@ forward `asend`, `athrow`, and `aclose`; method routing preserves normal, static
 descriptors on the original source class. Atomic classes preserve their public module, qualified
 name, documentation, annotations, constructor signature, bases, subclass behavior, and pickle
 identity. `ATOLL_DISABLE=1` keeps interpreted routing, while `ATOLL_REQUIRE_COMPILED=1` checks only
-promised bindings.
+promised bindings. `ATOLL_REQUIRE_OPTIMIZED=1` checks the accepted generated source fast path.
 Source-clean build failures keep terminal output short, write `.atoll/compile-report.*`, and remove
 temporary build and install roots. Run compile commands inside the target project's Python
 environment because native backends use the active interpreter and installed dependencies.

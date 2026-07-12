@@ -1,7 +1,8 @@
 # Async Execution Plan Feasibility
 
-This directory holds Milestone 1 benchmark notes for the deterministic async
-scheduler feasibility harness in `scripts/async_execution_plan_feasibility.py`.
+This directory documents the deterministic async scheduler feasibility harness in
+`scripts/async_execution_plan_feasibility.py`. The source-optimizer acceptance summary is in
+[`benchmarks/source_optimization/README.md`](../source_optimization/README.md).
 
 The harness repeats canonical semantic comparisons 32 times without timestamps
 or object addresses. It preserves baseline, task-preserving, and
@@ -38,7 +39,7 @@ the stability floor, or either fused arm misses its speedup gate:
 uv run python scripts/async_execution_plan_feasibility.py
 ```
 
-Milestone 1 requires semantic equivalence plus separate wall-clock ratios:
+The hard gate requires semantic equivalence plus separate wall-clock ratios:
 unsafe fused must be at least `3.30x` faster than baseline, and guarded fused
 must be at least `3.00x` faster than baseline. The callback-backed ratio remains
 reported as historical evidence, but it is not the fused feasibility gate.
