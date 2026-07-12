@@ -118,6 +118,7 @@ def test_strict_anyio_fast_path_matches_baseline_and_preserves_reflection(
     transformed_worker = _worker_callable(transformed, "immediate_double")
     values = tuple(range(32))
     monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+    _permit_optimized_runtime(transformed, monkeypatch)
 
     expected = asyncio.run(baseline_run(values, baseline_worker))
     trace = sys.gettrace()
@@ -143,6 +144,39 @@ def test_strict_anyio_fast_path_matches_baseline_and_preserves_reflection(
     runner = cast(type[object], vars(transformed)["PipelineRunner"])
     assert runner.__module__ == transformed.__name__
     assert runner.__qualname__ == "PipelineRunner"
+
+
+def test_active_monitoring_falls_back_before_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime monitoring preserves the original scheduler before fast-path entry."""
+    transformed, helpers = _transformed_module(tmp_path)
+    run = _pipeline_callable(transformed)
+    worker = _worker_callable(transformed, "immediate_double")
+    no_monitoring_name = next(name for name in vars(transformed) if name.endswith("_no_monitoring"))
+
+    def monitoring_active(_sys: object) -> bool:
+        return False
+
+    monkeypatch.setattr(transformed, no_monitoring_name, monitoring_active)
+    trace = sys.gettrace()
+    profile = sys.getprofile()
+    try:
+        sys.settrace(None)
+        sys.setprofile(None)
+        assert asyncio.run(run((2, 3, 5), worker)) == (4, 6, 10)
+        assert vars(transformed)[helpers[-1]] == 0
+        monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+        with pytest.raises(BaseExceptionGroup, match="unhandled errors in a TaskGroup") as raised:
+            asyncio.run(run((7,), worker))
+    finally:
+        sys.settrace(trace)
+        sys.setprofile(profile)
+    assert any(
+        isinstance(error, RuntimeError) and "AnyIO source guards failed" in str(error)
+        for error in raised.value.exceptions
+    )
 
 
 def test_suspending_callable_falls_back_before_entry(
@@ -373,3 +407,16 @@ def _worker_callable(
     name: str,
 ) -> Callable[[int], Awaitable[int]]:
     return cast(Callable[[int], Awaitable[int]], vars(module)[name])
+
+
+def _permit_optimized_runtime(
+    module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore only the test runner's monitoring while exercising strict routing."""
+    no_monitoring_name = next(name for name in vars(module) if name.endswith("_no_monitoring"))
+
+    def monitoring_disabled(_sys: object) -> bool:
+        return True
+
+    monkeypatch.setattr(module, no_monitoring_name, monitoring_disabled)

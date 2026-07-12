@@ -124,6 +124,7 @@ class _Names:
     eligibility_cache_attribute: str
     route_hits: str
     guard: str
+    no_monitoring: str
     eligible: str
     safe_callable: str
     safe_code: str
@@ -1933,6 +1934,23 @@ def {names.safe_code}(function, seen):
     return True
 
 
+def {names.no_monitoring}(sys_module):
+    monitoring = getattr(sys_module, "monitoring", None)
+    if monitoring is None:
+        return True
+    get_events = getattr(monitoring, "get_events", None)
+    if get_events is None:
+        all_events = getattr(monitoring, "_all_events", None)
+        return all_events is None or not all_events()
+    for tool_id in range(6):
+        try:
+            if get_events(tool_id):
+                return False
+        except ValueError:
+            continue
+    return True
+
+
 def {names.safe_callable}(call):
     if not {names.inspect}.iscoroutinefunction(call) or {names.inspect}.isasyncgenfunction(call):
         return False
@@ -2029,8 +2047,6 @@ def {names.guard}(self, request):
     sender = {shape.sender_expression}
     receiver = {shape.receiver_expression}
     stream_state = getattr(sender, "_state", None)
-    monitoring = getattr({names.sys}, "monitoring", None)
-    all_events = getattr(monitoring, "_all_events", None)
     try:
         loop = {names.asyncio}.get_running_loop()
     except RuntimeError:
@@ -2073,7 +2089,7 @@ def {names.guard}(self, request):
             and not stream_state.buffer
             and not stream_state.waiting_senders
             and not stream_state.waiting_receivers
-            and (all_events is None or not all_events())
+            and {names.no_monitoring}({names.sys})
         )
     if enabled:
         for item in request:
@@ -2398,6 +2414,7 @@ def _names(plan_id: str) -> _Names:
         eligibility_cache_attribute=f"{prefix}_eligibility_cache",
         route_hits=f"{prefix}_route_hits",
         guard=f"{prefix}_guard",
+        no_monitoring=f"{prefix}_no_monitoring",
         eligible=f"{prefix}_eligible",
         safe_callable=f"{prefix}_safe_callable",
         safe_code=f"{prefix}_safe_code",
