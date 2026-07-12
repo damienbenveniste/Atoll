@@ -23,7 +23,7 @@ startup and the separate graph-construction checksum from dominating the async s
 Evidence includes cold and warm JSON/Markdown reports, compiler logs, compiler-probe events, and
 source hash manifests. The run fails unless:
 
-- both reports are schema version 4 and profile-guided, proving the profile pass ran on both cold
+- both reports are schema version 5 and profile-guided, proving the profile pass ran on both cold
   and warm compiles;
 - at least one execution plan is discovered, applied, and accepted by an execution-plan trial;
 - each applied execution-plan trial records a cold staging-cache miss, a warm staging-cache hit, at

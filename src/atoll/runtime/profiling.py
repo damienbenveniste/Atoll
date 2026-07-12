@@ -90,6 +90,23 @@ class _CandidatePolicyContext:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProfileMemberPayloadContext:
+    """Merged sampling and lifecycle payloads used to construct one member record.
+
+    Attributes:
+        total_samples: Total statistical samples collected by the sampling pass.
+        scheduler_overhead_counts: Nested non-project samples grouped by project caller.
+        signature_payload: Bounded canonical type observations grouped by member.
+        member_lifecycle_payload: Lifecycle event counts grouped by member.
+    """
+
+    total_samples: int
+    scheduler_overhead_counts: JsonObject
+    signature_payload: JsonObject
+    member_lifecycle_payload: JsonObject
+
+
+@dataclass(frozen=True, slots=True)
 class SubprocessPassEvidence:
     """Captured evidence from one profiling child process.
 
@@ -219,6 +236,10 @@ class ProfiledMember:
         qualname: Runtime code qualified name.
         samples: Statistical leaf-frame samples mapped to this member.
         coverage: Fraction of total workload samples represented by this member.
+        scheduler_overhead_samples: Samples in non-project frames whose nearest active project
+            caller was this member.
+        scheduler_overhead_coverage: Fraction of workload samples attributed as nested scheduler
+            or library overhead beneath this member.
         call_count: Targeted type-observation calls observed for this member.
         invocation_count: Total target invocations, including calls after type observation capped.
         lifecycle: Python lifecycle event counts observed for this member.
@@ -238,11 +259,29 @@ class ProfiledMember:
     lifecycle: LifecycleCounts
     signatures: tuple[ObservedSignature, ...]
     polymorphic_overflow: bool
+    scheduler_overhead_samples: int = 0
+    scheduler_overhead_coverage: float = 0.0
     invocation_count: int = 0
     observation_capped: bool = False
     completed_calls: int = 0
     max_active_calls: int = 0
     pre_completion_suspensions: int = 0
+
+    @property
+    def immediate_result_ratio(self) -> float:
+        """Return a conservative fraction of completed calls that never suspended.
+
+        Monitoring reports suspension events rather than invocation identities. Treating every
+        event as a distinct suspended call can only lower this ratio, preserving conservative
+        source-optimization eligibility when one invocation suspends more than once.
+
+        Returns:
+            float: Value from zero to one, or zero when no call completed.
+        """
+        if self.completed_calls <= 0:
+            return 0.0
+        suspended_calls = min(self.completed_calls, self.pre_completion_suspensions)
+        return (self.completed_calls - suspended_calls) / self.completed_calls
 
     @property
     def symbol(self) -> SymbolId:
@@ -288,6 +327,9 @@ class ProfileResult:
         total_samples: Statistical samples collected across the benchmark.
         mapped_project_samples: Samples mapped to configured project modules.
         mapped_coverage: Fraction of samples mapped to configured project modules.
+        scheduler_overhead_samples: Nested non-project samples attributed to active project
+            callers.
+        scheduler_overhead_coverage: Fraction of total samples represented by that overhead.
         selected_hot_samples: Samples covered by selected candidates.
         selected_hot_coverage: Fraction of samples covered by selected candidates.
         runs: Child-process evidence for each profiling pass.
@@ -311,6 +353,8 @@ class ProfileResult:
     members: tuple[ProfiledMember, ...]
     candidates: tuple[MappedCandidateDecision, ...]
     selected_symbols: tuple[SymbolId, ...]
+    scheduler_overhead_samples: int = 0
+    scheduler_overhead_coverage: float = 0.0
     spawn_sites: tuple[ProfiledSpawnSite, ...] = ()
 
 
@@ -640,21 +684,30 @@ def _profile_from_payload(
 ) -> ProfileResult:
     total_samples = _int_field(payload, "total_samples")
     sample_counts = _object_field(payload, "sample_counts")
+    scheduler_overhead_counts = _object_field(payload, "scheduler_overhead_counts")
     signature_payload = _object_field(payload, "signatures")
     member_lifecycle_payload = _object_field(payload, "member_lifecycle")
     mapped_project_samples = sum(_int_value(value) for value in sample_counts.values())
     member_keys = frozenset(
         _string_key(key)
-        for container in (sample_counts, signature_payload, member_lifecycle_payload)
+        for container in (
+            sample_counts,
+            scheduler_overhead_counts,
+            signature_payload,
+            member_lifecycle_payload,
+        )
         for key in container
     )
     members = tuple(
         _profiled_member(
             key,
             _int_value(sample_counts.get(key, 0)),
-            total_samples,
-            signature_payload,
-            member_lifecycle_payload,
+            _ProfileMemberPayloadContext(
+                total_samples=total_samples,
+                scheduler_overhead_counts=scheduler_overhead_counts,
+                signature_payload=signature_payload,
+                member_lifecycle_payload=member_lifecycle_payload,
+            ),
         )
         for key in sorted(
             member_keys,
@@ -668,6 +721,13 @@ def _profile_from_payload(
         total_samples=total_samples,
         mapped_project_samples=mapped_project_samples,
         mapped_coverage=_coverage(mapped_project_samples, total_samples),
+        scheduler_overhead_samples=sum(
+            _int_value(value) for value in scheduler_overhead_counts.values()
+        ),
+        scheduler_overhead_coverage=_coverage(
+            sum(_int_value(value) for value in scheduler_overhead_counts.values()),
+            total_samples,
+        ),
         selected_hot_samples=0,
         selected_hot_coverage=0.0,
         runs=runs,
@@ -685,20 +745,22 @@ def _profile_from_payload(
 def _profiled_member(
     key: str,
     samples: int,
-    total_samples: int,
-    signature_payload: JsonObject,
-    member_lifecycle_payload: JsonObject,
+    context: _ProfileMemberPayloadContext,
 ) -> ProfiledMember:
     module, qualname = _split_member_key(key)
-    member_payload = _object_value(signature_payload.get(key, {}))
+    member_payload = _object_value(context.signature_payload.get(key, {}))
     return ProfiledMember(
         module=module,
         qualname=qualname,
         samples=samples,
-        coverage=_coverage(samples, total_samples),
+        coverage=_coverage(samples, context.total_samples),
+        scheduler_overhead_samples=_int_value(context.scheduler_overhead_counts.get(key, 0)),
+        scheduler_overhead_coverage=_coverage(
+            _int_value(context.scheduler_overhead_counts.get(key, 0)), context.total_samples
+        ),
         call_count=_int_field(member_payload, "call_count"),
         invocation_count=_int_field(member_payload, "invocation_count"),
-        lifecycle=_lifecycle_counts(_object_value(member_lifecycle_payload.get(key, {}))),
+        lifecycle=_lifecycle_counts(_object_value(context.member_lifecycle_payload.get(key, {}))),
         signatures=_signatures(_list_value(member_payload.get("signatures", []))),
         polymorphic_overflow=_bool_value(member_payload.get("polymorphic_overflow", False)),
         observation_capped=_bool_value(member_payload.get("observation_capped", False)),
@@ -797,6 +859,7 @@ def _hot_member_keys(payload: JsonObject) -> tuple[tuple[str, int], ...]:
 
 def _merge_payloads(sampling_payload: JsonObject, type_payload: JsonObject) -> JsonObject:
     merged = dict(sampling_payload)
+    merged["scheduler_overhead_counts"] = sampling_payload.get("scheduler_overhead_counts", {})
     merged["signatures"] = type_payload.get("signatures", {})
     merged["lifecycle"] = type_payload.get("lifecycle", {})
     merged["member_lifecycle"] = type_payload.get("member_lifecycle", {})
@@ -808,6 +871,7 @@ def _empty_payload() -> JsonObject:
     return {
         "total_samples": 0,
         "sample_counts": {},
+        "scheduler_overhead_counts": {},
         "lifecycle": {"start": 0, "return": 0, "yield": 0, "resume": 0, "unwind": 0, "throw": 0},
         "member_lifecycle": {},
         "signatures": {},

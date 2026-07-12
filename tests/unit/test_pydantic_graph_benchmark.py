@@ -134,7 +134,7 @@ def test_evaluate_reports_explains_every_hard_gate_failure() -> None:
     assert evaluation.succeeded is False
     message = "\n".join(evaluation.errors)
     assert "cold compile did not succeed" in message
-    assert "warm report is not schema version 4" in message
+    assert "warm report is not schema version 5" in message
     assert "warm profile status is static-fallback" in message
     assert "cold cache status is partial" in message
     assert "cold mypyc took" in message
@@ -346,7 +346,7 @@ def _report(
         "miss" if cache_status == "miss" else "hit"
     )
     return {
-        "version": 4,
+        "version": 5,
         "success": True,
         "build": {"cache_status": cache_status, "phase_timings": timings},
         "profile": {"status": "profiled"},

@@ -72,6 +72,17 @@ from atoll.runtime.fusion_performance import FusionArmRunEvidence, FusionTrial
 from atoll.runtime.package_verify import PackageVerificationResult
 from atoll.runtime.performance import BenchmarkGateResult, CommandRunEvidence
 from atoll.runtime.profiling import LifecycleCounts, ProfileResult
+from atoll.source_optimization.models import (
+    SourceAccessSite,
+    SourceCallableEvidence,
+    SourceEdit,
+    SourceOptimizationApplicationStatus,
+    SourceOptimizationAssessment,
+    SourceOptimizationPlan,
+    SourceOptimizationTrial,
+    SourceTransformationKind,
+    TransformationStep,
+)
 
 _STRONG_SCORE = 90
 _GOOD_SCORE = 80
@@ -716,6 +727,10 @@ class CompilationSummaryReport(TypedDict):
         fusion_plans: Number of deterministic task-fusion plans emitted.
         fusion_eligible_plans: Plans that passed every static and dynamic safety gate.
         fusion_trials: Number of three-arm fusion profitability trials run.
+        source_optimization_status: Overall source-optimization milestone status.
+        source_optimization_plans: Number of source-level optimization plans discovered.
+        source_optimization_trial_ready_assessments: Assessments ready for trial execution.
+        source_optimization_trials: Number of source-optimization trials run.
         duration_seconds: Elapsed wall-clock duration in seconds.
     """
 
@@ -747,6 +762,10 @@ class CompilationSummaryReport(TypedDict):
     fusion_plans: int
     fusion_eligible_plans: int
     fusion_trials: int
+    source_optimization_status: str
+    source_optimization_plans: int
+    source_optimization_trial_ready_assessments: int
+    source_optimization_trials: int
     duration_seconds: float
 
 
@@ -842,6 +861,9 @@ class CompilationProfileMemberReport(TypedDict):
         completed_calls: Target invocations observed through return or unwind.
         max_active_calls: Maximum simultaneous active invocations for this member.
         pre_completion_suspensions: Yield events observed while an invocation was active.
+        scheduler_overhead_samples: Nested scheduler samples attributed to active calls.
+        scheduler_overhead_coverage: Fraction of workload samples attributed to scheduler work.
+        immediate_result_ratio: Conservative fraction of completed calls without suspension.
     """
 
     module: str
@@ -858,6 +880,9 @@ class CompilationProfileMemberReport(TypedDict):
     completed_calls: int
     max_active_calls: int
     pre_completion_suspensions: int
+    scheduler_overhead_samples: int
+    scheduler_overhead_coverage: float
+    immediate_result_ratio: float
 
 
 class CompilationProfileCandidateDecisionReport(TypedDict):
@@ -931,6 +956,8 @@ class CompilationProfileReport(TypedDict):
         total_samples: Statistical samples collected across the benchmark.
         mapped_project_samples: Samples mapped to configured project modules.
         mapped_coverage: Fraction of samples mapped to configured project modules.
+        scheduler_overhead_samples: Nested scheduler samples attributed to project callers.
+        scheduler_overhead_coverage: Fraction of samples represented by scheduler overhead.
         selected_hot_samples: Samples covered by selected candidates.
         selected_hot_coverage: Fraction of mapped samples covered by selected candidates.
         child_passes: Child-process profiling pass evidence.
@@ -948,6 +975,8 @@ class CompilationProfileReport(TypedDict):
     total_samples: int
     mapped_project_samples: int
     mapped_coverage: float
+    scheduler_overhead_samples: int
+    scheduler_overhead_coverage: float
     selected_hot_samples: int
     selected_hot_coverage: float
     child_passes: list[CompilationProfilePassReport]
@@ -1318,6 +1347,288 @@ class CompilationFusionPlanReport(TypedDict):
     observed_signatures: int
     observation_capped: bool
     rejections: list[CompilationFusionGateRejectionReport]
+
+
+SourceOptimizationReportStatus = Literal[
+    "unbenchmarked",
+    "report-only",
+    "rejected",
+    "accepted",
+    "not-profitable",
+    "not-applied",
+    "applied",
+    "conflicted",
+    "rolled-back",
+    "stale-source",
+    "failed",
+    "unavailable",
+]
+
+
+class CompilationSourceOptimizationAccessSiteReport(TypedDict):
+    """Static source access evidence used by a source-optimization plan.
+
+    Attributes:
+        path: POSIX source path containing the access site.
+        symbol: Stable owner symbol, when resolution succeeded.
+        kind: Access operation observed at the site.
+        lineno: One-based source line for the access.
+        expression: Stable expression, attribute, or transport name.
+        hazards: Conservative hazards attached to the site.
+    """
+
+    path: str
+    symbol: str | None
+    kind: str
+    lineno: int
+    expression: str
+    hazards: list[str]
+
+
+class CompilationSourceOptimizationIdentityReport(TypedDict):
+    """Static source-optimization identity inputs retained for cache compatibility.
+
+    Attributes:
+        execution_plan_id: Stable execution-plan identifier that produced the plan.
+        source_hashes: Per-source-file hashes covered by the plan.
+        topology_fingerprint: Stable execution-plan topology digest.
+        dialect: Scheduler dialect whose semantics the transformation preserves.
+        lowering_version: Source-lowering version that changes patch semantics.
+        python_abi: Python ABI compatibility boundary.
+        transformation_versions: Per-transformation versions included in identity.
+    """
+
+    execution_plan_id: str
+    source_hashes: dict[str, str]
+    topology_fingerprint: str
+    dialect: str
+    lowering_version: str
+    python_abi: str
+    transformation_versions: dict[SourceTransformationKind, str]
+
+
+class CompilationSourceOptimizationStepReport(TypedDict):
+    """One ordered source transformation in a source-optimization plan.
+
+    Attributes:
+        id: Stable step identity derived from kind, version, and source symbol.
+        kind: Transformation family applied by this step.
+        version: Step-specific transformation version.
+        source_symbol: Primary symbol read or rewritten by the step.
+        target_symbol: Generated or rewritten symbol produced by the step.
+        access_sites: Static access evidence used by the step.
+        semantic_boundary: Invariant preserved by the step.
+        description: Human-readable report text for the transformation.
+    """
+
+    id: str
+    kind: SourceTransformationKind
+    version: str
+    source_symbol: str
+    target_symbol: str | None
+    access_sites: list[CompilationSourceOptimizationAccessSiteReport]
+    semantic_boundary: str
+    description: str
+
+
+class CompilationSourceOptimizationPlanReport(TypedDict):
+    """Source-level optimization plan derived from a scheduler execution plan.
+
+    Attributes:
+        id: Stable source-optimization plan identifier.
+        identity: Static identity inputs that define patch compatibility.
+        source: POSIX source path owning the entrypoint orchestration site.
+        owner: Orchestration owner symbol.
+        worker: Worker callable transformed by the plan.
+        consumer: Result consumer callable, when distinct.
+        reducer: Reduction callable, when relevant.
+        transport: Private transport expression or name used by the plan.
+        access_sites: Static source accesses used to prove privacy and semantics.
+        entrypoint: Callable used to enter the optimized path.
+        steps: Ordered transformations that make up the source patch.
+        semantic_boundaries: Named invariants the plan preserves.
+    """
+
+    id: str
+    identity: CompilationSourceOptimizationIdentityReport
+    source: str
+    owner: str
+    worker: str
+    consumer: str | None
+    reducer: str | None
+    transport: str
+    access_sites: list[CompilationSourceOptimizationAccessSiteReport]
+    entrypoint: str
+    steps: list[CompilationSourceOptimizationStepReport]
+    semantic_boundaries: list[str]
+
+
+class CompilationSourceOptimizationCallableEvidenceReport(TypedDict):
+    """Static and runtime callable evidence for source optimization assessment.
+
+    Attributes:
+        symbol: Callable represented by this evidence.
+        static_role: Plan-facing callable role.
+        observed_invocations: Runtime invocation count used for assessment.
+        completed_calls: Invocations observed through normal return or unwind.
+        static_suspension_points: Suspension syntax found in the declaration.
+        observed_suspensions: Runtime pre-completion suspension events.
+        immediate_result_ratio: Conservative fraction of completed calls without suspension.
+        median_seconds: Optional median runtime attributed to the callable.
+        hot_share: Fraction of mapped runtime attributed to the callable.
+        scheduler_overhead_samples: Nested scheduler samples attributed to active calls.
+        task_introspection: Static task identity or metadata reads.
+        cancellation: Static cancellation API references.
+        context_mutation: Static context-local mutation evidence.
+        unknown_dynamic_calls: Calls whose runtime target was not proven statically.
+        hazards: Conservative static hazards associated with the callable.
+    """
+
+    symbol: str
+    static_role: str
+    observed_invocations: int
+    completed_calls: int
+    static_suspension_points: int
+    observed_suspensions: int
+    immediate_result_ratio: float
+    median_seconds: float | None
+    hot_share: float
+    scheduler_overhead_samples: int
+    task_introspection: list[str]
+    cancellation: list[str]
+    context_mutation: list[str]
+    unknown_dynamic_calls: list[str]
+    hazards: list[str]
+
+
+class CompilationSourceOptimizationAssessmentReport(TypedDict):
+    """Capability and profitability assessment for one source-optimization plan.
+
+    Attributes:
+        plan_id: Stable source-optimization plan identifier.
+        status: Assessment outcome before trial execution.
+        minimum_speedup: Required speedup for profitability.
+        work_items: Static callable identities expected to benefit.
+        observed_work_items: Runtime work-item count represented by the plan.
+        immediate_result_ratio: Conservative fraction of work that did not suspend.
+        attributed_hot_share: Fraction of observed time attributed to the plan.
+        scheduler_overhead_samples: Nested scheduler samples attributed to the plan.
+        scheduler_overhead_share: Fraction of total samples represented by overhead.
+        scheduler_overhead_evidence: Normalized scheduler overhead evidence.
+        callable_evidence: Per-callable assessment evidence.
+        rejections: Deterministic rejection reasons or guarded caveats.
+        headroom_speedup: Optional measured ceiling speedup.
+    """
+
+    plan_id: str
+    status: str
+    minimum_speedup: float
+    work_items: list[str]
+    observed_work_items: int
+    immediate_result_ratio: float
+    attributed_hot_share: float
+    scheduler_overhead_samples: int
+    scheduler_overhead_share: float
+    scheduler_overhead_evidence: list[str]
+    callable_evidence: list[CompilationSourceOptimizationCallableEvidenceReport]
+    rejections: list[str]
+    headroom_speedup: float | None
+
+
+class CompilationSourceOptimizationEditReport(TypedDict):
+    """One source edit represented by a source-optimization trial patch.
+
+    Attributes:
+        path: POSIX source path changed by the edit.
+        before_hash: Digest of source before the edit, or `None` for additions.
+        after_hash: Digest of source after the edit.
+        summary: Stable summary of the generated change.
+        touched_symbols: Symbols whose definitions or call sites were edited.
+        transformation_id: Stable transformation step that produced the edit.
+        start_line: One-based first changed source line, when known.
+        end_line: One-based final changed source line, when known.
+    """
+
+    path: str
+    before_hash: str | None
+    after_hash: str
+    summary: str
+    touched_symbols: list[str]
+    transformation_id: str | None
+    start_line: int | None
+    end_line: int | None
+
+
+class CompilationSourceOptimizationTrialReport(TypedDict):
+    """Semantic and benchmark evidence for one source-optimization trial.
+
+    Attributes:
+        plan_id: Stable source-optimization plan identifier.
+        status: Trial outcome after commands and benchmarks run.
+        semantic_command: Command used to validate patched source behavior.
+        benchmark_command: Command used to measure source and wheel performance.
+        baseline_median_seconds: Median unoptimized source runtime.
+        current_median_seconds: Current accepted-candidate median before this trial.
+        source_median_seconds: Median optimized source runtime.
+        wheel_median_seconds: Median optimized wheel runtime.
+        source_speedup: Baseline median divided by optimized source median.
+        wheel_speedup: Baseline median divided by optimized wheel median.
+        patch_path: Filesystem path to the generated patch, when one exists.
+        source_edits: Source edits represented by the patch.
+        application_status: Whether the patch was applied to the working tree.
+        diagnostics: Semantic, benchmark, or application diagnostics.
+        candidate_id: Stable candidate-combination identity.
+        transformation_ids: Ordered transformation steps enabled for this candidate.
+        reason: Plain-language acceptance or rejection reason.
+        semantic_exit_code: Semantic command exit status, when executed.
+        semantic_duration_seconds: Parent-observed semantic command duration.
+    """
+
+    plan_id: str
+    status: str
+    semantic_command: list[str]
+    benchmark_command: list[str]
+    baseline_median_seconds: float | None
+    current_median_seconds: float | None
+    source_median_seconds: float | None
+    wheel_median_seconds: float | None
+    source_speedup: float | None
+    wheel_speedup: float | None
+    patch_path: str | None
+    source_edits: list[CompilationSourceOptimizationEditReport]
+    application_status: SourceOptimizationApplicationStatus
+    diagnostics: list[str]
+    candidate_id: str
+    transformation_ids: list[str]
+    reason: str
+    semantic_exit_code: int | None
+    semantic_duration_seconds: float | None
+
+
+class CompilationSourceOptimizationReport(TypedDict):
+    """Top-level source-optimization report section for schema v5.
+
+    Attributes:
+        status: Overall source-optimization milestone status.
+        minimum_speedup: Maximum required speedup among assessments and trials.
+        headroom_speedup: Best reported ceiling speedup, when available.
+        attributed_hot_share: Total assessed hot share capped to the full workload.
+        plans: Source-optimization plans discovered for report-only review.
+        assessments: Capability and profitability assessments for plans.
+        trials: Semantic and benchmark source-optimization trials.
+        patch_path: First emitted patch path, when a trial created one.
+        application_status: Aggregate patch application status.
+    """
+
+    status: SourceOptimizationReportStatus
+    minimum_speedup: float
+    headroom_speedup: float | None
+    attributed_hot_share: float
+    plans: list[CompilationSourceOptimizationPlanReport]
+    assessments: list[CompilationSourceOptimizationAssessmentReport]
+    trials: list[CompilationSourceOptimizationTrialReport]
+    patch_path: str | None
+    application_status: SourceOptimizationApplicationStatus
 
 
 class CompilationSuspensionPlanReport(TypedDict):
@@ -1733,6 +2044,7 @@ class CompilationReport(TypedDict):
         execution_plan_trials: Semantic and performance evidence for staged plans.
         fusion_plans: Report-only task-fusion safety plans rooted in profiled hot paths.
         fusion_trials: Three-arm fusion trials run for generated eligible variants.
+        source_optimization: Report-only source-optimization plans and trial evidence.
         suspension_plans: Per-callable suspension evidence and lowering decisions.
         backend_decisions: Normalized backend capability assessments.
         accepted_variants: Compatibility view of accepted compiled variants.
@@ -1767,6 +2079,7 @@ class CompilationReport(TypedDict):
     execution_plan_trials: list[CompilationExecutionPlanTrialReport]
     fusion_plans: list[CompilationFusionPlanReport]
     fusion_trials: list[CompilationFusionTrialReport]
+    source_optimization: CompilationSourceOptimizationReport
     suspension_plans: list[CompilationSuspensionPlanReport]
     backend_decisions: list[CompilationBackendDecisionReport]
     accepted_variants: list[CompilationAcceptedVariantReport]
@@ -1867,6 +2180,9 @@ class CompilationReportInput:
         execution_plan_trials: Semantic or performance evidence for staged plans.
         fusion_plans: Deterministic task-fusion safety plans.
         fusion_trials: Three-arm task-fusion research evidence.
+        source_optimization_plans: Source-level optimization plans discovered for review.
+        source_optimization_assessments: Trial-readiness assessments for source plans.
+        source_optimization_trials: Semantic and benchmark trials for source patches.
     """
 
     root: Path
@@ -1899,6 +2215,9 @@ class CompilationReportInput:
     execution_plan_trials: tuple[ExecutionPlanTrial, ...] = ()
     fusion_plans: tuple[FusionPlan, ...] = ()
     fusion_trials: tuple[FusionTrial, ...] = ()
+    source_optimization_plans: tuple[SourceOptimizationPlan, ...] = ()
+    source_optimization_assessments: tuple[SourceOptimizationAssessment, ...] = ()
+    source_optimization_trials: tuple[SourceOptimizationTrial, ...] = ()
 
 
 def build_scan_report(result: ScanResult) -> ScanReport:
@@ -2041,6 +2360,12 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     execution_plan_trials = _execution_plan_trial_reports(report_input.execution_plan_trials)
     fusion_plans = _fusion_plan_reports(report_input.fusion_plans)
     fusion_trials = _fusion_trial_reports(report_input.root, report_input.fusion_trials)
+    source_optimization = _source_optimization_report(
+        report_input.root,
+        report_input.source_optimization_plans,
+        report_input.source_optimization_assessments,
+        report_input.source_optimization_trials,
+    )
     accepted_hot_coverage = (
         candidate_trials[-1]["accepted_hot_coverage"] if candidate_trials else 0.0
     )
@@ -2064,7 +2389,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         and not wheel_missing
     )
     return {
-        "version": 4,
+        "version": 5,
         "tool": "atoll",
         "operation": report_input.operation,
         "mode": report_input.mode,
@@ -2112,6 +2437,13 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             "fusion_plans": len(fusion_plans),
             "fusion_eligible_plans": sum(plan["eligible"] for plan in fusion_plans),
             "fusion_trials": len(fusion_trials),
+            "source_optimization_status": source_optimization["status"],
+            "source_optimization_plans": len(source_optimization["plans"]),
+            "source_optimization_trial_ready_assessments": sum(
+                assessment["status"] == "trial-ready"
+                for assessment in source_optimization["assessments"]
+            ),
+            "source_optimization_trials": len(source_optimization["trials"]),
             "duration_seconds": report_input.build.duration_seconds,
         },
         "build": {
@@ -2151,6 +2483,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         "execution_plan_trials": execution_plan_trials,
         "fusion_plans": fusion_plans,
         "fusion_trials": fusion_trials,
+        "source_optimization": source_optimization,
         "suspension_plans": suspension_plans,
         "backend_decisions": backend_decisions,
         "accepted_variants": accepted_variants,
@@ -2382,6 +2715,14 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
             f"{report['summary']['fusion_eligible_plans']} eligible"
         ),
         f"- Task-fusion trials: {report['summary']['fusion_trials']}",
+        (
+            "- Source optimization: "
+            f"{report['summary']['source_optimization_status']}, "
+            f"{report['summary']['source_optimization_plans']} plan(s), "
+            f"{report['summary']['source_optimization_trial_ready_assessments']} "
+            "trial-ready"
+        ),
+        (f"- Source-optimization trials: {report['summary']['source_optimization_trials']}"),
         f"- Build duration: {report['summary']['duration_seconds']:.3f}s",
         "",
         "## Verification Scope",
@@ -2399,6 +2740,7 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
     )
     _append_fusion_plans_markdown(lines, report["fusion_plans"])
     _append_fusion_trials_markdown(lines, report["fusion_trials"])
+    _append_source_optimization_markdown(lines, report["source_optimization"])
     _append_suspension_plans_markdown(lines, report["suspension_plans"])
     if report["typed_regions"]:
         lines.extend(["## Planned Regions", ""])
@@ -2724,6 +3066,61 @@ def _append_fusion_trials_markdown(
             f"- `{trial['plan_id']}` {trial['status']}: overall {overall}; "
             f"over unfused {marginal}; {trial['reason']}"
         )
+    lines.append("")
+
+
+def _append_source_optimization_markdown(
+    lines: list[str],
+    source_optimization: CompilationSourceOptimizationReport,
+) -> None:
+    """Render source optimization milestone evidence without implying application.
+
+    Args:
+        lines: Mutable Markdown line buffer receiving the section.
+        source_optimization: Serialized source-optimization report section.
+    """
+    lines.extend(["## Source Optimization", ""])
+    lines.extend(
+        [
+            f"- Status: {source_optimization['status']}",
+            f"- Minimum speedup: {source_optimization['minimum_speedup']:.3f}x",
+            f"- Headroom speedup: {_optional_speedup(source_optimization['headroom_speedup'])}",
+            f"- Attributed hot share: {source_optimization['attributed_hot_share']:.1%}",
+            f"- Patch: {_optional_path(source_optimization['patch_path'])}",
+            f"- Application status: {source_optimization['application_status']}",
+            (
+                "- Runtime status: report-only in this milestone; source optimization "
+                "does not emit or apply a patch unless a source-optimization trial lists one."
+            ),
+        ]
+    )
+    if source_optimization["patch_path"] is None:
+        lines.append("- No patch was emitted.")
+    lines.extend(
+        (
+            f"- Plan `{plan['id']}`: `{plan['owner']}` -> `{plan['worker']}` via "
+            f"`{plan['transport']}`; {len(plan['steps'])} step(s); boundaries "
+            f"{', '.join(plan['semantic_boundaries']) or 'none'}"
+        )
+        for plan in source_optimization["plans"]
+    )
+    for assessment in source_optimization["assessments"]:
+        rejection_text = "; ".join(assessment["rejections"]) or "no rejection evidence"
+        lines.append(
+            f"- Assessment `{assessment['plan_id']}`: {assessment['status']}; "
+            f"minimum {assessment['minimum_speedup']:.3f}x; "
+            f"hot share {assessment['attributed_hot_share']:.1%}; {rejection_text}"
+        )
+    lines.extend(
+        (
+            f"- Trial `{trial['plan_id']}`: {trial['status']}; source "
+            f"{_optional_speedup(trial['source_speedup'])}; wheel "
+            f"{_optional_speedup(trial['wheel_speedup'])}; "
+            f"application {trial['application_status']}"
+            + (f"; {trial['reason']}" if trial["reason"] else "")
+        )
+        for trial in source_optimization["trials"]
+    )
     lines.append("")
 
 
@@ -3612,6 +4009,329 @@ def _fusion_arm_run_report(
     }
 
 
+def _source_optimization_report(
+    root: Path,
+    plans: tuple[SourceOptimizationPlan, ...],
+    assessments: tuple[SourceOptimizationAssessment, ...],
+    trials: tuple[SourceOptimizationTrial, ...],
+) -> CompilationSourceOptimizationReport:
+    """Serialize source-optimization milestone evidence for schema v5.
+
+    Source optimization remains report-only in this milestone unless callers pass
+    explicit trial or application evidence. The aggregate status is derived from
+    that evidence so command success remains governed by the existing compile,
+    verification, semantic-test, and performance gates.
+
+    Args:
+        root: Root directory used to normalize patch paths.
+        plans: Source-level optimization plans discovered for review.
+        assessments: Trial-readiness and profitability assessments for plans.
+        trials: Semantic, benchmark, and application evidence for patches.
+
+    Returns:
+        CompilationSourceOptimizationReport: Stable nested source-optimization report.
+    """
+    plan_reports = [_source_optimization_plan_report(plan) for plan in plans]
+    assessment_reports = [
+        _source_optimization_assessment_report(assessment)
+        for assessment in sorted(assessments, key=lambda item: item.plan_id)
+    ]
+    trial_reports = [
+        _source_optimization_trial_report(root, trial)
+        for trial in sorted(trials, key=lambda item: (item.plan_id, item.candidate_id))
+    ]
+    minimum_speedups = [assessment["minimum_speedup"] for assessment in assessment_reports]
+    headroom_speedups = [
+        assessment["headroom_speedup"]
+        for assessment in assessment_reports
+        if assessment["headroom_speedup"] is not None
+    ]
+    patch_path = next(
+        (trial["patch_path"] for trial in trial_reports if trial["patch_path"] is not None),
+        None,
+    )
+    application_status = _source_optimization_application_status(trial_reports)
+    return {
+        "status": _source_optimization_status(plan_reports, assessment_reports, trial_reports),
+        "minimum_speedup": max(minimum_speedups, default=3.0),
+        "headroom_speedup": max(headroom_speedups, default=None),
+        "attributed_hot_share": max(
+            (assessment["attributed_hot_share"] for assessment in assessment_reports),
+            default=0.0,
+        ),
+        "plans": plan_reports,
+        "assessments": assessment_reports,
+        "trials": trial_reports,
+        "patch_path": patch_path,
+        "application_status": application_status,
+    }
+
+
+def _source_optimization_status(
+    plans: list[CompilationSourceOptimizationPlanReport],
+    assessments: list[CompilationSourceOptimizationAssessmentReport],
+    trials: list[CompilationSourceOptimizationTrialReport],
+) -> SourceOptimizationReportStatus:
+    """Derive the aggregate source-optimization status from nested evidence.
+
+    Args:
+        plans: Serialized source optimization plans.
+        assessments: Serialized source optimization assessments.
+        trials: Serialized source optimization trials.
+
+    Returns:
+        SourceOptimizationReportStatus: Conservative overall status for report consumers.
+    """
+    status: SourceOptimizationReportStatus = "unbenchmarked"
+    if trials:
+        application_status = _source_optimization_application_status(trials)
+        if application_status != "not-applied":
+            status = application_status
+        elif any(trial["status"] == "accepted" for trial in trials):
+            status = "accepted"
+        elif all(trial["status"] in {"rejected", "not-profitable"} for trial in trials):
+            status = "not-profitable"
+        elif any(trial["status"] in {"failed-semantics", "unavailable"} for trial in trials):
+            status = "unavailable"
+        else:
+            status = "rejected"
+    elif any(assessment["status"] == "trial-ready" for assessment in assessments):
+        status = "report-only"
+    elif assessments and all(assessment["status"] == "unbenchmarked" for assessment in assessments):
+        status = "unbenchmarked"
+    elif plans:
+        status = "rejected"
+    return status
+
+
+def _source_optimization_application_status(
+    trials: list[CompilationSourceOptimizationTrialReport],
+) -> SourceOptimizationApplicationStatus:
+    """Return the aggregate patch application status for source optimization.
+
+    Args:
+        trials: Serialized source-optimization trial evidence.
+
+    Returns:
+        SourceOptimizationApplicationStatus: Highest-priority non-default application status.
+    """
+    priority: tuple[SourceOptimizationApplicationStatus, ...] = (
+        "failed",
+        "conflicted",
+        "rolled-back",
+        "stale-source",
+        "applied",
+        "unavailable",
+    )
+    statuses = {trial["application_status"] for trial in trials}
+    for status in priority:
+        if status in statuses:
+            return status
+    return "not-applied"
+
+
+def _source_optimization_plan_report(
+    plan: SourceOptimizationPlan,
+) -> CompilationSourceOptimizationPlanReport:
+    """Serialize one source-optimization plan and static identity inputs.
+
+    Args:
+        plan: Source-level optimization plan derived from an execution plan.
+
+    Returns:
+        CompilationSourceOptimizationPlanReport: JSON-compatible plan evidence.
+    """
+    return {
+        "id": plan.id,
+        "identity": {
+            "execution_plan_id": plan.identity.execution_plan_id,
+            "source_hashes": {
+                path.as_posix(): source_hash
+                for path, source_hash in sorted(
+                    plan.identity.source_hashes,
+                    key=lambda item: item[0].as_posix(),
+                )
+            },
+            "topology_fingerprint": plan.identity.topology_fingerprint,
+            "dialect": plan.identity.dialect,
+            "lowering_version": plan.identity.lowering_version,
+            "python_abi": plan.identity.python_abi,
+            "transformation_versions": dict(sorted(plan.identity.transformation_versions)),
+        },
+        "source": plan.source.as_posix(),
+        "owner": plan.owner.stable_id,
+        "worker": plan.worker.stable_id,
+        "consumer": plan.consumer.stable_id if plan.consumer is not None else None,
+        "reducer": plan.reducer.stable_id if plan.reducer is not None else None,
+        "transport": plan.transport,
+        "access_sites": [_source_access_site_report(site) for site in plan.access_sites],
+        "entrypoint": plan.entrypoint.stable_id,
+        "steps": [_source_optimization_step_report(step) for step in plan.steps],
+        "semantic_boundaries": list(plan.semantic_boundaries),
+    }
+
+
+def _source_optimization_step_report(
+    step: TransformationStep,
+) -> CompilationSourceOptimizationStepReport:
+    """Serialize one source transformation step.
+
+    Args:
+        step: Ordered transformation step from a source-optimization plan.
+
+    Returns:
+        CompilationSourceOptimizationStepReport: JSON-compatible step evidence.
+    """
+    return {
+        "id": step.stable_id,
+        "kind": step.kind,
+        "version": step.version,
+        "source_symbol": step.source_symbol.stable_id,
+        "target_symbol": step.target_symbol.stable_id if step.target_symbol is not None else None,
+        "access_sites": [_source_access_site_report(site) for site in step.access_sites],
+        "semantic_boundary": step.semantic_boundary,
+        "description": step.description,
+    }
+
+
+def _source_access_site_report(
+    site: SourceAccessSite,
+) -> CompilationSourceOptimizationAccessSiteReport:
+    """Serialize one source access site without source object references.
+
+    Args:
+        site: Static access evidence attached to a source optimization.
+
+    Returns:
+        CompilationSourceOptimizationAccessSiteReport: JSON-compatible access evidence.
+    """
+    return {
+        "path": site.path.as_posix(),
+        "symbol": site.symbol.stable_id if site.symbol is not None else None,
+        "kind": site.kind,
+        "lineno": site.lineno,
+        "expression": site.expression,
+        "hazards": list(site.hazards),
+    }
+
+
+def _source_optimization_assessment_report(
+    assessment: SourceOptimizationAssessment,
+) -> CompilationSourceOptimizationAssessmentReport:
+    """Serialize one source-optimization assessment.
+
+    Args:
+        assessment: Capability and profitability assessment for one source plan.
+
+    Returns:
+        CompilationSourceOptimizationAssessmentReport: JSON-compatible assessment evidence.
+    """
+    return {
+        "plan_id": assessment.plan_id,
+        "status": assessment.status,
+        "minimum_speedup": assessment.minimum_speedup,
+        "work_items": [symbol.stable_id for symbol in assessment.work_items],
+        "observed_work_items": assessment.observed_work_items,
+        "immediate_result_ratio": assessment.immediate_result_ratio,
+        "attributed_hot_share": assessment.attributed_hot_share,
+        "scheduler_overhead_samples": assessment.scheduler_overhead_samples,
+        "scheduler_overhead_share": assessment.scheduler_overhead_share,
+        "scheduler_overhead_evidence": list(assessment.scheduler_overhead_evidence),
+        "callable_evidence": [
+            _source_callable_evidence_report(evidence) for evidence in assessment.callable_evidence
+        ],
+        "rejections": list(assessment.rejections),
+        "headroom_speedup": assessment.headroom_speedup,
+    }
+
+
+def _source_callable_evidence_report(
+    evidence: SourceCallableEvidence,
+) -> CompilationSourceOptimizationCallableEvidenceReport:
+    """Serialize callable-level static and runtime source optimization evidence.
+
+    Args:
+        evidence: Callable evidence attached to an assessment.
+
+    Returns:
+        CompilationSourceOptimizationCallableEvidenceReport: JSON-compatible evidence.
+    """
+    return {
+        "symbol": evidence.symbol.stable_id,
+        "static_role": evidence.static_role,
+        "observed_invocations": evidence.observed_invocations,
+        "completed_calls": evidence.completed_calls,
+        "static_suspension_points": evidence.static_suspension_points,
+        "observed_suspensions": evidence.observed_suspensions,
+        "immediate_result_ratio": evidence.immediate_result_ratio,
+        "median_seconds": evidence.median_seconds,
+        "hot_share": evidence.hot_share,
+        "scheduler_overhead_samples": evidence.scheduler_overhead_samples,
+        "task_introspection": list(evidence.task_introspection),
+        "cancellation": list(evidence.cancellation),
+        "context_mutation": list(evidence.context_mutation),
+        "unknown_dynamic_calls": list(evidence.unknown_dynamic_calls),
+        "hazards": list(evidence.hazards),
+    }
+
+
+def _source_optimization_trial_report(
+    root: Path,
+    trial: SourceOptimizationTrial,
+) -> CompilationSourceOptimizationTrialReport:
+    """Serialize one source-optimization semantic and benchmark trial.
+
+    Args:
+        root: Root directory used to normalize patch paths.
+        trial: Trial evidence for a source-optimization candidate.
+
+    Returns:
+        CompilationSourceOptimizationTrialReport: JSON-compatible trial evidence.
+    """
+    return {
+        "plan_id": trial.plan_id,
+        "status": trial.status,
+        "semantic_command": list(trial.semantic_command),
+        "benchmark_command": list(trial.benchmark_command),
+        "baseline_median_seconds": trial.baseline_median_seconds,
+        "current_median_seconds": trial.current_median_seconds,
+        "source_median_seconds": trial.source_median_seconds,
+        "wheel_median_seconds": trial.wheel_median_seconds,
+        "source_speedup": trial.source_speedup,
+        "wheel_speedup": trial.wheel_speedup,
+        "patch_path": _path_text(root, trial.patch_path) if trial.patch_path is not None else None,
+        "source_edits": [_source_edit_report(edit) for edit in trial.source_edits],
+        "application_status": trial.application_status,
+        "diagnostics": list(trial.diagnostics),
+        "candidate_id": trial.candidate_id,
+        "transformation_ids": list(trial.transformation_ids),
+        "reason": trial.reason,
+        "semantic_exit_code": trial.semantic_exit_code,
+        "semantic_duration_seconds": trial.semantic_duration_seconds,
+    }
+
+
+def _source_edit_report(edit: SourceEdit) -> CompilationSourceOptimizationEditReport:
+    """Serialize one generated source edit.
+
+    Args:
+        edit: Source edit generated for a source-optimization trial.
+
+    Returns:
+        CompilationSourceOptimizationEditReport: JSON-compatible edit evidence.
+    """
+    return {
+        "path": edit.path.as_posix(),
+        "before_hash": edit.before_hash,
+        "after_hash": edit.after_hash,
+        "summary": edit.summary,
+        "touched_symbols": [symbol.stable_id for symbol in edit.touched_symbols],
+        "transformation_id": edit.transformation_id,
+        "start_line": edit.start_line,
+        "end_line": edit.end_line,
+    }
+
+
 def _compilation_profile_report(result: ProfileResult | None) -> CompilationProfileReport:
     """Serialize profile evidence without retaining runtime values or object reprs.
 
@@ -3631,6 +4351,8 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
             "total_samples": 0,
             "mapped_project_samples": 0,
             "mapped_coverage": 0.0,
+            "scheduler_overhead_samples": 0,
+            "scheduler_overhead_coverage": 0.0,
             "selected_hot_samples": 0,
             "selected_hot_coverage": 0.0,
             "child_passes": [],
@@ -3648,6 +4370,8 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
         "total_samples": result.total_samples,
         "mapped_project_samples": result.mapped_project_samples,
         "mapped_coverage": result.mapped_coverage,
+        "scheduler_overhead_samples": result.scheduler_overhead_samples,
+        "scheduler_overhead_coverage": result.scheduler_overhead_coverage,
         "selected_hot_samples": result.selected_hot_samples,
         "selected_hot_coverage": result.selected_hot_coverage,
         "child_passes": [
@@ -3689,6 +4413,9 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
                 "completed_calls": member.completed_calls,
                 "max_active_calls": member.max_active_calls,
                 "pre_completion_suspensions": member.pre_completion_suspensions,
+                "scheduler_overhead_samples": member.scheduler_overhead_samples,
+                "scheduler_overhead_coverage": member.scheduler_overhead_coverage,
+                "immediate_result_ratio": member.immediate_result_ratio,
             }
             for member in result.members
         ],
@@ -3962,6 +4689,10 @@ def _optional_path(path: str | None) -> str:
 
 def _optional_seconds(value: float | None) -> str:
     return f"{value:.3f}s" if value is not None else "unknown"
+
+
+def _optional_speedup(value: float | None) -> str:
+    return f"{value:.3f}x" if value is not None else "unavailable"
 
 
 def _line_suffix(line: int | None) -> str:

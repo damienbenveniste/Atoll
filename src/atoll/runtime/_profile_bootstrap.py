@@ -112,6 +112,7 @@ class _SamplingProfiler:
     def __init__(self, config: _Config) -> None:
         self._mapper = _FrameMapper(config)
         self._sample_counts: Counter[str] = Counter()
+        self._scheduler_overhead_counts: Counter[str] = Counter()
         self._total_samples = 0
         self._previous_handler: _SignalHandler = None
 
@@ -137,6 +138,7 @@ class _SamplingProfiler:
         return {
             "total_samples": self._total_samples,
             "sample_counts": dict(sorted(self._sample_counts.items())),
+            "scheduler_overhead_counts": dict(sorted(self._scheduler_overhead_counts.items())),
             "lifecycle": _empty_lifecycle_payload(),
             "member_lifecycle": {},
             "signatures": {},
@@ -148,6 +150,14 @@ class _SamplingProfiler:
         key = self._mapper.member_key(frame) if frame is not None else None
         if key is not None:
             self._sample_counts[key] += 1
+            return
+        ancestor = frame.f_back if frame is not None else None
+        while ancestor is not None:
+            key = self._mapper.member_key(ancestor)
+            if key is not None:
+                self._scheduler_overhead_counts[key] += 1
+                return
+            ancestor = ancestor.f_back
 
 
 class _TypeProfiler:
@@ -286,6 +296,7 @@ class _TypeProfiler:
         return {
             "total_samples": 0,
             "sample_counts": {},
+            "scheduler_overhead_counts": {},
             "lifecycle": dict(self._lifecycle_counts),
             "member_lifecycle": {
                 key: dict(counts) for key, counts in sorted(self._member_lifecycle_counts.items())

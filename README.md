@@ -83,9 +83,11 @@ associated with that variant. Each variant also reports `lowering_mode`; an `out
 variant lists the private synchronous `native_helpers` called by its staged Python suspension
 shell. Typed-region entries retain the original generic declaration plus the specialization origin,
 substitutions, and concrete type bindings.
-Compile report schema v4 includes profile coverage, exact scheduler spawn-site invocation evidence,
+Compile report schema v5 includes profile coverage, exact scheduler spawn-site invocation evidence,
 candidate decisions, backend decisions, suspension plans, candidate trials, execution-plan
-candidates and trials, task-fusion research, and accepted or rejected variants. Execution plans are
+candidates and trials, task-fusion research, source-optimization plans and assessments, and accepted
+or rejected variants. Source optimization is report-only until a trial emits a patch with passing
+semantic and 3x performance evidence. Execution plans are
 reported separately from mypyc and Cython typed regions. It lists discovered and rejected plans,
 `applied_execution_plans`, three-arm execution-plan trials, staging cache status, payload-file
 evidence, marginal speedup over the unplanned payload, and overall speedup over the interpreted
@@ -229,7 +231,7 @@ A linked hot reducer may replace
 `len(inspect.signature(function).parameters)` with an exact code-object parameter count only for an
 unwrapped Python function under the original `inspect` implementation. Every other callable uses
 the original reflection expression. Cross-module plan members and their complete source hashes are
-recorded in schema v4.
+recorded in schema v5.
 
 Execution-plan staging cache entries live under `.atoll/cache/execution-plans/`. A cache hit restores
 the planned payload files but does not skip semantic or profitability gates: profile collection,

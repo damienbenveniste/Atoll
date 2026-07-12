@@ -131,6 +131,14 @@ from atoll.runtime.profiling import (
     run_baseline_profile,
     select_profile_candidates,
 )
+from atoll.source_optimization import (
+    SourceOptimizationAssessment,
+    SourceOptimizationPlan,
+    SourceOptimizationPlanningOptions,
+    SourceOptimizationPlanningResult,
+    SourceOptimizationTrial,
+    build_source_optimization_plans,
+)
 from atoll.wheel_overlay import (
     WheelBuildEvidence,
     WheelOverlayError,
@@ -256,6 +264,9 @@ class PackageCommandResult:
         execution_plan_trials: Semantic and marginal benchmark evidence for plan candidates.
         fusion_plans: Deterministic report-only task-fusion safety decisions.
         fusion_trials: Three-arm research trials run only for eligible generated variants.
+        source_optimization_plans: Profile-ranked source rewrite plans retained for reporting.
+        source_optimization_assessments: Static and dynamic 3x gate evidence for source plans.
+        source_optimization_trials: Disposable source candidate trials, when implemented.
     """
 
     success: bool
@@ -290,6 +301,9 @@ class PackageCommandResult:
     execution_plan_trials: tuple[ExecutionPlanTrial, ...] = ()
     fusion_plans: tuple[FusionPlan, ...] = ()
     fusion_trials: tuple[FusionTrial, ...] = ()
+    source_optimization_plans: tuple[SourceOptimizationPlan, ...] = ()
+    source_optimization_assessments: tuple[SourceOptimizationAssessment, ...] = ()
+    source_optimization_trials: tuple[SourceOptimizationTrial, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -983,6 +997,30 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
                 f"{eligible_fusion_plans} passed every safety gate"
             ),
         )
+    source_optimization = (
+        build_source_optimization_plans(
+            scans,
+            execution_plans,
+            SourceOptimizationPlanningOptions(
+                profile=profile,
+                compile_config=project.config.compile,
+                project_root=project.config.root,
+            ),
+        )
+        if not options.selected_members
+        else SourceOptimizationPlanningResult(plans=(), assessments=())
+    )
+    if source_optimization.plans:
+        trial_ready = sum(
+            assessment.status == "trial-ready" for assessment in source_optimization.assessments
+        )
+        _progress(
+            options.progress,
+            (
+                f"source-optimization planning produced "
+                f"{len(source_optimization.plans)} plan(s); {trial_ready} passed report-only gates"
+            ),
+        )
     preparation = replace(
         preparation,
         profile=profile,
@@ -1021,37 +1059,46 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     )
     plan_only_allowed = bool(selected_execution_plans) and not options.selected_members
     if selection_error is not None and not plan_only_allowed:
-        return _failed_region_selection(
-            options=options,
-            project=project,
-            preparation=preparation,
-            error=selection_error,
-            typed_regions=typed_regions,
-        )
-    if plan_only_allowed and (not profile_members or not selected_typed_regions):
-        return _execute_execution_plan_only_package(
-            _ExecutionPlanOnlyContext(
+        return _with_source_optimization(
+            _failed_region_selection(
                 options=options,
                 project=project,
+                preparation=preparation,
+                error=selection_error,
                 typed_regions=typed_regions,
-                execution_plans=execution_plans,
-                prepared_baseline=baseline,
-                profile=profile,
-            )
+            ),
+            source_optimization,
         )
-    return _execute_typed_region_package(
-        options=options,
-        project=project,
-        context=_TypedRegionPackageContext(
-            selected=selected_typed_regions,
-            typed_regions=typed_regions,
-            preflight_skipped=(),
-            native_readiness=(),
-            execution_plans=execution_plans,
-            fusion_plans=fusion_plans,
+    if plan_only_allowed and (not profile_members or not selected_typed_regions):
+        return _with_source_optimization(
+            _execute_execution_plan_only_package(
+                _ExecutionPlanOnlyContext(
+                    options=options,
+                    project=project,
+                    typed_regions=typed_regions,
+                    execution_plans=execution_plans,
+                    prepared_baseline=baseline,
+                    profile=profile,
+                )
+            ),
+            source_optimization,
+        )
+    return _with_source_optimization(
+        _execute_typed_region_package(
+            options=options,
+            project=project,
+            context=_TypedRegionPackageContext(
+                selected=selected_typed_regions,
+                typed_regions=typed_regions,
+                preflight_skipped=(),
+                native_readiness=(),
+                execution_plans=execution_plans,
+                fusion_plans=fusion_plans,
+            ),
+            prepared_baseline=baseline,
+            profile=profile,
         ),
-        prepared_baseline=baseline,
-        profile=profile,
+        source_optimization,
     )
 
 
@@ -1146,6 +1193,26 @@ def _execute_execution_plan_only_package(
         execution_plans=context.execution_plans,
         applied_execution_plans=plan_application.applied_plan_ids,
         execution_plan_trials=plan_application.trials,
+    )
+
+
+def _with_source_optimization(
+    result: PackageCommandResult,
+    planning: SourceOptimizationPlanningResult,
+) -> PackageCommandResult:
+    """Attach report-only source plans without changing package success semantics.
+
+    Args:
+        result: Existing native or execution-plan package result.
+        planning: Source plans and 3x gate assessments derived before packaging.
+
+    Returns:
+        PackageCommandResult: Result augmented only with source-optimization report evidence.
+    """
+    return replace(
+        result,
+        source_optimization_plans=planning.plans,
+        source_optimization_assessments=planning.assessments,
     )
 
 
@@ -2443,7 +2510,8 @@ def _profile_progress(progress: PackageProgress | None, profile: ProfileResult) 
         progress,
         (
             f"profile status {profile.status}: {profile.total_samples} sample(s), "
-            f"{profile.mapped_project_samples} mapped to project code"
+            f"{profile.mapped_project_samples} mapped to project code, "
+            f"{profile.scheduler_overhead_samples} attributed to nested scheduler/library work"
         ),
     )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import inspect
 import json
 import os
 import subprocess
@@ -13,7 +14,7 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from dis import get_instructions
 from pathlib import Path
-from types import FunctionType
+from types import FrameType, FunctionType
 from typing import Protocol, cast
 
 import pytest
@@ -40,6 +41,8 @@ ASYNC_CAPPED_WORKER_CALLS = 300
 FREQUENT_CALLS = 800_000
 SPAWN_SITE_CALLS = 1_200
 DIRECT_SPAWN_CALLBACKS = 2
+SCHEDULER_OVERHEAD_SAMPLES = 60
+SCHEDULER_OVERHEAD_COVERAGE = 0.6
 BOOTSTRAP_EXIT_CODE = 7
 BOOTSTRAP_USAGE_ERROR_CODE = 2
 BOOTSTRAP_STRING_EXIT_CODE = 1
@@ -99,6 +102,17 @@ class _TypeProfilerHarness:
 
 
 @dataclass(frozen=True, slots=True)
+class _SamplingProfilerHarness:
+    wrapped: object
+
+    def sample(self, frame: FrameType | None) -> None:
+        _callable_attribute(self.wrapped, "_sample")(0, frame)
+
+    def payload(self) -> dict[str, object]:
+        return cast(dict[str, object], _callable_attribute(self.wrapped, "payload")())
+
+
+@dataclass(frozen=True, slots=True)
 class _BootstrapConfigInput:
     profile_stage: str
     launch_kind: str
@@ -119,6 +133,135 @@ def test_unconfigured_profile_returns_deterministic_no_benchmark_evidence() -> N
     assert first.launch_kind == "unconfigured"
     assert first.total_samples == 0
     assert first.selected_symbols == ()
+
+
+def test_profiled_member_reports_conservative_immediate_result_ratio() -> None:
+    member = ProfiledMember(
+        module="workload",
+        qualname="worker",
+        samples=0,
+        coverage=0.0,
+        call_count=10,
+        lifecycle=LifecycleCounts(start=10, return_=10, yield_=3, resume=3, unwind=0, throw=0),
+        signatures=(),
+        polymorphic_overflow=False,
+        invocation_count=10,
+        completed_calls=10,
+        pre_completion_suspensions=3,
+    )
+
+    assert member.immediate_result_ratio == pytest.approx(0.7)
+    assert replace(member, pre_completion_suspensions=30).immediate_result_ratio == 0.0
+    assert replace(member, completed_calls=0).immediate_result_ratio == 0.0
+
+
+def test_profile_preserves_nested_scheduler_overhead_attribution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(invocation: SubprocessInvocationView) -> subprocess.CompletedProcess[str]:
+        config_path = Path(invocation.command[-1])
+        config = cast(dict[str, object], json.loads(config_path.read_text(encoding="utf-8")))
+        result_path = config["result_path"]
+        profile_stage = config["profile_stage"]
+        assert isinstance(result_path, str)
+        assert isinstance(profile_stage, str)
+        payload: dict[str, object]
+        if profile_stage == "sampling":
+            payload = {
+                "total_samples": 100,
+                "sample_counts": {"workload::worker": 40},
+                "scheduler_overhead_counts": {"workload::worker": SCHEDULER_OVERHEAD_SAMPLES},
+                "lifecycle": {},
+                "member_lifecycle": {},
+                "signatures": {},
+                "spawn_sites": [],
+            }
+        else:
+            payload = {
+                "total_samples": 0,
+                "sample_counts": {},
+                "scheduler_overhead_counts": {},
+                "lifecycle": {},
+                "member_lifecycle": {
+                    "workload::worker": {
+                        "start": 100,
+                        "return": 100,
+                        "yield": 0,
+                        "resume": 0,
+                        "unwind": 0,
+                        "throw": 0,
+                    }
+                },
+                "signatures": {
+                    "workload::worker": {
+                        "call_count": 100,
+                        "invocation_count": 100,
+                        "completed_calls": 100,
+                        "max_active_calls": 1,
+                        "pre_completion_suspensions": 0,
+                        "polymorphic_overflow": False,
+                        "observation_capped": False,
+                        "signatures": [],
+                    }
+                },
+                "spawn_sites": [],
+            }
+        Path(result_path).write_text(json.dumps(payload), encoding="utf-8")
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(profiling, "_run_subprocess", fake_run)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("workload", "workload.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    member = _member(result, "workload", "worker")
+    assert result.scheduler_overhead_samples == SCHEDULER_OVERHEAD_SAMPLES
+    assert result.scheduler_overhead_coverage == pytest.approx(SCHEDULER_OVERHEAD_COVERAGE)
+    assert member.scheduler_overhead_samples == SCHEDULER_OVERHEAD_SAMPLES
+    assert member.scheduler_overhead_coverage == pytest.approx(SCHEDULER_OVERHEAD_COVERAGE)
+    assert member.immediate_result_ratio == 1.0
+
+
+def test_sampling_profiler_attributes_unmapped_leaf_to_project_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "project_stack.py"
+    source_path.write_text("def project_call(callback):\n    callback()\n", encoding="utf-8")
+    config_path, _result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="script",
+            target="unused.py",
+            module_paths=(("project_stack", "project_stack.py"),),
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path, "project_stack", add_root=True)
+    profiler = _sampling_profiler(config_path)
+    project_stack = importlib.import_module("project_stack")
+    project_call = cast(
+        Callable[[Callable[[], None]], None],
+        _callable_attribute(project_stack, "project_call"),
+    )
+
+    def external_leaf() -> None:
+        frame = inspect.currentframe()
+        assert frame is not None
+        profiler.sample(frame)
+
+    project_call(external_leaf)
+
+    payload = profiler.payload()
+    overhead = cast(dict[str, int], payload["scheduler_overhead_counts"])
+    assert payload["sample_counts"] == {}
+    assert overhead == {"project_stack::project_call": 1}
 
 
 def test_unsupported_launcher_returns_static_fallback_without_scratch_files(tmp_path: Path) -> None:
@@ -1057,6 +1200,19 @@ def _type_profiler(config_path: Path) -> _TypeProfilerHarness:
         _callable_attribute(module, "_TypeProfiler"),
     )
     return _TypeProfilerHarness(factory(read_config(config_path)))
+
+
+def _sampling_profiler(config_path: Path) -> _SamplingProfilerHarness:
+    module = importlib.import_module("atoll.runtime._profile_bootstrap")
+    read_config = cast(
+        Callable[[Path], object],
+        _callable_attribute(module, "_read_config"),
+    )
+    factory = cast(
+        Callable[[object], object],
+        _callable_attribute(module, "_SamplingProfiler"),
+    )
+    return _SamplingProfilerHarness(factory(read_config(config_path)))
 
 
 def _callable_attribute(value: object, name: str) -> Callable[..., object]:

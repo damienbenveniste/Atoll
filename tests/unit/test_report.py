@@ -45,6 +45,7 @@ from atoll.report import (
     CompilationPreflightBlockerInput,
     CompilationReportInput,
     CompilationSkippedModuleInput,
+    SourceOptimizationReportStatus,
     build_compilation_report,
     render_compilation_markdown_report,
     risk_summary,
@@ -64,15 +65,32 @@ from atoll.runtime.profiling import (
     ProfileSpawnSiteTarget,
     SubprocessPassEvidence,
 )
+from atoll.source_optimization.models import (
+    SourceAccessSite,
+    SourceCallableEvidence,
+    SourceEdit,
+    SourceOptimizationApplicationStatus,
+    SourceOptimizationAssessment,
+    SourceOptimizationIdentity,
+    SourceOptimizationPlan,
+    SourceOptimizationTrial,
+    SourceOptimizationTrialStatus,
+    TransformationStep,
+)
 
-REPORT_SCHEMA_VERSION = 4
+REPORT_SCHEMA_VERSION = 5
 PROFILE_MAPPED_COVERAGE = 0.75
 PROFILE_SELECTED_HOT_COVERAGE = 0.8
 PROFILE_SAMPLING_INTERVAL_MS = 2
 PROFILE_COMPLETED_CALLS = 11
 PROFILE_MAX_ACTIVE_CALLS = 2
 PROFILE_SPAWN_INVOCATIONS = 1_200
+PROFILE_SCHEDULER_OVERHEAD_SAMPLES = 20
+PROFILE_SCHEDULER_OVERHEAD_COVERAGE = 0.1
+PROFILE_MEMBER_SCHEDULER_OVERHEAD_SAMPLES = 8
+PROFILE_MEMBER_SCHEDULER_OVERHEAD_COVERAGE = 0.04
 EXECUTION_PLAN_CANDIDATE_COUNT = 2
+SOURCE_OPTIMIZATION_CURRENT_MEDIAN_SECONDS = 0.92
 
 
 @pytest.mark.parametrize(
@@ -356,6 +374,8 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
         "total_samples": 0,
         "mapped_project_samples": 0,
         "mapped_coverage": 0.0,
+        "scheduler_overhead_samples": 0,
+        "scheduler_overhead_coverage": 0.0,
         "selected_hot_samples": 0,
         "selected_hot_coverage": 0.0,
         "child_passes": [],
@@ -366,6 +386,21 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
         "selected_symbols": [],
     }
     assert report["candidate_trials"] == []
+    assert report["summary"]["source_optimization_status"] == "unbenchmarked"
+    assert report["summary"]["source_optimization_plans"] == 0
+    assert report["summary"]["source_optimization_trial_ready_assessments"] == 0
+    assert report["summary"]["source_optimization_trials"] == 0
+    assert report["source_optimization"] == {
+        "status": "unbenchmarked",
+        "minimum_speedup": 3.0,
+        "headroom_speedup": None,
+        "attributed_hot_share": 0.0,
+        "plans": [],
+        "assessments": [],
+        "trials": [],
+        "patch_path": None,
+        "application_status": "not-applied",
+    }
     assert report["suspension_plans"] == []
     assert report["backend_decisions"] == []
     assert report["accepted_variants"] == []
@@ -378,6 +413,10 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
     assert "## Profile-Guided Selection" in markdown
     assert "- Status: unconfigured" in markdown
     assert "- Selected candidates: none" in markdown
+    assert "## Source Optimization" in markdown
+    assert "- Status: unbenchmarked" in markdown
+    assert "- Minimum speedup: 3.000x" in markdown
+    assert "- No patch was emitted." in markdown
     assert "Scan scores estimate extraction safety" not in markdown
     assert "`app.ranking.score_user`: rejected (30/100)" not in markdown
     assert "- Wheel: `.atoll/dist/app-0+atoll-cp312.whl`" in markdown
@@ -396,6 +435,8 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
         total_samples=200,
         mapped_project_samples=150,
         mapped_coverage=PROFILE_MAPPED_COVERAGE,
+        scheduler_overhead_samples=PROFILE_SCHEDULER_OVERHEAD_SAMPLES,
+        scheduler_overhead_coverage=PROFILE_SCHEDULER_OVERHEAD_COVERAGE,
         selected_hot_samples=120,
         selected_hot_coverage=PROFILE_SELECTED_HOT_COVERAGE,
         runs=(
@@ -438,6 +479,8 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                     ),
                 ),
                 polymorphic_overflow=True,
+                scheduler_overhead_samples=PROFILE_MEMBER_SCHEDULER_OVERHEAD_SAMPLES,
+                scheduler_overhead_coverage=PROFILE_MEMBER_SCHEDULER_OVERHEAD_COVERAGE,
                 observation_capped=True,
                 completed_calls=PROFILE_COMPLETED_CALLS,
                 max_active_calls=PROFILE_MAX_ACTIVE_CALLS,
@@ -593,6 +636,8 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
     assert report["summary"]["profile_mapped_coverage"] == PROFILE_MAPPED_COVERAGE
     assert report["summary"]["profile_selected_hot_coverage"] == PROFILE_SELECTED_HOT_COVERAGE
     assert report["summary"]["profile_accepted_hot_coverage"] == PROFILE_SELECTED_HOT_COVERAGE
+    assert report["profile"]["scheduler_overhead_samples"] == PROFILE_SCHEDULER_OVERHEAD_SAMPLES
+    assert report["profile"]["scheduler_overhead_coverage"] == PROFILE_SCHEDULER_OVERHEAD_COVERAGE
     assert report["candidate_trials"] == [
         {
             "id": "01:score-cython",
@@ -634,6 +679,15 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
     assert report["profile"]["members"][0]["max_active_calls"] == PROFILE_MAX_ACTIVE_CALLS
     assert report["profile"]["members"][0]["pre_completion_suspensions"] == 1
     assert report["profile"]["members"][0]["invocation_count"] == PROFILE_SPAWN_INVOCATIONS
+    assert (
+        report["profile"]["members"][0]["scheduler_overhead_samples"]
+        == PROFILE_MEMBER_SCHEDULER_OVERHEAD_SAMPLES
+    )
+    assert (
+        report["profile"]["members"][0]["scheduler_overhead_coverage"]
+        == PROFILE_MEMBER_SCHEDULER_OVERHEAD_COVERAGE
+    )
+    assert report["profile"]["members"][0]["immediate_result_ratio"] == pytest.approx(10 / 11)
     assert report["profile"]["spawn_sites"] == [
         {
             "id": "spawn-site-report",
@@ -1153,6 +1207,344 @@ def test_compilation_report_serializes_execution_plan_schema_v4(tmp_path: Path) 
     ]
     assert "## Async Execution Plans" in markdown
     assert "Runtime status: report-only unless an applied plan" in markdown
+
+
+def test_compilation_report_serializes_source_optimization_schema_v5(
+    tmp_path: Path,
+) -> None:
+    """Schema v5 reports source optimization plans, assessments, trials, and Markdown."""
+    owner = SymbolId(module="app.scheduler", qualname="run")
+    worker = SymbolId(module="app.scheduler", qualname="_produce")
+    consumer = SymbolId(module="app.scheduler", qualname="_consume")
+    access_site = SourceAccessSite(
+        path=PurePosixPath("app/scheduler.py"),
+        symbol=owner,
+        kind="transport-drain",
+        lineno=18,
+        expression="queue",
+        hazards=("suspension",),
+    )
+    step = TransformationStep(
+        kind="private-transport-batch-drain",
+        version="v1",
+        source_symbol=worker,
+        target_symbol=SymbolId(module="app.scheduler", qualname="_produce_batch"),
+        access_sites=(access_site,),
+        semantic_boundary="private-queue-ordering",
+        description="batch private queue drains inside the owner",
+    )
+    identity = SourceOptimizationIdentity(
+        execution_plan_id="exec-plan-selected",
+        source_hashes=((PurePosixPath("app/scheduler.py"), "a" * 64),),
+        topology_fingerprint="c" * 64,
+        dialect="asyncio",
+        lowering_version="source-v1",
+        python_abi="cp312",
+        transformation_versions=((step.kind, step.version),),
+    )
+    plan = SourceOptimizationPlan(
+        id="source-opt-fixture",
+        identity=identity,
+        source=PurePosixPath("app/scheduler.py"),
+        owner=owner,
+        worker=worker,
+        consumer=consumer,
+        reducer=None,
+        transport="queue",
+        access_sites=(access_site,),
+        entrypoint=owner,
+        steps=(step,),
+        semantic_boundaries=("private-queue-ordering",),
+    )
+    callable_evidence = SourceCallableEvidence(
+        symbol=worker,
+        static_role="worker",
+        observed_invocations=400,
+        completed_calls=390,
+        static_suspension_points=1,
+        observed_suspensions=0,
+        immediate_result_ratio=1.0,
+        median_seconds=0.002,
+        hot_share=0.42,
+        scheduler_overhead_samples=35,
+        task_introspection=("asyncio.current_task",),
+        cancellation=("CancelledError",),
+        context_mutation=("contextvars.ContextVar.set",),
+        unknown_dynamic_calls=("callback",),
+        hazards=("suspension",),
+    )
+    assessment = SourceOptimizationAssessment(
+        plan_id=plan.id,
+        status="trial-ready",
+        minimum_speedup=1.2,
+        work_items=(worker,),
+        observed_work_items=400,
+        immediate_result_ratio=1.0,
+        attributed_hot_share=0.46,
+        scheduler_overhead_samples=35,
+        scheduler_overhead_share=0.07,
+        scheduler_overhead_evidence=("35 nested sample(s)",),
+        callable_evidence=(callable_evidence,),
+        headroom_speedup=1.8,
+    )
+    overlapping_assessment = SourceOptimizationAssessment(
+        plan_id=f"{plan.id}:overlap",
+        status="partial",
+        minimum_speedup=1.1,
+        work_items=(consumer,),
+        observed_work_items=200,
+        immediate_result_ratio=0.9,
+        attributed_hot_share=0.31,
+        scheduler_overhead_samples=20,
+        scheduler_overhead_share=0.04,
+        scheduler_overhead_evidence=("overlapping owner sample window",),
+        callable_evidence=(),
+        rejections=("overlapping hot share with source-opt-fixture",),
+        headroom_speedup=1.3,
+    )
+    unbenchmarked_assessment = SourceOptimizationAssessment(
+        plan_id=plan.id,
+        status="unbenchmarked",
+        minimum_speedup=3.0,
+        work_items=(worker,),
+        observed_work_items=0,
+        immediate_result_ratio=0.0,
+        attributed_hot_share=0.0,
+        scheduler_overhead_samples=0,
+        scheduler_overhead_share=0.0,
+        scheduler_overhead_evidence=(),
+        callable_evidence=(),
+    )
+    patch_path = tmp_path / ".atoll" / "patches" / "source-opt-fixture.patch"
+    trial = SourceOptimizationTrial(
+        plan_id=plan.id,
+        status="accepted",
+        semantic_command=("pytest", "tests/test_scheduler.py"),
+        benchmark_command=("python", "bench_scheduler.py"),
+        baseline_median_seconds=1.0,
+        current_median_seconds=SOURCE_OPTIMIZATION_CURRENT_MEDIAN_SECONDS,
+        source_median_seconds=0.7,
+        wheel_median_seconds=0.65,
+        source_speedup=1.43,
+        wheel_speedup=1.54,
+        patch_path=patch_path,
+        source_edits=(
+            SourceEdit(
+                path=PurePosixPath("app/scheduler.py"),
+                before_hash="b" * 64,
+                after_hash="c" * 64,
+                summary="batch private queue drains",
+                touched_symbols=(owner, worker),
+                transformation_id=step.stable_id,
+                start_line=10,
+                end_line=25,
+            ),
+        ),
+        application_status="not-applied",
+        diagnostics=("semantic command passed",),
+        candidate_id="source-opt-fixture:batch",
+        transformation_ids=(step.stable_id,),
+        reason="source and wheel speedups exceeded the profitability gate",
+        semantic_exit_code=0,
+        semantic_duration_seconds=0.4,
+    )
+    report_only = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter="app.scheduler",
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "compile"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=1.0,
+            ),
+            source_optimization_plans=(plan,),
+            source_optimization_assessments=(assessment, overlapping_assessment),
+        )
+    )
+    unbenchmarked_report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter="app.scheduler",
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "compile"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=1.0,
+            ),
+            source_optimization_plans=(plan,),
+            source_optimization_assessments=(unbenchmarked_assessment,),
+        )
+    )
+    rejected_report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter="app.scheduler",
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "compile"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=1.0,
+            ),
+            source_optimization_plans=(plan,),
+            source_optimization_assessments=(
+                replace(assessment, status="unsupported", rejections=("unsafe",)),
+            ),
+        )
+    )
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter="app.scheduler",
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "compile"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=1.0,
+            ),
+            source_optimization_plans=(plan,),
+            source_optimization_assessments=(assessment, overlapping_assessment),
+            source_optimization_trials=(trial,),
+        )
+    )
+    report_only_markdown = render_compilation_markdown_report(report_only)
+    markdown = render_compilation_markdown_report(report)
+
+    assert report_only["source_optimization"]["status"] == "report-only"
+    assert report_only["source_optimization"]["patch_path"] is None
+    assert unbenchmarked_report["source_optimization"]["status"] == "unbenchmarked"
+    assert rejected_report["source_optimization"]["status"] == "rejected"
+    assert "- No patch was emitted." in report_only_markdown
+    assert "report-only in this milestone" in report_only_markdown
+    assert report["version"] == REPORT_SCHEMA_VERSION
+    assert report["execution_plans"] == []
+    assert report["fusion_plans"] == []
+    assert report["source_optimization"]["status"] == "accepted"
+    assert report["source_optimization"]["minimum_speedup"] == pytest.approx(1.2)
+    assert report["source_optimization"]["headroom_speedup"] == pytest.approx(1.8)
+    assert report["source_optimization"]["attributed_hot_share"] == pytest.approx(0.46)
+    assert report["source_optimization"]["patch_path"] == (
+        ".atoll/patches/source-opt-fixture.patch"
+    )
+    assert report["source_optimization"]["application_status"] == "not-applied"
+    assert report["summary"]["source_optimization_status"] == "accepted"
+    assert report["summary"]["source_optimization_plans"] == 1
+    assert report["summary"]["source_optimization_trial_ready_assessments"] == 1
+    assert report["summary"]["source_optimization_trials"] == 1
+    assert report["source_optimization"]["plans"][0]["identity"]["source_hashes"] == {
+        "app/scheduler.py": "a" * 64
+    }
+    assert report["source_optimization"]["plans"][0]["steps"][0]["access_sites"][0] == {
+        "path": "app/scheduler.py",
+        "symbol": "app.scheduler::run",
+        "kind": "transport-drain",
+        "lineno": 18,
+        "expression": "queue",
+        "hazards": ["suspension"],
+    }
+    assert report["source_optimization"]["assessments"][0]["callable_evidence"][0][
+        "unknown_dynamic_calls"
+    ] == ["callback"]
+    assert report["source_optimization"]["trials"][0]["source_edits"] == [
+        {
+            "path": "app/scheduler.py",
+            "before_hash": "b" * 64,
+            "after_hash": "c" * 64,
+            "summary": "batch private queue drains",
+            "touched_symbols": ["app.scheduler::run", "app.scheduler::_produce"],
+            "transformation_id": step.stable_id,
+            "start_line": 10,
+            "end_line": 25,
+        }
+    ]
+    assert report["source_optimization"]["trials"][0]["semantic_command"] == [
+        "pytest",
+        "tests/test_scheduler.py",
+    ]
+    assert report["source_optimization"]["trials"][0]["baseline_median_seconds"] == 1.0
+    assert (
+        report["source_optimization"]["trials"][0]["current_median_seconds"]
+        == SOURCE_OPTIMIZATION_CURRENT_MEDIAN_SECONDS
+    )
+    assert report["source_optimization"]["trials"][0]["source_speedup"] == pytest.approx(1.43)
+    assert report["source_optimization"]["trials"][0]["wheel_speedup"] == pytest.approx(1.54)
+    assert "## Source Optimization" in markdown
+    assert "Plan `source-opt-fixture`" in markdown
+    assert "Trial `source-opt-fixture`: accepted" in markdown
+
+
+@pytest.mark.parametrize(
+    ("trial_status", "application_status", "expected_status"),
+    [
+        ("accepted", "applied", "applied"),
+        ("rejected", "not-applied", "not-profitable"),
+        ("failed-semantics", "not-applied", "unavailable"),
+        ("not-run", "not-applied", "rejected"),
+        ("accepted", "failed", "failed"),
+        ("accepted", "conflicted", "conflicted"),
+        ("accepted", "rolled-back", "rolled-back"),
+        ("accepted", "stale-source", "stale-source"),
+        ("accepted", "unavailable", "unavailable"),
+    ],
+)
+def test_source_optimization_report_derives_trial_and_application_statuses(
+    tmp_path: Path,
+    trial_status: SourceOptimizationTrialStatus,
+    application_status: SourceOptimizationApplicationStatus,
+    expected_status: SourceOptimizationReportStatus,
+) -> None:
+    """Schema v5 distinguishes trial decisions from transactional application state."""
+    trial = SourceOptimizationTrial(
+        plan_id="source-opt-status",
+        status=trial_status,
+        semantic_command=("pytest", "-q"),
+        benchmark_command=("python", "bench.py"),
+        baseline_median_seconds=None,
+        source_median_seconds=None,
+        wheel_median_seconds=None,
+        source_speedup=None,
+        wheel_speedup=None,
+        patch_path=None,
+        source_edits=(),
+        application_status=application_status,
+    )
+
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter=None,
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "compile"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.0,
+            ),
+            source_optimization_trials=(trial,),
+        )
+    )
+
+    assert report["source_optimization"]["status"] == expected_status
+    assert report["source_optimization"]["application_status"] == application_status
 
 
 def test_suspension_report_applies_member_rejections_to_block_eligibility(

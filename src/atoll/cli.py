@@ -886,6 +886,9 @@ def _write_source_clean_compile_report(
             execution_plan_trials=result.execution_plan_trials,
             fusion_plans=result.fusion_plans,
             fusion_trials=result.fusion_trials,
+            source_optimization_plans=result.source_optimization_plans,
+            source_optimization_assessments=result.source_optimization_assessments,
+            source_optimization_trials=result.source_optimization_trials,
         )
     )
     json_path = result.project_root / ".atoll" / "compile-report.json"
