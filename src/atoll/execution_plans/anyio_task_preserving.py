@@ -1,11 +1,12 @@
 """Task-preserving lowering for structured AnyIO fan-out on asyncio.
 
-This backend recognizes a narrow two-loop dispatch shape and retains the
-source scheduler unchanged. It removes only cancellation of workers that have
-already made a statically terminal private-stream handoff, and it can specialize
-a linked hot reducer's guarded signature arity. One real task, every checkpoint,
-rendezvous backpressure, ordering, and all nonterminal cancellation remain in
-the original AnyIO implementation.
+This backend recognizes a narrow two-loop dispatch shape and retains AnyIO's
+task creation path. It hoists stable worker metadata, calls the exact guarded
+`TaskGroup.create_task()` implementation for a source-proven coroutine, removes
+only cancellation of workers that already made a statically terminal private
+stream handoff, and can specialize a linked reducer's guarded signature arity.
+One real task, every checkpoint, rendezvous backpressure, ordering, and all
+nonterminal cancellation remain in the original AnyIO implementation.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ from atoll.execution_plans.task_preserving import (
 from atoll.models import SymbolId
 
 _BACKEND_NAME: Final = "anyio-task-preserving"
-_LOWERING_VERSION: Final = "anyio-task-preserving-v7"
+_LOWERING_VERSION: Final = "anyio-task-preserving-v8"
 _SUPPORTED_DIALECT: Final = "anyio-on-asyncio"
 _CLASS_METHOD_PARTS: Final = 2
 _FIELD_PATH_PARTS: Final = 2
@@ -412,11 +413,18 @@ class _ConsumerReducerCall:
 @dataclass(frozen=True, slots=True)
 class _SupportNames:
     owner_class: str
+    worker_method: str
+    worker_code: str
     last_mode: str
     monitoring: str
+    monitoring_module: str
     original_all_events: str
     states: str
     enable: str
+    dispatch: str
+    scheduler_call: str
+    worker_call: str
+    task_name: str
     terminal_state: str
     reducer_module: str
     reducer_class: str
@@ -538,11 +546,18 @@ def _validated_rewrite(
     names = _support_names(plan.id)
     for name in (
         names.owner_class,
+        names.worker_method,
+        names.worker_code,
         names.last_mode,
         names.monitoring,
+        names.monitoring_module,
         names.original_all_events,
         names.states,
         names.enable,
+        names.dispatch,
+        names.scheduler_call,
+        names.worker_call,
+        names.task_name,
         names.terminal_state,
         names.reducer_module,
         names.reducer_class,
@@ -596,8 +611,8 @@ def _validated_rewrite(
         guard_expression=(
             "exact owner, private AnyIO stream state and capacity, private scope map, "
             "exact built-in request and registry types, unmodified AnyIO task group, "
-            "default task factory, dispatch-only reducer identities, debug, trace, profile, "
-            "and monitoring identities"
+            "default task factory, exact AnyIO create-task and coroutine worker identities, "
+            "dispatch-only reducer identities, debug, trace, profile, and monitoring identities"
         ),
     )
 
@@ -610,10 +625,11 @@ def _fused_dispatch_edit(
 ) -> tuple[int, int, str]:
     """Build a guarded one-pass dispatch with the original loops as fallback.
 
-    The optimized branch is selected only for exact built-in requests and an
-    unmodified AnyIO asyncio task group. The fallback embeds the original source
-    text so custom factories, custom sequences, and dynamic scheduler objects
-    retain their original registration-before-scheduling behavior.
+    The optimized branch is selected only for exact built-in requests, an
+    unmodified source coroutine, and an unmodified AnyIO asyncio task group. It
+    uses AnyIO's own `create_task()` after hoisting the stable task name. The
+    fallback embeds the original source so custom factories, custom sequences,
+    and dynamic scheduler objects retain their original behavior.
 
     Args:
         source_text: Original module source containing both adjacent loops.
@@ -634,12 +650,19 @@ def _fused_dispatch_edit(
         f"    {line}" if line.strip() else line for line in original.splitlines(keepends=True)
     )
     fused = (
-        f"{indent}if {names.enable}({target.receiver_name}, {target.request_name}):{newline}"
+        f"{indent}{names.dispatch} = "
+        f"{names.enable}({target.receiver_name}, {target.request_name}){newline}"
+        f"{indent}if {names.dispatch} is not None:{newline}"
+        f"{body_indent}({newline}"
+        f"{loop_indent}{names.scheduler_call},{newline}"
+        f"{loop_indent}{names.worker_call},{newline}"
+        f"{loop_indent}{names.task_name},{newline}"
+        f"{body_indent}) = {names.dispatch}{newline}"
         f"{body_indent}for {target.item_name} in {target.request_name}:{newline}"
         f"{loop_indent}{target.receiver_name}.{target.registry_field}"
         f"[{target.item_name}.{target.key_field}] = {target.item_name}{newline}"
-        f"{loop_indent}{target.receiver_name}.{target.scheduler_field}.start_soon("
-        f"{target.receiver_name}.{target.worker_method}, {target.item_name}){newline}"
+        f"{loop_indent}{names.scheduler_call}("
+        f"{names.worker_call}({target.item_name}), name={names.task_name}){newline}"
         f"{indent}else:{newline}"
         f"{fallback}"
     )
@@ -1749,7 +1772,12 @@ def _direct_reducer_edit(
         f"{cast_guard}{context_guard}{newline}"
         f"{level1}and {names.reducer_sys}.gettrace() is None{newline}"
         f"{level1}and {names.reducer_sys}.getprofile() is None{newline}"
-        f"{level1}and {names.monitoring}({names.reducer_sys})"
+        f"{level1}and {names.original_all_events} is not None{newline}"
+        f"{level1}and getattr({names.reducer_sys}, 'monitoring', None) "
+        f"is {names.monitoring_module}{newline}"
+        f"{level1}and getattr({names.monitoring_module}, '_all_events', None) "
+        f"is {names.original_all_events}{newline}"
+        f"{level1}and not {names.original_all_events}()"
     )
     long_context = f"{level3}{context_statement}{newline}" if context_statement else ""
     nested_fallback_context = f"{level2}{context_statement}{newline}" if context_statement else ""
@@ -1759,9 +1787,7 @@ def _direct_reducer_edit(
         f"{level1}{names.reducer_callable} = {receiver}.{reducer.callable_field}{newline}"
         f"{level1}if ({newline}"
         f"{level2}type({names.reducer_callable}) is {names.reducer_function_type}{newline}"
-        f"{level2}and not hasattr({names.reducer_callable}, '__signature__'){newline}"
-        f"{level2}and not hasattr({names.reducer_callable}, '__wrapped__'){newline}"
-        f"{level2}and not hasattr({names.reducer_callable}, '__text_signature__'){newline}"
+        f"{level2}and not {names.reducer_callable}.__dict__{newline}"
         f"{level1}):{newline}"
         f"{level2}{names.reducer_code} = {names.reducer_callable}.__code__{newline}"
         f"{level2}{names.reducer_arity} = ({newline}"
@@ -1843,11 +1869,18 @@ def _support_names(plan_id: str) -> _SupportNames:
     prefix = f"_atoll_anyio_dispatch_{suffix}"
     return _SupportNames(
         owner_class=f"{prefix}_owner_class",
+        worker_method=f"{prefix}_worker_method",
+        worker_code=f"{prefix}_worker_code",
         last_mode=f"{prefix}_last_mode",
         monitoring=f"{prefix}_no_monitoring",
+        monitoring_module=f"{prefix}_monitoring",
         original_all_events=f"{prefix}_all_events",
         states=f"{prefix}_states",
         enable=f"{prefix}_enable",
+        dispatch=f"{prefix}_dispatch",
+        scheduler_call=f"{prefix}_scheduler_call",
+        worker_call=f"{prefix}_worker_call",
+        task_name=f"{prefix}_task_name",
         terminal_state=f"{prefix}_terminal_state",
         reducer_module=f"{prefix}_reducer_module",
         reducer_class=f"{prefix}_reducer_class",
@@ -1882,11 +1915,12 @@ def _support_source(
     reducer_support = _direct_reducer_support(names, consumer_reducer)
     return f"""# AnyIO terminal-handoff support appended by Atoll.
 {names.owner_class} = {target.owner_class}
+{names.worker_method} = {names.owner_class}.__dict__.get({target.worker_method!r})
+{names.worker_code} = getattr({names.worker_method}, "__code__", None)
 {names.last_mode} = None
 {names.states} = {{}}
-{names.original_all_events} = getattr(
-    getattr(__import__("sys"), "monitoring", None), "_all_events", None
-)
+{names.monitoring_module} = getattr(__import__("sys"), "monitoring", None)
+{names.original_all_events} = getattr({names.monitoring_module}, "_all_events", None)
 {reducer_support}
 
 def {names.enable}(owner, request):
@@ -1902,26 +1936,53 @@ def {names.enable}(owner, request):
     owner_id = id(owner)
     current = {names.states}.get(owner_id)
     if current is not None and current[0]() is owner:
-        {names.last_mode} = "optimized"
         scheduler = owner.{target.scheduler_field}
-        return (
+        start_soon_call = scheduler.start_soon
+        scheduler_call = scheduler.create_task
+        worker_call = owner.{target.worker_method}
+        backend_module = current[11]
+        optimized = (
             type(request) in (list, tuple)
             and type(owner.{target.registry_field}) is dict
             and current[3] is not None
             and type(scheduler) is current[3]
             and type(scheduler).start_soon is current[4]
+            and getattr(current[4], "__code__", None) is current[5]
+            and type(scheduler).create_task is current[6]
+            and getattr(current[6], "__code__", None) is current[7]
+            and getattr(start_soon_call, "__self__", None) is scheduler
+            and getattr(start_soon_call, "__func__", None) is current[4]
+            and getattr(scheduler_call, "__self__", None) is scheduler
+            and getattr(scheduler_call, "__func__", None) is current[6]
+            and getattr(backend_module, "call_for_coroutine", None) is current[8]
+            and getattr(current[8], "__code__", None) is current[9]
+            and getattr(backend_module, "get_callable_name", None) is current[10]
+            and {names.owner_class}.__dict__.get({target.worker_method!r})
+            is {names.worker_method}
+            and getattr({names.worker_method}, "__code__", None) is {names.worker_code}
+            and getattr(worker_call, "__self__", None) is owner
+            and getattr(worker_call, "__func__", None) is {names.worker_method}
             and loop.get_task_factory() is None
         )
+        {names.last_mode} = "optimized" if optimized else "fallback"
+        if not optimized:
+            return None
+        task_name = current[10](worker_call, None) if request else None
+        return scheduler_call, worker_call, task_name
     if current is not None:
         {names.states}.pop(owner_id, None)
     try:
-        from anyio._backends._asyncio import TaskGroup as _AtollTaskGroup
+        from anyio._backends import _asyncio as _AtollBackend
         from anyio.streams.memory import MemoryObjectReceiveStream as _AtollReceiveStream
         from anyio.streams.memory import MemoryObjectSendStream as _AtollSendStream
-    except ImportError:
+
+        _AtollTaskGroup = _AtollBackend.TaskGroup
+        _AtollCallForCoroutine = _AtollBackend.call_for_coroutine
+        _AtollGetCallableName = _AtollBackend.get_callable_name
+    except (AttributeError, ImportError):
         {names.last_mode} = "fallback"
         {names.states}.pop(owner_id, None)
-        return False
+        return None
     scheduler = owner.{target.scheduler_field}
     optimized = (
         type(owner) is {names.owner_class}
@@ -1938,7 +1999,7 @@ def {names.enable}(owner, request):
     if not optimized:
         {names.last_mode} = "fallback"
         {names.states}.pop(owner_id, None)
-        return False
+        return None
     try:
         owner_ref = weakref.ref(
             owner,
@@ -1947,22 +2008,50 @@ def {names.enable}(owner, request):
     except TypeError:
         {names.last_mode} = "fallback"
         {names.states}.pop(owner_id, None)
-        return False
+        return None
     {names.states}[owner_id] = (
         owner_ref,
         _AtollSendStream,
         _AtollReceiveStream,
         _AtollTaskGroup,
         _AtollTaskGroup.start_soon,
+        getattr(_AtollTaskGroup.start_soon, "__code__", None),
+        _AtollTaskGroup.create_task,
+        getattr(_AtollTaskGroup.create_task, "__code__", None),
+        _AtollCallForCoroutine,
+        getattr(_AtollCallForCoroutine, "__code__", None),
+        _AtollGetCallableName,
+        _AtollBackend,
     )
-    {names.last_mode} = "optimized"
-    return (
+    start_soon_call = scheduler.start_soon
+    scheduler_call = scheduler.create_task
+    worker_call = owner.{target.worker_method}
+    dispatchable = (
         type(request) in (list, tuple)
         and type(owner.{target.registry_field}) is dict
         and type(scheduler) is _AtollTaskGroup
         and type(scheduler).start_soon is _AtollTaskGroup.start_soon
+        and getattr(_AtollTaskGroup.start_soon, "__code__", None) is not None
+        and type(scheduler).create_task is _AtollTaskGroup.create_task
+        and getattr(_AtollTaskGroup.create_task, "__code__", None) is not None
+        and getattr(_AtollCallForCoroutine, "__code__", None) is not None
+        and getattr(start_soon_call, "__self__", None) is scheduler
+        and getattr(start_soon_call, "__func__", None) is _AtollTaskGroup.start_soon
+        and getattr(scheduler_call, "__self__", None) is scheduler
+        and getattr(scheduler_call, "__func__", None) is _AtollTaskGroup.create_task
+        and {names.owner_class}.__dict__.get({target.worker_method!r})
+        is {names.worker_method}
+        and {names.worker_code} is not None
+        and getattr({names.worker_method}, "__code__", None) is {names.worker_code}
+        and getattr(worker_call, "__self__", None) is owner
+        and getattr(worker_call, "__func__", None) is {names.worker_method}
         and loop.get_task_factory() is None
-)
+    )
+    {names.last_mode} = "optimized" if dispatchable else "fallback"
+    if not dispatchable:
+        return None
+    task_name = _AtollGetCallableName(worker_call, None) if request else None
+    return scheduler_call, worker_call, task_name
 
 def {names.monitoring}(sys_module):
     monitoring = getattr(sys_module, "monitoring", None)

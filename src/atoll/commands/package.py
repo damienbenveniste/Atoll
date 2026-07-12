@@ -3379,6 +3379,8 @@ def _apply_execution_plan_trials_once(
     every reported file change, runs the configured semantic command once, and then
     compares the planned copy with the current accepted payload. Only a passing
     semantic result and at least 1.05x marginal speedup replace the accepted payload.
+    The later final payload benchmark independently enforces the configured overall
+    threshold before a wheel can be promoted.
 
     Args:
         context: Project policy, payload roots, native allowlist, and selected plans.

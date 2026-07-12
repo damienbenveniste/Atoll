@@ -567,12 +567,9 @@ def _accepted_execution_plan_trial_errors(inputs: _EvaluationInputs) -> tuple[st
             errors.append(f"applied execution plan {plan_id} has no accepted trial")
             continue
         marginal = _optional_number_field(trial, "marginal_speedup")
-        overall = _optional_number_field(trial, "overall_speedup")
         cache_status = _string_field(trial, "cache_status")
         if marginal is None or marginal < MINIMUM_MARGINAL_SPEEDUP:
             errors.append("an accepted execution-plan trial is below 1.05x marginal speedup")
-        if overall is None or overall < MINIMUM_FINAL_SPEEDUP:
-            errors.append("an accepted execution-plan trial is below 1.10x overall speedup")
         if cache_status != "hit":
             errors.append(f"warm execution-plan trial cache status is {cache_status}, expected hit")
     return tuple(errors)

@@ -230,7 +230,36 @@ def test_execution_plan_benchmark_rejects_nonprofitable_thresholds(
     assert result.status == "not-profitable"
     assert result.overall_speedup == pytest.approx(1.08)
     assert result.marginal_speedup == pytest.approx(1.04)
-    assert "missed thresholds" in result.reason
+    assert "marginal ratio missed threshold" in result.reason
+
+
+def test_execution_plan_benchmark_defers_overall_ratio_to_final_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[CallRecord] = []
+    monkeypatch.setattr(
+        execution_plan_performance,
+        "run_performance_command",
+        _fake_runner([0.5, 0.5, 0.5, 1.095, 1.079, 1.0], calls),
+    )
+
+    result = run_execution_plan_benchmark(
+        ExecutionPlanBenchmarkConfig(
+            plan_id=PLAN_ID,
+            command=("python", "bench.py"),
+            samples=1,
+        ),
+        project_root=tmp_path,
+        baseline_payload_root=tmp_path / "baseline",
+        unplanned_payload_root=tmp_path / "unplanned",
+        planned_payload_root=tmp_path / "planned",
+    )
+
+    assert result.status == "passed"
+    assert result.marginal_speedup == pytest.approx(1.079)
+    assert result.overall_speedup == pytest.approx(1.095)
+    assert "final payload gate decides promotion" in result.reason
 
 
 def test_execution_plan_benchmark_accepts_exact_thresholds(

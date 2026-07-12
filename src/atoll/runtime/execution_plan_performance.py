@@ -30,9 +30,10 @@ class ExecutionPlanBenchmarkConfig:
 
     The benchmark command is an argv tuple executed with `shell=False` through
     the shared runtime command machinery. Exactly one warmup trio runs before
-    the measured samples. `minimum_marginal_speedup` gates the unplanned median
-    divided by the planned median, while `minimum_overall_speedup` gates the
-    baseline median divided by the planned median.
+    the measured samples. `minimum_marginal_speedup` gates whether the plan is
+    retained for the final payload benchmark. `minimum_overall_speedup` records
+    the final promotion target so the trial can explain its provisional overall
+    ratio without duplicating the authoritative final gate.
 
     Attributes:
         plan_id: Stable execution-plan identity represented by the benchmark.
@@ -40,7 +41,7 @@ class ExecutionPlanBenchmarkConfig:
             benchmark is available.
         samples: Number of measured three-arm sample trios.
         minimum_marginal_speedup: Required unplanned-median / planned-median ratio.
-        minimum_overall_speedup: Required baseline-median / planned-median ratio.
+        minimum_overall_speedup: Final baseline-median / payload-median promotion target.
     """
 
     plan_id: str
@@ -123,17 +124,19 @@ class ExecutionPlanBenchmarkResult:
     """Three-arm execution-plan benchmark decision and command evidence.
 
     `status` is `passed` only when every command succeeds, measured medians are
-    stable, and the planned payload meets both profitability thresholds.
-    `not-profitable` means timings were stable but one or both thresholds were
-    missed. `invalid` means execution failed or timings were too short to trust.
-    `unavailable` means the caller did not configure a benchmark command.
+    stable, and the planned payload meets the marginal profitability threshold.
+    The overall ratio is provisional evidence because the separate final payload
+    gate is authoritative for wheel promotion. `not-profitable` means timings
+    were stable but the marginal threshold was missed. `invalid` means execution
+    failed or timings were too short to trust. `unavailable` means the caller did
+    not configure a benchmark command.
 
     Attributes:
         plan_id: Stable execution-plan identity evaluated by this benchmark.
         status: Benchmark decision.
         reason: Concrete execution or timing evidence supporting the decision.
         minimum_marginal_speedup: Required unplanned-median / planned-median ratio.
-        minimum_overall_speedup: Required baseline-median / planned-median ratio.
+        minimum_overall_speedup: Final baseline-median / payload-median promotion target.
         baseline_median_seconds: Median elapsed time for baseline measured samples.
         unplanned_median_seconds: Median elapsed time for unplanned measured samples.
         planned_median_seconds: Median elapsed time for planned measured samples.
@@ -315,17 +318,22 @@ def _decision_result(
 
     marginal_speedup = unplanned_median / planned_median
     overall_speedup = baseline_median / planned_median
-    if (
-        marginal_speedup >= config.minimum_marginal_speedup
-        and overall_speedup >= config.minimum_overall_speedup
-    ):
+    if marginal_speedup >= config.minimum_marginal_speedup:
+        overall_reason = (
+            f"overall_speedup={overall_speedup:.3f}"
+            if overall_speedup >= config.minimum_overall_speedup
+            else (
+                f"provisional overall_speedup={overall_speedup:.3f} is below final target "
+                f"{config.minimum_overall_speedup:.3f}; final payload gate decides promotion"
+            )
+        )
         return ExecutionPlanBenchmarkResult(
             plan_id=config.plan_id,
             status="passed",
             reason=(
-                "planned ratios meet thresholds: "
+                "planned marginal ratio meets threshold: "
                 f"marginal_speedup={marginal_speedup:.3f} "
-                f"overall_speedup={overall_speedup:.3f}"
+                f"{overall_reason}"
             ),
             minimum_marginal_speedup=config.minimum_marginal_speedup,
             minimum_overall_speedup=config.minimum_overall_speedup,
@@ -341,11 +349,11 @@ def _decision_result(
         plan_id=config.plan_id,
         status="not-profitable",
         reason=(
-            "planned ratios missed thresholds: "
+            "planned marginal ratio missed threshold: "
             f"marginal_speedup={marginal_speedup:.3f} "
             f"required={config.minimum_marginal_speedup:.3f}; "
-            f"overall_speedup={overall_speedup:.3f} "
-            f"required={config.minimum_overall_speedup:.3f}"
+            f"provisional overall_speedup={overall_speedup:.3f} "
+            f"final_target={config.minimum_overall_speedup:.3f}"
         ),
         minimum_marginal_speedup=config.minimum_marginal_speedup,
         minimum_overall_speedup=config.minimum_overall_speedup,

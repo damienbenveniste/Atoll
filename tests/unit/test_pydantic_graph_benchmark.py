@@ -148,7 +148,7 @@ def test_evaluate_reports_explains_every_hard_gate_failure() -> None:
     assert "was not discovered as selected" in message
     assert "has no accepted trial" in message
     assert "below 1.05x marginal" in message
-    assert "below 1.10x overall" in message
+    assert "below 1.10x overall" not in message
     assert "warm execution-plan trial cache status is miss" in message
     assert "did not leave a promoted wheel" in message
     assert "missing the required 1.05x" in message
@@ -251,7 +251,7 @@ def test_evaluate_reports_rejects_missing_execution_plan_source_hashes() -> None
     assert "has no per-module source hashes" in message
 
 
-def test_evaluate_reports_rejects_subthreshold_execution_plan_trial() -> None:
+def test_evaluate_reports_rejects_subthreshold_execution_plan_margin() -> None:
     cold = _report(cache_status="miss", mypyc_seconds=COLD_TEST_SECONDS)
     warm = _report(
         cache_status="hit",
@@ -277,7 +277,7 @@ def test_evaluate_reports_rejects_subthreshold_execution_plan_trial() -> None:
 
     message = "\n".join(evaluation.errors)
     assert "below 1.05x marginal" in message
-    assert "below 1.10x overall" in message
+    assert "below 1.10x overall" not in message
 
 
 def test_source_manifest_detects_only_python_source_changes(tmp_path: Path) -> None:

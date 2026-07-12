@@ -8,7 +8,7 @@ import hashlib
 import importlib.util
 import inspect
 import sys
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import FrameType, ModuleType
@@ -162,7 +162,10 @@ def test_backend_stages_only_payload_overlays_and_preserves_source(
     assert "self.task_group.start_soon(self._worker, item)" in runner_source
     assert runner_source.count("_atoll_anyio_dispatch_") > 0
     assert "if _atoll_anyio_dispatch_" in runner_source
-    assert "_enable(self, request):" in runner_source
+    assert "_dispatch = _atoll_anyio_dispatch_" in runner_source
+    assert "_scheduler_call(" in runner_source
+    assert ".create_task" in runner_source
+    assert "._spawn" not in runner_source
     assert "else:\n            for item in request:" in runner_source
     assert "if scope is not None:\n            scope.cancel()" in runner_source
     assert "_all_events" in runner_source
@@ -943,7 +946,7 @@ def test_staged_runtime_preserves_anyio_task_semantics(
     assert normal["task_names"] == ["workflow.runner.Runner._worker"] * 3
     assert normal["mode"] == expected_mode
     assert factory_run["values"] == [("outer", 8), ("outer", 10)]
-    assert factory_run["mode"] == expected_mode
+    assert factory_run["mode"] == "fallback"
     assert cast(list[object], factory_run["factory_task_types"])
     assert factory_run["factory_registry_sizes"] == [2, 2]
     assert debug_fallback["mode"] == "fallback"
@@ -1004,6 +1007,36 @@ def test_staged_runtime_preserves_anyio_task_semantics(
     with pytest.raises(ExceptionGroup) as raised:
         asyncio.run(module.execute([7, 8], fail=16, use_task_factory=True))
     assert any(str(error) == "boom" for error in raised.value.exceptions)
+
+
+def test_staged_runtime_falls_back_for_replaced_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker descriptor replacement routes the complete request through source."""
+    pytest.importorskip("anyio")
+    scans = _fixture_scans(tmp_path)
+    plan = _selected_plan(scans)
+    payload_root = _payload_from_scans(tmp_path, scans)
+    AnyioTaskPreservingExecutionPlanBackend().stage(
+        plan,
+        ExecutionPlanStageContext(tmp_path, payload_root, tmp_path / ".cache"),
+    )
+    module = cast(_PayloadModule, _import_module(payload_root / "workflow" / "runner.py"))
+    runner_class = cast(type[object], vars(module)["Runner"])
+    original_worker = cast(
+        Callable[[object, object], Awaitable[None]],
+        vars(runner_class)["_worker"],
+    )
+
+    async def replacement_worker(owner: object, item: object) -> None:
+        await original_worker(owner, item)
+
+    monkeypatch.setattr(runner_class, "_worker", replacement_worker)
+    replaced_worker = asyncio.run(module.execute([10]))
+
+    assert replaced_worker["values"] == [("outer", 20)]
+    assert replaced_worker["mode"] == "fallback"
 
 
 def _fixture_scans(

@@ -211,17 +211,21 @@ regions. Plan staging happens in a disposable copy of the accepted payload, keep
 implementation as a guarded fallback, and validates every reported payload change before project
 code runs. Atoll runs the semantic command once, then uses one warmup and seven alternating
 benchmark trios across interpreted baseline, unplanned compiled payload, and planned payload. A
-plan replaces the unplanned payload only when its marginal median speedup is at least `1.05x` and
-its overall speedup satisfies the configured `minimum_speedup`; the configured full benchmark still
-controls final wheel promotion. Without both commands, plans remain report-only and the staged wheel
-keeps the native-region behavior it already had. A plan-only overlay that contains no native
-artifacts preserves the baseline wheel's pure tag, such as `py3-none-any`.
+plan replaces the unplanned payload only when its marginal median speedup is at least `1.05x`.
+The trial records a provisional overall ratio, but the configured full benchmark is the sole
+`minimum_speedup` gate and removes the wheel when the final payload misses it. Without both commands,
+plans remain report-only and the staged wheel keeps the native-region behavior it already had. A
+plan-only overlay that contains no native artifacts preserves the baseline wheel's pure tag, such
+as `py3-none-any`.
 
-For field-backed AnyIO rendezvous workflows, the task-preserving backend leaves the original
-`start_soon` calls, task factory, task objects, stream sends, and stream receives in place. It can
-skip cancellation only after a source-hashed worker has made a tail-position terminal handoff on
-the plan's private stream; nonterminal sends, sibling cancellation, changed stream topology,
-debugging, tracing, and monitoring retain the original path. A linked hot reducer may replace
+For field-backed AnyIO rendezvous workflows, the task-preserving backend guards the exact task-group
+and source coroutine identities, hoists the stable worker name, and calls AnyIO's original
+`create_task()` path. This retains the task factory, task objects, handles, context, cancellation,
+stream sends, and stream receives; the original `start_soon()` branch remains the fallback. It can
+skip cancellation only after a source-hashed worker has made a tail-position terminal handoff on the
+plan's private stream. Custom factories, changed workers or task groups, nonterminal sends, sibling
+cancellation, changed stream topology, debugging, tracing, and monitoring retain the original path.
+A linked hot reducer may replace
 `len(inspect.signature(function).parameters)` with an exact code-object parameter count only for an
 unwrapped Python function under the original `inspect` implementation. Every other callable uses
 the original reflection expression. Cross-module plan members and their complete source hashes are
