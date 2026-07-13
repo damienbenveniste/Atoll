@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.execution_plans.models import ExecutionPlan, PlanEdge, PlanNode, PlanRejection
-from atoll.models import CompileConfig, ModuleId, ModuleScan, SymbolId
+from atoll.models import CompileConfig, ModuleId, ModuleScan, SymbolId, SymbolRecord
 from atoll.runtime.profiling import LifecycleCounts, ProfiledMember, ProfileResult
+from atoll.source_optimization import analysis as source_analysis
 from atoll.source_optimization.analysis import (
     SourceOptimizationPlanningOptions,
     build_source_optimization_plans,
@@ -188,6 +190,40 @@ def test_source_planner_allows_direct_worker_context_mutation(tmp_path: Path) ->
     producer = next(item for item in assessment.callable_evidence if item.static_role == "producer")
     assert producer.context_mutation == ("_CONTEXT_LABEL.set",)
     assert assessment.status == "trial-ready"
+
+
+def test_source_dependency_resolution_follows_direct_receiver_methods(tmp_path: Path) -> None:
+    """Plan coverage includes proven `self` and `cls` helpers but not nested attributes."""
+    path = tmp_path / "method_pipeline.py"
+    path.write_text(
+        "class Runner:\n"
+        "    def root(self):\n"
+        "        return self.helper()\n"
+        "    def helper(self):\n"
+        "        return 1\n"
+        "    @classmethod\n"
+        "    def class_root(cls):\n"
+        "        return cls.class_helper()\n"
+        "    @classmethod\n"
+        "    def class_helper(cls):\n"
+        "        return 2\n"
+        "    def dynamic(self):\n"
+        "        return self.delegate.run()\n",
+        encoding="utf-8",
+    )
+    scan = scan_module(ModuleId(name="method_pipeline", path=path))
+    records = {record.id.qualname: record for record in scan.symbols}
+    resolver = cast(
+        Callable[[SymbolRecord, str, dict[str, SymbolRecord]], SymbolRecord | None],
+        vars(source_analysis)["_called_dependency"],
+    )
+
+    assert resolver(records["Runner.root"], "self.helper", records) == records["Runner.helper"]
+    assert (
+        resolver(records["Runner.class_root"], "cls.class_helper", records)
+        == records["Runner.class_helper"]
+    )
+    assert resolver(records["Runner.dynamic"], "self.delegate.run", records) is None
 
 
 def test_source_planner_reports_missing_profile_and_ignores_unusable_plans(tmp_path: Path) -> None:

@@ -91,6 +91,7 @@ PROFILE_SCHEDULER_OVERHEAD_SAMPLES = 20
 PROFILE_SCHEDULER_OVERHEAD_COVERAGE = 0.1
 PROFILE_MEMBER_SCHEDULER_OVERHEAD_SAMPLES = 8
 PROFILE_MEMBER_SCHEDULER_OVERHEAD_COVERAGE = 0.04
+PROFILE_SELECTED_MEMBER_SAMPLES = 120
 EXECUTION_PLAN_CANDIDATE_COUNT = 2
 SOURCE_OPTIMIZATION_CURRENT_MEDIAN_SECONDS = 0.92
 SOURCE_OPTIMIZATION_RESIDUAL_SAMPLES = 123
@@ -457,7 +458,7 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
             ProfiledMember(
                 module="app.ranking",
                 qualname="score_user",
-                samples=120,
+                samples=PROFILE_SELECTED_MEMBER_SAMPLES,
                 coverage=0.6,
                 call_count=12,
                 invocation_count=PROFILE_SPAWN_INVOCATIONS,
@@ -515,6 +516,9 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                 qualname="score_user",
                 samples=120,
                 coverage=0.6,
+                scheduler_overhead_samples=0,
+                attributed_samples=PROFILE_SELECTED_MEMBER_SAMPLES,
+                attributed_coverage=0.6,
                 selected=True,
                 reason="selected",
             ),
@@ -524,6 +528,9 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                 qualname="cold_path",
                 samples=30,
                 coverage=0.15,
+                scheduler_overhead_samples=0,
+                attributed_samples=30,
+                attributed_coverage=0.15,
                 selected=False,
                 reason="unmapped",
             ),
@@ -734,7 +741,12 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
         }
     ]
     assert report["profile"]["candidate_mapping_decisions"][1]["reason"] == "unmapped"
+    assert (
+        report["profile"]["candidate_mapping_decisions"][0]["attributed_samples"]
+        == PROFILE_SELECTED_MEMBER_SAMPLES
+    )
     assert report["profile"]["selected_symbols"] == ["app.ranking::score_user"]
+    assert "120 leaf + 0 nested = 120" in markdown
     assert "## Candidate Profitability" in markdown
     assert "marginal speedup 1.040x" in markdown
     assert "fallback: mypyc rejected unresolved source TypeVars" in markdown

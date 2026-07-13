@@ -905,6 +905,9 @@ class CompilationProfileCandidateDecisionReport(TypedDict):
         qualname: Runtime qualified name observed in the profile.
         samples: Statistical samples mapped to this member.
         coverage: Fraction of total workload samples represented by this member.
+        scheduler_overhead_samples: Nested scheduler or library samples owned by the member.
+        attributed_samples: Leaf plus nested samples used by candidate selection.
+        attributed_coverage: Fraction of workload samples used by candidate selection.
         selected: Whether the member passed the candidate policy.
         reason: Deterministic selection or rejection reason.
     """
@@ -914,6 +917,9 @@ class CompilationProfileCandidateDecisionReport(TypedDict):
     qualname: str
     samples: int
     coverage: float
+    scheduler_overhead_samples: int
+    attributed_samples: int
+    attributed_coverage: float
     selected: bool
     reason: str
 
@@ -3140,6 +3146,22 @@ def _append_profile_guided_selection_markdown(
         lines.append(f"- Unmeasured profiling passes: {pass_text}")
     selected = profile["selected_symbols"]
     selected_text = ", ".join(f"`{symbol}`" for symbol in selected) if selected else "none"
+    selected_activity = [
+        candidate for candidate in profile["candidate_mapping_decisions"] if candidate["selected"]
+    ]
+    selected_activity_text = (
+        ", ".join(
+            (
+                f"`{candidate['module']}::{candidate['qualname']}` "
+                f"{candidate['samples']} leaf + "
+                f"{candidate['scheduler_overhead_samples']} nested = "
+                f"{candidate['attributed_samples']}"
+            )
+            for candidate in selected_activity
+        )
+        if selected_activity
+        else "none"
+    )
     rejected = [
         candidate
         for candidate in profile["candidate_mapping_decisions"]
@@ -3162,6 +3184,7 @@ def _append_profile_guided_selection_markdown(
     lines.extend(
         [
             f"- Selected candidates: {selected_text}",
+            f"- Selected candidate activity: {selected_activity_text}",
             f"- Rejected candidates: {rejected_text}",
             f"- Bounded type observation reached: {capped_text}",
             "",
@@ -4916,6 +4939,9 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
                 "qualname": candidate.qualname,
                 "samples": candidate.samples,
                 "coverage": candidate.coverage,
+                "scheduler_overhead_samples": candidate.scheduler_overhead_samples,
+                "attributed_samples": candidate.attributed_samples,
+                "attributed_coverage": candidate.attributed_coverage,
                 "selected": candidate.selected,
                 "reason": candidate.reason,
             }

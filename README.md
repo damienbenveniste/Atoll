@@ -139,7 +139,9 @@ constant-time checks for scalar or nominal classes, `None`, or unions of those; 
 use the captured Python function. Parameterized containers, generic defaults or variadics,
 conflicting call sites, unresolved TypeVars, semantic `Any`, subclass overrides, and dynamic owner
 classes are not specialized. Profile-hot boxed callables can still be compiled without pretending
-that their types became concrete.
+that their types became concrete. When boxed executable code reads a canonical module-level
+`TypeVar`, `ParamSpec`, or `TypeVarTuple`, the generated unit reads the original runtime object from
+the live source module instead of copying or erasing its declaration.
 
 Pure synchronous functions and static methods with exact `int` inputs can receive guarded Cython
 `int32_t` and `int64_t` variants when interval analysis proves every intermediate and return value.
@@ -215,6 +217,8 @@ guard visible to strict tests.
 
 After a transformed candidate passes semantics and the `1.05x` marginal search gate, Atoll profiles
 that staged payload again with optimized routing enabled before it can seed another search depth.
+The marginal gate uses the median of corresponding current/candidate ratios from the rotating
+three-arm samples, so one order-biased current measurement cannot select a different source patch.
 Only a completed dynamic profile may advance the beam; unsupported launchers, insufficient samples,
 and failed passes remain rejection evidence. For structurally owned AnyIO-on-asyncio streams, later
 cumulative trials can amortize run guards, collapse quiescent await chains, elide context copies only
@@ -268,17 +272,17 @@ and representative family promotion use the separate `3.0x` hard floor.
 
 Commands run directly with `shell=False`. For `python script.py` and `python -m module` benchmark
 commands, Atoll first builds and tests the baseline wheel, then runs unmeasured profile passes before
-selecting regions. A 2 ms statistical leaf-frame sampler identifies project hot paths. A bounded
-Python 3.12 monitoring pass records lifecycle counts and canonical `module.qualname` argument type
-identities for those members. Reports never persist argument values or representations, retain at
-most eight signatures per member, and mark polymorphic or observation-capped evidence explicitly.
-Recognized task-spawn callees are observed even when leaf sampling attributes their cost to an event
-loop or nested callback. Their evidence includes completed calls, maximum overlapping active calls,
-and suspensions before completion.
-Atoll requires 100 workload samples, then considers members with at least 20 samples and 2% of the
-workload. It selects at most four in descending order until they cover 80% of mapped project
-samples. Unsupported launchers or insufficient samples use static selection, but still run the
-final benchmark gate.
+selecting regions. A 2 ms statistical sampler attributes both project leaf frames and nested
+scheduler or library frames to the active project caller. A bounded Python 3.12 monitoring pass
+records lifecycle counts and canonical `module.qualname` argument type identities for the hottest
+combined activity. Reports never persist argument values or representations, retain at most eight
+signatures per member, and mark polymorphic or observation-capped evidence explicitly. Recognized
+task-spawn callees are also observed directly. Their evidence includes completed calls, maximum
+overlapping active calls, and suspensions before completion.
+Atoll requires 100 workload samples, then considers members with at least 20 attributed samples and
+2% of the workload. It selects at most four in descending order until they cover 80% of mapped
+project activity. Unsupported launchers or insufficient samples use static selection, but still run
+the final benchmark gate.
 
 For a supported profile, Atoll compiles the selected candidates once and evaluates them in hotness
 order. Each candidate combination runs the semantic command once, then one warmup and three

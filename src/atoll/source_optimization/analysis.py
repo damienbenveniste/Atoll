@@ -471,16 +471,45 @@ def _callable_roles(
     records_by_qualname = {symbol.id.qualname: symbol for symbol in records.values()}
     while pending:
         symbol_id = pending.pop()
-        record = records_by_qualname.get(symbol_id.qualname)
+        record = records.get(symbol_id)
         if record is None:
             continue
         for path in record.called_paths:
-            dependency = records_by_qualname.get(path)
+            dependency = _called_dependency(record, path, records_by_qualname)
             if dependency is None or dependency.kind == "class" or dependency.id in roles:
                 continue
             roles[dependency.id] = "dependency"
             pending.append(dependency.id)
     return roles
+
+
+def _called_dependency(
+    caller: SymbolRecord,
+    path: str,
+    records_by_qualname: dict[str, SymbolRecord],
+) -> SymbolRecord | None:
+    """Resolve direct and receiver-relative calls without guessing dynamic attributes.
+
+    Args:
+        caller: Static symbol containing the call site.
+        path: Scanner-normalized callable path.
+        records_by_qualname: Same-module symbols keyed by qualified name.
+
+    Returns:
+        Same-module callee for a direct name or `self`/`cls` method call, when proven.
+    """
+    direct = records_by_qualname.get(path)
+    if direct is not None:
+        return direct
+    if caller.kind != "method" or not path.startswith(("self.", "cls.")):
+        return None
+    relative = path.split(".", maxsplit=1)[1]
+    if "." in relative:
+        return None
+    owner, separator, _member = caller.id.qualname.rpartition(".")
+    if not separator:
+        return None
+    return records_by_qualname.get(f"{owner}.{relative}")
 
 
 def _callable_evidence_item(

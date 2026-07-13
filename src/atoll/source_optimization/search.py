@@ -25,6 +25,7 @@ from atoll.models import CompileAttempt, CompileConfig, CompilePhaseTiming
 from atoll.optimization_policy import (
     DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
     HARD_BENCHMARK_MINIMUM_SPEEDUP,
+    assess_paired_speedup,
     assess_speedup,
 )
 from atoll.runtime.performance import (
@@ -202,6 +203,8 @@ class _SearchBenchmarkResult:
     baseline_median_seconds: float | None
     current_median_seconds: float | None
     candidate_median_seconds: float | None
+    paired_marginal_speedup: float | None
+    paired_marginal_passed: bool
     runs: tuple[CommandRunEvidence, ...]
 
 
@@ -649,13 +652,8 @@ def _evaluate_candidate(
         benchmark.candidate_median_seconds,
         minimum_speedup=SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP,
     )
-    marginal_assessment = assess_speedup(
-        current_median,
-        benchmark.candidate_median_seconds,
-        minimum_speedup=SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP,
-    )
     source_speedup = source_assessment.speedup or 0.0
-    improves_current = marginal_assessment.passed
+    improves_current = benchmark.paired_marginal_passed
     residual_profile: ProfileResult | None = None
     profile_diagnostics: tuple[str, ...] = ()
     profile_failed = False
@@ -796,6 +794,8 @@ def _run_search_benchmark(context: _SearchBenchmarkContext) -> _SearchBenchmarkR
                         baseline_median_seconds=None,
                         current_median_seconds=None,
                         candidate_median_seconds=None,
+                        paired_marginal_speedup=None,
+                        paired_marginal_passed=False,
                         runs=tuple(item for _arm, item in runs),
                     )
     sample_runs = runs[SOURCE_SEARCH_WARMUPS * 3 :]
@@ -805,17 +805,37 @@ def _run_search_benchmark(context: _SearchBenchmarkContext) -> _SearchBenchmarkR
         )
         for arm in ("baseline", "current", "candidate")
     }
+    sample_groups = tuple(sample_runs[index : index + 3] for index in range(0, len(sample_runs), 3))
+    paired = assess_paired_speedup(
+        tuple(
+            next(run.duration_seconds for arm, run in group if arm == "current")
+            for group in sample_groups
+        ),
+        tuple(
+            next(run.duration_seconds for arm, run in group if arm == "candidate")
+            for group in sample_groups
+        ),
+        minimum_speedup=SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP,
+    )
+    paired_text = (
+        f"{paired.median_pair_speedup:.3f}x"
+        if paired.median_pair_speedup is not None
+        else "unstable"
+    )
     return _SearchBenchmarkResult(
         success=True,
         reason=(
             "candidate search medians: "
             f"baseline={medians['baseline']:.3f}s, "
             f"current={medians['current']:.3f}s, "
-            f"candidate={medians['candidate']:.3f}s"
+            f"candidate={medians['candidate']:.3f}s, "
+            f"paired marginal={paired_text}"
         ),
         baseline_median_seconds=medians["baseline"],
         current_median_seconds=medians["current"],
         candidate_median_seconds=medians["candidate"],
+        paired_marginal_speedup=paired.median_pair_speedup,
+        paired_marginal_passed=paired.passed,
         runs=tuple(item for _arm, item in runs),
     )
 

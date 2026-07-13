@@ -149,7 +149,9 @@ decision or native files without invoking mypyc or Cython. `atoll clean --cache`
 reusable compiler state.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
 scan and compile reports. A callable from such a module is compiled only when the typed-region
-analysis and backend capability assessment can still preserve its source behavior.
+analysis and backend capability assessment can still preserve its source behavior. Boxed executable
+code that reads a canonical module-level `TypeVar`, `ParamSpec`, or `TypeVarTuple` resolves the
+original object through the live source module rather than copying or erasing the declaration.
 
 Atoll v1 source-clean compile targets backend-supported typed regions, including ordinary
 functions, eligible classes and methods, async shapes, and narrowly guarded concrete generic
@@ -177,7 +179,9 @@ original path; `ATOLL_REQUIRE_OPTIMIZED=1` exposes guard failure to strict tests
 
 After a transformed candidate passes semantics and the `1.05x` marginal search gate, Atoll reruns
 profiling against that staged payload with optimized routing enabled. Only a completed dynamic profile
-can seed another search depth; unsupported launchers, insufficient samples, and failed passes stay in
+can seed another search depth. The gate uses the median of corresponding current/candidate ratios
+from each rotating three-arm sample group, preventing one order-biased current measurement from
+changing the accepted patch. Unsupported launchers, insufficient samples, and failed passes stay in
 the report as rejection evidence. Structurally owned AnyIO-on-asyncio streams can receive cumulative
 residual trials for run-scoped guard amortization, quiescent await-chain collapse, proven-safe context
 copy elision, incremental completion accounting, and private result-record projection. Each trial's
@@ -226,15 +230,16 @@ use the separate `3.0x` hard floor.
 
 Atoll runs these arrays with `shell=False`. For `python script.py` and `python -m module` benchmark
 commands, it builds and tests the baseline wheel before region selection, then runs unmeasured
-profiling. A 2 ms statistical leaf-frame sampler identifies hot project members. A bounded Python
-3.12 monitoring pass records lifecycle counts and canonical `module.qualname` argument type
-identities without retaining values or representations. Reports keep at most eight signatures per
+profiling. A 2 ms statistical sampler combines project leaf frames with nested scheduler or library
+frames attributed to the active project caller. A bounded Python 3.12 monitoring pass records
+lifecycle counts and canonical `module.qualname` argument type identities for the hottest combined
+activity without retaining values or representations. Reports keep at most eight signatures per
 member and distinguish polymorphism from a reached observation budget. Recognized task-spawn
-callees are targeted even when leaf sampling attributes their cost elsewhere; reports retain their
-completion count, maximum overlap, and pre-completion suspension count. Atoll requires 100 total
-samples, considers candidates with at least 20 samples and 2% of workload samples, and selects at
-most four in descending order until they cover 80% of mapped project samples. Unsupported launchers
-or insufficient samples fall back to static selection while retaining the final performance gate.
+callees are also targeted directly; reports retain their completion count, maximum overlap, and
+pre-completion suspension count. Atoll requires 100 total samples, considers candidates with at
+least 20 attributed samples and 2% of workload samples, and selects at most four in descending order
+until they cover 80% of mapped project activity. Unsupported launchers or insufficient samples fall
+back to static selection while retaining the final performance gate.
 
 For a supported profile, Atoll compiles the candidate superset once and tests candidates in hotness
 order through an internal region allowlist. Each candidate combination runs the semantic command

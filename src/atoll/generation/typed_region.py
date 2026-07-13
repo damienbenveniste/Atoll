@@ -627,19 +627,19 @@ def _runtime_boundary_roots(
     member_by_id = {member.id: member for member in members}
     roots: set[str] = set()
     for dependency in region.dependencies:
-        if (
-            dependency.src not in selected
-            or dependency.role != "runtime"
-            or dependency.requires_same_unit
-            or not isinstance(dependency.dst, SymbolId)
-            or dependency.dst.module != region.source_module.name
-            or dependency.dst in selected
-        ):
+        if dependency.src not in selected or dependency.role != "runtime":
+            continue
+        if dependency.requires_same_unit:
+            continue
+        if isinstance(dependency.dst, str):
+            if dependency.kind == "uses_global" and dependency.dst.isidentifier():
+                roots.add(dependency.dst)
+            continue
+        if dependency.dst.module != region.source_module.name or dependency.dst in selected:
             continue
         source_member = member_by_id[dependency.src]
-        if _uses_receiver_dispatch(source_member, dependency.dst, dependency.lineno):
-            continue
-        roots.add(dependency.dst.qualname.split(".", maxsplit=1)[0])
+        if not _uses_receiver_dispatch(source_member, dependency.dst, dependency.lineno):
+            roots.add(dependency.dst.qualname.split(".", maxsplit=1)[0])
     return frozenset(roots)
 
 

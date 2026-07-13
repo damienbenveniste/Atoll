@@ -45,6 +45,11 @@ DIRECT_CALL_EDGE_CALLS = 1_200
 DIRECT_SPAWN_CALLBACKS = 2
 SCHEDULER_OVERHEAD_SAMPLES = 60
 SCHEDULER_OVERHEAD_COVERAGE = 0.6
+ATTRIBUTED_OWNER_LEAF_SAMPLES = 10
+ATTRIBUTED_OWNER_SCHEDULER_SAMPLES = 70
+ATTRIBUTED_OWNER_SAMPLES = 80
+ATTRIBUTED_OWNER_COVERAGE = 0.4
+SELECTED_ACTIVITY_SAMPLES = 170
 BOOTSTRAP_EXIT_CODE = 7
 BOOTSTRAP_USAGE_ERROR_CODE = 2
 BOOTSTRAP_STRING_EXIT_CODE = 1
@@ -577,6 +582,71 @@ def test_select_profile_candidates_applies_threshold_coverage_and_limit_policy()
         ("epsilon", "below-threshold"),
         ("zeta", "below-threshold"),
     ]
+
+
+def test_candidate_selection_includes_attributed_scheduler_activity() -> None:
+    """Nested scheduler samples can identify a hot owner with a cold leaf frame."""
+    profile = _profile_with_members(
+        total_samples=200,
+        members=(
+            ("pkg.hot", "owner", 10),
+            ("pkg.hot", "leaf", 50),
+            ("pkg.hot", "helper", 40),
+        ),
+    )
+    members = tuple(
+        replace(
+            member,
+            scheduler_overhead_samples=(
+                ATTRIBUTED_OWNER_SCHEDULER_SAMPLES if member.qualname == "owner" else 0
+            ),
+            scheduler_overhead_coverage=(0.35 if member.qualname == "owner" else 0.0),
+        )
+        for member in profile.members
+    )
+    profile = replace(
+        profile,
+        mapped_project_samples=100,
+        mapped_coverage=0.5,
+        scheduler_overhead_samples=ATTRIBUTED_OWNER_SCHEDULER_SAMPLES,
+        scheduler_overhead_coverage=0.35,
+        members=members,
+    )
+
+    selected = select_profile_candidates(
+        profile,
+        tuple(_symbol(module, qualname) for module, qualname, _samples in _member_specs(profile)),
+    )
+
+    assert [symbol.qualname for symbol in selected.selected_symbols] == [
+        "owner",
+        "leaf",
+        "helper",
+    ]
+    assert selected.selected_hot_samples == SELECTED_ACTIVITY_SAMPLES
+    assert selected.selected_hot_coverage == 1.0
+    owner = _candidate(selected, "owner")
+    assert owner.samples == ATTRIBUTED_OWNER_LEAF_SAMPLES
+    assert owner.scheduler_overhead_samples == ATTRIBUTED_OWNER_SCHEDULER_SAMPLES
+    assert owner.attributed_samples == ATTRIBUTED_OWNER_SAMPLES
+    assert owner.attributed_coverage == ATTRIBUTED_OWNER_COVERAGE
+
+
+def test_targeted_observation_ranks_leaf_and_scheduler_samples_together() -> None:
+    """The type pass observes active owners instead of only Python leaf frames."""
+    hot_member_keys = cast(
+        Callable[[dict[str, object]], tuple[tuple[str, int], ...]],
+        _callable_attribute(profiling, "_hot_member_keys"),
+    )
+
+    ranked = hot_member_keys(
+        {
+            "sample_counts": {"pkg::leaf": 60, "pkg::owner": 10},
+            "scheduler_overhead_counts": {"pkg::owner": 70},
+        }
+    )
+
+    assert ranked[:2] == (("pkg::owner", 80), ("pkg::leaf", 60))
 
 
 def test_select_profile_candidates_reports_unmapped_without_selecting_low_total_samples() -> None:

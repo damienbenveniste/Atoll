@@ -46,3 +46,26 @@ def test_dynamic_global_dependency_rejects_candidate(tmp_path: Path) -> None:
 
     assert scan.island_candidates == ()
     assert {blocker.code for blocker in scan.symbols[0].blockers} == {"DYNAMIC_GLOBAL_DEP"}
+
+
+def test_project_typevar_named_factory_remains_dynamic(tmp_path: Path) -> None:
+    """Only factories imported from canonical typing modules gain a boundary."""
+    module_path = tmp_path / "custom_typevar.py"
+    module_path.write_text(
+        """def TypeVar(name):
+    return object()
+
+T = TypeVar("T")
+
+def runtime_alias(value):
+    return tuple[T]((value,))
+""",
+        encoding="utf-8",
+    )
+
+    scan = enrich_island_analysis(scan_module(ModuleId(name="custom_typevar", path=module_path)))
+    runtime_alias = next(symbol for symbol in scan.symbols if symbol.id.qualname == "runtime_alias")
+
+    assert {blocker.code for blocker in runtime_alias.blockers if blocker.severity == "hard"} == {
+        "DYNAMIC_GLOBAL_DEP"
+    }

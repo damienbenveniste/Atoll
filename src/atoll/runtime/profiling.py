@@ -88,7 +88,7 @@ class _BootstrapRequest:
 @dataclass(frozen=True, slots=True)
 class _CandidatePolicyContext:
     total_samples: int
-    mapped_project_samples: int
+    mapped_activity_samples: int
     selected_samples: int
     selected_count: int
 
@@ -340,6 +340,15 @@ class ProfiledMember:
         return (self.completed_calls - suspended_calls) / self.completed_calls
 
     @property
+    def attributed_samples(self) -> int:
+        """Return leaf work plus nested scheduler or library work owned by this member.
+
+        Returns:
+            int: Disjoint sampling events attributed to the callable or its active stack.
+        """
+        return self.samples + self.scheduler_overhead_samples
+
+    @property
     def symbol(self) -> SymbolId:
         """Return the static symbol identity implied by the profiled member.
 
@@ -361,6 +370,9 @@ class MappedCandidateDecision:
         coverage: Fraction of total workload samples represented by this member.
         selected: Whether the member passed the candidate policy.
         reason: Deterministic policy reason for selection or rejection.
+        scheduler_overhead_samples: Nested scheduler or library samples owned by the member.
+        attributed_samples: Leaf plus nested samples used by the hotness policy.
+        attributed_coverage: Fraction of total workload samples used by the hotness policy.
     """
 
     symbol: SymbolId | None
@@ -368,6 +380,9 @@ class MappedCandidateDecision:
     qualname: str
     samples: int
     coverage: float
+    scheduler_overhead_samples: int
+    attributed_samples: int
+    attributed_coverage: float
     selected: bool
     reason: CandidateDecisionReason
 
@@ -386,8 +401,8 @@ class ProfileResult:
         scheduler_overhead_samples: Nested non-project samples attributed to active project
             callers.
         scheduler_overhead_coverage: Fraction of total samples represented by that overhead.
-        selected_hot_samples: Samples covered by selected candidates.
-        selected_hot_coverage: Fraction of samples covered by selected candidates.
+        selected_hot_samples: Leaf and attributed scheduler samples covered by candidates.
+        selected_hot_coverage: Fraction of mapped project activity covered by candidates.
         runs: Child-process evidence for each profiling pass.
         lifecycle: Python lifecycle event counts from the targeted observation pass.
         members: Profiled project members with sample and type evidence.
@@ -585,10 +600,16 @@ def select_profile_candidates(
                     coverage=member.coverage,
                     selected=False,
                     reason=("below-threshold" if member.symbol in available else "unmapped"),
+                    scheduler_overhead_samples=member.scheduler_overhead_samples,
+                    attributed_samples=member.attributed_samples,
+                    attributed_coverage=_coverage(
+                        member.attributed_samples,
+                        profile.total_samples,
+                    ),
                 )
                 for member in sorted(
                     profile.members,
-                    key=lambda item: (-item.samples, item.module, item.qualname),
+                    key=lambda item: (-item.attributed_samples, item.module, item.qualname),
                 )
             ),
             selected_symbols=(),
@@ -598,7 +619,7 @@ def select_profile_candidates(
     selected_samples = 0
     for member in sorted(
         profile.members,
-        key=lambda item: (-item.samples, item.module, item.qualname),
+        key=lambda item: (-item.attributed_samples, item.module, item.qualname),
     ):
         symbol = member.symbol if member.symbol in available else None
         reason = _candidate_reason(
@@ -606,7 +627,9 @@ def select_profile_candidates(
             symbol=symbol,
             context=_CandidatePolicyContext(
                 total_samples=profile.total_samples,
-                mapped_project_samples=profile.mapped_project_samples,
+                mapped_activity_samples=(
+                    profile.mapped_project_samples + profile.scheduler_overhead_samples
+                ),
                 selected_samples=selected_samples,
                 selected_count=len(selected_symbols),
             ),
@@ -614,7 +637,7 @@ def select_profile_candidates(
         selected = reason == "selected"
         if selected:
             selected_symbols.append(member.symbol)
-            selected_samples += member.samples
+            selected_samples += member.attributed_samples
         decisions.append(
             MappedCandidateDecision(
                 symbol=symbol,
@@ -624,12 +647,21 @@ def select_profile_candidates(
                 coverage=member.coverage,
                 selected=selected,
                 reason=reason,
+                scheduler_overhead_samples=member.scheduler_overhead_samples,
+                attributed_samples=member.attributed_samples,
+                attributed_coverage=_coverage(
+                    member.attributed_samples,
+                    profile.total_samples,
+                ),
             )
         )
     return replace(
         profile,
         selected_hot_samples=selected_samples,
-        selected_hot_coverage=_coverage(selected_samples, profile.mapped_project_samples),
+        selected_hot_coverage=_coverage(
+            selected_samples,
+            profile.mapped_project_samples + profile.scheduler_overhead_samples,
+        ),
         candidates=tuple(decisions),
         selected_symbols=tuple(selected_symbols),
     )
@@ -804,7 +836,13 @@ def _profile_from_payload(
         )
         for key in sorted(
             member_keys,
-            key=lambda item: (-_int_value(sample_counts.get(item, 0)), item),
+            key=lambda item: (
+                -(
+                    _int_value(sample_counts.get(item, 0))
+                    + _int_value(scheduler_overhead_counts.get(item, 0))
+                ),
+                item,
+            ),
         )
     )
     return ProfileResult(
@@ -947,15 +985,15 @@ def _candidate_reason(
         return "unmapped"
     if (
         context.total_samples < _MIN_TOTAL_SAMPLES
-        or member.samples < _MIN_CANDIDATE_SAMPLES
-        or _coverage(member.samples, context.total_samples) < _MIN_CANDIDATE_SHARE
+        or member.attributed_samples < _MIN_CANDIDATE_SAMPLES
+        or _coverage(member.attributed_samples, context.total_samples) < _MIN_CANDIDATE_SHARE
     ):
         return "below-threshold"
     if context.selected_count >= _MAX_SELECTED_CANDIDATES:
         return "limit"
     if (
         context.selected_count > 0
-        and context.selected_samples >= context.mapped_project_samples * _TARGET_MAPPED_COVERAGE
+        and context.selected_samples >= context.mapped_activity_samples * _TARGET_MAPPED_COVERAGE
     ):
         return "coverage-reached"
     return "selected"
@@ -963,9 +1001,18 @@ def _candidate_reason(
 
 def _hot_member_keys(payload: JsonObject) -> tuple[tuple[str, int], ...]:
     sample_counts = _object_field(payload, "sample_counts")
+    scheduler_counts = _object_field(payload, "scheduler_overhead_counts")
+    members = frozenset((*sample_counts, *scheduler_counts))
     return tuple(
         sorted(
-            ((_string_key(key), _int_value(value)) for key, value in sample_counts.items()),
+            (
+                (
+                    _string_key(key),
+                    _int_value(sample_counts.get(key, 0))
+                    + _int_value(scheduler_counts.get(key, 0)),
+                )
+                for key in members
+            ),
             key=lambda item: (-item[1], item[0]),
         )[:_MAX_SELECTED_CANDIDATES]
     )

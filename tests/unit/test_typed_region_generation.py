@@ -404,6 +404,45 @@ def type_name[T](value: T) -> str:
         )
 
 
+def test_cython_boxed_lowering_reads_module_runtime_type_parameters(
+    tmp_path: Path,
+) -> None:
+    """Legacy TypeVar objects keep identity through the live source module."""
+    source_path = tmp_path / "runtime_type_parameter_boundary.py"
+    source_path.write_text(
+        """from typing_extensions import TypeVar as TV
+
+T = TV("T")
+
+def runtime_alias(value):
+    return tuple[T]((value,))
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(
+        scan_module(ModuleId(name="runtime_type_parameter_boundary", path=source_path))
+    )
+    symbol = next(item for item in scan.symbols if item.id.qualname == "runtime_alias")
+    region = next(
+        item
+        for item in scan.typed_regions
+        if any(member.id == symbol.id for member in item.members)
+    )
+
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (symbol.id,),
+        output_path=tmp_path / "generated_runtime_boundary.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    assert not any(blocker.code == "DYNAMIC_GLOBAL_DEP" for blocker in symbol.blockers)
+    assert "import runtime_type_parameter_boundary as _atoll_source" in generation.source_text
+    assert "return tuple[_atoll_source.T]((value,))" in generation.source_text
+    assert 'T = TV("T")' not in generation.source_text
+
+
 def test_atomic_class_generation_preserves_declaration_and_mypyc_contract(
     tmp_path: Path,
 ) -> None:

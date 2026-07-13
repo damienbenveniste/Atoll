@@ -8,6 +8,7 @@ why nearby code was rejected.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 
 from atoll.analysis.call_graph import build_dependency_edges
@@ -28,6 +29,8 @@ _MIN_SYMBOL_SCORE = 60
 _MIN_CLUSTER_SCORE = 70
 _MIN_CLUSTER_LINES = 3
 _HIGH_CONFIDENCE_SCORE = 90
+_TYPING_MODULES = frozenset({"typing", "typing_extensions"})
+_TYPE_PARAMETER_FACTORIES = frozenset({"TypeVar", "ParamSpec", "TypeVarTuple"})
 
 
 def enrich_island_analysis(module: ModuleScan) -> ModuleScan:
@@ -66,8 +69,15 @@ def _attach_dynamic_global_blockers(module: ModuleScan) -> tuple[SymbolRecord, .
         imported_name for record in module.imports for imported_name in record.imported_names
     }
     local_symbols = {symbol.id.qualname for symbol in module.symbols}
+    runtime_type_parameters = _runtime_type_parameter_names(module)
     return tuple(
-        _attach_symbol_dynamic_global_blockers(symbol, constants, imported_names, local_symbols)
+        _attach_symbol_dynamic_global_blockers(
+            symbol,
+            constants,
+            imported_names,
+            local_symbols,
+            runtime_type_parameters,
+        )
         for symbol in module.symbols
     )
 
@@ -77,6 +87,7 @@ def _attach_symbol_dynamic_global_blockers(
     constants: dict[str, ConstantRecord],
     imported_names: set[str],
     local_symbols: set[str],
+    runtime_type_parameters: frozenset[str],
 ) -> SymbolRecord:
     blockers = tuple(
         Blocker(
@@ -87,7 +98,13 @@ def _attach_symbol_dynamic_global_blockers(
             symbol=symbol.id,
         )
         for name in symbol.uses_globals
-        if _is_dynamic_global(name, constants, imported_names, local_symbols)
+        if _is_dynamic_global(
+            name,
+            constants,
+            imported_names,
+            local_symbols,
+            runtime_type_parameters,
+        )
     )
     if not blockers:
         return symbol
@@ -99,12 +116,76 @@ def _is_dynamic_global(
     constants: dict[str, ConstantRecord],
     imported_names: set[str],
     local_symbols: set[str],
+    runtime_type_parameters: frozenset[str],
 ) -> bool:
-    if name in imported_names or name in local_symbols:
+    if name in imported_names or name in local_symbols or name in runtime_type_parameters:
         return False
     if name in constants:
         return constants[name].kind != "literal_constant"
     return True
+
+
+def _runtime_type_parameter_names(module: ModuleScan) -> frozenset[str]:
+    """Return module globals that are canonical runtime type parameters.
+
+    These objects are dynamic, but generated boxed callables can preserve their
+    identity by reading them from the live source module. Only direct calls to
+    ``TypeVar``, ``ParamSpec``, or ``TypeVarTuple`` imported from the standard
+    typing modules are accepted; similarly named project factories remain hard
+    blockers.
+
+    Args:
+        module: First-pass scan retaining exact imports and assignments.
+
+    Returns:
+        frozenset[str]: Safe source-module type-parameter bindings.
+    """
+    typing_modules: set[str] = set()
+    factories: set[str] = set()
+    for record in module.imports:
+        statement = ast.parse(record.source_text).body[0]
+        if isinstance(statement, ast.Import):
+            typing_modules.update(
+                alias.asname or alias.name
+                for alias in statement.names
+                if alias.name in _TYPING_MODULES
+            )
+        elif isinstance(statement, ast.ImportFrom) and statement.module in _TYPING_MODULES:
+            factories.update(
+                alias.asname or alias.name
+                for alias in statement.names
+                if alias.name in _TYPE_PARAMETER_FACTORIES
+            )
+
+    names: set[str] = set()
+    for constant in module.constants:
+        if constant.kind != "runtime_dynamic":
+            continue
+        statement = ast.parse(constant.source_text).body[0]
+        value = statement.value if isinstance(statement, ast.Assign | ast.AnnAssign) else None
+        if isinstance(value, ast.Call) and _is_type_parameter_factory(
+            value.func,
+            typing_modules=typing_modules,
+            factories=factories,
+        ):
+            names.add(constant.name)
+    return frozenset(names)
+
+
+def _is_type_parameter_factory(
+    node: ast.expr,
+    *,
+    typing_modules: set[str],
+    factories: set[str],
+) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in factories
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in typing_modules
+        and node.attr in _TYPE_PARAMETER_FACTORIES
+    )
 
 
 def _attach_blocked_local_call_blockers(
