@@ -362,6 +362,7 @@ def analyze_buffer_member(
     resolved = options or BufferMemberAnalysisOptions()
     try:
         node, source = _validate_member(member)
+        _validate_local_annotations(node)
         _validate_scope(
             source,
             node,
@@ -467,6 +468,24 @@ def _validate_member(member: RegionMember) -> tuple[ast.FunctionDef, str]:
     return node, source
 
 
+def _validate_local_annotations(node: ast.FunctionDef) -> None:
+    """Reject non-integer local annotations before version-specific scope analysis.
+
+    Args:
+        node: Parsed synchronous callable whose local declarations are being proved.
+
+    Raises:
+        _AnalysisError: If a local annotation is not exactly ``int``.
+    """
+    for descendant in ast.walk(node):
+        if isinstance(descendant, ast.AnnAssign) and ast.unparse(descendant.annotation) != "int":
+            raise _AnalysisError(
+                "unsupported-annotation",
+                "buffer reduction locals must use exact int annotations",
+                descendant.lineno,
+            )
+
+
 def _validate_member_contract(member: RegionMember) -> None:
     _validate_member_shape(member)
     _validate_member_parameters(member)
@@ -541,7 +560,10 @@ def _validate_scope(
     )
     if function_table is None:
         raise _AnalysisError("unsupported-scope", "symtable did not expose callable scope")
-    if function_table.get_children():
+    runtime_children = tuple(
+        child for child in function_table.get_children() if str(child.get_type()) != "annotation"
+    )
+    if runtime_children:
         raise _AnalysisError(
             "unsupported-scope",
             "nested functions, classes, comprehensions, and lambdas are not supported",

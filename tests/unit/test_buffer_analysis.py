@@ -413,7 +413,7 @@ def test_buffer_analysis_accepts_memoryview_branch_checks(tmp_path: Path) -> Non
                     total += value
                 return total
             """,
-            "opaque-call",
+            "unsupported-annotation",
         ),
         (
             "second_accumulator",
