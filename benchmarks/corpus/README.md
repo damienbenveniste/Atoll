@@ -16,6 +16,19 @@ Verify the reviewed dependency-lock identities, optionally for one case:
 uv run python -m scripts.benchmark_corpus lock --case CASE_ID
 ```
 
+Regenerate selected locks from their reviewed inputs when dependencies are
+intentionally changed:
+
+```bash
+uv run python -m scripts.benchmark_corpus lock --write --case CASE_ID
+```
+
+Lock generation targets Python 3.12 across supported platforms, includes
+distribution hashes, and excludes artifacts published after July 13, 2026.
+The generated header records the exact regeneration command. Validation rejects
+unhashed or non-exact requirements, direct URLs, editable installs, local paths,
+and package-index directives before a case can execute.
+
 Run one pinned case into disposable workspace and persistent evidence roots:
 
 ```bash
@@ -35,3 +48,11 @@ are present. External code is executed by the isolated lifecycle runner, never b
 manifest validation, lock inspection, or matrix generation. Successful runs
 delete cloned sources and wheels while retaining bounded logs, source manifests,
 policy evidence, toolchain identity, compile reports, and wheel digests.
+
+The version-1 compatibility matrix contains all 25 planned repositories on both
+Ubuntu 24.04 and macOS 14. Pins use the inspected default-branch revision when it
+passes baseline qualification. SQLGlot uses the newest qualifying Python 3.12
+release revision because newer revisions contain a forbidden submodule.
+html5lib remains in the matrix even though its newest Python 3.12 release still
+contains a test-data submodule; its explicit `security-violation` result is part
+of corpus coverage rather than an omitted hard case.

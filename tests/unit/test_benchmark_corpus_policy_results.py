@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tomllib
 from pathlib import Path, PurePosixPath
@@ -95,6 +96,33 @@ def test_append_compile_policy_rejects_upstream_compile_table(tmp_path: Path) ->
             tmp_path / "evidence",
             checkout,
         )
+
+
+def test_append_compile_policy_creates_disposable_pep517_file_for_legacy_project(
+    tmp_path: Path,
+) -> None:
+    """A setup.py-only checkout receives reviewable default build metadata."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    pyproject = checkout / "pyproject.toml"
+
+    evidence = append_compile_policy(
+        pyproject,
+        CompilePolicy(backends=("mypyc", "cython")),
+        tmp_path / "evidence",
+        checkout,
+    )
+
+    parsed = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    patch = (tmp_path / "evidence" / evidence.patch_path).read_text(encoding="utf-8")
+    assert parsed["build-system"] == {
+        "requires": ["setuptools>=77", "wheel"],
+        "build-backend": "setuptools.build_meta",
+    }
+    assert parsed["tool"]["atoll"]["compile"]["backends"] == ["mypyc", "cython"]
+    assert "--- /dev/null" in patch
+    assert "+++ b/pyproject.toml" in patch
+    assert evidence.digest == hashlib.sha256(patch.encode()).hexdigest()
 
 
 def test_case_result_json_and_markdown_are_derived_from_same_evidence(tmp_path: Path) -> None:

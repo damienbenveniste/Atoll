@@ -1,0 +1,4 @@
+-r common.in
+markdown-it-py>=2.2
+pytest>=7,<8
+pygments>=2.13

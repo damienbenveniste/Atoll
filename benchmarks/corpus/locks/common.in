@@ -1,0 +1,15 @@
+# Shared compiler, build-frontend, and test requirements for Python 3.12 cases.
+build>=1.2
+cython>=3.1
+flit-core>=3.12
+hatch-fancy-pypi-readme>=25.1
+hatch-vcs>=0.5
+hatchling>=1.27
+libcst>=1.8
+mypy>=1.17
+packaging>=24
+poetry-core>=2.2
+setuptools>=77
+setuptools-scm>=8
+uv-dynamic-versioning>=0.7
+wheel>=0.43

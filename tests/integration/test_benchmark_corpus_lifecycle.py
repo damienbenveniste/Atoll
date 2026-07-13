@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from scripts.benchmark_corpus.lifecycle import LifecycleOptions, run_case
+from scripts.benchmark_corpus.lifecycle import (
+    LifecycleOptions,
+    dependency_bootstrap_commands,
+    run_case,
+    tools_venv_command,
+    venv_python,
+)
 from scripts.benchmark_corpus.manifest import load_manifest
 from scripts.benchmark_corpus.process import detect_sandbox
 
@@ -17,6 +25,51 @@ ATOLL_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_ROOT = ATOLL_ROOT / "tests" / "fixtures" / "simple_project"
 ADAPTER_ROOT = ATOLL_ROOT / "tests" / "fixtures"
 BACKEND_PATH = ATOLL_ROOT / "tests" / "fixtures" / "corpus_backend.py"
+
+
+def test_venv_python_preserves_environment_symlink_path(tmp_path: Path) -> None:
+    """The case interpreter path must not resolve back to its host Python."""
+    environment = tmp_path / "environment"
+    binary = environment / "bin"
+    binary.mkdir(parents=True)
+    python = binary / "python"
+    try:
+        python.symlink_to(sys.executable)
+    except OSError:
+        pytest.skip("symbolic links are unavailable")
+
+    observed = venv_python(environment)
+
+    assert observed == python.absolute()
+    assert os.fspath(observed) != os.fspath(python.resolve())
+
+
+def test_isolated_bootstrap_uses_bundled_pip_and_hash_verified_locks(
+    tmp_path: Path,
+) -> None:
+    """Network bootstrap never executes an unpinned downloaded pip package."""
+    environment = tmp_path / "tools"
+    tools_python = environment / "bin" / "python"
+    lock = tmp_path / "lock.txt"
+    wheelhouse = tmp_path / "wheelhouse"
+
+    create = tools_venv_command("/uv", "3.12", environment)
+    bootstrap = dependency_bootstrap_commands(
+        "/uv",
+        tools_python,
+        lock,
+        wheelhouse,
+    )
+
+    assert create == ("/uv", "venv", "--python", "3.12", str(environment))
+    assert "--seed" not in create
+    assert bootstrap.ensure_pip[-3:] == ("-m", "ensurepip", "--upgrade")
+    assert bootstrap.download[:4] == (str(tools_python), "-m", "pip", "download")
+    assert "--require-hashes" in bootstrap.download
+    assert bootstrap.download[-1] == str(wheelhouse)
+    assert bootstrap.sync[:3] == ("/uv", "pip", "sync")
+    assert "--require-hashes" in bootstrap.sync
+    assert "--offline" in bootstrap.sync
 
 
 def test_local_pinned_lifecycle_is_source_clean_and_warm_cached(tmp_path: Path) -> None:

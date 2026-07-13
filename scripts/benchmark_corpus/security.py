@@ -24,7 +24,6 @@ FindingCode = Literal[
     "gitmodules",
     "invalid-pyproject",
     "lfs-pointer",
-    "missing-pyproject",
     "revision-mismatch",
     "submodule",
     "symlink-escape",
@@ -428,13 +427,8 @@ def _inspect_pyproject(
     try:
         parsed = cast(dict[str, object], tomllib.loads(pyproject.read_text(encoding="utf-8")))
     except FileNotFoundError:
-        findings.append(
-            SecurityFinding(
-                "missing-pyproject",
-                f"target project has no {relative_pyproject.as_posix()}",
-                relative_pyproject,
-            )
-        )
+        # Legacy setup.py projects are valid corpus inputs.  The lifecycle
+        # creates a disposable PEP 517 policy file after baseline qualification.
         return
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         findings.append(

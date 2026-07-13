@@ -12,6 +12,34 @@ from scripts.benchmark_corpus import load_manifest, main, manifest_matrix
 _SHA_A = "a" * 40
 _SHA_B = "b" * 40
 _INVALID_MANIFEST_EXIT_CODE = 2
+_VALID_HASH = "a" * 64
+_EXPECTED_REPOSITORY_CASES = {
+    "anyio",
+    "attrs",
+    "cattrs",
+    "click",
+    "dulwich",
+    "html5lib",
+    "httpx",
+    "jsonschema",
+    "mako",
+    "markdown",
+    "marshmallow",
+    "mypy",
+    "networkx",
+    "pluggy",
+    "pydantic",
+    "pydantic-graph",
+    "rich",
+    "sortedcontainers",
+    "sqlalchemy",
+    "sqlglot",
+    "sympy",
+    "tomli",
+    "tornado",
+    "trio",
+    "websockets",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +330,7 @@ def test_lock_cli_reports_reviewed_dependency_identity(
 ) -> None:
     """Lock inspection hashes the exact repository-local constraints file."""
     lock = tmp_path / "uv.lock"
-    lock.write_text("package==1.0 --hash=sha256:abc\n", encoding="utf-8")
+    lock.write_text(f"package==1.0 --hash=sha256:{_VALID_HASH}\n", encoding="utf-8")
     manifest = _write_manifest(tmp_path / "corpus.toml")
 
     assert (
@@ -347,3 +375,105 @@ def test_lock_cli_rejects_dependency_lock_symlink(
         == _INVALID_MANIFEST_EXIT_CODE
     )
     assert "unsafe dependency lock" in capsys.readouterr().err
+
+
+def test_repository_manifest_keeps_httpx_and_dulwich_tests_with_their_projects() -> None:
+    """Focused test argv cannot be silently exchanged between corpus cases."""
+    manifest = load_manifest(Path("benchmarks/corpus/manifest.toml"))
+    commands = {case.id: case.focused_test_command for case in manifest.cases}
+
+    assert commands["httpx"][-1] == (
+        "tests/client/test_async_client.py::test_async_mock_transport[asyncio]"
+    )
+    assert commands["dulwich"][-1] == (
+        "tests.test_objects.BlobReadTests.test_create_blob_from_string"
+    )
+    assert set(commands) == _EXPECTED_REPOSITORY_CASES
+
+
+def test_lock_cli_write_uses_reviewed_input_and_reproducible_uv_policy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lock generation fixes Python, platform coverage, hashes, and time cutoff."""
+    lock_input = tmp_path / "uv.in"
+    lock_input.write_text("package>=1\n", encoding="utf-8")
+    manifest = _write_manifest(tmp_path / "corpus.toml")
+    observed: list[tuple[str, ...]] = []
+
+    class _Completed:
+        returncode = 0
+
+    def fake_run(argv: tuple[str, ...], **_kwargs: object) -> _Completed:
+        observed.append(argv)
+        output = Path(argv[argv.index("--output-file") + 1])
+        output.write_text(
+            f"package==1.0 --hash=sha256:{_VALID_HASH}\n",
+            encoding="utf-8",
+        )
+        return _Completed()
+
+    def fake_which(_name: str) -> str:
+        return "/uv"
+
+    monkeypatch.setattr("scripts.benchmark_corpus.cli.shutil.which", fake_which)
+    monkeypatch.setattr("scripts.benchmark_corpus.cli.subprocess.run", fake_run)
+
+    assert (
+        main(
+            (
+                "--manifest",
+                str(manifest),
+                "lock",
+                "--atoll-root",
+                str(tmp_path),
+                "--write",
+                "--case",
+                "alpha",
+            )
+        )
+        == 0
+    )
+    assert observed
+    command = observed[0]
+    assert command[:3] == ("/uv", "pip", "compile")
+    assert "--universal" in command
+    assert command[command.index("--python-version") + 1] == "3.12"
+    assert "--generate-hashes" in command
+    assert command[command.index("--exclude-newer") + 1] == "2026-07-13T23:59:59Z"
+    assert '"case":"alpha"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        "package==1.0",
+        f"package>=1.0 --hash=sha256:{_VALID_HASH}",
+        f"package @ https://example.invalid/package.whl --hash=sha256:{_VALID_HASH}",
+        "--index-url https://example.invalid/simple",
+        "-e ../package",
+    ],
+)
+def test_lock_cli_rejects_unhashed_unpinned_or_external_requirements(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    requirement: str,
+) -> None:
+    """Reviewed locks contain only exact index artifacts with SHA-256 hashes."""
+    (tmp_path / "uv.lock").write_text(f"{requirement}\n", encoding="utf-8")
+    manifest = _write_manifest(tmp_path / "corpus.toml")
+
+    assert (
+        main(
+            (
+                "--manifest",
+                str(manifest),
+                "lock",
+                "--atoll-root",
+                str(tmp_path),
+            )
+        )
+        == _INVALID_MANIFEST_EXIT_CODE
+    )
+    assert "exact hashed requirements" in capsys.readouterr().err

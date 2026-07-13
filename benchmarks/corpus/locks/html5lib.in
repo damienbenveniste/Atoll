@@ -1,0 +1,7 @@
+-r common.in
+pytest>=5.4,<8
+pytest-expect>=1.1,<2
+setuptools>=77,<81
+six>=1.9
+u-msgpack-python
+webencodings>=0.5.1

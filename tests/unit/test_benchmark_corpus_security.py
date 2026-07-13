@@ -148,6 +148,25 @@ def test_validate_checkout_rejects_existing_compile_policy(tmp_path: Path) -> No
     assert "compile-policy" in _finding_codes(raised.value)
 
 
+def test_validate_checkout_accepts_legacy_setup_project_without_pyproject(
+    tmp_path: Path,
+) -> None:
+    """A setup.py-only project reaches the disposable policy lifecycle."""
+    repository, _revision = _repository(tmp_path)
+    (repository / "pyproject.toml").unlink()
+    (repository / "setup.py").write_text(
+        "from setuptools import setup\nsetup()\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "--all")
+    revision = _commit_detached(repository, "use legacy build metadata")
+
+    validated = validate_checkout(repository, revision, git_executable=_git_executable())
+
+    assert validated.revision == revision
+    assert PurePosixPath("setup.py") in {record.path for record in validated.source_manifest.files}
+
+
 def test_tracked_source_manifest_has_stable_sorted_hashes(tmp_path: Path) -> None:
     """Manifest identity is stable and changes only when tracked bytes change."""
     repository, revision = _repository(tmp_path)

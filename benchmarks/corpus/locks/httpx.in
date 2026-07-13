@@ -1,0 +1,11 @@
+-r common.in
+anyio>=4
+certifi
+cryptography>=43
+h11>=0.16
+httpcore>=1,<2
+idna
+pytest==8.4.1
+trio>=0.31
+trustme>=1.2
+uvicorn>=0.30

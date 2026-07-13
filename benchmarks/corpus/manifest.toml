@@ -5,3 +5,331 @@ test_timeout_seconds = 300
 compile_timeout_seconds = 2700
 performance_timeout_seconds = 5400
 max_log_bytes = 10485760
+
+[[case]]
+id = "anyio"
+name = "AnyIO"
+repository = "https://github.com/agronholm/anyio.git"
+revision = "c384f99687c64c59ed8a11c3a0f11a2d57daff71"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/anyio.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "tests/streams/test_memory.py::test_receive_then_send[asyncio]"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "anyio"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "attrs"
+name = "attrs"
+repository = "https://github.com/python-attrs/attrs.git"
+revision = "d544dd2dacb4cbd660891e323ad92751ba65b4e0"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/attrs.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "tests/test_import.py"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "attrs"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "cattrs"
+name = "cattrs"
+repository = "https://github.com/python-attrs/cattrs.git"
+revision = "a6c0900533af780155510343c1472a46fcb984f5"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/cattrs.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "tests/test_enums.py::test_structure_complex_enum"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "cattrs"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "click"
+name = "Click"
+repository = "https://github.com/pallets/click.git"
+revision = "b67832c2167e5b0ff6764a8c04a0a9087e697b5a"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/click.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_basic.py::test_basic_functionality"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "click"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "dulwich"
+name = "Dulwich"
+repository = "https://github.com/jelmer/dulwich.git"
+revision = "fdfd2607e41ad1ca63dd1c4c8a36b5032a2f6562"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/dulwich.txt"
+focused_test_command = ["python", "-m", "unittest", "-q", "tests.test_objects.BlobReadTests.test_create_blob_from_string"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "dulwich"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "html5lib"
+name = "html5lib"
+repository = "https://github.com/html5lib/html5lib-python.git"
+revision = "f87487a4ada2d6cf223bdd182774a01ba3c84618"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/html5lib.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "html5lib/tests/test_parser2.py", "html5lib/tests/test_tokenizer2.py", "html5lib/tests/test_serializer.py"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "html5lib"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "httpx"
+name = "HTTPX"
+repository = "https://github.com/encode/httpx.git"
+revision = "b5addb64f0161ff6bfe94c124ef76f6a1fba5254"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/httpx.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "tests/client/test_async_client.py::test_async_mock_transport[asyncio]"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "httpx"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "jsonschema"
+name = "jsonschema"
+repository = "https://github.com/python-jsonschema/jsonschema.git"
+revision = "597e53f974260aba010716f7c9250f01a193969a"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/jsonschema.txt"
+focused_test_command = ["python", "-m", "unittest", "-q", "jsonschema.tests.test_validators.TestCreateAndExtend.test_iter_errors_one_error"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "jsonschema"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "mako"
+name = "Mako"
+repository = "https://github.com/sqlalchemy/mako.git"
+revision = "d58a9208fd62a816e9609a35be55aa6d3c5b14e7"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/mako.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "test/test_lexer.py::LexerTest::test_text_and_tag"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "mako"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "markdown"
+name = "Python-Markdown"
+repository = "https://github.com/Python-Markdown/markdown.git"
+revision = "8453df010daf9547efcc20a05bb12c0e2fd2016a"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/markdown.txt"
+focused_test_command = ["python", "-m", "unittest", "-q", "tests.test_apis.TestMarkdownBasics.testSimpleInput"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "markdown"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "marshmallow"
+name = "marshmallow"
+repository = "https://github.com/marshmallow-code/marshmallow.git"
+revision = "3265c13945a9533f9a3ade8d47eb9b32412c4c27"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/marshmallow.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "tests/test_serialization.py::TestFieldSerialization::test_function_field_passed_serialize"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "marshmallow"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "mypy"
+name = "mypy"
+repository = "https://github.com/python/mypy.git"
+revision = "40b75e09260905b3ade37e5bf36d795b733605d4"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/mypy.txt"
+focused_test_command = ["python", "-m", "unittest", "-q", "mypyc.test.test_pprint.TestGenerateNames.test_int_op"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "mypy"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+compile_timeout_seconds = 5400
+
+[[case]]
+id = "networkx"
+name = "NetworkX"
+repository = "https://github.com/networkx/networkx.git"
+revision = "b1f956344071ba1adfad17d56d62a7a78dfd37e6"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/networkx.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "networkx/algorithms/components/tests/test_connected.py::TestConnected::test_number_connected_components"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "networkx"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "pluggy"
+name = "pluggy"
+repository = "https://github.com/pytest-dev/pluggy.git"
+revision = "71137409e4b1d48ceaea83d32e30b65f4d712b34"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/pluggy.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "testing/test_result.py::test_exceptions_traceback_doesnt_get_longer_and_longer"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "pluggy"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "pydantic"
+name = "Pydantic"
+repository = "https://github.com/pydantic/pydantic.git"
+revision = "f59e929c999e8b2efc7b12fd0bc1685c1a186be3"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/pydantic.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "tests/test_main.py::test_success"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "pydantic"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "pydantic-graph"
+name = "Pydantic Graph"
+repository = "https://github.com/pydantic/pydantic-ai.git"
+revision = "e6ff64409f74124de581068be644a3dbf8999e7d"
+project_subroot = "pydantic_graph"
+dependency_lock = "benchmarks/corpus/locks/pydantic-graph.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "--confcutdir=../tests/graph", "../tests/graph/test_utils.py"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "pydantic-graph"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+compile_timeout_seconds = 5400
+
+[[case]]
+id = "rich"
+name = "Rich"
+repository = "https://github.com/Textualize/rich.git"
+revision = "9d8f9a372cc5916fd4781fec207ced7ddac2f08f"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/rich.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_filesize.py::test_pick_unit_and_suffix"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "rich"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "sortedcontainers"
+name = "SortedContainers"
+repository = "https://github.com/grantjenks/python-sortedcontainers.git"
+revision = "3ac358631f58c1347f1d6d2d92784117db0f38ed"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/sortedcontainers.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_coverage_sortedlist.py::test_add"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "sortedcontainers"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "sqlalchemy"
+name = "SQLAlchemy"
+repository = "https://github.com/sqlalchemy/sqlalchemy.git"
+revision = "149572707d5332df77838e9014616dedb0f416e5"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/sqlalchemy.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "test/base/test_utils.py::ToListTest::test_from_tuple"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "sqlalchemy"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "sqlglot"
+name = "SQLGlot"
+repository = "https://github.com/tobymao/sqlglot.git"
+revision = "21a2a5773717f675963dddbdba3df9343da60abe"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/sqlglot.txt"
+focused_test_command = ["python", "-m", "unittest", "-q", "tests.test_parser.TestParser.test_parse_empty"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "sqlglot"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "sympy"
+name = "SymPy"
+repository = "https://github.com/sympy/sympy.git"
+revision = "15e21aca70f79e9b45e05ac1b474aafd05c919a6"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/sympy.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "sympy/core/tests/test_numbers.py::test_hashing_sympy_integers"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "sympy"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+compile_timeout_seconds = 5400
+
+[[case]]
+id = "tomli"
+name = "Tomli"
+repository = "https://github.com/hukkin/tomli.git"
+revision = "5a77b12a7a9f052ce5a20c335d2825658f6aea52"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/tomli.txt"
+focused_test_command = ["python", "-m", "unittest", "-q", "tests.test_misc.TestMiscellaneous.test_parse_float"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "tomli"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "tornado"
+name = "Tornado"
+repository = "https://github.com/tornadoweb/tornado.git"
+revision = "e530031405e2154654dedc4c84d5656b557ea310"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/tornado.txt"
+focused_test_command = ["python", "-bb", "-m", "tornado.test", "tornado.test.gen_test.GenBasicTest.test_multi", "tornado.test.httputil_test.HTTPHeadersTest.test_multi_line"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "tornado"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "trio"
+name = "Trio"
+repository = "https://github.com/python-trio/trio.git"
+revision = "5a5111bba2b26da5668c27ee1824e890f5753c3d"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/trio.txt"
+focused_test_command = ["python", "-m", "pytest", "-q", "src/trio/_tests/test_channel.py::test_channel"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "trio"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]
+
+[[case]]
+id = "websockets"
+name = "websockets"
+repository = "https://github.com/python-websockets/websockets.git"
+revision = "bd85dcecce68d6b2bd5985daeefe4938ad87fa1d"
+project_subroot = "."
+dependency_lock = "benchmarks/corpus/locks/websockets.txt"
+focused_test_command = ["python", "-W", "error::DeprecationWarning", "-W", "error::PendingDeprecationWarning", "-X", "context_aware_warnings=0", "-m", "unittest", "tests.test_frames.FrameTests.test_text_unmasked", "tests.asyncio.test_messages.AssemblerTests.test_get_fragmented_text_message_already_received"]
+oracle_adapter = "compatibility"
+oracle_arguments = ["--case", "websockets"]
+tiers = ["compatibility"]
+platforms = ["ubuntu-24.04", "macos-14"]

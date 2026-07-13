@@ -174,7 +174,7 @@ class PolicyEvidence:
     """Reviewable source change introducing disposable compile configuration.
 
     Attributes:
-        digest: SHA-256 digest of the exact appended TOML text.
+        digest: SHA-256 digest of the exact retained unified policy patch.
         patch_path: Evidence-relative path containing a unified source patch.
         source_path: Checkout-relative pyproject path changed by the policy.
     """

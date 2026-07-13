@@ -18,6 +18,10 @@ from scripts.benchmark_corpus.manifest import ManifestError
 from scripts.benchmark_corpus.models import CompilePolicy, PolicyEvidence
 
 _REQUIRED_BACKEND_COUNT = 2
+_LEGACY_BUILD_SYSTEM = """[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+"""
 
 
 def append_compile_policy(
@@ -44,19 +48,22 @@ def append_compile_policy(
     resolved_pyproject = pyproject.resolve()
     if not resolved_pyproject.is_relative_to(resolved_checkout):
         raise ManifestError("target pyproject resolves outside the disposable checkout")
-    original = pyproject.read_text(encoding="utf-8")
-    parsed = cast(dict[str, object], tomllib.loads(original))
-    if _has_compile_policy(parsed):
-        raise ManifestError("upstream project already defines [tool.atoll.compile]")
+    existed = pyproject.exists()
+    original = pyproject.read_text(encoding="utf-8") if existed else ""
+    if existed:
+        parsed = cast(dict[str, object], tomllib.loads(original))
+        if _has_compile_policy(parsed):
+            raise ManifestError("upstream project already defines [tool.atoll.compile]")
     rendered = render_compile_policy(policy)
-    updated = f"{original.rstrip()}\n\n{rendered}"
+    prefix = original.rstrip() if existed else _LEGACY_BUILD_SYSTEM.rstrip()
+    updated = f"{prefix}\n\n{rendered}"
     pyproject.write_text(updated, encoding="utf-8")
     relative_source = resolved_pyproject.relative_to(resolved_checkout).as_posix()
     patch_text = "".join(
         difflib.unified_diff(
             original.splitlines(keepends=True),
             updated.splitlines(keepends=True),
-            fromfile=f"a/{relative_source}",
+            fromfile=f"a/{relative_source}" if existed else "/dev/null",
             tofile=f"b/{relative_source}",
         )
     )
@@ -64,7 +71,7 @@ def append_compile_policy(
     patch_path = evidence_root / "compile-policy.patch"
     patch_path.write_text(patch_text, encoding="utf-8")
     return PolicyEvidence(
-        digest=hashlib.sha256(rendered.encode()).hexdigest(),
+        digest=hashlib.sha256(patch_text.encode()).hexdigest(),
         patch_path=PurePosixPath(patch_path.relative_to(evidence_root).as_posix()),
         source_path=PurePosixPath(relative_source),
     )

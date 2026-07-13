@@ -196,6 +196,21 @@ class _PhaseRequest:
     network_allowed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class DependencyBootstrapCommands:
+    """Hash-enforcing commands used after the isolated tools venv exists.
+
+    Attributes:
+        ensure_pip: Offline standard-library bootstrap for the venv-local pip.
+        download: Network-enabled wheelhouse population from the reviewed lock.
+        sync: Offline tools-environment synchronization from that wheelhouse.
+    """
+
+    ensure_pip: tuple[str, ...]
+    download: tuple[str, ...]
+    sync: tuple[str, ...]
+
+
 def run_case(
     manifest: CorpusManifest,
     case_id: str,
@@ -610,24 +625,43 @@ def _prepare_tools_environment(
     uv = shutil.which("uv")
     if uv is None:
         raise LifecycleError("infrastructure-error", "uv executable is unavailable")
-    paths.wheelhouse.mkdir()
-    download_command = (
-        sys.executable,
-        "-m",
-        "pip",
-        "download",
-        "--only-binary=:all:",
-        "--requirement",
-        str(lock_path),
-        "--dest",
-        str(paths.wheelhouse),
+    _required_phase(
+        context,
+        _PhaseRequest(
+            name="tools-venv",
+            argv=tools_venv_command(uv, manifest.python_version, paths.tools_environment),
+            cwd=paths.workspace,
+            environment=online_environment,
+            timeout_seconds=300,
+            network_allowed=True,
+        ),
+        "isolated tools environment creation",
     )
+    tools_python = venv_python(paths.tools_environment)
+    bootstrap = dependency_bootstrap_commands(
+        uv,
+        tools_python,
+        lock_path,
+        paths.wheelhouse,
+    )
+    _required_phase(
+        context,
+        _PhaseRequest(
+            name="tools-ensurepip",
+            argv=bootstrap.ensure_pip,
+            cwd=paths.workspace,
+            environment=offline_environment,
+            timeout_seconds=300,
+        ),
+        "bundled pip bootstrap",
+    )
+    paths.wheelhouse.mkdir()
     for attempt in range(1, _BOOTSTRAP_ATTEMPTS + 1):
         result = _phase(
             context,
             _PhaseRequest(
                 name=f"dependency-download-{attempt}",
-                argv=download_command,
+                argv=bootstrap.download,
                 cwd=paths.workspace,
                 environment=online_environment,
                 timeout_seconds=900,
@@ -638,42 +672,12 @@ def _prepare_tools_environment(
             break
         if attempt == _BOOTSTRAP_ATTEMPTS:
             _require_success(result, "infrastructure-error", "dependency wheelhouse bootstrap")
-    _required_phase(
-        context,
-        _PhaseRequest(
-            name="tools-venv",
-            argv=(
-                uv,
-                "venv",
-                "--python",
-                manifest.python_version,
-                str(paths.tools_environment),
-            ),
-            cwd=paths.workspace,
-            environment=offline_environment,
-            timeout_seconds=300,
-        ),
-        "isolated tools environment creation",
-    )
-    tools_python = _venv_python(paths.tools_environment)
     sync_environment = {**offline_environment, "PIP_FIND_LINKS": str(paths.wheelhouse)}
     _required_phase(
         context,
         _PhaseRequest(
             name="tools-sync",
-            argv=(
-                uv,
-                "pip",
-                "sync",
-                "--python",
-                str(tools_python),
-                "--offline",
-                "--find-links",
-                str(paths.wheelhouse),
-                "--link-mode",
-                "copy",
-                str(lock_path),
-            ),
+            argv=bootstrap.sync,
             cwd=paths.workspace,
             environment=sync_environment,
             timeout_seconds=900,
@@ -694,7 +698,6 @@ def _prepare_tools_environment(
                 "--find-links",
                 str(paths.wheelhouse),
                 "--no-deps",
-                "--editable",
                 str(options.atoll_root.resolve()),
             ),
             cwd=paths.workspace,
@@ -766,7 +769,7 @@ def _prepare_arm(
         ),
         f"{label} environment creation",
     )
-    python = _venv_python(environment_root)
+    python = venv_python(environment_root)
     _required_phase(
         context,
         _PhaseRequest(
@@ -777,6 +780,7 @@ def _prepare_arm(
                 "sync",
                 "--python",
                 str(python),
+                "--require-hashes",
                 "--offline",
                 "--find-links",
                 str(paths.wheelhouse),
@@ -1309,7 +1313,82 @@ def _single_wheel(directory: Path) -> Path:
     return wheels[0]
 
 
-def _venv_python(environment_root: Path) -> Path:
+def tools_venv_command(uv: str, python_version: str, environment_root: Path) -> tuple[str, ...]:
+    """Build an unseeded uv venv command for the isolated corpus toolchain.
+
+    Args:
+        uv: Absolute uv executable path.
+        python_version: Manifest-selected Python minor version.
+        environment_root: Case-local destination for the tools environment.
+
+    Returns:
+        tuple[str, ...]: Shell-free argv that does not fetch or seed pip.
+    """
+    return (uv, "venv", "--python", python_version, str(environment_root))
+
+
+def dependency_bootstrap_commands(
+    uv: str,
+    python: Path,
+    lock_path: Path,
+    wheelhouse: Path,
+) -> DependencyBootstrapCommands:
+    """Build the exact offline-bootstrap and hash-verified dependency commands.
+
+    Args:
+        uv: Absolute uv executable path.
+        python: Venv-local interpreter receiving the bundled pip bootstrap.
+        lock_path: Reviewed exact and hash-verified requirements file.
+        wheelhouse: Case-local directory receiving downloaded wheels.
+
+    Returns:
+        DependencyBootstrapCommands: Commands with one explicit network download
+        and offline installation from the resulting wheelhouse.
+    """
+    return DependencyBootstrapCommands(
+        ensure_pip=(str(python), "-m", "ensurepip", "--upgrade"),
+        download=(
+            str(python),
+            "-m",
+            "pip",
+            "download",
+            "--only-binary=:all:",
+            "--require-hashes",
+            "--requirement",
+            str(lock_path),
+            "--dest",
+            str(wheelhouse),
+        ),
+        sync=(
+            uv,
+            "pip",
+            "sync",
+            "--python",
+            str(python),
+            "--require-hashes",
+            "--offline",
+            "--find-links",
+            str(wheelhouse),
+            "--link-mode",
+            "copy",
+            str(lock_path),
+        ),
+    )
+
+
+def venv_python(environment_root: Path) -> Path:
+    """Return the venv-local executable path without resolving its symlink.
+
+    Args:
+        environment_root: Root created by ``uv venv``.
+
+    Returns:
+        Path: Absolute executable path that still identifies the venv to uv.
+
+    Raises:
+        LifecycleError: If the environment has zero or multiple supported
+            interpreter paths.
+    """
     candidates = (environment_root / "bin" / "python", environment_root / "Scripts" / "python.exe")
     matches = tuple(path for path in candidates if path.is_file())
     if len(matches) != 1:
@@ -1317,7 +1396,10 @@ def _venv_python(environment_root: Path) -> Path:
             "infrastructure-error",
             f"cannot locate isolated Python under {environment_root}",
         )
-    return matches[0].resolve()
+    # uv locates the environment from the executable path.  Resolving the
+    # standard venv symlink would point back at the base interpreter and make a
+    # subsequent sync mutate the host environment instead of this venv.
+    return matches[0].absolute()
 
 
 def _read_json_object(path: Path) -> dict[str, object]:

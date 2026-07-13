@@ -1,0 +1,5 @@
+-r common.in
+attrs>=22.2
+jsonschema-specifications>=2023.3.6
+referencing>=0.28.4
+rpds-py>=0.7.1

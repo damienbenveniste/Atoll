@@ -1,0 +1,3 @@
+-r common.in
+pytest>=8.4,<9
+typing-extensions>=4.6

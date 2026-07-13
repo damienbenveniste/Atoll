@@ -1,0 +1,6 @@
+-r common.in
+httpx>=0.27
+logfire-api>=3.14.1
+pydantic>=2.12
+pytest>=9,<10
+typing-inspection>=0.4

@@ -1,0 +1,8 @@
+-r common.in
+attrs>=23.2
+exceptiongroup>=1.2
+idna
+outcome
+pytest>=9,<10
+sniffio>=1.3
+sortedcontainers
