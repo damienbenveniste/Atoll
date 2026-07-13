@@ -56,6 +56,7 @@ class _BaselineProfileOptions(TypedDict):
     scratch_dir: Path
     observation_targets: NotRequired[tuple[SymbolId, ...]]
     spawn_targets: NotRequired[tuple[ProfileSpawnSiteTarget, ...]]
+    call_edge_targets: NotRequired[tuple[ProfileCallEdgeTarget, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +80,7 @@ class _BootstrapRequest:
     scratch_dir: Path
     targets: tuple[str, ...]
     spawn_targets: tuple[ProfileSpawnSiteTarget, ...]
+    call_edge_targets: tuple[ProfileCallEdgeTarget, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +199,58 @@ class ProfiledSpawnSite:
     target: ProfileSpawnSiteTarget
     invocation_count: int
     callable_identities: tuple[CanonicalCallableCount, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCallEdgeTarget:
+    """Static same-module direct call site to count during targeted profiling.
+
+    The target carries only source identities and coordinates. Runtime profiling
+    increments its count when the exact call instruction resolves to the
+    configured canonical callable identity; argument values are never observed.
+
+    Attributes:
+        id: Stable source-derived call-site identity.
+        owner: Project callable containing the direct call.
+        callee: Expected same-module project callable invoked at the site.
+        lineno: One-based call source line.
+        col_offset: Zero-based call source column.
+        end_lineno: One-based final call source line.
+        end_col_offset: Zero-based final call source column.
+
+    Raises:
+        ValueError: The owner and callee belong to different modules.
+    """
+
+    id: str
+    owner: SymbolId
+    callee: SymbolId
+    lineno: int
+    col_offset: int
+    end_lineno: int | None = None
+    end_col_offset: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject cross-module edges before they reach the profiling child.
+
+        Raises:
+            ValueError: If owner and callee do not belong to the same project module.
+        """
+        if self.owner.module != self.callee.module:
+            raise ValueError("profiled direct call edges must remain within one module")
+
+
+@dataclass(frozen=True, slots=True)
+class ProfiledCallEdge:
+    """Exact runtime count for one canonical same-module direct call edge.
+
+    Attributes:
+        target: Static source call-site contract used for collection.
+        invocation_count: Calls whose source position and runtime callable identity matched.
+    """
+
+    target: ProfileCallEdgeTarget
+    invocation_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +392,7 @@ class ProfileResult:
         candidates: Candidate mapping decisions derived from static symbols.
         selected_symbols: Static symbols accepted by the candidate policy.
         spawn_sites: Exact scheduler call-site invocation evidence.
+        call_edges: Exact same-module direct call-edge invocation evidence.
     """
 
     status: ProfileStatus
@@ -356,6 +411,7 @@ class ProfileResult:
     scheduler_overhead_samples: int = 0
     scheduler_overhead_coverage: float = 0.0
     spawn_sites: tuple[ProfiledSpawnSite, ...] = ()
+    call_edges: tuple[ProfiledCallEdge, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,7 +462,8 @@ def run_baseline_profile(
         options: Required `scratch_dir` directory for temporary JSON files removed before
             return, plus optional `observation_targets` symbols to observe even when sampling
             does not identify them as hot members and `spawn_targets` scheduler calls whose exact
-            invocation counts and canonical callable identities must be retained.
+            invocation counts and canonical callable identities must be retained. Optional
+            `call_edge_targets` count exact same-module direct calls without retaining values.
 
     Returns:
         ProfileResult: Baseline profile evidence without candidate decisions.
@@ -434,6 +491,7 @@ def run_baseline_profile(
             scratch_dir=resolved_scratch_dir,
             targets=(),
             spawn_targets=(),
+            call_edge_targets=(),
         )
     )
     runs: tuple[SubprocessPassEvidence, ...] = (sampling_run,)
@@ -450,6 +508,9 @@ def run_baseline_profile(
     explicit_targets = tuple(
         _member_key(target) for target in options.get("observation_targets", ())
     )
+    call_edge_owner_targets = tuple(
+        _member_key(target.owner) for target in options.get("call_edge_targets", ())
+    )
     type_payload, type_run = _run_bootstrap_pass(
         _BootstrapRequest(
             profile_stage="types",
@@ -458,8 +519,11 @@ def run_baseline_profile(
             payload_root=resolved_payload_root,
             module_paths=module_paths,
             scratch_dir=resolved_scratch_dir,
-            targets=tuple(dict.fromkeys((*hot_targets, *explicit_targets))),
+            targets=tuple(
+                dict.fromkeys((*hot_targets, *explicit_targets, *call_edge_owner_targets))
+            ),
             spawn_targets=options.get("spawn_targets", ()),
+            call_edge_targets=options.get("call_edge_targets", ()),
         )
     )
     runs = (sampling_run, type_run)
@@ -638,6 +702,18 @@ def _bootstrap_config(request: _BootstrapRequest, *, result_path: Path) -> JsonO
             }
             for target in request.spawn_targets
         ],
+        "call_edge_targets": [
+            {
+                "id": target.id,
+                "owner": _member_key(target.owner),
+                "callee": _member_key(target.callee),
+                "lineno": target.lineno,
+                "col_offset": target.col_offset,
+                "end_lineno": target.end_lineno,
+                "end_col_offset": target.end_col_offset,
+            }
+            for target in request.call_edge_targets
+        ],
     }
 
 
@@ -740,6 +816,10 @@ def _profile_from_payload(
             _profiled_spawn_site(_object_value(item))
             for item in _list_value(payload.get("spawn_sites", []))
         ),
+        call_edges=tuple(
+            _profiled_call_edge(_object_value(item))
+            for item in _list_value(payload.get("call_edges", []))
+        ),
     )
 
 
@@ -789,6 +869,23 @@ def _profiled_spawn_site(payload: JsonObject) -> ProfiledSpawnSite:
             CanonicalCallableCount(identity=_string_key(identity), count=_int_value(count))
             for identity, count in sorted(callable_identities.items())
         ),
+    )
+
+
+def _profiled_call_edge(payload: JsonObject) -> ProfiledCallEdge:
+    owner_module, owner_qualname = _split_member_key(_string_field(payload, "owner"))
+    callee_module, callee_qualname = _split_member_key(_string_field(payload, "callee"))
+    return ProfiledCallEdge(
+        target=ProfileCallEdgeTarget(
+            id=_string_field(payload, "id"),
+            owner=SymbolId(module=owner_module, qualname=owner_qualname),
+            callee=SymbolId(module=callee_module, qualname=callee_qualname),
+            lineno=_int_field(payload, "lineno"),
+            col_offset=_int_field(payload, "col_offset"),
+            end_lineno=_optional_int_field(payload, "end_lineno"),
+            end_col_offset=_optional_int_field(payload, "end_col_offset"),
+        ),
+        invocation_count=_int_field(payload, "invocation_count"),
     )
 
 
@@ -865,6 +962,7 @@ def _merge_payloads(sampling_payload: JsonObject, type_payload: JsonObject) -> J
     merged["lifecycle"] = type_payload.get("lifecycle", {})
     merged["member_lifecycle"] = type_payload.get("member_lifecycle", {})
     merged["spawn_sites"] = type_payload.get("spawn_sites", [])
+    merged["call_edges"] = type_payload.get("call_edges", [])
     return merged
 
 
@@ -877,6 +975,7 @@ def _empty_payload() -> JsonObject:
         "member_lifecycle": {},
         "signatures": {},
         "spawn_sites": [],
+        "call_edges": [],
     }
 
 

@@ -56,6 +56,11 @@ from atoll.execution_plans.models import (
     StagedExecutionPlan,
 )
 from atoll.execution_plans.task_preserving import TASK_PRESERVING_BACKEND
+from atoll.generation.call_chain import (
+    CALL_CHAIN_GENERATOR_VERSION,
+    CallChainGenerationRequest,
+    generate_call_chain_kernel,
+)
 from atoll.generation.outlined_region import (
     OUTLINED_REGION_GENERATOR_VERSION,
     generate_outlined_region,
@@ -102,6 +107,12 @@ from atoll.models import (
     SymbolId,
     TypedRegion,
 )
+from atoll.native_optimization.call_chains import (
+    CallChainAnalysisResult,
+    CallChainPlan,
+    analyze_call_chain_scan,
+    call_chain_runtime_guards,
+)
 from atoll.native_optimization.scalar_analysis import (
     ScalarAnalysisResult,
     ScalarKernelPlan,
@@ -139,6 +150,7 @@ from atoll.runtime.performance import (
     run_performance_command,
 )
 from atoll.runtime.profiling import (
+    ProfileCallEdgeTarget,
     ProfileResult,
     run_baseline_profile,
     select_profile_candidates,
@@ -188,6 +200,7 @@ _WHEEL_TAG_COMPONENT_COUNT = 3
 _SCALAR_INT32_WIDTH = 32
 _SCALAR_INT32_DISPATCH_RANK = 10
 _SCALAR_INT64_DISPATCH_RANK = 20
+_MAX_PROFILED_CALL_CHAIN_ROOTS = 4
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -274,6 +287,7 @@ class PackageCommandResult:
         native_readiness: Post-generation native-readiness evidence.
         typed_regions: Backend-neutral typed regions discovered or reported.
         scalar_analyses: Fixed-width scalar plans and explicit frontend fallbacks.
+        call_chain_analyses: Direct native call-chain plans and explicit fallbacks.
         compiled_regions: Typed regions successfully compiled into the wheel.
         compiled_bindings: Source bindings successfully provided by compiled regions.
         compiled_variants: Backend and specialization variants successfully compiled.
@@ -312,6 +326,7 @@ class PackageCommandResult:
     native_readiness: tuple[NativeReadiness, ...] = ()
     typed_regions: tuple[TypedRegion, ...] = ()
     scalar_analyses: tuple[ScalarAnalysisResult, ...] = ()
+    call_chain_analyses: tuple[CallChainAnalysisResult, ...] = ()
     compiled_regions: tuple[TypedRegion, ...] = ()
     compiled_bindings: tuple[BindingTarget, ...] = ()
     compiled_variants: tuple[CompiledRegionVariant, ...] = ()
@@ -579,6 +594,25 @@ class _ScalarExtensionContext:
 
 
 @dataclass(frozen=True, slots=True)
+class _CallChainExtensionContext:
+    """Compile configuration and staged roots for direct call-chain variants.
+
+    Attributes:
+        project: Discovered target project and configured backend order.
+        build_root: Disposable root receiving generated call-chain units.
+        staged_source_roots: Copied import roots used for source-clean compilation.
+        analyses: Direct call-chain plans and rejection evidence for selected scans.
+        progress: Optional callback receiving call-chain preparation progress.
+    """
+
+    project: DiscoveredProject
+    build_root: Path
+    staged_source_roots: tuple[Path, ...]
+    analyses: tuple[CallChainAnalysisResult, ...]
+    progress: PackageProgress | None
+
+
+@dataclass(frozen=True, slots=True)
 class _TypedRegionPackageContext:
     """Selected analysis evidence carried into source-clean region packaging.
 
@@ -590,6 +624,7 @@ class _TypedRegionPackageContext:
         execution_plans: Scheduler execution-plan candidates retained for reporting.
         fusion_plans: Deterministic task-fusion safety evidence for profiled scheduler sites.
         scalar_analyses: Fixed-width scalar proofs and explicit fallbacks for selected scans.
+        call_chain_analyses: Direct call-chain plans and explicit fallbacks for selected scans.
     """
 
     selected: tuple[_SelectedTypedRegion, ...]
@@ -599,6 +634,7 @@ class _TypedRegionPackageContext:
     execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = ()
     fusion_plans: tuple[FusionPlan, ...] = ()
     scalar_analyses: tuple[ScalarAnalysisResult, ...] = ()
+    call_chain_analyses: tuple[CallChainAnalysisResult, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1022,6 +1058,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     scans = _selected_scans(project, options.module_name, options.selected_members)
     typed_regions = tuple(region for scan in scans for region in scan.typed_regions)
     scalar_analyses = _scalar_analyses(scans, options.progress)
+    call_chain_analyses = _call_chain_analyses(scans, options.progress)
     execution_plans = build_execution_plans(scans, None)
     _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
     preflight_selected = _selected_typed_regions(
@@ -1055,15 +1092,21 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             typed_regions=typed_regions,
             execution_plans=execution_plans,
         )
-    preparation = _prepare_profile_guided_selection(options, project, scans)
+    preparation = _prepare_profile_guided_selection(
+        options,
+        project,
+        scans,
+        call_chain_analyses,
+    )
     if preparation.failure is not None:
         return preparation.failure
     baseline = preparation.baseline
     profile = preparation.profile
     if profile is not None:
-        profile = select_profile_candidates(
+        profile = _select_profile_with_call_chains(
             profile,
-            tuple(symbol for scan in scans for symbol in scan.symbols),
+            scans,
+            call_chain_analyses,
         )
         _progress(
             options.progress,
@@ -1143,6 +1186,14 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     profile_members = (
         profile.selected_symbols if profile is not None and profile.status == "profiled" else ()
     )
+    profile_members = tuple(
+        dict.fromkeys(
+            (
+                *profile_members,
+                *_profiled_call_chain_roots(call_chain_analyses, profile),
+            )
+        )
+    )
     selection_members = options.selected_members or profile_members
     selected_typed_regions = (
         _selected_typed_regions(
@@ -1202,12 +1253,17 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
                 execution_plans=execution_plans,
                 fusion_plans=fusion_plans,
                 scalar_analyses=scalar_analyses,
+                call_chain_analyses=call_chain_analyses,
             ),
             prepared_baseline=baseline,
             profile=profile,
         )
     return _with_source_optimization(
-        replace(package_result, scalar_analyses=scalar_analyses),
+        replace(
+            package_result,
+            scalar_analyses=scalar_analyses,
+            call_chain_analyses=call_chain_analyses,
+        ),
         source_optimization,
         source_trials,
     )
@@ -1412,11 +1468,13 @@ def _execute_composed_source_arm(
         options.selected_members,
     )
     scalar_analyses = _scalar_analyses(active_scans, options.progress)
+    call_chain_analyses = _call_chain_analyses(active_scans, options.progress)
     active_profile = preparation.profile
     if active_profile is not None:
-        active_profile = select_profile_candidates(
+        active_profile = _select_profile_with_call_chains(
             active_profile,
-            tuple(symbol for scan in active_scans for symbol in scan.symbols),
+            active_scans,
+            call_chain_analyses,
         )
     active_execution_plans = build_execution_plans(active_scans, active_profile)
     active_fusion_plans = (
@@ -1427,6 +1485,14 @@ def _execute_composed_source_arm(
         active_profile.selected_symbols
         if active_profile is not None and active_profile.status == "profiled"
         else ()
+    )
+    profile_members = tuple(
+        dict.fromkeys(
+            (
+                *profile_members,
+                *_profiled_call_chain_roots(call_chain_analyses, active_profile),
+            )
+        )
     )
     selection_members = options.selected_members or profile_members
     selected = _selected_typed_regions(
@@ -1455,6 +1521,7 @@ def _execute_composed_source_arm(
                 search=search,
             ),
             scalar_analyses=scalar_analyses,
+            call_chain_analyses=call_chain_analyses,
         )
 
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
@@ -1479,6 +1546,7 @@ def _execute_composed_source_arm(
                     execution_plans=active_execution_plans,
                     fusion_plans=active_fusion_plans,
                     scalar_analyses=scalar_analyses,
+                    call_chain_analyses=call_chain_analyses,
                 ),
                 prepared_baseline=arm.baseline,
                 profile=active_profile,
@@ -1503,6 +1571,7 @@ def _execute_composed_source_arm(
                     rebased,
                     test_results=(*search.test_results, *rebased.test_results),
                     scalar_analyses=scalar_analyses,
+                    call_chain_analyses=call_chain_analyses,
                 ),
                 planning,
                 search.trials,
@@ -1521,6 +1590,7 @@ def _execute_composed_source_arm(
         return replace(
             _source_result_with_composition_fallback(source_result, candidate, project),
             scalar_analyses=scalar_analyses,
+            call_chain_analyses=call_chain_analyses,
         )
 
 
@@ -1978,11 +2048,23 @@ def _execute_typed_region_package(
         prepared=prepared,
         failures=preparation_failures,
     )
+    prepared, preparation_failures, call_chain_variant_count = _extend_with_call_chain_variants(
+        context=_CallChainExtensionContext(
+            project=project,
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            analyses=context.call_chain_analyses,
+            progress=options.progress,
+        ),
+        prepared=prepared,
+        failures=preparation_failures,
+    )
     _progress(
         options.progress,
         (
             f"lowered {len(prepared)} native region variant(s), "
-            f"including {scalar_variant_count} fixed-width scalar variant(s); "
+            f"including {scalar_variant_count} scalar and "
+            f"{call_chain_variant_count} direct call-chain variant(s); "
             f"kept {len(preparation_failures)} as fallback in {_duration(generation_started)}"
         ),
     )
@@ -2211,6 +2293,8 @@ def _execute_typed_region_package(
         preflight_skipped=context.preflight_skipped,
         native_readiness=context.native_readiness,
         typed_regions=context.typed_regions,
+        scalar_analyses=context.scalar_analyses,
+        call_chain_analyses=context.call_chain_analyses,
         compiled_regions=successful_regions,
         compiled_bindings=successful_bindings,
         compiled_variants=successful_variants,
@@ -2459,17 +2543,17 @@ def _extend_with_scalar_variants(
         analyses=selected_analyses,
     )
     return (
-        _merge_scalar_companions(prepared, scalar_prepared),
+        _merge_specialized_companions(prepared, scalar_prepared),
         [*failures, *scalar_failures],
         len(scalar_prepared),
     )
 
 
-def _merge_scalar_companions(
+def _merge_specialized_companions(
     generic: list[_PreparedTypedRegion],
-    scalar: tuple[_PreparedTypedRegion, ...],
+    specialized: tuple[_PreparedTypedRegion, ...],
 ) -> list[_PreparedTypedRegion]:
-    """Place scalar variants beside the selected generic public binding.
+    """Place specialized variants beside the selected generic public binding.
 
     Atomic class variants retain their existing first position. Scalar method
     companions inherit the method fallback's class-failure condition, while
@@ -2477,13 +2561,13 @@ def _merge_scalar_companions(
 
     Args:
         generic: Existing generic variants in selection priority order.
-        scalar: Width variants in frontend dispatch order.
+        specialized: Width or call-chain variants in frontend dispatch order.
 
     Returns:
         list[_PreparedTypedRegion]: Composable variant order used for build and trials.
     """
     by_source: dict[SymbolId, list[_PreparedTypedRegion]] = {}
-    for item in scalar:
+    for item in specialized:
         source = item.generation.bindings[0].source
         by_source.setdefault(source, []).append(item)
     merged: list[_PreparedTypedRegion] = []
@@ -2499,6 +2583,140 @@ def _merge_scalar_companions(
         merged.append(item)
     merged.extend(companion for companions in by_source.values() for companion in companions)
     return merged
+
+
+def _extend_with_call_chain_variants(
+    *,
+    context: _CallChainExtensionContext,
+    prepared: list[_PreparedTypedRegion],
+    failures: list[PackageRegionBuildFailure],
+) -> tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure], int]:
+    """Prepend direct call-chain variants without changing generic fallbacks.
+
+    Args:
+        context: Target project, staged roots, call-chain analyses, and progress callback.
+        prepared: Existing generic and scalar native variants.
+        failures: Existing preparation failures.
+
+    Returns:
+        tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure], int]:
+        Updated variants, failures, and prepared call-chain variant count.
+    """
+    if "cython" not in context.project.config.compile.backends:
+        if any(analysis.plans for analysis in context.analyses):
+            _progress(
+                context.progress,
+                "direct call-chain variants skipped because Cython is disabled",
+            )
+        return prepared, failures, 0
+    selected_sources = {
+        binding.source
+        for item in prepared
+        for binding in item.generation.bindings
+        if binding.kind != "class"
+    }
+    selected_analyses = tuple(
+        replace(
+            analysis,
+            plans=tuple(plan for plan in analysis.plans if plan.root in selected_sources),
+        )
+        for analysis in context.analyses
+    )
+    chain_prepared, chain_failures = _prepare_call_chain_variants(
+        project=context.project,
+        build_root=context.build_root,
+        staged_source_roots=context.staged_source_roots,
+        analyses=selected_analyses,
+    )
+    return (
+        _merge_specialized_companions(prepared, chain_prepared),
+        [*failures, *chain_failures],
+        len(chain_prepared),
+    )
+
+
+def _prepare_call_chain_variants(
+    *,
+    project: DiscoveredProject,
+    build_root: Path,
+    staged_source_roots: tuple[Path, ...],
+    analyses: tuple[CallChainAnalysisResult, ...],
+) -> tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+    """Revalidate and lower direct call-chain plans inside copied source roots.
+
+    Args:
+        project: Original project discovery used to map staged modules.
+        build_root: Disposable source-clean native build root.
+        staged_source_roots: Copied import roots used during lowering.
+        analyses: Checkout or accepted-source call-chain proof evidence.
+
+    Returns:
+        tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+        Prepared width variants and explicit lowering failures.
+    """
+    plans = tuple(plan for analysis in analyses for plan in analysis.plans)
+    scans: dict[str, ModuleScan] = {}
+    staged_analyses: dict[str, CallChainAnalysisResult] = {}
+    prepared: list[_PreparedTypedRegion] = []
+    failures: list[PackageRegionBuildFailure] = []
+    for plan in plans:
+        module = _find_module(project.modules, plan.root.module)
+        staged_scan = scans.get(plan.root.module)
+        if staged_scan is None:
+            staged_module = _staged_module(module, project, staged_source_roots)
+            staged_scan = enrich_island_analysis(scan_module(staged_module))
+            scans[plan.root.module] = staged_scan
+            staged_analyses[plan.root.module] = analyze_call_chain_scan(staged_scan)
+        staged_region = _call_chain_region_for_plan(staged_scan, plan)
+        staged_plan = next(
+            (
+                candidate
+                for candidate in staged_analyses[plan.root.module].plans
+                if candidate.id == plan.id and candidate.root == plan.root
+            ),
+            None,
+        )
+        if staged_plan is None:
+            failures.append(
+                PackageRegionBuildFailure(
+                    region=staged_region,
+                    variant_id=f"{plan.id}@cython-call-chain",
+                    backend="cython",
+                    assessment=CYTHON_BACKEND.assess(staged_region),
+                    build=_failed_region_attempt(
+                        "call-chain lowering failed: staged proof differs from checkout analysis"
+                    ),
+                )
+            )
+            continue
+        for proof in staged_plan.scalar_plan.width_proofs:
+            variant_id = _call_chain_variant_id(staged_plan, proof)
+            try:
+                prepared.append(
+                    _prepare_call_chain_variant(
+                        context=_ScalarVariantContext(
+                            project=project,
+                            build_root=build_root,
+                            staged_source_roots=staged_source_roots,
+                            scan=staged_scan,
+                            region=staged_region,
+                        ),
+                        plan=staged_plan,
+                        variant_id=variant_id,
+                        proof=proof,
+                    )
+                )
+            except (SyntaxError, ValueError) as error:
+                failures.append(
+                    PackageRegionBuildFailure(
+                        region=staged_region,
+                        variant_id=variant_id,
+                        backend="cython",
+                        assessment=CYTHON_BACKEND.assess(staged_region),
+                        build=_failed_region_attempt(f"call-chain lowering failed: {error}"),
+                    )
+                )
+    return tuple(prepared), tuple(failures)
 
 
 def _prepare_scalar_variant(
@@ -2589,6 +2807,98 @@ def _scalar_region_for_plan(scan: ModuleScan, plan: ScalarKernelPlan) -> TypedRe
 def _scalar_variant_id(plan: ScalarKernelPlan, proof: ScalarWidthProof) -> str:
     signed = "i" if proof.native.signed else "u"
     return f"{plan.id}@cython-{signed}{proof.native.width}"
+
+
+def _prepare_call_chain_variant(
+    *,
+    context: _ScalarVariantContext,
+    plan: CallChainPlan,
+    variant_id: str,
+    proof: ScalarWidthProof,
+) -> _PreparedTypedRegion:
+    """Generate one guarded Cython call-chain variant with private helpers.
+
+    Args:
+        context: Staged source, scan, region, and filesystem evidence.
+        plan: Revalidated direct call-chain plan.
+        variant_id: Stable width-specific variant identity.
+        proof: Fixed-width proof selected for lowering.
+
+    Returns:
+        _PreparedTypedRegion: Compilable unit and transactional shim contract.
+    """
+    logical_module = _typed_region_module_name(context.region, "cython", variant_id)
+    generated_path = context.build_root / f"{logical_module}.pyx"
+    generated = generate_call_chain_kernel(
+        CallChainGenerationRequest(
+            scan=context.scan,
+            region=context.region,
+            plan=plan,
+            width_proof=proof,
+            logical_module=logical_module,
+            output_path=generated_path,
+        )
+    )
+    members = (plan.root, *plan.helpers)
+    unit = CYTHON_BACKEND.lower(
+        BackendLoweringRequest(
+            region=context.region,
+            source_path=generated_path,
+            logical_module=logical_module,
+            install_relative_dir=_region_artifact_relative_dir(variant_id),
+            members=members,
+            variant_id=variant_id,
+        )
+    )
+    source_module = _find_module(context.project.modules, context.scan.module.name)
+    staged_source_root = _staged_source_root(
+        source_module,
+        context.project,
+        context.staged_source_roots,
+    )
+    return _PreparedTypedRegion(
+        generation=generated.generation,
+        assessment=CYTHON_BACKEND.assess(context.region),
+        unit=unit,
+        shim=RegionShimConfig(
+            source_module=context.scan.module.name,
+            source_path=context.scan.module.path,
+            region_id=context.region.id,
+            variant_id=variant_id,
+            backend="cython",
+            compiled_module=logical_module,
+            artifact_dir=staged_source_root / unit.install_relative_dir,
+            bindings=generated.generation.bindings,
+            dispatch_rank=(
+                _SCALAR_INT32_DISPATCH_RANK
+                if proof.native.width == _SCALAR_INT32_WIDTH
+                else _SCALAR_INT64_DISPATCH_RANK
+            ),
+            variant_guards=call_chain_runtime_guards(plan, proof),
+        ),
+        minimum_marginal_speedup=_SPECIALIZED_VARIANT_MINIMUM_SPEEDUP,
+    )
+
+
+def _call_chain_region_for_plan(scan: ModuleScan, plan: CallChainPlan) -> TypedRegion:
+    region = next((item for item in scan.typed_regions if item.id == plan.region_id), None)
+    if region is None:
+        region = next(
+            (
+                item
+                for item in scan.typed_regions
+                if any(member.id == plan.root for member in item.members)
+            ),
+            None,
+        )
+    if region is None:
+        raise ValueError(f"staged call-chain root is absent: {plan.root.stable_id}")
+    return region
+
+
+def _call_chain_variant_id(plan: CallChainPlan, proof: ScalarWidthProof) -> str:
+    signed = "i" if proof.native.signed else "u"
+    return f"{plan.id}@cython-chain-{signed}{proof.native.width}"
 
 
 def _attach_outlined_fallback(
@@ -2924,6 +3234,7 @@ def _build_typed_regions(
             ("typed_region_generator", TYPED_METHOD_GENERATOR_VERSION),
             ("outlined_region_generator", OUTLINED_REGION_GENERATOR_VERSION),
             ("scalar_kernel_generator", SCALAR_KERNEL_GENERATOR_VERSION),
+            ("call_chain_generator", CALL_CHAIN_GENERATOR_VERSION),
         ),
     )
     for index, item in enumerate(prepared, start=1):
@@ -3430,6 +3741,7 @@ def _prepare_profile_guided_selection(
     options: PackageOptions,
     project: DiscoveredProject,
     scans: tuple[ModuleScan, ...],
+    call_chain_analyses: tuple[CallChainAnalysisResult, ...],
 ) -> _ProfilePreparation:
     """Build, test, and profile the baseline before static region selection.
 
@@ -3437,6 +3749,7 @@ def _prepare_profile_guided_selection(
         options: Validated command or generation options.
         project: Discovered target project configuration and modules.
         scans: Static scan facts used to include task-spawn callees in targeted observation.
+        call_chain_analyses: Static direct edges counted by targeted profiling.
 
     Returns:
         _ProfilePreparation: Prepared baseline/profile evidence or an early failure.
@@ -3522,6 +3835,7 @@ def _prepare_profile_guided_selection(
         scratch_dir=build_root / "profile",
         observation_targets=_profile_observation_symbols(scans),
         spawn_targets=execution_plan_profile_targets(scans),
+        call_edge_targets=_call_chain_profile_targets(call_chain_analyses),
     )
     baseline = _append_profile_timings(baseline, profile)
     preparation = replace(preparation, baseline=baseline, profile=profile)
@@ -5995,6 +6309,149 @@ def _scalar_analyses(
         ),
     )
     return analyses
+
+
+def _call_chain_analyses(
+    scans: tuple[ModuleScan, ...],
+    progress: PackageProgress | None,
+) -> tuple[CallChainAnalysisResult, ...]:
+    """Derive direct native call-chain candidates without changing selection.
+
+    Args:
+        scans: Enriched module scans in compile order.
+        progress: Optional CLI progress callback.
+
+    Returns:
+        tuple[CallChainAnalysisResult, ...]: Per-module plans and explicit fallbacks.
+    """
+    analyses = tuple(analyze_call_chain_scan(scan) for scan in scans)
+    plan_count = sum(len(analysis.plans) for analysis in analyses)
+    rejection_count = sum(len(analysis.rejections) for analysis in analyses)
+    _progress(
+        progress,
+        (
+            f"call-chain analysis proved {plan_count} root(s); "
+            f"{rejection_count} root(s) retained Python dispatch"
+        ),
+    )
+    return analyses
+
+
+def _call_chain_profile_targets(
+    analyses: tuple[CallChainAnalysisResult, ...],
+) -> tuple[ProfileCallEdgeTarget, ...]:
+    """Return deduplicated exact source sites for direct call-edge counting.
+
+    Args:
+        analyses: Static call-chain plans whose edges may be hot at runtime.
+
+    Returns:
+        tuple[ProfileCallEdgeTarget, ...]: Stable full-span profiling targets.
+    """
+    targets: dict[str, ProfileCallEdgeTarget] = {}
+    for analysis in analyses:
+        for plan in analysis.plans:
+            for edge in plan.edges:
+                identity = (
+                    f"{edge.caller.stable_id}>{edge.callee.stable_id}:"
+                    f"{edge.lineno}:{edge.col_offset}:{edge.end_lineno}:{edge.end_col_offset}"
+                )
+                target_id = (
+                    f"call-edge-{hashlib.blake2b(identity.encode(), digest_size=12).hexdigest()}"
+                )
+                targets.setdefault(
+                    target_id,
+                    ProfileCallEdgeTarget(
+                        id=target_id,
+                        owner=edge.caller,
+                        callee=edge.callee,
+                        lineno=edge.lineno,
+                        col_offset=edge.col_offset,
+                        end_lineno=edge.end_lineno,
+                        end_col_offset=edge.end_col_offset,
+                    ),
+                )
+    return tuple(targets.values())
+
+
+def _profiled_call_chain_roots(
+    analyses: tuple[CallChainAnalysisResult, ...],
+    profile: ProfileResult | None,
+) -> tuple[SymbolId, ...]:
+    """Rank hot caller roots by exact direct-edge invocation counts.
+
+    Args:
+        analyses: Current static call-chain plans.
+        profile: Current-invocation profile evidence, when configured.
+
+    Returns:
+        tuple[SymbolId, ...]: At most four hot public roots in descending count order.
+    """
+    if profile is None or profile.status != "profiled":
+        return ()
+    counts = {
+        (
+            item.target.owner,
+            item.target.callee,
+            item.target.lineno,
+            item.target.col_offset,
+            item.target.end_lineno,
+            item.target.end_col_offset,
+        ): item.invocation_count
+        for item in profile.call_edges
+    }
+    root_counts: dict[SymbolId, int] = {}
+    for analysis in analyses:
+        for plan in analysis.plans:
+            direct_count = sum(
+                counts.get(
+                    (
+                        edge.caller,
+                        edge.callee,
+                        edge.lineno,
+                        edge.col_offset,
+                        edge.end_lineno,
+                        edge.end_col_offset,
+                    ),
+                    0,
+                )
+                for edge in plan.edges
+                if edge.caller == plan.root
+            )
+            if direct_count > 0:
+                root_counts[plan.root] = max(root_counts.get(plan.root, 0), direct_count)
+    ranked = sorted(root_counts, key=lambda item: (-root_counts[item], item.stable_id))
+    return tuple(ranked[:_MAX_PROFILED_CALL_CHAIN_ROOTS])
+
+
+def _select_profile_with_call_chains(
+    profile: ProfileResult,
+    scans: tuple[ModuleScan, ...],
+    analyses: tuple[CallChainAnalysisResult, ...],
+) -> ProfileResult:
+    """Add exact-edge hot callers to ordinary leaf-sample profile selection.
+
+    Args:
+        profile: Current-invocation baseline profile.
+        scans: Current static symbols used for ordinary candidate mapping.
+        analyses: Current call-chain plans used for edge-root promotion.
+
+    Returns:
+        ProfileResult: Candidate selection including hot public call-chain roots.
+    """
+    call_chain_roots = _profiled_call_chain_roots(analyses, profile)
+    selected = select_profile_candidates(
+        profile,
+        tuple(symbol for scan in scans for symbol in scan.symbols),
+    )
+    if not call_chain_roots:
+        return selected
+    return replace(
+        selected,
+        status="profiled",
+        reason="baseline profile collected with hot direct call-edge roots",
+        selected_symbols=tuple(dict.fromkeys((*selected.selected_symbols, *call_chain_roots))),
+    )
 
 
 def _profile_candidate_members(

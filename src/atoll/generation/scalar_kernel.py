@@ -73,7 +73,7 @@ class _ScalarRenderContext:
     c_type: str
 
 
-class _PowerExpansion(ast.NodeTransformer):
+class ScalarPowerExpansion(ast.NodeTransformer):
     """Expand small constant powers into exact integer multiplication trees."""
 
     def visit_BinOp(self, node: ast.BinOp) -> ast.expr:
@@ -139,9 +139,9 @@ def generate_scalar_kernel(request: ScalarKernelGenerationRequest) -> ScalarKern
     source_hash = hashlib.sha256(member.source_text.encode("utf-8")).hexdigest()
     if source_hash != request.plan.source_hash:
         raise ValueError("staged scalar member source differs from analyzed source")
-    node = _callable_node(member)
+    node = scalar_callable_node(member)
     compiled_name = _compiled_name(member, request.width_proof)
-    c_type = _c_type(request.width_proof)
+    c_type = scalar_c_type(request.width_proof)
     source_text = _render_source(
         _ScalarRenderContext(
             scan=request.scan,
@@ -154,7 +154,7 @@ def generate_scalar_kernel(request: ScalarKernelGenerationRequest) -> ScalarKern
     )
     request.output_path.parent.mkdir(parents=True, exist_ok=True)
     request.output_path.write_text(source_text, encoding="utf-8")
-    binding = _binding(request.region, member, compiled_name)
+    binding = scalar_binding(request.region, member, compiled_name)
     generation = TypedRegionGeneration(
         region=request.region,
         logical_module=request.logical_module,
@@ -174,7 +174,18 @@ def generate_scalar_kernel(request: ScalarKernelGenerationRequest) -> ScalarKern
     )
 
 
-def _callable_node(member: RegionMember) -> ast.FunctionDef:
+def scalar_callable_node(member: RegionMember) -> ast.FunctionDef:
+    """Parse one retained synchronous scalar member declaration.
+
+    Args:
+        member: Retained region member containing exact source text.
+
+    Returns:
+        ast.FunctionDef: Parsed synchronous declaration.
+
+    Raises:
+        ValueError: If the retained source is not exactly one synchronous function.
+    """
     parsed = ast.parse(textwrap.dedent(member.source_text))
     declarations = tuple(node for node in parsed.body if isinstance(node, ast.FunctionDef))
     if len(declarations) != 1:
@@ -188,7 +199,15 @@ def _compiled_name(member: RegionMember, proof: ScalarWidthProof) -> str:
     return f"_atoll_scalar_{stem}_{signed}{proof.native.width}"
 
 
-def _c_type(proof: ScalarWidthProof) -> str:
+def scalar_c_type(proof: ScalarWidthProof) -> str:
+    """Render the portable stdint Cython type authorized by a width proof.
+
+    Args:
+        proof: Fixed-width scalar proof selected for lowering.
+
+    Returns:
+        str: Signed or unsigned stdint Cython type name.
+    """
     signed = "int" if proof.native.signed else "uint"
     return f"{signed}{proof.native.width}_t"
 
@@ -197,10 +216,10 @@ def _render_source(context: _ScalarRenderContext) -> str:
     native_parameters = ", ".join(
         f"{context.c_type} {parameter.name}" for parameter in context.member.parameters
     )
-    wrapper_parameters = _wrapper_parameter_declarations(context.member)
+    wrapper_parameters = scalar_wrapper_parameter_declarations(context.member)
     native_arguments = ", ".join(parameter.name for parameter in context.member.parameters)
     native_name = f"{context.compiled_name}_native"
-    transformed = _PowerExpansion().visit(ast.fix_missing_locations(context.node))
+    transformed = ScalarPowerExpansion().visit(ast.fix_missing_locations(context.node))
     if not isinstance(transformed, ast.FunctionDef):
         raise TypeError("scalar power expansion produced a non-function")
     body = list(transformed.body)
@@ -211,7 +230,7 @@ def _render_source(context: _ScalarRenderContext) -> str:
         and isinstance(body[0].value.value, str)
     ):
         body.pop(0)
-    local_names = _local_integer_names(
+    local_names = scalar_local_integer_names(
         transformed,
         frozenset(parameter.name for parameter in context.member.parameters),
     )
@@ -232,7 +251,7 @@ def _render_source(context: _ScalarRenderContext) -> str:
     ]
     if local_names:
         sections.append(f"    cdef {context.c_type} {', '.join(local_names)}")
-    sections.extend(_render_statement(statement) for statement in body)
+    sections.extend(render_scalar_statement(statement) for statement in body)
     sections.extend(
         (
             "",
@@ -246,7 +265,18 @@ def _render_source(context: _ScalarRenderContext) -> str:
     return "\n".join(sections)
 
 
-def _wrapper_parameter_declarations(member: RegionMember) -> str:
+def scalar_wrapper_parameter_declarations(member: RegionMember) -> str:
+    """Render a signature-shaped Python wrapper declaration for a source member.
+
+    Args:
+        member: Source member whose Python calling convention must be preserved.
+
+    Returns:
+        str: Cython-compatible wrapper parameter declaration.
+
+    Raises:
+        ValueError: If the source uses a parameter shape unsupported by scalar lowering.
+    """
     positional_only: list[str] = []
     positional: list[str] = []
     keyword_only: list[str] = []
@@ -270,7 +300,18 @@ def _wrapper_parameter_declarations(member: RegionMember) -> str:
     return ", ".join(declarations)
 
 
-def _local_integer_names(node: ast.FunctionDef, parameters: frozenset[str]) -> tuple[str, ...]:
+def scalar_local_integer_names(
+    node: ast.FunctionDef, parameters: frozenset[str]
+) -> tuple[str, ...]:
+    """Return deterministic local names that the proof permits as native integers.
+
+    Args:
+        node: Parsed proof-authorized function declaration.
+        parameters: Names already represented by native parameters.
+
+    Returns:
+        tuple[str, ...]: Local integer names in deterministic source order.
+    """
     names: set[str] = set()
     for descendant in ast.walk(node):
         if isinstance(descendant, ast.Assign):
@@ -308,7 +349,7 @@ def _referenced_integer_constants(
     unresolved = referenced - {
         *[parameter.name for parameter in proof.parameters],
         *[name for name, _ in constants],
-        *list(_local_integer_names(node, frozenset())),
+        *list(scalar_local_integer_names(node, frozenset())),
         "range",
     }
     if unresolved:
@@ -318,7 +359,18 @@ def _referenced_integer_constants(
     return tuple(constants)
 
 
-def _render_statement(statement: ast.stmt) -> str:
+def render_scalar_statement(statement: ast.stmt) -> str:
+    """Render one proof-authorized scalar statement as Cython source.
+
+    Args:
+        statement: Statement accepted by the scalar proof frontend.
+
+    Returns:
+        str: Indented Cython statement source.
+
+    Raises:
+        ValueError: If an annotation-only local has no initializer.
+    """
     if isinstance(statement, ast.AnnAssign):
         if statement.value is None:
             raise ValueError("scalar local annotation requires an initializer")
@@ -326,10 +378,23 @@ def _render_statement(statement: ast.stmt) -> str:
     return textwrap.indent(ast.unparse(statement), "    ")
 
 
-def _binding(region: TypedRegion, member: RegionMember, compiled_name: str) -> BindingTarget:
+def scalar_binding(region: TypedRegion, member: RegionMember, compiled_name: str) -> BindingTarget:
+    """Retarget a source binding to one generated scalar entry point.
+
+    Args:
+        region: Typed region containing the source binding contract.
+        member: Source callable represented by the generated entry point.
+        compiled_name: Python-visible name exported by the native module.
+
+    Returns:
+        BindingTarget: Runtime binding preserving source descriptor metadata.
+
+    Raises:
+        ValueError: If a non-module callable has no reconstructable runtime binding.
+    """
     source = next((binding for binding in region.bindings if binding.source == member.id), None)
     if source is None:
-        if member.binding_kind not in {"module", "staticmethod"}:
+        if member.binding_kind not in {"module", "staticmethod", "instance_method"}:
             raise ValueError(f"scalar member has no runtime binding: {member.id.stable_id}")
         return BindingTarget(
             source=member.id,

@@ -41,6 +41,7 @@ from atoll.models import (
     SymbolId,
     TypedRegion,
 )
+from atoll.native_optimization.call_chains import CallChainAnalysisResult
 from atoll.project import DiscoveredProject, discover_project
 from atoll.report import CompilationReportInput, build_compilation_report
 from atoll.runtime.fusion_performance import (
@@ -63,6 +64,8 @@ from atoll.runtime.performance import (
 )
 from atoll.runtime.profiling import (
     LifecycleCounts,
+    ProfileCallEdgeTarget,
+    ProfiledCallEdge,
     ProfiledMember,
     ProfileResult,
     unconfigured_profile,
@@ -79,12 +82,15 @@ from atoll.source_optimization.transforms import (
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 TYPED_FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
+NATIVE_FIXTURE_ROOT = Path("tests/fixtures/native_optimization_project")
 EXPECTED_ATOMIC_SELECTION_COUNT = 2
 TEST_FAILURE_RETURN_CODE = 9
 RANKING_BINDING_COUNT = 3
 OUTLINED_COMPILE_CALL_COUNT = 2
 _CANDIDATE_SPEEDUP = 1.01
 EXPECTED_FINAL_TEST_RESULTS = 2
+EXPECTED_CALL_CHAIN_WIDTH_COUNT = 2
+EXPECTED_SINGLE_FAILURE = 1
 
 
 @pytest.fixture(autouse=True)
@@ -355,6 +361,46 @@ _profile_candidate_members = cast(
     Callable[[tuple[ModuleScan, ...], tuple[Backend, ...]], tuple[SymbolId, ...]],
     _package_attr("_profile_candidate_members"),
 )
+_call_chain_analyses = cast(
+    Callable[
+        [tuple[ModuleScan, ...], Callable[[str], None] | None],
+        tuple[CallChainAnalysisResult, ...],
+    ],
+    _package_attr("_call_chain_analyses"),
+)
+_call_chain_profile_targets = cast(
+    Callable[
+        [tuple[CallChainAnalysisResult, ...]],
+        tuple[ProfileCallEdgeTarget, ...],
+    ],
+    _package_attr("_call_chain_profile_targets"),
+)
+_profiled_call_chain_roots = cast(
+    Callable[
+        [tuple[CallChainAnalysisResult, ...], ProfileResult | None],
+        tuple[SymbolId, ...],
+    ],
+    _package_attr("_profiled_call_chain_roots"),
+)
+_select_profile_with_call_chains = cast(
+    Callable[
+        [ProfileResult, tuple[ModuleScan, ...], tuple[CallChainAnalysisResult, ...]],
+        ProfileResult,
+    ],
+    _package_attr("_select_profile_with_call_chains"),
+)
+_CallChainExtensionContext = cast(
+    Callable[..., object],
+    _package_attr("_CallChainExtensionContext"),
+)
+_prepare_call_chain_variants = cast(
+    Callable[..., tuple[tuple[_PreparedTypedRegion, ...], tuple[_TypedRegionFailure, ...]]],
+    _package_attr("_prepare_call_chain_variants"),
+)
+_extend_with_call_chain_variants = cast(
+    Callable[..., tuple[list[_PreparedTypedRegion], list[_TypedRegionFailure], int]],
+    _package_attr("_extend_with_call_chain_variants"),
+)
 _runtime_member_closure = cast(
     Callable[[TypedRegion, tuple[SymbolId, ...], frozenset[SymbolId]], tuple[SymbolId, ...]],
     _package_attr("_runtime_member_closure"),
@@ -532,6 +578,153 @@ def test_explicit_function_selection_creates_one_directed_slice_per_binding(
     } == set(requested)
     assert all(selection.slice_root is not None for selection in selections)
     assert all(selection.source_region_id is not None for selection in selections)
+
+
+def test_profiled_call_edges_promote_hot_call_chain_root(tmp_path: Path) -> None:
+    """Exact helper-edge counts select the public caller rather than only the leaf."""
+    project_root = tmp_path / "native_project"
+    shutil.copytree(Path("tests/fixtures/native_optimization_project"), project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "native_optimization_fixture.kernels")
+    analyses = _call_chain_analyses(scans, None)
+    targets = _call_chain_profile_targets(analyses)
+    target = next(item for item in targets if item.owner.qualname == "direct_chain_root")
+    profile = replace(
+        unconfigured_profile(),
+        status="profiled",
+        reason="test profile",
+        call_edges=(ProfiledCallEdge(target=target, invocation_count=10_000),),
+    )
+
+    roots = _profiled_call_chain_roots(analyses, profile)
+    selected = _select_profile_with_call_chains(profile, scans, analyses)
+
+    assert roots[0] == SymbolId(
+        "native_optimization_fixture.kernels",
+        "direct_chain_root",
+    )
+    assert roots[0] in selected.selected_symbols
+
+
+def test_call_chain_extension_reports_cython_disabled(tmp_path: Path) -> None:
+    """Configured backend order disables specialized chain variants explicitly."""
+    project_root = tmp_path / "native_project"
+    shutil.copytree(NATIVE_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    project = replace(
+        project,
+        config=replace(
+            project.config,
+            compile=replace(project.config.compile, backends=("mypyc",)),
+        ),
+    )
+    analyses = _call_chain_analyses(
+        _selected_scans(project, "native_optimization_fixture.kernels"),
+        None,
+    )
+    messages: list[str] = []
+    context = _CallChainExtensionContext(
+        project=project,
+        build_root=tmp_path / "build",
+        staged_source_roots=(),
+        analyses=analyses,
+        progress=messages.append,
+    )
+
+    prepared, failures, count = _extend_with_call_chain_variants(
+        context=context,
+        prepared=[],
+        failures=[],
+    )
+
+    assert prepared == []
+    assert failures == []
+    assert count == 0
+    assert messages == ["direct call-chain variants skipped because Cython is disabled"]
+
+
+def test_call_chain_preparation_rejects_staged_source_drift(tmp_path: Path) -> None:
+    """Copied-source rescanning must reproduce the exact call-chain plan identity."""
+    project_root = tmp_path / "native_project"
+    shutil.copytree(NATIVE_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    analyses = _call_chain_analyses(
+        _selected_scans(project, "native_optimization_fixture.kernels"),
+        None,
+    )
+    selected_analyses = tuple(
+        replace(
+            analysis,
+            plans=tuple(
+                plan for plan in analysis.plans if plan.root.qualname == "direct_chain_root"
+            ),
+        )
+        for analysis in analyses
+    )
+    build_root = tmp_path / "build"
+    staged_roots = _copy_source_roots(project, build_root)
+    module = _find_module(project.modules, "native_optimization_fixture.kernels")
+    staged_module = _staged_module(module, project, staged_roots)
+    source = staged_module.path.read_text(encoding="utf-8")
+    staged_module.path.write_text(
+        source.replace(
+            "    total = 0\n    for offset in range(depth):",
+            "    total = 1\n    for offset in range(depth):",
+            1,
+        )
+    )
+
+    prepared, failures = _prepare_call_chain_variants(
+        project=project,
+        build_root=build_root,
+        staged_source_roots=staged_roots,
+        analyses=selected_analyses,
+    )
+
+    assert prepared == ()
+    assert len(failures) == EXPECTED_SINGLE_FAILURE
+    assert failures[0].variant_id.endswith("@cython-call-chain")
+
+
+def test_call_chain_preparation_retains_each_width_lowering_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generator rejection records both width variants without losing fallback."""
+    project_root = tmp_path / "native_project"
+    shutil.copytree(NATIVE_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    analyses = _call_chain_analyses(
+        _selected_scans(project, "native_optimization_fixture.kernels"),
+        None,
+    )
+    selected_analyses = tuple(
+        replace(
+            analysis,
+            plans=tuple(
+                plan for plan in analysis.plans if plan.root.qualname == "direct_chain_root"
+            ),
+        )
+        for analysis in analyses
+    )
+    build_root = tmp_path / "build"
+    staged_roots = _copy_source_roots(project, build_root)
+
+    def reject_lowering(**_kwargs: object) -> object:
+        raise ValueError("deliberate call-chain lowering rejection")
+
+    monkeypatch.setattr(package_command, "_prepare_call_chain_variant", reject_lowering)
+
+    prepared, failures = _prepare_call_chain_variants(
+        project=project,
+        build_root=build_root,
+        staged_source_roots=staged_roots,
+        analyses=selected_analyses,
+    )
+
+    assert prepared == ()
+    assert len(failures) == EXPECTED_CALL_CHAIN_WIDTH_COUNT
+    assert all(failure.variant_id.startswith("call-chain-") for failure in failures)
 
 
 def test_directed_selection_rejects_staged_drift_and_missing_root(tmp_path: Path) -> None:
@@ -1837,9 +2030,12 @@ def test_package_reports_progress_for_expensive_phases(
     assert result.success is True
     assert result.scalar_analyses
     assert any(analysis.plans or analysis.rejections for analysis in result.scalar_analyses)
+    assert result.call_chain_analyses
+    assert any(analysis.plans or analysis.rejections for analysis in result.call_chain_analyses)
     assert any(message.startswith("discovered ") for message in messages)
     assert any(message.startswith("scanned ") for message in messages)
     assert any(message.startswith("scalar analysis proved ") for message in messages)
+    assert any(message.startswith("call-chain analysis proved ") for message in messages)
     assert any(message.startswith("compiling typed region variant") for message in messages)
     assert any(message.startswith("compile cache miss") for message in messages)
     assert any(message.startswith("writing wheel") for message in messages)

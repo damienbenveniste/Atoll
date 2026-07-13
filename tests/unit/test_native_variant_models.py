@@ -241,6 +241,21 @@ def test_guard_expression_rejects_mismatched_payloads(kind: str, payload: object
             owner_type_qualname="Worker",
             field_name="state.value",
         ),
+        lambda: DirectFieldGuardPayload(
+            owner_subject="worker",
+            owner_type_module="app.worker",
+            owner_type_qualname="Worker",
+            field_name="factor",
+            minimum=0,
+        ),
+        lambda: DirectFieldGuardPayload(
+            owner_subject="worker",
+            owner_type_module="app.worker",
+            owner_type_qualname="Worker",
+            field_name="factor",
+            minimum=5,
+            maximum=4,
+        ),
         lambda: BufferLayoutGuardPayload(
             subject="values",
             format="i",

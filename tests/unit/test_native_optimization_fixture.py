@@ -20,8 +20,19 @@ SOURCE_ROOT = FIXTURE_ROOT / "src"
 KERNEL_SOURCE = SOURCE_ROOT / "native_optimization_fixture" / "kernels.py"
 BENCHMARK_SCRIPT = FIXTURE_ROOT / "benchmarks" / "run_native_workload.py"
 SCALAR_BENCHMARK_SCRIPT = FIXTURE_ROOT / "benchmarks" / "run_scalar_hard.py"
+CALL_CHAIN_BENCHMARK_SCRIPT = FIXTURE_ROOT / "benchmarks" / "run_call_chain_hard.py"
 BENCHMARK_ITERATIONS = 6000
 EXPECTED_BRANCH_CHECKSUM = 173
+EXPECTED_CALL_CHAIN_CHECKSUM = 294
+EXPECTED_CALL_CHAIN_HARD_CHECKSUM = 1802
+EXPECTED_CALL_CHAIN_CUSTOM = 205
+EXPECTED_CALL_CHAIN_LEAF = 21
+EXPECTED_CALL_CHAIN_MIDDLE = 35
+EXPECTED_CALL_CHAIN_SHORT = 81
+EXPECTED_INSTANCE_FACTOR = 3
+EXPECTED_INSTANCE_STEP = 13
+EXPECTED_INSTANCE_RUN = 95
+EXPECTED_CALL_CHAIN_HARD_DEPTH = 64
 EXPECTED_EVEN_MIXED = 35
 EXPECTED_NEGATIVE_MIXED = -7
 EXPECTED_ODD_MIXED = 128
@@ -61,6 +72,28 @@ class ScalarArithmeticType(Protocol):
         ...
 
 
+class ChainAccumulatorInstance(Protocol):
+    """Instance-method call-chain surface exported by the fixture."""
+
+    factor: int
+
+    def step(self, value: int, bias: int = ...) -> int:
+        """Return one direct-field helper result."""
+        ...
+
+    def run(self, value: int, rounds: int = ...) -> int:
+        """Return one repeated helper-chain reduction."""
+        ...
+
+
+class ChainAccumulatorType(Protocol):
+    """Constructor surface for the instance-method call-chain fixture."""
+
+    def __call__(self, factor: int) -> ChainAccumulatorInstance:
+        """Create a stateful call-chain instance."""
+        ...
+
+
 class BenchmarkModule(Protocol):
     """Loaded benchmark module interface used by these tests."""
 
@@ -73,6 +106,7 @@ class FixtureModule(Protocol):
     """Loaded fixture module interface used by these tests."""
 
     BranchArithmetic: BranchArithmeticType
+    ChainAccumulator: ChainAccumulatorType
     FALLBACK_LIMIT: int
     FallbackProbe: FallbackProbeType
     ScalarArithmetic: ScalarArithmeticType
@@ -98,6 +132,47 @@ class FixtureModule(Protocol):
         bias: int = ...,
     ) -> tuple[int, ...]:
         """Return deterministic polynomial window values."""
+        ...
+
+    def direct_chain_leaf(self, value: int, increment: int = ..., *, scale: int = ...) -> int:
+        """Return the terminal direct-chain helper value."""
+        ...
+
+    def direct_chain_middle(
+        self,
+        value: int,
+        increment: int = ...,
+        *,
+        scale: int = ...,
+        bias: int = ...,
+    ) -> int:
+        """Return the middle direct-chain helper value."""
+        ...
+
+    def direct_chain_root(
+        self,
+        value: int,
+        depth: int = ...,
+        *,
+        scale: int = ...,
+        bias: int = ...,
+    ) -> int:
+        """Return the acyclic direct-chain result."""
+        ...
+
+    def direct_chain_route(
+        self,
+        value: int,
+        depth: int = ...,
+        *,
+        scale: int = ...,
+        bias: int = ...,
+    ) -> tuple[str, int]:
+        """Return the direct-chain execution route and exact result."""
+        ...
+
+    def call_chain_hard_checksum(self, calls: int, *, depth: int = ...) -> int:
+        """Return the deterministic direct-chain benchmark checksum."""
         ...
 
 
@@ -168,6 +243,37 @@ def test_static_methods_cover_branch_and_fallback_semantics() -> None:
     assert fallback_probe.square_route(huge) == ("python", huge * huge)
 
 
+def test_direct_call_chain_semantics_are_stable(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _fixture_module()
+
+    assert module.direct_chain_leaf(4, scale=3) == EXPECTED_CALL_CHAIN_LEAF
+    assert module.direct_chain_middle(4, scale=3, bias=7) == EXPECTED_CALL_CHAIN_MIDDLE
+    assert module.direct_chain_root(4, scale=3, bias=7) == EXPECTED_CALL_CHAIN_CUSTOM
+    assert module.direct_chain_root(2, 3, scale=4, bias=1) == EXPECTED_CALL_CHAIN_SHORT
+    assert module.direct_chain_route(4, scale=3, bias=7) == ("native", EXPECTED_CALL_CHAIN_CUSTOM)
+    assert module.call_chain_hard_checksum(5) == EXPECTED_CALL_CHAIN_CHECKSUM
+
+    kernels = importlib.import_module("native_optimization_fixture.kernels")
+
+    def patched_leaf(value: int, increment: int = 3, *, scale: int = 2) -> int:
+        """Return a monkey-patched leaf result for fallback route coverage."""
+        return (value + increment + 1) * scale
+
+    monkeypatch.setattr(kernels, "direct_chain_leaf", patched_leaf)
+
+    assert module.direct_chain_route(1, 2, scale=3, bias=4) == ("python", 49)
+
+
+def test_instance_call_chain_semantics_are_stable() -> None:
+    """The fixture exposes exact-owner helpers with one direct scalar field."""
+    module = _fixture_module()
+    accumulator = module.ChainAccumulator(EXPECTED_INSTANCE_FACTOR)
+
+    assert accumulator.factor == EXPECTED_INSTANCE_FACTOR
+    assert accumulator.step(4) == EXPECTED_INSTANCE_STEP
+    assert accumulator.run(4) == EXPECTED_INSTANCE_RUN
+
+
 def test_source_shape_contains_typed_functions_and_static_methods() -> None:
     tree = ast.parse(KERNEL_SOURCE.read_text(encoding="utf-8"))
     functions = _functions(tree)
@@ -178,20 +284,45 @@ def test_source_shape_contains_typed_functions_and_static_methods() -> None:
         "polynomial_checksum",
         "branch_checksum",
         "keyword_polynomial_window",
+        "direct_chain_leaf",
+        "direct_chain_middle",
+        "direct_chain_root",
+        "direct_chain_route",
+        "call_chain_hard_checksum",
     }
     assert required_functions <= functions.keys()
     assert _has_for_loop(functions["scalar_polynomial"])
     assert _has_for_loop(functions["polynomial_checksum"])
+    assert _has_for_loop(functions["direct_chain_root"])
+    assert _has_for_loop(functions["call_chain_hard_checksum"])
     assert _has_keyword_only_defaults(functions["keyword_polynomial_window"], {"scale", "bias"})
+    assert _has_keyword_only_defaults(functions["direct_chain_leaf"], {"scale"})
+    assert _has_keyword_only_defaults(functions["direct_chain_middle"], {"scale", "bias"})
+    assert _has_keyword_only_defaults(functions["direct_chain_root"], {"scale", "bias"})
+    assert _has_positional_defaults(functions["direct_chain_leaf"], {"increment"})
+    assert _has_positional_defaults(functions["direct_chain_root"], {"depth"})
     assert _annotated_returns(functions["polynomial_checksum"], "int")
     assert _annotated_returns(functions["keyword_polynomial_window"], "tuple")
+    assert _annotated_returns(functions["direct_chain_leaf"], "int")
+    assert _annotated_returns(functions["direct_chain_middle"], "int")
+    assert _annotated_returns(functions["direct_chain_root"], "int")
+    assert _annotated_returns(functions["direct_chain_route"], "tuple")
+    assert _direct_calls(functions["direct_chain_middle"]) == {"direct_chain_leaf"}
+    assert _direct_calls(functions["direct_chain_root"]) == {"direct_chain_middle", "range"}
+    assert "direct_chain_root" in _direct_calls(functions["direct_chain_route"])
 
     branch_methods = _static_methods(classes["BranchArithmetic"])
     fallback_methods = _static_methods(classes["FallbackProbe"])
     scalar_methods = _static_methods(classes["ScalarArithmetic"])
+    chain_methods = {
+        child.name
+        for child in classes["ChainAccumulator"].body
+        if isinstance(child, ast.FunctionDef)
+    }
     assert {"accumulate", "mixed"} <= branch_methods
     assert fallback_methods == {"square_route"}
     assert scalar_methods == {"weighted_sum"}
+    assert {"__init__", "step", "run"} <= chain_methods
     assert any(isinstance(node, ast.If) for node in ast.walk(classes["BranchArithmetic"]))
 
 
@@ -224,6 +355,22 @@ def test_scalar_hard_benchmark_prints_stable_json_checksum(
     assert json.loads(capsys.readouterr().out) == {
         "calls": 5,
         "checksum": EXPECTED_SCALAR_BENCHMARK_CHECKSUM,
+    }
+
+
+def test_call_chain_hard_benchmark_prints_stable_json_checksum(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    benchmark = _benchmark_module(CALL_CHAIN_BENCHMARK_SCRIPT)
+    monkeypatch.chdir(FIXTURE_ROOT)
+    monkeypatch.setattr(sys, "argv", ["run_call_chain_hard.py", "--calls", "5"])
+
+    assert benchmark.main() == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "calls": 5,
+        "checksum": EXPECTED_CALL_CHAIN_HARD_CHECKSUM,
+        "depth": EXPECTED_CALL_CHAIN_HARD_DEPTH,
     }
 
 
@@ -296,6 +443,20 @@ def _has_for_loop(node: ast.FunctionDef) -> bool:
 def _has_keyword_only_defaults(node: ast.FunctionDef, names: set[str]) -> bool:
     keyword_names = {argument.arg for argument in node.args.kwonlyargs}
     return names <= keyword_names and all(default is not None for default in node.args.kw_defaults)
+
+
+def _has_positional_defaults(node: ast.FunctionDef, names: set[str]) -> bool:
+    arguments_with_defaults = node.args.args[-len(node.args.defaults) :]
+    default_names = {argument.arg for argument in arguments_with_defaults}
+    return names <= default_names
+
+
+def _direct_calls(node: ast.FunctionDef) -> set[str]:
+    calls: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+            calls.add(child.func.id)
+    return calls
 
 
 def _annotated_returns(node: ast.FunctionDef, expected: str) -> bool:

@@ -13,6 +13,7 @@ FALLBACK_LIMIT = (1 << 53) - 1
 _MASK = (1 << 61) - 1
 _DEFAULT_WIDTH = 96
 _DEFAULT_REPETITIONS = 24
+_DEFAULT_CHAIN_DEPTH = 5
 
 
 def scalar_polynomial(limit: int, rounds: int = 1, *, bias: int = 3) -> int:
@@ -50,6 +51,167 @@ class ScalarArithmetic:
         for value in range(limit):
             total += value * factor + 1
         return total
+
+
+class ChainAccumulator:
+    """Stateful exact-int call chain used to verify instance-method lowering."""
+
+    factor: int
+
+    def __init__(self, factor: int) -> None:
+        """Store the direct scalar field consumed by native variants.
+
+        Args:
+            factor: Exact integer multiplied by every helper invocation.
+        """
+        self.factor = factor
+
+    def step(self, value: int, bias: int = 1) -> int:
+        """Return one direct-field arithmetic helper result.
+
+        Args:
+            value: Input multiplied by the retained instance factor.
+            bias: Additive result bias.
+
+        Returns:
+            Exact helper result.
+        """
+        return value * self.factor + bias
+
+    def run(self, value: int, rounds: int = 5) -> int:
+        """Accumulate repeated exact-receiver helper calls.
+
+        Args:
+            value: Starting input for the helper sequence.
+            rounds: Number of offset helper calls.
+
+        Returns:
+            Exact accumulated result.
+        """
+        total = 0
+        for offset in range(rounds):
+            total += self.step(value + offset)
+        return total
+
+
+def direct_chain_leaf(value: int, increment: int = 3, *, scale: int = 2) -> int:
+    """Return the terminal step in an acyclic direct-call helper chain.
+
+    Args:
+        value: Integer input for the terminal arithmetic.
+        increment: Positional default added before scaling.
+        scale: Keyword-only multiplier applied to the adjusted value.
+
+    Returns:
+        Exact integer result for the terminal helper call.
+    """
+
+    return (value + increment) * scale
+
+
+def direct_chain_middle(
+    value: int,
+    increment: int = 3,
+    *,
+    scale: int = 2,
+    bias: int = 5,
+) -> int:
+    """Return the middle step in a direct typed helper chain.
+
+    Args:
+        value: Integer input for the middle arithmetic.
+        increment: Positional default forwarded to the leaf helper.
+        scale: Keyword-only multiplier forwarded to the leaf helper.
+        bias: Keyword-only additive result bias.
+
+    Returns:
+        Exact integer result after calling the terminal helper.
+    """
+
+    return direct_chain_leaf(value + bias, increment, scale=scale) - bias
+
+
+def direct_chain_root(
+    value: int,
+    depth: int = 5,
+    *,
+    scale: int = 2,
+    bias: int = 5,
+) -> int:
+    """Run an acyclic direct-call chain with defaults and keywords.
+
+    Args:
+        value: Starting integer value.
+        depth: Number of direct middle-helper calls to execute.
+        scale: Keyword-only multiplier forwarded through the chain.
+        bias: Keyword-only additive result bias forwarded through the chain.
+
+    Returns:
+        Exact integer result after the requested direct-call chain depth.
+    """
+
+    total = 0
+    for offset in range(depth):
+        total += direct_chain_middle(value + offset, scale=scale, bias=bias)
+    return total
+
+
+_ORIGINAL_DIRECT_CHAIN_LEAF = direct_chain_leaf
+
+
+def direct_chain_route(
+    value: int,
+    depth: int = _DEFAULT_CHAIN_DEPTH,
+    *,
+    scale: int = 2,
+    bias: int = 5,
+) -> tuple[str, int]:
+    """Report whether the direct helper chain can use the native route.
+
+    Args:
+        value: Starting integer value.
+        depth: Number of helper-chain calls to execute.
+        scale: Keyword-only multiplier forwarded through the chain.
+        bias: Keyword-only additive result bias forwarded through the chain.
+
+    Returns:
+        Pair whose first item is `native` while the terminal helper remains the
+        original function and `python` after monkey-patching. The second item is
+        always the exact chain result produced by the currently installed
+        helper.
+    """
+
+    route = "native"
+    if direct_chain_leaf is not _ORIGINAL_DIRECT_CHAIN_LEAF:
+        route = "python"
+    return (route, direct_chain_root(value, depth, scale=scale, bias=bias))
+
+
+def call_chain_hard_checksum(calls: int, *, depth: int = _DEFAULT_CHAIN_DEPTH) -> int:
+    """Return deterministic CPU work for direct-call-chain benchmarking.
+
+    Args:
+        calls: Number of direct-chain root calls to execute.
+        depth: Helper-chain depth for each root call.
+
+    Returns:
+        Deterministic checksum constrained to a fixed mask.
+
+    Raises:
+        ValueError: If `calls` is less than one.
+    """
+
+    if calls < 1:
+        raise ValueError("calls must be positive")
+
+    checksum = 0
+    for index in range(calls):
+        scale = 2 + (index & 3)
+        bias = 3 + (index % 5)
+        result = direct_chain_root(index & 31, depth, scale=scale, bias=bias)
+        checksum = (checksum ^ result) + index + (result & 17)
+        checksum &= _MASK
+    return checksum
 
 
 @dataclass(frozen=True, slots=True)

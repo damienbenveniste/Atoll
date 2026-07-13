@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.machinery
 import importlib.util
 import inspect
 import sys
-from collections.abc import AsyncGenerator, Coroutine, Generator
+from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
@@ -28,6 +29,11 @@ from atoll.models import (
     ExecutionKind,
     RuntimeTypeGuard,
     SymbolId,
+)
+from atoll.native_optimization.models import (
+    CallableCodeIdentityGuardPayload,
+    DirectFieldGuardPayload,
+    GuardExpression,
 )
 
 FALLBACK_RESULT = 4
@@ -72,6 +78,32 @@ class _TextScaleWorkerProtocol(Protocol):
 
     def scale(self, value: int) -> str:
         """Return the selected scale implementation."""
+        ...
+
+
+class _FieldWorkerProtocol(Protocol):
+    """Exact-field instance surface used by structured guard tests."""
+
+    def scale(self, value: int) -> tuple[str, int]:
+        """Return the selected scale route and value."""
+        ...
+
+
+class _FieldWorkerTypeProtocol(Protocol):
+    """Constructor surface used by structured direct-field guard tests."""
+
+    def __call__(self, factor: object) -> _FieldWorkerProtocol:
+        """Create one worker with the requested field value."""
+        ...
+
+
+class _CallableGuardModule(Protocol):
+    """Dynamic module surface used by callable-identity dispatcher tests."""
+
+    helper: Callable[[int], int]
+
+    def root(self, value: int) -> tuple[str, int]:
+        """Return the selected call-chain route and value."""
         ...
 
 
@@ -153,6 +185,180 @@ def _load_region_module(
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_region_shim_falls_back_when_direct_helper_identity_or_code_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Call-chain guards reject monkey-patched helpers before native execution."""
+    source_path = tmp_path / "pkg" / "worker.py"
+    artifact_dir = tmp_path / "pkg" / "artifacts"
+    binding = BindingTarget(
+        source=SymbolId(module="pkg.worker", qualname="root"),
+        compiled_name="compiled_root",
+        kind="module",
+        owner_class=None,
+        execution_kind="sync",
+    )
+    guard = GuardExpression(
+        kind="callable-code-identity",
+        payload=CallableCodeIdentityGuardPayload(
+            subject="helper",
+            callable_module="pkg.worker",
+            callable_qualname="helper",
+            code_fingerprint=hashlib.sha256(
+                b"def helper(value: int) -> int:\n    return value + 1"
+            ).hexdigest(),
+            code_firstlineno=1,
+        ),
+        message="helper identity must match",
+    )
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=source_path,
+        region_id="chain-region",
+        backend="cython",
+        compiled_module="_atoll_chain",
+        artifact_dir=artifact_dir,
+        bindings=(binding,),
+        variant_id="chain-i32",
+        dispatch_rank=10,
+        variant_guards=(guard,),
+    )
+    source = """def helper(value: int) -> int:
+    return value + 1
+
+def root(value: int) -> tuple[str, int]:
+    return ("python", helper(value))
+"""
+    compiled = """def compiled_root(value):
+    return ("compiled", value + 1)
+"""
+    module = cast(_CallableGuardModule, _load_region_module(config, source, compiled, monkeypatch))
+    original_helper = module.helper
+
+    assert module.root(3) == ("compiled", 4)
+
+    def replacement(value: int) -> int:
+        return value + 10
+
+    module.helper = replacement
+    assert module.root(3) == ("python", 13)
+
+    module.helper = original_helper
+    original_helper.__code__ = replacement.__code__
+    assert module.root(3) == ("python", 13)
+
+
+def test_region_shim_guards_exact_owner_and_direct_integer_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Instance native entry requires exact class, field type, and closed field domain."""
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=tmp_path / "pkg" / "worker.py",
+        region_id="instance-chain",
+        backend="cython",
+        compiled_module="_atoll_instance_chain",
+        artifact_dir=tmp_path / "pkg" / "artifacts",
+        bindings=(_binding("scale", "instance_method"),),
+        variant_id="instance-chain-i32",
+        dispatch_rank=10,
+        variant_guards=(
+            GuardExpression(
+                kind="direct-field",
+                payload=DirectFieldGuardPayload(
+                    owner_subject="self",
+                    owner_type_module="pkg.worker",
+                    owner_type_qualname="Worker",
+                    field_name="factor",
+                    field_type="int",
+                    minimum=0,
+                    maximum=100,
+                ),
+                message="worker.factor must fit the proven domain",
+            ),
+        ),
+    )
+    source = """class Worker:
+    def __init__(self, factor):
+        self.factor = factor
+
+    def scale(self, value: int) -> tuple[str, int]:
+        return ("python", value * self.factor)
+"""
+    compiled = """def Worker__scale(self, value):
+    return ("compiled", value * self.factor)
+"""
+    module = _load_region_module(config, source, compiled, monkeypatch)
+    worker_type = cast(_FieldWorkerTypeProtocol, module.Worker)
+    runtime_worker_class = cast(type[object], module.Worker)
+    child_type = cast(_FieldWorkerTypeProtocol, type("Child", (runtime_worker_class,), {}))
+
+    assert worker_type(3).scale(4) == ("compiled", 12)
+    assert worker_type(True).scale(4) == ("python", 4)
+    assert worker_type(101).scale(4) == ("python", 404)
+    assert child_type(3).scale(4) == ("python", 12)
+
+
+def test_region_shim_rejects_helper_rebound_during_module_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source fingerprint validation rejects a stale native helper before installation."""
+    original_source = "def helper(value: int) -> int:\n    return value + 1"
+    guard = GuardExpression(
+        kind="callable-code-identity",
+        payload=CallableCodeIdentityGuardPayload(
+            subject="helper",
+            callable_module="pkg.worker",
+            callable_qualname="helper",
+            code_fingerprint=hashlib.sha256(original_source.encode()).hexdigest(),
+            code_firstlineno=1,
+        ),
+        message="helper source must match",
+    )
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=tmp_path / "pkg" / "worker.py",
+        region_id="module-rebind-chain",
+        backend="cython",
+        compiled_module="_atoll_rebound_chain",
+        artifact_dir=tmp_path / "pkg" / "artifacts",
+        bindings=(
+            BindingTarget(
+                source=SymbolId("pkg.worker", "root"),
+                compiled_name="compiled_root",
+                kind="module",
+                owner_class=None,
+                execution_kind="sync",
+            ),
+        ),
+        variant_guards=(guard,),
+    )
+    source = f"""{original_source}
+
+def replacement(value: int) -> int:
+    return value + 10
+
+helper = replacement
+
+def root(value: int) -> tuple[str, int]:
+    return ("python", helper(value))
+"""
+    module = cast(
+        _CallableGuardModule,
+        _load_region_module(
+            config,
+            source,
+            'def compiled_root(value):\n    return ("compiled", value + 1)\n',
+            monkeypatch,
+        ),
+    )
+
+    assert module.root(3) == ("python", 13)
 
 
 def test_region_shim_renders_descriptor_and_status_contract(tmp_path: Path) -> None:

@@ -190,6 +190,8 @@ class DirectFieldGuardPayload:
         owner_type_qualname: Qualified owner type name inside `owner_type_module`.
         field_name: Direct field name expected on the owner.
         field_type: Optional report-facing field type identity required by the variant.
+        minimum: Optional inclusive integer lower bound for the field.
+        maximum: Optional inclusive integer upper bound for the field.
     """
 
     owner_subject: str
@@ -197,6 +199,8 @@ class DirectFieldGuardPayload:
     owner_type_qualname: str
     field_name: str
     field_type: str | None = None
+    minimum: int | None = None
+    maximum: int | None = None
 
     def __post_init__(self) -> None:
         """Reject missing owner identity or missing direct field name.
@@ -212,6 +216,10 @@ class DirectFieldGuardPayload:
             raise ValueError("direct-field field_name must name one direct field")
         if self.field_type is not None:
             _require_identifier(self.field_type, "field_type")
+        if (self.minimum is None) != (self.maximum is None):
+            raise ValueError("direct-field integer bounds must be provided together")
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError("direct-field minimum must not exceed maximum")
 
     @property
     def canonical_serialization(self) -> str:
@@ -228,6 +236,8 @@ class DirectFieldGuardPayload:
                 self.owner_type_qualname,
                 self.field_name,
                 self.field_type or "",
+                "" if self.minimum is None else str(self.minimum),
+                "" if self.maximum is None else str(self.maximum),
             )
         )
 
@@ -241,12 +251,16 @@ class CallableCodeIdentityGuardPayload:
         callable_module: Importable module that owns the expected callable.
         callable_qualname: Qualified callable name inside `callable_module`.
         code_fingerprint: Stable digest of the callable code object or source body.
+        receiver_subject: Optional instance receiver checked for method shadowing.
+        code_firstlineno: Expected declaration start line for the live Python code object.
     """
 
     subject: str
     callable_module: str
     callable_qualname: str
     code_fingerprint: str
+    receiver_subject: str | None = None
+    code_firstlineno: int | None = None
 
     def __post_init__(self) -> None:
         """Reject incomplete callable or code identity fields.
@@ -258,6 +272,10 @@ class CallableCodeIdentityGuardPayload:
         _require_identifier(self.callable_module, "callable_module")
         _require_identifier(self.callable_qualname, "callable_qualname")
         _require_identifier(self.code_fingerprint, "code_fingerprint")
+        if self.receiver_subject is not None:
+            _require_identifier(self.receiver_subject, "receiver_subject")
+        if self.code_firstlineno is not None and self.code_firstlineno < 1:
+            raise ValueError("code_firstlineno must be positive when provided")
 
     @property
     def canonical_serialization(self) -> str:
@@ -273,6 +291,8 @@ class CallableCodeIdentityGuardPayload:
                 self.callable_module,
                 self.callable_qualname,
                 self.code_fingerprint,
+                self.receiver_subject or "",
+                "" if self.code_firstlineno is None else str(self.code_firstlineno),
             )
         )
 

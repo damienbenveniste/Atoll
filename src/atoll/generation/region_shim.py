@@ -16,6 +16,8 @@ from pathlib import Path
 
 from atoll.models import Backend, BindingTarget
 from atoll.native_optimization.models import (
+    CallableCodeIdentityGuardPayload,
+    DirectFieldGuardPayload,
     ExactTypeGuardPayload,
     GuardExpression,
     IntegerDomainGuardPayload,
@@ -99,10 +101,7 @@ class RegionShimConfig:
             raise ValueError("region shim requires at least one promised binding")
         if self.outlined_shell is not None and len(self.bindings) != 1:
             raise ValueError("outlined region shim requires exactly one public binding")
-        if any(guard.kind not in {"exact-type", "integer-domain"} for guard in self.variant_guards):
-            raise ValueError(
-                "region shim supports only exact-type and integer-domain variant guards"
-            )
+        self._validate_variant_guards()
         for binding in self.bindings:
             if binding.source.module != self.source_module:
                 raise ValueError("region shim binding belongs to another source module")
@@ -122,6 +121,30 @@ class RegionShimConfig:
                 binding.owner_class is not None or binding.target_owner_class is not None
             ):
                 raise ValueError("module or class region shim binding cannot name an owner class")
+
+    def _validate_variant_guards(self) -> None:
+        """Reject unsupported or cross-module structured dispatcher guards.
+
+        Raises:
+            ValueError: If a guard kind is unsupported or pins a callable in another module.
+        """
+        supported = {
+            "exact-type",
+            "integer-domain",
+            "direct-field",
+            "callable-code-identity",
+        }
+        if any(guard.kind not in supported for guard in self.variant_guards):
+            raise ValueError(
+                "region shim supports only exact-type, integer-domain, and callable identity "
+                "variant guards"
+            )
+        if any(
+            isinstance(guard.payload, CallableCodeIdentityGuardPayload)
+            and guard.payload.callable_module != self.source_module
+            for guard in self.variant_guards
+        ):
+            raise ValueError("callable identity guard belongs to another source module")
 
     def _validate_dispatch_identity(self) -> None:
         """Validate optional variant identity and deterministic dispatch priority.
@@ -208,8 +231,10 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "# This staged-wheel block is managed by Atoll. Do not edit manually.",
             "try:",
             "    _atoll_preexisting_names = frozenset(globals())",
+            "    import ast as _atoll_ast",
             "    import builtins as _atoll_builtins",
             "    import functools as _atoll_functools",
+            "    import hashlib as _atoll_hashlib",
             "    import importlib.machinery as _atoll_machinery",
             "    import importlib.util as _atoll_util",
             "    import inspect as _atoll_inspect",
@@ -228,25 +253,144 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "            raise TypeError(f'Atoll guard is not a nominal type: {_atoll_path}')",
             "        return _atoll_value",
             "",
+            "    def _atoll_source_fingerprint(_atoll_qualname):",
+            "        _atoll_source = _atoll_pathlib.Path(__file__).read_text(encoding='utf-8')",
+            "        _atoll_tree = _atoll_ast.parse(_atoll_source)",
+            "        _atoll_body = _atoll_tree.body",
+            "        _atoll_node = None",
+            "        _atoll_parts = _atoll_qualname.split('.')",
+            "        for _atoll_index, _atoll_part in enumerate(_atoll_parts):",
+            "            _atoll_node = next(",
+            (
+                "                (item for item in _atoll_body "
+                "if getattr(item, 'name', None) == _atoll_part), None"
+            ),
+            "            )",
+            "            if _atoll_node is None:",
+            "                raise AttributeError(_atoll_qualname)",
+            "            if _atoll_index < len(_atoll_parts) - 1:",
+            "                if not isinstance(_atoll_node, _atoll_ast.ClassDef):",
+            "                    raise TypeError('Atoll callable owner is not a class')",
+            "                _atoll_body = _atoll_node.body",
+            "        if not isinstance(",
+            "            _atoll_node, (_atoll_ast.FunctionDef, _atoll_ast.AsyncFunctionDef)",
+            "        ):",
+            "            raise TypeError('Atoll callable source declaration is not a function')",
+            "        _atoll_start = min(",
+            "            (_atoll_item.lineno for _atoll_item in _atoll_node.decorator_list),",
+            "            default=_atoll_node.lineno,",
+            "        )",
+            "        _atoll_lines = _atoll_source.splitlines(keepends=True)",
+            "        _atoll_declaration = ''.join(",
+            "            _atoll_lines[_atoll_start - 1 : _atoll_node.end_lineno]",
+            "        ).removesuffix('\\n')",
+            "        return _atoll_hashlib.sha256(_atoll_declaration.encode('utf-8')).hexdigest()",
+            "",
+            "    def _atoll_callable_slot(_atoll_qualname):",
+            "        _atoll_parts = _atoll_qualname.split('.')",
+            "        if len(_atoll_parts) == 1:",
+            "            return globals(), _atoll_parts[0]",
+            "        _atoll_owner = globals().get(_atoll_parts[0])",
+            "        if _atoll_owner is None:",
+            "            raise AttributeError(_atoll_qualname)",
+            "        for _atoll_part in _atoll_parts[1:-1]:",
+            "            if isinstance(_atoll_owner, type):",
+            "                _atoll_owner = vars(_atoll_owner).get(_atoll_part)",
+            "            else:",
+            "                _atoll_owner = getattr(_atoll_owner, _atoll_part)",
+            "        return _atoll_owner, _atoll_parts[-1]",
+            "",
+            "    def _atoll_read_callable_slot(_atoll_owner, _atoll_name):",
+            "        if isinstance(_atoll_owner, dict):",
+            "            _atoll_value = _atoll_owner.get(_atoll_name)",
+            "        elif isinstance(_atoll_owner, type):",
+            "            _atoll_value = vars(_atoll_owner).get(_atoll_name)",
+            "        else:",
+            "            _atoll_value = getattr(_atoll_owner, _atoll_name)",
+            "        if isinstance(_atoll_value, (staticmethod, classmethod)):",
+            "            _atoll_value = _atoll_value.__func__",
+            "        return _atoll_value",
+            "",
             "    def _atoll_resolve_guards(_atoll_guards):",
-            "        return tuple(",
-            "            {",
+            "        _atoll_resolved = []",
+            "        for _atoll_guard in _atoll_guards:",
+            "            _atoll_item = {",
             "                **_atoll_guard,",
             "                'types': tuple(",
             "                    _atoll_resolve_type(_atoll_path)",
             "                    for _atoll_path in _atoll_guard.get('nominal_type_paths', ())",
             "                ),",
             "            }",
-            "            for _atoll_guard in _atoll_guards",
-            "        )",
+            "            if _atoll_guard.get('kind') == 'callable-code-identity':",
+            "                _atoll_owner, _atoll_name = _atoll_callable_slot(",
+            "                    _atoll_guard['callable_qualname']",
+            "                )",
+            "                _atoll_expected = _atoll_read_callable_slot(",
+            "                    _atoll_owner, _atoll_name",
+            "                )",
+            "                if not callable(_atoll_expected):",
+            "                    raise TypeError('Atoll identity guard target is not callable')",
+            "                _atoll_source_digest = _atoll_source_fingerprint(",
+            "                    _atoll_guard['callable_qualname']",
+            "                )",
+            "                if _atoll_source_digest != _atoll_guard['code_fingerprint']:",
+            "                    raise TypeError('Atoll callable source fingerprint changed')",
+            "                _atoll_expected_line = _atoll_guard.get('code_firstlineno')",
+            "                if _atoll_expected_line is not None and getattr(",
+            "                    _atoll_expected, '__code__', None",
+            "                ).co_firstlineno != _atoll_expected_line:",
+            "                    raise TypeError('Atoll callable code location changed')",
+            "                _atoll_item['slot_owner'] = _atoll_owner",
+            "                _atoll_item['slot_name'] = _atoll_name",
+            "                _atoll_item['expected_callable'] = _atoll_expected",
+            (
+                "                _atoll_item['expected_code'] = "
+                "getattr(_atoll_expected, '__code__', None)"
+            ),
+            "                if _atoll_item['expected_code'] is None:",
+            (
+                "                    raise TypeError("
+                "'Atoll callable identity guard requires Python code')"
+            ),
+            "            _atoll_resolved.append(_atoll_item)",
+            "        return tuple(_atoll_resolved)",
             "",
-            "    def _atoll_guards_pass(_atoll_guards, _atoll_values):",
+            "    def _atoll_guards_pass(",
+            "        _atoll_guards,",
+            "        _atoll_values,",
+            "        _atoll_read_callable_value=_atoll_read_callable_slot,",
+            "    ):",
             "        for _atoll_guard in _atoll_guards:",
+            "            _atoll_kind = _atoll_guard.get('kind', 'runtime-type')",
+            "            if _atoll_kind == 'callable-code-identity':",
+            "                try:",
+            "                    _atoll_live = _atoll_read_callable_value(",
+            "                        _atoll_guard['slot_owner'], _atoll_guard['slot_name']",
+            "                    )",
+            "                except Exception:",
+            "                    return False",
+            "                _atoll_receiver_name = _atoll_guard.get('receiver_subject')",
+            "                if _atoll_receiver_name is not None:",
+            "                    if _atoll_receiver_name not in _atoll_values:",
+            "                        return False",
+            "                    _atoll_instance = _atoll_values[_atoll_receiver_name]",
+            "                    try:",
+            "                        _atoll_instance_values = vars(_atoll_instance)",
+            "                    except TypeError:",
+            "                        _atoll_instance_values = {}",
+            "                    if _atoll_guard['slot_name'] in _atoll_instance_values:",
+            "                        return False",
+            "                if (",
+            "                    _atoll_live is _atoll_guard['expected_callable']",
+            "                    and getattr(_atoll_live, '__code__', None)",
+            "                    is _atoll_guard['expected_code']",
+            "                ):",
+            "                    continue",
+            "                return False",
             "            _atoll_parameter = _atoll_guard['parameter_name']",
             "            if _atoll_parameter not in _atoll_values:",
             "                return False",
             "            _atoll_value = _atoll_values[_atoll_parameter]",
-            "            _atoll_kind = _atoll_guard.get('kind', 'runtime-type')",
             "            if _atoll_kind == 'exact-type':",
             "                if len(_atoll_guard['types']) == 1 and type(_atoll_value) is (",
             "                    _atoll_guard['types'][0]",
@@ -260,6 +404,23 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "                ):",
             "                    continue",
             "                return False",
+            "            if _atoll_kind == 'direct-field':",
+            "                if len(_atoll_guard['types']) != 1 or type(_atoll_value) is not (",
+            "                    _atoll_guard['types'][0]",
+            "                ):",
+            "                    return False",
+            "                try:",
+            "                    _atoll_field = getattr(_atoll_value, _atoll_guard['field_name'])",
+            "                except Exception:",
+            "                    return False",
+            "                if type(_atoll_field) is not int:",
+            "                    return False",
+            "                if not (",
+            "                    _atoll_guard['minimum'] <= _atoll_field",
+            "                    <= _atoll_guard['maximum']",
+            "                ):",
+            "                    return False",
+            "                continue",
             "            if _atoll_value is None and _atoll_guard['allow_none']:",
             "                continue",
             "            if _atoll_guard['types']:",
@@ -1091,18 +1252,26 @@ def _runtime_region(config: RegionShimConfig) -> dict[str, object]:
                     }
                     for guard in binding.guards
                 )
-                + tuple(_structured_guard(guard) for guard in config.variant_guards),
+                + tuple(
+                    _structured_guard(guard, source_module=config.source_module)
+                    for guard in config.variant_guards
+                ),
             }
             for binding in config.bindings
         ),
     }
 
 
-def _structured_guard(guard: GuardExpression) -> dict[str, object]:
+def _structured_guard(
+    guard: GuardExpression,
+    *,
+    source_module: str,
+) -> dict[str, object]:
     """Serialize one safe scalar guard for staged runtime dispatch.
 
     Args:
         guard: Structured guard produced by scalar proof analysis.
+        source_module: Module whose globals own same-module nominal guard types.
 
     Returns:
         dict[str, object]: Literal-only runtime mapping embedded in the staged shim.
@@ -1111,10 +1280,10 @@ def _structured_guard(guard: GuardExpression) -> dict[str, object]:
         ValueError: If a future guard kind reaches this milestone's renderer.
     """
     if guard.kind == "exact-type" and isinstance(guard.payload, ExactTypeGuardPayload):
-        path = (
-            guard.payload.type_qualname
-            if guard.payload.type_module == "builtins"
-            else f"{guard.payload.type_module}.{guard.payload.type_qualname}"
+        path = _runtime_type_path(
+            guard.payload.type_module,
+            guard.payload.type_qualname,
+            source_module,
         )
         return {
             "kind": "exact-type",
@@ -1128,7 +1297,40 @@ def _structured_guard(guard: GuardExpression) -> dict[str, object]:
             "minimum": guard.payload.minimum,
             "maximum": guard.payload.maximum,
         }
+    if guard.kind == "direct-field" and isinstance(guard.payload, DirectFieldGuardPayload):
+        if guard.payload.minimum is None or guard.payload.maximum is None:
+            raise ValueError("runtime direct-field integer guards require closed bounds")
+        owner_path = _runtime_type_path(
+            guard.payload.owner_type_module,
+            guard.payload.owner_type_qualname,
+            source_module,
+        )
+        return {
+            "kind": "direct-field",
+            "parameter_name": guard.payload.owner_subject,
+            "nominal_type_paths": (owner_path,),
+            "field_name": guard.payload.field_name,
+            "minimum": guard.payload.minimum,
+            "maximum": guard.payload.maximum,
+        }
+    if guard.kind == "callable-code-identity" and isinstance(
+        guard.payload, CallableCodeIdentityGuardPayload
+    ):
+        return {
+            "kind": "callable-code-identity",
+            "callable_module": guard.payload.callable_module,
+            "callable_qualname": guard.payload.callable_qualname,
+            "code_fingerprint": guard.payload.code_fingerprint,
+            "receiver_subject": guard.payload.receiver_subject,
+            "code_firstlineno": guard.payload.code_firstlineno,
+        }
     raise ValueError(f"unsupported structured region guard: {guard.kind}")
+
+
+def _runtime_type_path(type_module: str, type_qualname: str, source_module: str) -> str:
+    if type_module in {"builtins", source_module}:
+        return type_qualname
+    return f"{type_module}.{type_qualname}"
 
 
 def _binding_runtime_qualname(binding: BindingTarget) -> str:

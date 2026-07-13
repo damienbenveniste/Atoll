@@ -49,6 +49,7 @@ class _Config:
     result_path: Path
     targets: frozenset[str]
     spawn_targets: tuple[_SpawnTarget, ...]
+    call_edge_targets: tuple[_CallEdgeTarget, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +67,29 @@ class _SpawnTarget:
     lineno: int
     col_offset: int
     scheduler_method: str
+    end_lineno: int | None
+    end_col_offset: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CallEdgeTarget:
+    """Canonical same-module direct call site observed by the bootstrap.
+
+    Attributes:
+        id: Stable source-derived call-site identity.
+        owner: Canonical `module::qualname` identity of the containing callable.
+        callee: Canonical `module::qualname` identity expected at runtime.
+        lineno: One-based call source line.
+        col_offset: Zero-based call source column.
+        end_lineno: One-based final call source line.
+        end_col_offset: Zero-based final call source column.
+    """
+
+    id: str
+    owner: str
+    callee: str
+    lineno: int
+    col_offset: int
     end_lineno: int | None
     end_col_offset: int | None
 
@@ -143,6 +167,7 @@ class _SamplingProfiler:
             "member_lifecycle": {},
             "signatures": {},
             "spawn_sites": [],
+            "call_edges": [],
         }
 
     def _sample(self, _signum: int, frame: FrameType | None) -> None:
@@ -166,6 +191,8 @@ class _TypeProfiler:
         self._targets = config.targets
         self._spawn_targets = config.spawn_targets
         self._spawn_targets_by_owner = _spawn_targets_by_owner(config.spawn_targets)
+        self._call_edge_targets = config.call_edge_targets
+        self._call_edge_targets_by_owner = _call_edge_targets_by_owner(config.call_edge_targets)
         self._signatures: dict[str, Counter[tuple[tuple[str, str], ...]]] = {}
         self._call_counts: Counter[str] = Counter()
         self._invocation_counts: Counter[str] = Counter()
@@ -184,6 +211,7 @@ class _TypeProfiler:
         ] = {}
         self._spawn_counts: Counter[str] = Counter()
         self._spawn_callable_counts: dict[str, Counter[str]] = {}
+        self._call_edge_counts: Counter[str] = Counter()
         self._enabled = False
 
     def start(self) -> None:
@@ -318,6 +346,19 @@ class _TypeProfiler:
                 }
                 for target in self._spawn_targets
             ],
+            "call_edges": [
+                {
+                    "id": target.id,
+                    "owner": target.owner,
+                    "callee": target.callee,
+                    "lineno": target.lineno,
+                    "col_offset": target.col_offset,
+                    "end_lineno": target.end_lineno,
+                    "end_col_offset": target.end_col_offset,
+                    "invocation_count": self._call_edge_counts[target.id],
+                }
+                for target in self._call_edge_targets
+            ],
         }
 
     def _on_start(self, code: CodeType, _offset: int) -> object:
@@ -351,7 +392,7 @@ class _TypeProfiler:
             return
         events = sys.monitoring.events
         local_events = events.PY_RETURN | events.PY_YIELD | events.PY_RESUME
-        if key in self._spawn_targets_by_owner:
+        if key in self._spawn_targets_by_owner or key in self._call_edge_targets_by_owner:
             local_events |= events.CALL
         sys.monitoring.set_local_events(
             _MONITORING_TOOL_ID,
@@ -368,19 +409,27 @@ class _TypeProfiler:
         _arg0: object,
     ) -> object:
         key = self._mapper.code_key(code)
-        targets = self._spawn_targets_by_owner.get(key or "", ())
-        if not targets:
+        owner = key or ""
+        spawn_targets = self._spawn_targets_by_owner.get(owner, ())
+        call_edge_targets = self._call_edge_targets_by_owner.get(owner, ())
+        if not spawn_targets and not call_edge_targets:
             return None
         position = self._instruction_position(code, instruction_offset)
         callable_name = getattr(callable_object, "__name__", None)
-        for target in targets:
-            if target.scheduler_method != callable_name or not _position_within_spawn_target(
-                position, target
+        identity = _canonical_callable_identity(callable_object)
+        for spawn_target in spawn_targets:
+            if spawn_target.scheduler_method != callable_name or not _position_within_spawn_target(
+                position, spawn_target
             ):
                 continue
-            self._spawn_counts[target.id] += 1
-            identity = _canonical_callable_identity(callable_object)
-            self._spawn_callable_counts.setdefault(target.id, Counter())[identity] += 1
+            self._spawn_counts[spawn_target.id] += 1
+            self._spawn_callable_counts.setdefault(spawn_target.id, Counter())[identity] += 1
+        for call_edge_target in call_edge_targets:
+            if identity != _member_key_callable_identity(
+                call_edge_target.callee
+            ) or not _position_matches_call_edge_target(position, call_edge_target):
+                continue
+            self._call_edge_counts[call_edge_target.id] += 1
         return None
 
     def _instruction_position(
@@ -549,10 +598,56 @@ def _position_within_spawn_target(
     ) <= (target.end_lineno, target.end_col_offset)
 
 
+def _position_matches_call_edge_target(
+    position: tuple[int | None, int | None, int | None, int | None],
+    target: _CallEdgeTarget,
+) -> bool:
+    """Return whether a CALL instruction exactly matches a source call site.
+
+    Args:
+        position: Source range attached to the monitored CALL instruction.
+        target: Static direct-call target with source coordinates.
+
+    Returns:
+        bool: `True` only for the configured call expression range.
+    """
+    lineno, col_offset, end_lineno, end_col_offset = position
+    if (lineno, col_offset) != (target.lineno, target.col_offset):
+        return False
+    if target.end_lineno is None or target.end_col_offset is None:
+        return True
+    return (end_lineno, end_col_offset) == (target.end_lineno, target.end_col_offset)
+
+
+def _member_key_callable_identity(member_key: str) -> str:
+    """Convert `module::qualname` into runtime callable identity form.
+
+    Args:
+        member_key: Canonical static member key from profiling configuration.
+
+    Returns:
+        str: Canonical runtime `module.qualname` identity.
+    """
+    module, separator, qualname = member_key.partition("::")
+    return f"{module}.{qualname}" if separator else member_key
+
+
 def _spawn_targets_by_owner(
     targets: tuple[_SpawnTarget, ...],
 ) -> dict[str, tuple[_SpawnTarget, ...]]:
     grouped: dict[str, list[_SpawnTarget]] = {}
+    for target in targets:
+        grouped.setdefault(target.owner, []).append(target)
+    return {
+        owner: tuple(sorted(items, key=lambda item: (item.lineno, item.col_offset, item.id)))
+        for owner, items in grouped.items()
+    }
+
+
+def _call_edge_targets_by_owner(
+    targets: tuple[_CallEdgeTarget, ...],
+) -> dict[str, tuple[_CallEdgeTarget, ...]]:
+    grouped: dict[str, list[_CallEdgeTarget]] = {}
     for target in targets:
         grouped.setdefault(target.owner, []).append(target)
     return {
@@ -597,6 +692,10 @@ def _read_config(path: Path) -> _Config:
             _spawn_target(_object_value(item))
             for item in _list_value(payload.get("spawn_targets", []))
         ),
+        call_edge_targets=tuple(
+            _call_edge_target(_object_value(item))
+            for item in _list_value(payload.get("call_edge_targets", []))
+        ),
     )
 
 
@@ -607,6 +706,18 @@ def _spawn_target(payload: JsonObject) -> _SpawnTarget:
         lineno=_int_field(payload, "lineno"),
         col_offset=_int_field(payload, "col_offset"),
         scheduler_method=_string_field(payload, "scheduler_method"),
+        end_lineno=_optional_int_field(payload, "end_lineno"),
+        end_col_offset=_optional_int_field(payload, "end_col_offset"),
+    )
+
+
+def _call_edge_target(payload: JsonObject) -> _CallEdgeTarget:
+    return _CallEdgeTarget(
+        id=_string_field(payload, "id"),
+        owner=_string_field(payload, "owner"),
+        callee=_string_field(payload, "callee"),
+        lineno=_int_field(payload, "lineno"),
+        col_offset=_int_field(payload, "col_offset"),
         end_lineno=_optional_int_field(payload, "end_lineno"),
         end_col_offset=_optional_int_field(payload, "end_col_offset"),
     )

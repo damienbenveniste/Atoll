@@ -26,6 +26,7 @@ from atoll.runtime.profiling import (
     LifecycleCounts,
     MappedCandidateDecision,
     ObservedSignature,
+    ProfileCallEdgeTarget,
     ProfiledMember,
     ProfileResult,
     ProfileSpawnSiteTarget,
@@ -40,6 +41,7 @@ ASYNC_WORKER_CALLS = 5
 ASYNC_CAPPED_WORKER_CALLS = 300
 FREQUENT_CALLS = 800_000
 SPAWN_SITE_CALLS = 1_200
+DIRECT_CALL_EDGE_CALLS = 1_200
 DIRECT_SPAWN_CALLBACKS = 2
 SCHEDULER_OVERHEAD_SAMPLES = 60
 SCHEDULER_OVERHEAD_COVERAGE = 0.6
@@ -122,6 +124,7 @@ class _BootstrapConfigInput:
     module_paths: tuple[tuple[str, str], ...] = ()
     targets: tuple[str, ...] = ()
     spawn_targets: tuple[ProfileSpawnSiteTarget, ...] = ()
+    call_edge_targets: tuple[ProfileCallEdgeTarget, ...] = ()
 
 
 def test_unconfigured_profile_returns_deterministic_no_benchmark_evidence() -> None:
@@ -134,6 +137,7 @@ def test_unconfigured_profile_returns_deterministic_no_benchmark_evidence() -> N
     assert first.launch_kind == "unconfigured"
     assert first.total_samples == 0
     assert first.selected_symbols == ()
+    assert first.call_edges == ()
 
 
 def test_profiled_member_reports_conservative_immediate_result_ratio() -> None:
@@ -227,6 +231,7 @@ def test_profile_preserves_nested_scheduler_overhead_attribution(
     assert member.scheduler_overhead_samples == SCHEDULER_OVERHEAD_SAMPLES
     assert member.scheduler_overhead_coverage == pytest.approx(SCHEDULER_OVERHEAD_COVERAGE)
     assert member.immediate_result_ratio == 1.0
+    assert result.call_edges == ()
 
 
 def test_sampling_profiler_attributes_unmapped_leaf_to_project_ancestor(
@@ -414,6 +419,49 @@ def test_targeted_profile_counts_exact_spawn_site_beyond_type_budget(tmp_path: P
     assert worker.call_count == MAX_TYPE_OBSERVATIONS_PER_MEMBER
     assert worker.invocation_count == SPAWN_SITE_CALLS
     assert worker.lifecycle.start == SPAWN_SITE_CALLS
+
+
+def test_targeted_profile_counts_canonical_same_module_direct_call_edge(tmp_path: Path) -> None:
+    """Direct edge evidence stays exact after bounded type observation stops."""
+    source = _write_call_edge_project(tmp_path)
+    call = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "leaf"
+    )
+    target = ProfileCallEdgeTarget(
+        id="call-edge-test",
+        owner=SymbolId("call_edge_case", "root"),
+        callee=SymbolId("call_edge_case", "leaf"),
+        lineno=call.lineno,
+        col_offset=call.col_offset,
+        end_lineno=call.end_lineno,
+        end_col_offset=call.end_col_offset,
+    )
+
+    result = run_baseline_profile(
+        (sys.executable, "bench_call_edge.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("call_edge_case", "call_edge_case.py"),),
+        scratch_dir=tmp_path / "scratch",
+        call_edge_targets=(target,),
+    )
+
+    assert result.call_edges[0].target == target
+    assert result.call_edges[0].invocation_count == DIRECT_CALL_EDGE_CALLS
+    assert _member(result, "call_edge_case", "root").invocation_count == 1
+
+
+def test_profile_call_edge_target_rejects_cross_module_edge() -> None:
+    with pytest.raises(ValueError, match="within one module"):
+        ProfileCallEdgeTarget(
+            id="cross-module",
+            owner=SymbolId("owner_module", "root"),
+            callee=SymbolId("callee_module", "leaf"),
+            lineno=1,
+            col_offset=0,
+        )
 
 
 def test_type_observation_stores_canonical_types_without_values_or_repr(tmp_path: Path) -> None:
@@ -809,7 +857,9 @@ def test_profile_bootstrap_config_rejects_non_structured_sequences(tmp_path: Pat
     )
 
     assert read_config(list_payload) is not None
-    assert read_config(malformed_sequences) is not None
+    parsed = read_config(malformed_sequences)
+    assert parsed is not None
+    assert _attribute(parsed, "call_edge_targets") == ()
 
 
 def test_type_profiler_callbacks_are_bounded_and_ignore_non_targets(
@@ -955,6 +1005,81 @@ def test_type_profiler_matches_full_spawn_spans_and_helper_boundaries(
         "spawn_callback.TaskGroup.create_task": DIRECT_SPAWN_CALLBACKS
     }
     _assert_profile_bootstrap_position_helpers(profiler, target)
+
+
+def test_type_profiler_matches_call_edge_position_and_callable_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only exact source positions resolving to the configured callee increment an edge."""
+    source = (
+        "def leaf(value):\n"
+        "    return value + 1\n\n"
+        "def other(value):\n"
+        "    return value - 1\n\n"
+        "def root(value):\n"
+        "    return leaf(value) + leaf(value + 1)\n"
+    )
+    (tmp_path / "call_edge_callback.py").write_text(source, encoding="utf-8")
+    calls = sorted(
+        (
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "leaf"
+        ),
+        key=lambda node: node.col_offset,
+    )
+    targets = tuple(
+        ProfileCallEdgeTarget(
+            id=f"edge-{index}",
+            owner=SymbolId("call_edge_callback", "root"),
+            callee=SymbolId("call_edge_callback", "leaf"),
+            lineno=call.lineno,
+            col_offset=call.col_offset,
+            end_lineno=call.end_lineno,
+            end_col_offset=call.end_col_offset,
+        )
+        for index, call in enumerate(calls)
+    )
+    config_path, _result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="types",
+            launch_kind="script",
+            target="unused.py",
+            module_paths=(("call_edge_callback", "call_edge_callback.py"),),
+            targets=("call_edge_callback::root",),
+            call_edge_targets=targets,
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path, "call_edge_callback", add_root=True)
+    callback_module = importlib.import_module("call_edge_callback")
+    root = cast(FunctionType, _callable_attribute(callback_module, "root"))
+    leaf = _callable_attribute(callback_module, "leaf")
+    other = _callable_attribute(callback_module, "other")
+    instructions = {
+        (
+            instruction.positions.col_offset,
+            instruction.positions.end_col_offset,
+        ): instruction
+        for instruction in get_instructions(root)
+        if instruction.opname == "CALL" and instruction.positions is not None
+    }
+    profiler = _type_profiler(config_path)
+
+    first = instructions[(calls[0].col_offset, calls[0].end_col_offset)]
+    second = instructions[(calls[1].col_offset, calls[1].end_col_offset)]
+    profiler.call_callback(root.__code__, first.offset, leaf, object())
+    profiler.call_callback(root.__code__, first.offset, other, object())
+    profiler.call_callback(root.__code__, second.offset, leaf, object())
+    profiler.call_callback((lambda: None).__code__, first.offset, leaf, object())
+
+    payload = profiler.payload()
+    call_edges = cast(list[dict[str, object]], payload["call_edges"])
+    assert [edge["invocation_count"] for edge in call_edges] == [1, 1]
+    assert all("callable_identities" not in edge for edge in call_edges)
 
 
 def test_type_profiler_reports_monitoring_tool_conflict(
@@ -1184,6 +1309,24 @@ def _write_spawn_site_project(root: Path) -> None:
     )
 
 
+def _write_call_edge_project(root: Path) -> str:
+    source = (
+        "def leaf(value: int) -> int:\n"
+        "    return value + 1\n\n"
+        "def root() -> int:\n"
+        "    total = 0\n"
+        f"    for item in range({DIRECT_CALL_EDGE_CALLS}):\n"
+        "        total += leaf(item)\n"
+        "    return total\n"
+    )
+    (root / "call_edge_case.py").write_text(source, encoding="utf-8")
+    (root / "bench_call_edge.py").write_text(
+        "from call_edge_case import root\nroot()\n",
+        encoding="utf-8",
+    )
+    return source
+
+
 def _profile_bootstrap() -> ProfileBootstrapModule:
     return cast(
         ProfileBootstrapModule,
@@ -1298,6 +1441,18 @@ def _write_bootstrap_config(
                         "end_col_offset": target.end_col_offset,
                     }
                     for target in config.spawn_targets
+                ],
+                "call_edge_targets": [
+                    {
+                        "id": target.id,
+                        "owner": target.owner.stable_id,
+                        "callee": target.callee.stable_id,
+                        "lineno": target.lineno,
+                        "col_offset": target.col_offset,
+                        "end_lineno": target.end_lineno,
+                        "end_col_offset": target.end_col_offset,
+                    }
+                    for target in config.call_edge_targets
                 ],
             }
         ),
