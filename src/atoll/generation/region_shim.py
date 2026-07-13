@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from atoll.models import Backend, BindingTarget
+from atoll.native_optimization.models import (
+    ExactTypeGuardPayload,
+    GuardExpression,
+    IntegerDomainGuardPayload,
+)
 
 _MARKER_LABEL = "ATOLL TYPED REGIONS"
 
@@ -65,6 +70,7 @@ class RegionShimConfig:
         variant_id: Stable dispatcher-variant identity. The region ID is used when omitted.
         dispatch_rank: Explicit dispatcher priority. Generic mypyc/Cython defaults are used when
             omitted; specialized lowerings provide a smaller rank.
+        variant_guards: Structured checks applied before selecting this compiled variant.
     """
 
     source_module: str
@@ -77,6 +83,7 @@ class RegionShimConfig:
     outlined_shell: OutlinedShellConfig | None = None
     variant_id: str | None = None
     dispatch_rank: int | None = None
+    variant_guards: tuple[GuardExpression, ...] = ()
 
     def __post_init__(self) -> None:
         """Reject configs the current runtime binder cannot preserve.
@@ -92,6 +99,10 @@ class RegionShimConfig:
             raise ValueError("region shim requires at least one promised binding")
         if self.outlined_shell is not None and len(self.bindings) != 1:
             raise ValueError("outlined region shim requires exactly one public binding")
+        if any(guard.kind not in {"exact-type", "integer-domain"} for guard in self.variant_guards):
+            raise ValueError(
+                "region shim supports only exact-type and integer-domain variant guards"
+            )
         for binding in self.bindings:
             if binding.source.module != self.source_module:
                 raise ValueError("region shim binding belongs to another source module")
@@ -223,7 +234,7 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "                **_atoll_guard,",
             "                'types': tuple(",
             "                    _atoll_resolve_type(_atoll_path)",
-            "                    for _atoll_path in _atoll_guard['nominal_type_paths']",
+            "                    for _atoll_path in _atoll_guard.get('nominal_type_paths', ())",
             "                ),",
             "            }",
             "            for _atoll_guard in _atoll_guards",
@@ -235,6 +246,20 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "            if _atoll_parameter not in _atoll_values:",
             "                return False",
             "            _atoll_value = _atoll_values[_atoll_parameter]",
+            "            _atoll_kind = _atoll_guard.get('kind', 'runtime-type')",
+            "            if _atoll_kind == 'exact-type':",
+            "                if len(_atoll_guard['types']) == 1 and type(_atoll_value) is (",
+            "                    _atoll_guard['types'][0]",
+            "                ):",
+            "                    continue",
+            "                return False",
+            "            if _atoll_kind == 'integer-domain':",
+            "                if type(_atoll_value) is int and (",
+            "                    _atoll_guard['minimum'] <= _atoll_value",
+            "                    <= _atoll_guard['maximum']",
+            "                ):",
+            "                    continue",
+            "                return False",
             "            if _atoll_value is None and _atoll_guard['allow_none']:",
             "                continue",
             "            if _atoll_guard['types']:",
@@ -1057,6 +1082,7 @@ def _runtime_region(config: RegionShimConfig) -> dict[str, object]:
                 "required": binding.required,
                 "guards": tuple(
                     {
+                        "kind": "runtime-type",
                         "parameter_name": guard.parameter_name,
                         "positional_index": guard.positional_index,
                         "annotation": guard.annotation,
@@ -1064,11 +1090,45 @@ def _runtime_region(config: RegionShimConfig) -> dict[str, object]:
                         "allow_none": guard.allow_none,
                     }
                     for guard in binding.guards
-                ),
+                )
+                + tuple(_structured_guard(guard) for guard in config.variant_guards),
             }
             for binding in config.bindings
         ),
     }
+
+
+def _structured_guard(guard: GuardExpression) -> dict[str, object]:
+    """Serialize one safe scalar guard for staged runtime dispatch.
+
+    Args:
+        guard: Structured guard produced by scalar proof analysis.
+
+    Returns:
+        dict[str, object]: Literal-only runtime mapping embedded in the staged shim.
+
+    Raises:
+        ValueError: If a future guard kind reaches this milestone's renderer.
+    """
+    if guard.kind == "exact-type" and isinstance(guard.payload, ExactTypeGuardPayload):
+        path = (
+            guard.payload.type_qualname
+            if guard.payload.type_module == "builtins"
+            else f"{guard.payload.type_module}.{guard.payload.type_qualname}"
+        )
+        return {
+            "kind": "exact-type",
+            "parameter_name": guard.payload.subject,
+            "nominal_type_paths": (path,),
+        }
+    if guard.kind == "integer-domain" and isinstance(guard.payload, IntegerDomainGuardPayload):
+        return {
+            "kind": "integer-domain",
+            "parameter_name": guard.payload.subject,
+            "minimum": guard.payload.minimum,
+            "maximum": guard.payload.maximum,
+        }
+    raise ValueError(f"unsupported structured region guard: {guard.kind}")
 
 
 def _binding_runtime_qualname(binding: BindingTarget) -> str:

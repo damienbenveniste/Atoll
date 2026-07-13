@@ -1,10 +1,9 @@
-"""Programmatic Cython build backend for source-clean typed regions.
+"""Programmatic Cython build backend for source-clean native regions.
 
-The backend compiles prepared pure-Python region modules with Cython while
-preserving Python annotation semantics. It owns capability assessment,
-content/toolchain fingerprinting, in-process extension builds, and stable
-diagnostic normalization; source generation and runtime binding remain outside
-this module.
+The backend compiles preserved ``.py`` regions and proof-authorized ``.pyx``
+specializations. It owns capability assessment, content/toolchain fingerprinting,
+portable compiler optimization, in-process extension builds, and stable diagnostic
+normalization; source generation and runtime binding remain outside this module.
 """
 
 from __future__ import annotations
@@ -51,7 +50,7 @@ from atoll.models import (
     TypedRegion,
 )
 
-_CYTHON_ADAPTER_VERSION = "2"
+_CYTHON_ADAPTER_VERSION = "3"
 _DIRECTIVES: dict[str, object] = {
     "language_level": 3,
     "annotation_typing": False,
@@ -61,6 +60,9 @@ _DIRECTIVES: dict[str, object] = {
 }
 _MAX_DIAGNOSTIC_LINES = 20
 _SHARED_REGION_ID = "__shared__"
+_SUPPORTED_SOURCE_SUFFIXES = frozenset({".py", ".pyx"})
+_PROOF_GENERATED_PYX_MARKER = "# atoll scalar proof "
+_PORTABLE_OPTIMIZATION_FLAGS = ("/O2",) if os.name == "nt" else ("-O3",)
 
 
 class _CythonizeFunction(Protocol):
@@ -204,9 +206,16 @@ class CythonBackend:
             raise UnsupportedBackendRegionError(
                 f"cython cannot lower requested members for {request.region.id}: {names}"
             )
-        if request.source_path.suffix != ".py":
+        if request.source_path.suffix not in _SUPPORTED_SOURCE_SUFFIXES:
             raise UnsupportedBackendRegionError(
-                f"cython only lowers pure-Python .py units: {request.source_path}"
+                f"cython lowers only .py and proof-generated .pyx units: {request.source_path}"
+            )
+        if request.source_path.suffix == ".pyx" and not _is_proof_generated_pyx(
+            request.source_path
+        ):
+            raise UnsupportedBackendRegionError(
+                f"cython .pyx lowering requires Atoll scalar proof provenance: "
+                f"{request.source_path}"
             )
         return CompilationUnit(
             region_id=request.variant_id or request.region.id,
@@ -263,6 +272,7 @@ class CythonBackend:
             "cython_version": importlib_metadata.version("Cython"),
             "setuptools_version": importlib_metadata.version("setuptools"),
             "directives": _DIRECTIVES,
+            "portable_optimization_flags": _PORTABLE_OPTIMIZATION_FLAGS,
             "python_cache_tag": sys.implementation.cache_tag,
             "platform": sysconfig.get_platform(),
             "soabi": sysconfig.get_config_var("SOABI"),
@@ -275,6 +285,7 @@ class CythonBackend:
             "install_relative_dir": unit.install_relative_dir,
             "source_hash": unit.source_hash,
             "source_digests": [_file_digest(path) for path in unit.source_paths],
+            "source_suffixes": [path.suffix for path in unit.source_paths],
             "members": [member.stable_id for member in unit.members],
             "project_root": str(context.project_root.resolve()),
             "source_roots": [str(path.resolve()) for path in context.source_roots],
@@ -402,13 +413,40 @@ def _validate_units(
         raise ValueError(
             f"{expected_backend} backend received source-less unit(s): {', '.join(empty)}"
         )
-    non_python = tuple(
-        str(path) for unit in units for path in unit.source_paths if path.suffix != ".py"
+    unsupported_sources = tuple(
+        str(path)
+        for unit in units
+        for path in unit.source_paths
+        if path.suffix not in _SUPPORTED_SOURCE_SUFFIXES
     )
-    if non_python:
+    if unsupported_sources:
         raise ValueError(
-            f"{expected_backend} backend received non-pure-Python unit(s): {', '.join(non_python)}"
+            f"{expected_backend} backend received unsupported source unit(s): "
+            f"{', '.join(unsupported_sources)}"
         )
+    unproven_pyx = tuple(
+        str(path)
+        for unit in units
+        for path in unit.source_paths
+        if path.suffix == ".pyx" and not _is_proof_generated_pyx(path)
+    )
+    if unproven_pyx:
+        raise ValueError(
+            f"{expected_backend} backend received .pyx unit(s) without scalar proof provenance: "
+            f"{', '.join(unproven_pyx)}"
+        )
+
+
+def _is_proof_generated_pyx(path: Path) -> bool:
+    """Return whether a Cython source carries Atoll's proof-generation marker.
+
+    Args:
+        path: Candidate `.pyx` source supplied to the backend.
+
+    Returns:
+        bool: Whether the file was emitted by Atoll's scalar proof generator.
+    """
+    return _PROOF_GENERATED_PYX_MARKER in path.read_text(encoding="utf-8")
 
 
 def _build_units(
@@ -551,7 +589,11 @@ def _cythonize_extensions(
     cythonized_dir = build_dir / "cythonized"
     cythonized_dir.mkdir(parents=True, exist_ok=True)
     extensions = [
-        Extension(unit.logical_module, [_project_path(unit.source_paths[0], project_root)])
+        Extension(
+            unit.logical_module,
+            [_project_path(unit.source_paths[0], project_root)],
+            extra_compile_args=list(_PORTABLE_OPTIMIZATION_FLAGS),
+        )
         for unit in units
     ]
     return cythonize(

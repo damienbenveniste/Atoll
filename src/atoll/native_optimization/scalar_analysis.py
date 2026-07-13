@@ -585,7 +585,7 @@ def _attempt_width(
         environment[parameter.name] = ClosedIntInterval.closed(minimum, maximum)
     try:
         state = _analyze_block(
-            context.node.body,
+            _callable_body(context.node),
             _ProofState(environment, (), ()),
             context.native,
         )
@@ -599,6 +599,18 @@ def _attempt_width(
     if any(not record.proof.fits_native(context.native) for record in state.operations):
         return None
     return state
+
+
+def _callable_body(node: ast.FunctionDef) -> list[ast.stmt]:
+    body = list(node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body.pop(0)
+    return body
 
 
 def _parameter_minimums(
@@ -936,6 +948,14 @@ def _evaluate(
         proof = subtract(ClosedIntInterval.point(0), operand)
         return _proved_result(proof, expression), (*records, _record(expression, proof))
     if isinstance(expression, ast.BinOp):
+        if isinstance(expression.op, ast.Pow) and not (
+            isinstance(expression.right, ast.Constant) and type(expression.right.value) is int
+        ):
+            raise _AnalysisError(
+                "unsupported-expression",
+                "scalar powers require a literal integer exponent",
+                getattr(expression.right, "lineno", None),
+            )
         left, left_records = _evaluate(expression.left, environment)
         right, right_records = _evaluate(expression.right, environment)
         proof = _binary_proof(expression.op, left, right, expression)

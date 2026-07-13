@@ -1,0 +1,20 @@
+[project]
+name = "native-optimization-project"
+version = "0.1.0"
+description = "Generic native-optimization acceptance fixture."
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["setuptools>=69", "wheel>=0.43"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.atoll.compile]
+test_command = ["python", "-m", "pytest", "tests", "-q"]
+benchmark_command = ["python", "benchmarks/run_native_workload.py", "--iterations", "6000"]
+minimum_speedup = 1.25
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

@@ -18,14 +18,112 @@ from atoll.generation.region_shim import (
     RegionShimConfig,
     insert_or_replace_region_shim,
 )
+from atoll.generation.scalar_kernel import (
+    ScalarKernelGenerationRequest,
+    generate_scalar_kernel,
+)
 from atoll.generation.typed_region import (
     TypedRegionGenerationOptions,
     generate_typed_method_region,
 )
 from atoll.models import BackendCompileContext, BackendLoweringRequest, ModuleId
+from atoll.native_optimization.scalar_analysis import analyze_scalar_scan
 
 SENT_VALUE = 3
 LARGE_INTEGER = 10**40
+SCALAR_VALUE = 12
+SCALAR_BIAS = 3
+SCALAR_EXPECTED = 147
+SCALAR_BOOL_EXPECTED = 4
+
+
+def test_cython_compiles_guarded_fixed_width_scalar_variant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generated .pyx kernel routes exact safe ints and falls back before entry."""
+    module_name = "cython_scalar_runtime"
+    source_path = tmp_path / f"{module_name}.py"
+    source = """def polynomial(value: int, *, bias: int = 1) -> int:
+    return value * value + bias
+"""
+    source_path.write_text(source, encoding="utf-8")
+    scan = enrich_island_analysis(scan_module(ModuleId(name=module_name, path=source_path)))
+    plan = analyze_scalar_scan(scan).plans[0]
+    region = next(item for item in scan.typed_regions if item.id == plan.region_id)
+    proof = plan.width_proofs[0]
+    logical_module = "_atoll_cython_scalar_runtime"
+    variant_id = f"{plan.id}@cython-i32"
+    generated = generate_scalar_kernel(
+        ScalarKernelGenerationRequest(
+            scan=scan,
+            region=region,
+            plan=plan,
+            width_proof=proof,
+            logical_module=logical_module,
+            output_path=tmp_path / f"{logical_module}.pyx",
+        )
+    )
+    backend = CythonBackend()
+    unit = backend.lower(
+        BackendLoweringRequest(
+            region=region,
+            source_path=generated.generation.source_path,
+            logical_module=logical_module,
+            install_relative_dir="compiled",
+            members=(plan.member,),
+            variant_id=variant_id,
+        )
+    )
+    result = backend.compile(
+        (unit,),
+        BackendCompileContext(
+            project_root=tmp_path,
+            build_dir=tmp_path / ".atoll" / "build",
+            source_roots=(tmp_path,),
+        ),
+    )
+
+    assert result.attempt.success is True, result.attempt.stderr
+    config = RegionShimConfig(
+        source_module=module_name,
+        source_path=source_path,
+        region_id=region.id,
+        variant_id=variant_id,
+        backend="cython",
+        compiled_module=logical_module,
+        artifact_dir=tmp_path / ".atoll" / "artifacts",
+        bindings=generated.generation.bindings,
+        dispatch_rank=10,
+        variant_guards=proof.guards,
+    )
+    source_path.write_text(
+        insert_or_replace_region_shim(source, (config,)).new_text,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "path", [str(tmp_path), *sys.path])
+    sys.modules.pop(module_name, None)
+    module = importlib.import_module(module_name)
+
+    assert module.polynomial(SCALAR_VALUE, bias=SCALAR_BIAS) == SCALAR_EXPECTED
+    assert module.polynomial(True, bias=SCALAR_BIAS) == SCALAR_BOOL_EXPECTED
+    assert module.polynomial(LARGE_INTEGER, bias=SCALAR_BIAS) == (
+        LARGE_INTEGER * LARGE_INTEGER + SCALAR_BIAS
+    )
+    candidate = module.polynomial.__atoll_binding_variants__[0]
+    compiled_target = candidate["target"]
+
+    def native_probe(*_args: object, **_kwargs: object) -> int:
+        raise RuntimeError("native route")
+
+    candidate["target"] = native_probe
+    with pytest.raises(RuntimeError, match="native route"):
+        module.polynomial(SCALAR_VALUE, bias=SCALAR_BIAS)
+    assert module.polynomial(True, bias=SCALAR_BIAS) == SCALAR_BOOL_EXPECTED
+    assert module.polynomial(LARGE_INTEGER, bias=SCALAR_BIAS) == (
+        LARGE_INTEGER * LARGE_INTEGER + SCALAR_BIAS
+    )
+    candidate["target"] = compiled_target
 
 
 def test_cython_outlined_coroutine_routes_through_native_helper(

@@ -23,7 +23,7 @@ from atoll.runtime.performance import run_performance_command
 
 FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
 COMPILED_SYMBOL_COUNT = 11
-COMPILED_REGION_COUNT = 7
+COMPILED_REGION_COUNT = 9
 SCALE_RESULT = 23
 PARSED_RESULT = 7
 ADJUSTED_RESULT = 6

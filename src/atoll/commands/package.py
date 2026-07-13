@@ -65,6 +65,11 @@ from atoll.generation.region_shim import (
     insert_or_replace_region_shim,
     remove_region_shim,
 )
+from atoll.generation.scalar_kernel import (
+    SCALAR_KERNEL_GENERATOR_VERSION,
+    ScalarKernelGenerationRequest,
+    generate_scalar_kernel,
+)
 from atoll.generation.task_fusion import generate_eager_task_fusion
 from atoll.generation.typed_region import (
     TYPED_METHOD_GENERATOR_VERSION,
@@ -97,7 +102,12 @@ from atoll.models import (
     SymbolId,
     TypedRegion,
 )
-from atoll.native_optimization.scalar_analysis import ScalarAnalysisResult, analyze_scalar_scan
+from atoll.native_optimization.scalar_analysis import (
+    ScalarAnalysisResult,
+    ScalarKernelPlan,
+    ScalarWidthProof,
+    analyze_scalar_scan,
+)
 from atoll.project import DiscoveredProject, discover_project
 from atoll.region_cache import compile_with_region_cache
 from atoll.runtime.execution_plan_performance import (
@@ -171,9 +181,13 @@ _EXECUTION_PLAN_BACKENDS: tuple[ExecutionPlanBackend, ...] = (
 _CANDIDATE_BENCHMARK_WARMUPS = 1
 _CANDIDATE_BENCHMARK_SAMPLES = 3
 _CANDIDATE_MINIMUM_SPEEDUP = 1.01
+_SPECIALIZED_VARIANT_MINIMUM_SPEEDUP = 1.05
 _EXECUTION_PLAN_BENCHMARK_SAMPLES = 7
 _EXECUTION_PLAN_MINIMUM_SPEEDUP = 1.05
 _WHEEL_TAG_COMPONENT_COUNT = 3
+_SCALAR_INT32_WIDTH = 32
+_SCALAR_INT32_DISPATCH_RANK = 10
+_SCALAR_INT64_DISPATCH_RANK = 20
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -440,6 +454,8 @@ class _PreparedTypedRegion:
         lowering_mode: Whether the compiled target owns the whole callable or native blocks.
         native_helpers: Private native helper names used by an outlined Python shell.
         fallback_reason: Ordered deterministic backend failures preceding this successful variant.
+        minimum_marginal_speedup: Candidate-specific profitability floor, or
+            ``None`` for the generic compiler policy.
     """
 
     generation: TypedRegionGeneration
@@ -451,6 +467,7 @@ class _PreparedTypedRegion:
     lowering_mode: LoweringMode = "whole-callable"
     native_helpers: tuple[str, ...] = ()
     fallback_reason: str | None = None
+    minimum_marginal_speedup: float | None = None
 
     def __post_init__(self) -> None:
         """Require outlined variants to identify every native helper.
@@ -462,6 +479,8 @@ class _PreparedTypedRegion:
             raise ValueError("outlined prepared regions require native helpers")
         if self.lowering_mode == "whole-callable" and self.native_helpers:
             raise ValueError("whole-callable prepared regions cannot declare native helpers")
+        if self.minimum_marginal_speedup is not None and self.minimum_marginal_speedup <= 1.0:
+            raise ValueError("native variant marginal speedup must be greater than 1.0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,6 +538,44 @@ class _StagedTypedRegionContext:
     module: ModuleId
     scan: ModuleScan
     region: TypedRegion
+
+
+@dataclass(frozen=True, slots=True)
+class _ScalarVariantContext:
+    """Staged filesystem and scan evidence shared by scalar width variants.
+
+    Attributes:
+        project: Discovered target project used to map copied source roots.
+        build_root: Disposable root receiving generated scalar compilation units.
+        staged_source_roots: Copied import roots used for source-clean compilation.
+        scan: Revalidated scan of the staged module copy.
+        region: Typed region containing the scalar member.
+    """
+
+    project: DiscoveredProject
+    build_root: Path
+    staged_source_roots: tuple[Path, ...]
+    scan: ModuleScan
+    region: TypedRegion
+
+
+@dataclass(frozen=True, slots=True)
+class _ScalarExtensionContext:
+    """Compile configuration and staged roots for scalar variant extension.
+
+    Attributes:
+        project: Discovered target project and configured backend order.
+        build_root: Disposable root receiving generated scalar compilation units.
+        staged_source_roots: Copied import roots used for source-clean compilation.
+        analyses: Scalar plans and rejection evidence for selected scans.
+        progress: Optional callback receiving scalar preparation progress.
+    """
+
+    project: DiscoveredProject
+    build_root: Path
+    staged_source_roots: tuple[Path, ...]
+    analyses: tuple[ScalarAnalysisResult, ...]
+    progress: PackageProgress | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1904,32 +1961,28 @@ def _execute_typed_region_package(
     _progress(options.progress, f"copied source roots in {_duration(copy_started)}")
 
     generation_started = time.perf_counter()
-    prepared: list[_PreparedTypedRegion] = []
-    preparation_failures: list[PackageRegionBuildFailure] = []
-    for selection in context.selected:
-        try:
-            prepared.append(
-                _prepare_typed_region(
-                    project=project,
-                    build_root=build_root,
-                    staged_source_roots=staged_source_roots,
-                    selection=selection,
-                )
-            )
-        except (SyntaxError, ValueError) as lowering_error:
-            preparation_failures.append(
-                PackageRegionBuildFailure(
-                    region=selection.region,
-                    variant_id=selection.variant_id,
-                    backend=selection.backend,
-                    assessment=selection.assessment,
-                    build=_failed_region_attempt(f"typed-region lowering failed: {lowering_error}"),
-                )
-            )
+    prepared, preparation_failures = _prepare_selected_variants(
+        project=project,
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        selected=context.selected,
+    )
+    prepared, preparation_failures, scalar_variant_count = _extend_with_scalar_variants(
+        context=_ScalarExtensionContext(
+            project=project,
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            analyses=context.scalar_analyses,
+            progress=options.progress,
+        ),
+        prepared=prepared,
+        failures=preparation_failures,
+    )
     _progress(
         options.progress,
         (
-            f"lowered {len(prepared)} typed region backend variant(s); "
+            f"lowered {len(prepared)} native region variant(s), "
+            f"including {scalar_variant_count} fixed-width scalar variant(s); "
             f"kept {len(preparation_failures)} as fallback in {_duration(generation_started)}"
         ),
     )
@@ -2001,9 +2054,7 @@ def _execute_typed_region_package(
             fusion_plans=context.fusion_plans,
         )
 
-    successful_bindings = tuple(
-        binding for item in outcome.successful for binding in item.generation.bindings
-    )
+    successful_bindings = _deduplicated_public_bindings(outcome.successful)
     compiled_sources = frozenset(binding.source for binding in successful_bindings)
     missing_compiled = tuple(
         member for member in options.selected_members if member not in compiled_sources
@@ -2131,9 +2182,7 @@ def _execute_typed_region_package(
     successful_regions = tuple(
         {item.generation.region.id: item.generation.region for item in accepted_successful}.values()
     )
-    successful_bindings = tuple(
-        binding for item in accepted_successful for binding in item.generation.bindings
-    )
+    successful_bindings = _deduplicated_public_bindings(accepted_successful)
     successful_variants = tuple(
         CompiledRegionVariant(
             id=item.unit.region_id,
@@ -2179,6 +2228,50 @@ def _execute_typed_region_package(
         fusion_plans=context.fusion_plans,
         fusion_trials=fusion_research.trials,
     )
+
+
+def _prepare_selected_variants(
+    *,
+    project: DiscoveredProject,
+    build_root: Path,
+    staged_source_roots: tuple[Path, ...],
+    selected: tuple[_SelectedTypedRegion, ...],
+) -> tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure]]:
+    """Lower generic backend selections while retaining explicit failures.
+
+    Args:
+        project: Target project discovery.
+        build_root: Disposable native build root.
+        staged_source_roots: Copied import roots.
+        selected: Generic typed-region backend selections.
+
+    Returns:
+        tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure]]:
+        Prepared variants and deterministic lowering failures.
+    """
+    prepared: list[_PreparedTypedRegion] = []
+    failures: list[PackageRegionBuildFailure] = []
+    for selection in selected:
+        try:
+            prepared.append(
+                _prepare_typed_region(
+                    project=project,
+                    build_root=build_root,
+                    staged_source_roots=staged_source_roots,
+                    selection=selection,
+                )
+            )
+        except (SyntaxError, ValueError) as error:
+            failures.append(
+                PackageRegionBuildFailure(
+                    region=selection.region,
+                    variant_id=selection.variant_id,
+                    backend=selection.backend,
+                    assessment=selection.assessment,
+                    build=_failed_region_attempt(f"typed-region lowering failed: {error}"),
+                )
+            )
+    return prepared, failures
 
 
 def _prepare_typed_region(
@@ -2230,6 +2323,272 @@ def _prepare_typed_region(
     else:
         fallback = _attach_outlined_fallback(staged, fallback_selection, fallback)
     return replace(prepared, fallback=fallback)
+
+
+def _prepare_scalar_variants(
+    *,
+    project: DiscoveredProject,
+    build_root: Path,
+    staged_source_roots: tuple[Path, ...],
+    analyses: tuple[ScalarAnalysisResult, ...],
+) -> tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+    """Revalidate and lower fixed-width plans inside copied source roots.
+
+    Args:
+        project: Original project discovery used to map staged module paths.
+        build_root: Disposable source-clean build root.
+        staged_source_roots: Copied import roots that remain source-clean.
+        analyses: Checkout or accepted-source scalar proof evidence.
+
+    Returns:
+        tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+        Prepared 32/64-bit variants followed by explicit lowering failures.
+    """
+    plans = tuple(plan for analysis in analyses for plan in analysis.plans)
+    scans: dict[str, ModuleScan] = {}
+    staged_analyses: dict[str, ScalarAnalysisResult] = {}
+    prepared: list[_PreparedTypedRegion] = []
+    failures: list[PackageRegionBuildFailure] = []
+    for plan in plans:
+        module = _find_module(project.modules, plan.member.module)
+        staged_scan = scans.get(plan.member.module)
+        if staged_scan is None:
+            staged_module = _staged_module(module, project, staged_source_roots)
+            staged_scan = enrich_island_analysis(scan_module(staged_module))
+            scans[plan.member.module] = staged_scan
+            staged_analyses[plan.member.module] = analyze_scalar_scan(staged_scan)
+        staged_region = _scalar_region_for_plan(staged_scan, plan)
+        staged_plan = next(
+            (
+                candidate
+                for candidate in staged_analyses[plan.member.module].plans
+                if candidate.id == plan.id and candidate.member == plan.member
+            ),
+            None,
+        )
+        if staged_plan is None:
+            failures.append(
+                PackageRegionBuildFailure(
+                    region=staged_region,
+                    variant_id=f"{plan.id}@cython-scalar",
+                    backend="cython",
+                    assessment=CYTHON_BACKEND.assess(staged_region),
+                    build=_failed_region_attempt(
+                        "scalar lowering failed: staged proof differs from checkout analysis"
+                    ),
+                )
+            )
+            continue
+        for proof in staged_plan.width_proofs:
+            variant_id = _scalar_variant_id(staged_plan, proof)
+            try:
+                prepared.append(
+                    _prepare_scalar_variant(
+                        context=_ScalarVariantContext(
+                            project=project,
+                            build_root=build_root,
+                            staged_source_roots=staged_source_roots,
+                            scan=staged_scan,
+                            region=staged_region,
+                        ),
+                        plan=staged_plan,
+                        variant_id=variant_id,
+                        proof=proof,
+                    )
+                )
+            except (SyntaxError, ValueError) as error:
+                failures.append(
+                    PackageRegionBuildFailure(
+                        region=staged_region,
+                        variant_id=variant_id,
+                        backend="cython",
+                        assessment=CYTHON_BACKEND.assess(staged_region),
+                        build=_failed_region_attempt(f"scalar lowering failed: {error}"),
+                    )
+                )
+    return tuple(prepared), tuple(failures)
+
+
+def _extend_with_scalar_variants(
+    *,
+    context: _ScalarExtensionContext,
+    prepared: list[_PreparedTypedRegion],
+    failures: list[PackageRegionBuildFailure],
+) -> tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure], int]:
+    """Prepend available scalar variants without changing generic fallback.
+
+    Args:
+        context: Target project, copied roots, analyses, and progress callback.
+        prepared: Existing generic native variants.
+        failures: Existing generic preparation failures.
+
+    Returns:
+        tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure], int]:
+        Updated variants, failures, and prepared scalar variant count.
+    """
+    if "cython" not in context.project.config.compile.backends:
+        if any(analysis.plans for analysis in context.analyses):
+            _progress(
+                context.progress,
+                "scalar native variants skipped because Cython is disabled",
+            )
+        return prepared, failures, 0
+    selected_sources = {
+        binding.source
+        for item in prepared
+        for binding in item.generation.bindings
+        if binding.kind != "class"
+    }
+    selected_sources.update(
+        member.id
+        for failure in failures
+        for member in failure.region.members
+        if member.kind in {"function", "method"}
+    )
+    selected_analyses = tuple(
+        replace(
+            analysis,
+            plans=tuple(plan for plan in analysis.plans if plan.member in selected_sources),
+        )
+        for analysis in context.analyses
+    )
+    scalar_prepared, scalar_failures = _prepare_scalar_variants(
+        project=context.project,
+        build_root=context.build_root,
+        staged_source_roots=context.staged_source_roots,
+        analyses=selected_analyses,
+    )
+    return (
+        _merge_scalar_companions(prepared, scalar_prepared),
+        [*failures, *scalar_failures],
+        len(scalar_prepared),
+    )
+
+
+def _merge_scalar_companions(
+    generic: list[_PreparedTypedRegion],
+    scalar: tuple[_PreparedTypedRegion, ...],
+) -> list[_PreparedTypedRegion]:
+    """Place scalar variants beside the selected generic public binding.
+
+    Atomic class variants retain their existing first position. Scalar method
+    companions inherit the method fallback's class-failure condition, while
+    module functions try int32, int64, then their generic target.
+
+    Args:
+        generic: Existing generic variants in selection priority order.
+        scalar: Width variants in frontend dispatch order.
+
+    Returns:
+        list[_PreparedTypedRegion]: Composable variant order used for build and trials.
+    """
+    by_source: dict[SymbolId, list[_PreparedTypedRegion]] = {}
+    for item in scalar:
+        source = item.generation.bindings[0].source
+        by_source.setdefault(source, []).append(item)
+    merged: list[_PreparedTypedRegion] = []
+    for item in generic:
+        sources = tuple(
+            binding.source for binding in item.generation.bindings if binding.kind != "class"
+        )
+        for source in sources:
+            merged.extend(
+                replace(companion, conditional_on_failure_of=item.conditional_on_failure_of)
+                for companion in by_source.pop(source, ())
+            )
+        merged.append(item)
+    merged.extend(companion for companions in by_source.values() for companion in companions)
+    return merged
+
+
+def _prepare_scalar_variant(
+    *,
+    context: _ScalarVariantContext,
+    plan: ScalarKernelPlan,
+    variant_id: str,
+    proof: ScalarWidthProof,
+) -> _PreparedTypedRegion:
+    """Generate one Cython fixed-width variant and staged dispatcher config.
+
+    Args:
+        context: Target project, copied roots, scan, and region evidence.
+        plan: Revalidated scalar kernel plan.
+        variant_id: Stable width-specific variant identity.
+        proof: Width proof selected from ``plan``.
+
+    Returns:
+        _PreparedTypedRegion: Compilable unit and guarded runtime binding.
+
+    """
+    logical_module = _typed_region_module_name(context.region, "cython", variant_id)
+    generated_path = context.build_root / f"{logical_module}.pyx"
+    generated = generate_scalar_kernel(
+        ScalarKernelGenerationRequest(
+            scan=context.scan,
+            region=context.region,
+            plan=plan,
+            width_proof=proof,
+            logical_module=logical_module,
+            output_path=generated_path,
+        )
+    )
+    unit = CYTHON_BACKEND.lower(
+        BackendLoweringRequest(
+            region=context.region,
+            source_path=generated_path,
+            logical_module=logical_module,
+            install_relative_dir=_region_artifact_relative_dir(variant_id),
+            members=(plan.member,),
+            variant_id=variant_id,
+        )
+    )
+    source_module = _find_module(context.project.modules, context.scan.module.name)
+    staged_source_root = _staged_source_root(
+        source_module,
+        context.project,
+        context.staged_source_roots,
+    )
+    return _PreparedTypedRegion(
+        generation=generated.generation,
+        assessment=CYTHON_BACKEND.assess(context.region),
+        unit=unit,
+        shim=RegionShimConfig(
+            source_module=context.scan.module.name,
+            source_path=context.scan.module.path,
+            region_id=context.region.id,
+            variant_id=variant_id,
+            backend="cython",
+            compiled_module=logical_module,
+            artifact_dir=staged_source_root / unit.install_relative_dir,
+            bindings=generated.generation.bindings,
+            dispatch_rank=(
+                _SCALAR_INT32_DISPATCH_RANK
+                if proof.native.width == _SCALAR_INT32_WIDTH
+                else _SCALAR_INT64_DISPATCH_RANK
+            ),
+            variant_guards=proof.guards,
+        ),
+        minimum_marginal_speedup=_SPECIALIZED_VARIANT_MINIMUM_SPEEDUP,
+    )
+
+
+def _scalar_region_for_plan(scan: ModuleScan, plan: ScalarKernelPlan) -> TypedRegion:
+    region = next(
+        (
+            candidate
+            for candidate in scan.typed_regions
+            if any(member.id == plan.member for member in candidate.members)
+        ),
+        None,
+    )
+    if region is None:
+        raise ValueError(f"staged scalar member is absent: {plan.member.stable_id}")
+    return region
+
+
+def _scalar_variant_id(plan: ScalarKernelPlan, proof: ScalarWidthProof) -> str:
+    signed = "i" if proof.native.signed else "u"
+    return f"{plan.id}@cython-{signed}{proof.native.width}"
 
 
 def _attach_outlined_fallback(
@@ -2519,6 +2878,31 @@ def _prepared_backend_assessments(
     return tuple(assessments.values())
 
 
+def _deduplicated_public_bindings(
+    prepared: tuple[_PreparedTypedRegion, ...],
+) -> tuple[BindingTarget, ...]:
+    """Collapse native variants to one report-facing public binding promise.
+
+    Args:
+        prepared: Accepted scalar, generic, and specialization variants.
+
+    Returns:
+        tuple[BindingTarget, ...]: First binding for each public installation destination.
+    """
+    bindings: dict[tuple[object, ...], BindingTarget] = {}
+    for item in prepared:
+        for binding in item.generation.bindings:
+            identity = (
+                binding.source,
+                binding.kind,
+                binding.owner_class,
+                binding.target_owner_class,
+                binding.execution_kind,
+            )
+            bindings.setdefault(identity, binding)
+    return tuple(bindings.values())
+
+
 def _build_typed_regions(
     *,
     prepared: tuple[_PreparedTypedRegion, ...],
@@ -2539,6 +2923,7 @@ def _build_typed_regions(
         backend_options=(
             ("typed_region_generator", TYPED_METHOD_GENERATOR_VERSION),
             ("outlined_region_generator", OUTLINED_REGION_GENERATOR_VERSION),
+            ("scalar_kernel_generator", SCALAR_KERNEL_GENERATOR_VERSION),
         ),
     )
     for index, item in enumerate(prepared, start=1):
@@ -5064,7 +5449,11 @@ def _select_profitable_candidates(
                     command=benchmark_command,
                     warmups=_CANDIDATE_BENCHMARK_WARMUPS,
                     samples=_CANDIDATE_BENCHMARK_SAMPLES,
-                    minimum_speedup=_CANDIDATE_MINIMUM_SPEEDUP,
+                    minimum_speedup=(
+                        prepared.minimum_marginal_speedup
+                        if prepared.minimum_marginal_speedup is not None
+                        else _CANDIDATE_MINIMUM_SPEEDUP
+                    ),
                 ),
                 project_root=quality_root,
                 baseline_payload_root=context.payload_root,

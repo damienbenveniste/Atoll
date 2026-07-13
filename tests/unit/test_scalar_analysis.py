@@ -272,6 +272,29 @@ def test_scalar_analysis_rejects_unsafe_callable_shapes(tmp_path: Path) -> None:
     assert rejected["Worker.instance"].code == "unsupported-binding"
 
 
+def test_scalar_analysis_rejects_nonliteral_power_exponents(tmp_path: Path) -> None:
+    """Proof and code generation agree that power exponents are AST literals."""
+    scan = _scan(
+        tmp_path,
+        """
+        EXPONENT = 2
+
+        def named_power(value: int) -> int:
+            return value ** EXPONENT
+
+        def local_power(value: int) -> int:
+            exponent = 2
+            return value ** exponent
+        """,
+    )
+
+    result = analyze_scalar_scan(scan)
+    rejected = {rejection.member.qualname: rejection for rejection in result.rejections}
+
+    assert rejected["named_power"].code == "unproven-arithmetic"
+    assert rejected["local_power"].code == "unproven-arithmetic"
+
+
 def test_scalar_member_rejects_annotations_defaults_and_external_mutation(tmp_path: Path) -> None:
     """Scalar proof never invents integer semantics for incomplete declarations."""
     cases = (

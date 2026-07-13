@@ -239,13 +239,39 @@ def test_cython_lower_validates_requested_members_and_variant_id(tmp_path: Path)
             )
         )
 
-    non_python_path = source_path.with_suffix(".pyx")
-    non_python_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
-    with pytest.raises(UnsupportedBackendRegionError, match=r"only lowers pure-Python \.py"):
+    cython_path = source_path.with_suffix(".pyx")
+    cython_path.write_text(
+        "# atoll scalar proof fixture\n" + source_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    cython_unit = backend.lower(
+        BackendLoweringRequest(
+            region=region,
+            source_path=cython_path,
+            logical_module="cython_lowering_specialized",
+            members=(scale,),
+        )
+    )
+    assert cython_unit.source_paths == (cython_path,)
+
+    cython_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(UnsupportedBackendRegionError, match="requires Atoll scalar proof"):
         backend.lower(
             BackendLoweringRequest(
                 region=region,
-                source_path=non_python_path,
+                source_path=cython_path,
+                logical_module="cython_lowering_unproven",
+                members=(scale,),
+            )
+        )
+
+    unsupported_path = source_path.with_suffix(".txt")
+    unsupported_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(UnsupportedBackendRegionError, match=r"only \.py and proof-generated \.pyx"):
+        backend.lower(
+            BackendLoweringRequest(
+                region=region,
+                source_path=unsupported_path,
                 logical_module="cython_lowering",
                 members=(scale,),
             )
@@ -401,7 +427,7 @@ def test_cython_rejects_incompatible_sourceless_and_non_python_units(tmp_path: P
         region_id="non-python",
         backend="cython",
         logical_module="fixture",
-        source_paths=(tmp_path / "fixture.pyx",),
+        source_paths=(tmp_path / "fixture.txt",),
         source_hash="fixture",
         members=(),
     )
@@ -414,7 +440,7 @@ def test_cython_rejects_incompatible_sourceless_and_non_python_units(tmp_path: P
         backend.fingerprint(incompatible, context)
     with pytest.raises(ValueError, match="source-less"):
         backend.fingerprint(source_less, context)
-    with pytest.raises(ValueError, match="non-pure-Python"):
+    with pytest.raises(ValueError, match="unsupported source"):
         backend.fingerprint(non_python, context)
 
 
