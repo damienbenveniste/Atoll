@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
@@ -22,11 +23,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
+from scripts.benchmark_corpus.identity import case_digest, comparison_key
 from scripts.benchmark_corpus.manifest import ManifestError
 from scripts.benchmark_corpus.models import (
     CaseResult,
     CaseStatus,
     CompilePolicy,
+    CorpusBackend,
     CorpusCase,
     CorpusManifest,
     CorpusPlatform,
@@ -55,11 +58,14 @@ from scripts.benchmark_corpus.security import (
 )
 
 EnvironmentMode = Literal["isolated", "current-test"]
+PerformanceMode = Literal["baseline", "compiled"]
 CASE_RESULT_SCHEMA_VERSION = 1
 _NATIVE_PHASES = frozenset({"mypycify", "cythonize", "build_ext"})
 _COMPILE_REPORT_SCHEMA_VERSION = 6
 _COMPILER_WRAPPER_NAME = "compiler-probe.py"
 _BOOTSTRAP_ATTEMPTS = 2
+_BENCHMARK_WARMUPS = 1
+_BENCHMARK_SAMPLES = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +180,7 @@ class _State:
     cold_compiler_invocations: int | None = None
     warm_compiler_invocations: int | None = None
     comparison_key: str | None = None
+    ratios: RatioEvidence = field(default_factory=RatioEvidence)
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +191,22 @@ class _RunContext:
     paths: _Paths
     sandbox: Sandbox
     state: _State
+
+
+@dataclass(frozen=True, slots=True)
+class _CompileOutcome:
+    """Cold/warm compile agreement and any promoted wheel.
+
+    Attributes:
+        report: Warm schema-v6 report retained as the canonical compile evidence.
+        status: Corpus classification agreed by cold and warm compiles.
+        wheel: Promoted wheel, baseline wheel for a clean no-op, or ``None``
+            when profitability or stability prevented wheel promotion.
+    """
+
+    report: dict[str, object]
+    status: CaseStatus
+    wheel: Path | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +257,7 @@ def run_case(
     paths = _prepare_paths(case, options)
     state = _State()
     manifest_digest = _sha256_file(manifest.path)
-    case_digest = _case_digest(case)
+    case_identity = case_digest(case)
     try:
         sandbox = options.sandbox_override or detect_sandbox(options.allow_unsandboxed)
         _execute_case(
@@ -261,7 +284,7 @@ def run_case(
         if _source_changed(state):
             state.status = "compatibility-regression"
             state.diagnostics.append("Atoll changed tracked checkout files after policy injection")
-        result = _case_result(case, options, state, manifest_digest, case_digest)
+        result = _case_result(case, options, state, manifest_digest, case_identity)
         json_path, markdown_path = write_case_result(result, paths.evidence)
         if not options.keep_workspace:
             shutil.rmtree(paths.workspace, ignore_errors=True)
@@ -269,7 +292,6 @@ def run_case(
 
 
 def _execute_case(context: _RunContext) -> None:
-    manifest = context.manifest
     case = context.case
     options = context.options
     paths = context.paths
@@ -320,24 +342,344 @@ def _execute_case(context: _RunContext) -> None:
             "upstream-broken",
             "disposable checkout did not return to its pinned source identity",
         )
+    _validate_workload_assets(context)
     state.policy = append_compile_policy(
         paths.project / "pyproject.toml",
-        CompilePolicy(backends=manifest.backends),
+        _compile_policy(context, tools_python),
         paths.evidence,
         paths.checkout,
     )
+    state.comparison_key = comparison_key(case, state.environment, state.policy)
     state.source_before = tracked_source_manifest(paths.checkout)
     _write_source_manifest(state.source_before, paths.evidence / "source-manifest-before.json")
-    warm_report, compiled_wheel = _compile_cold_and_warm(
+    outcome = _compile_cold_and_warm(
         context,
         tools_python,
         compiler_environment,
         compiler_log,
         baseline_wheel,
     )
-    _verify_compiled_wheel(context, compiled_wheel, compiler_environment, lock_path, warm_report)
-    state.status = classify_compile_report(warm_report, options.tier)
-    state.comparison_key = _comparison_key(case, state.environment, state.policy)
+    state.ratios = ratio_evidence_from_report(outcome.report)
+    if outcome.wheel is not None:
+        _verify_compiled_wheel(
+            context,
+            outcome.wheel,
+            compiler_environment,
+            lock_path,
+            outcome.report,
+        )
+    state.status = outcome.status
+
+
+def _compile_policy(context: _RunContext, tools_python: Path) -> CompilePolicy:
+    """Build the disposable static or measured policy for one corpus tier.
+
+    Performance commands use the isolated case interpreter and reviewed Atoll
+    adapters by absolute path. The target checkout is supplied only as input;
+    imports are routed by Atoll to each baseline or candidate wheel payload.
+
+    Args:
+        context: Selected manifest case and trusted repository paths.
+        tools_python: Isolated interpreter containing locked case dependencies.
+
+    Returns:
+        CompilePolicy: Backend-only compatibility policy or fully configured
+            semantic and benchmark commands for a performance case.
+    """
+    if context.options.tier != "performance":
+        return CompilePolicy(backends=context.manifest.backends)
+    semantic_adapter = _reviewed_adapter_path(context, context.case.oracle_adapter)
+    performance_adapter = _reviewed_adapter_path(
+        context,
+        context.case.id.replace("-", "_"),
+    )
+    return build_performance_compile_policy(
+        backends=context.manifest.backends,
+        tools_python=tools_python,
+        adapters=(semantic_adapter, performance_adapter),
+        project_root=context.paths.project,
+        oracle_arguments=context.case.oracle_arguments,
+    )
+
+
+def build_performance_compile_policy(
+    *,
+    backends: tuple[CorpusBackend, ...],
+    tools_python: Path,
+    adapters: tuple[Path, Path],
+    project_root: Path,
+    oracle_arguments: tuple[str, ...],
+) -> CompilePolicy:
+    """Construct the exact measured policy after trusted paths are resolved.
+
+    Args:
+        backends: Manifest backend preference order.
+        tools_python: Isolated interpreter containing target dependencies.
+        adapters: Reviewed semantic and performance command sources, in that order.
+        project_root: Disposable target checkout root.
+        oracle_arguments: Case-specific semantic adapter arguments.
+
+    Returns:
+        CompilePolicy: One warmup, seven measured pairs, and the default 1.10 gate.
+    """
+    semantic_adapter, performance_adapter = adapters
+    return CompilePolicy(
+        backends=backends,
+        test_command=(
+            str(tools_python),
+            str(semantic_adapter),
+            "--project-root",
+            str(project_root),
+            *oracle_arguments,
+        ),
+        benchmark_command=(
+            str(tools_python),
+            str(performance_adapter),
+            "--project-root",
+            str(project_root),
+        ),
+        benchmark_warmups=_BENCHMARK_WARMUPS,
+        benchmark_samples=_BENCHMARK_SAMPLES,
+    )
+
+
+def _validate_workload_assets(context: _RunContext) -> None:
+    """Enforce manifest workload identity before external performance runs.
+
+    The case-local workload digest is manifest data. Shared runner and golden
+    files are tied to the recorded Atoll revision, but are still required to be
+    regular repository files so a local symlink cannot redirect execution.
+
+    Args:
+        context: Selected case and trusted Atoll repository root.
+
+    Raises:
+        LifecycleError: If a performance workload, notice, adapter, shared
+            runner, or golden oracle is missing, redirected, or digest-mismatched.
+    """
+    if context.options.tier != "performance":
+        return
+    adapter_root = context.options.adapter_root or (
+        context.options.atoll_root / "benchmarks" / "corpus" / "adapters"
+    )
+    validate_performance_assets(
+        context.options.atoll_root,
+        context.case,
+        adapter_root,
+    )
+
+
+def validate_performance_assets(
+    atoll_root: Path,
+    case: CorpusCase,
+    adapter_root: Path,
+) -> None:
+    """Validate one performance case's reviewed workload and harness files.
+
+    Args:
+        atoll_root: Repository root containing manifest-relative workload assets.
+        case: Performance case whose digest and stable ID select the workload.
+        adapter_root: Reviewed adapter directory used by the lifecycle.
+
+    Raises:
+        LifecycleError: If any required asset is unavailable or fails identity checks.
+    """
+    workload = case.workload
+    if workload is None:
+        raise LifecycleError("infrastructure-error", "performance case has no workload identity")
+    observed_digest = performance_asset_digest(atoll_root, case, adapter_root)
+    if observed_digest != workload.sha256:
+        raise LifecycleError(
+            "security-violation",
+            f"manifest workload bundle digest does not match {workload.path}",
+        )
+
+
+def performance_asset_digest(atoll_root: Path, case: CorpusCase, adapter_root: Path) -> str:
+    """Digest every reviewed file that defines one performance measurement.
+
+    Args:
+        atoll_root: Repository root containing workload and notice paths.
+        case: Performance case selecting the case-specific workload and adapter.
+        adapter_root: Reviewed adapter directory used by execution.
+
+    Returns:
+        str: Stable SHA-256 over logical path labels and exact file bytes.
+
+    Raises:
+        LifecycleError: If the case has no workload or any asset is unsafe.
+    """
+    workload = case.workload
+    if workload is None:
+        raise LifecycleError("infrastructure-error", "performance case has no workload identity")
+    root = atoll_root.resolve(strict=True)
+    workload_path = _trusted_atoll_asset(root, workload.path, "workload")
+    expected = root / "benchmarks" / "corpus" / "workloads" / (f"{case.id.replace('-', '_')}.py")
+    if workload_path != expected.resolve(strict=True):
+        raise LifecycleError(
+            "security-violation",
+            f"manifest workload path does not match case {case.id}",
+        )
+    notice = _trusted_atoll_asset(root, workload.notice, "workload notice")
+    if not notice.read_text(encoding="utf-8").strip():
+        raise LifecycleError("security-violation", f"workload notice is empty: {workload.notice}")
+    adapters = adapter_root.resolve(strict=True)
+    adapter = _trusted_atoll_asset(
+        adapters,
+        PurePosixPath(f"{case.id.replace('-', '_')}.py"),
+        "performance adapter",
+    )
+    shared = _trusted_atoll_asset(
+        root,
+        PurePosixPath("benchmarks/corpus/adapters/_performance.py"),
+        "performance harness",
+    )
+    golden = _trusted_atoll_asset(
+        root,
+        PurePosixPath("benchmarks/corpus/workloads/golden.json"),
+        "performance harness",
+    )
+    return _asset_bundle_digest(
+        (
+            (f"adapters/{adapter.name}", adapter),
+            ("adapters/_performance.py", shared),
+            ("workloads/golden.json", golden),
+            (f"workloads/{workload_path.name}", workload_path),
+            (f"notices/{notice.name}", notice),
+        )
+    )
+
+
+def _asset_bundle_digest(assets: tuple[tuple[str, Path], ...]) -> str:
+    """Hash labeled file boundaries so concatenation cannot create collisions."""
+    digest = hashlib.sha256()
+    for label, path in sorted(assets):
+        contents = path.read_bytes()
+        digest.update(label.encode())
+        digest.update(b"\0")
+        digest.update(str(len(contents)).encode())
+        digest.update(b"\0")
+        digest.update(contents)
+    return digest.hexdigest()
+
+
+def _trusted_atoll_asset(root: Path, relative: PurePosixPath, label: str) -> Path:
+    """Resolve one regular repository asset without following a final symlink."""
+    candidate = root.joinpath(*relative.parts)
+    if candidate.is_symlink():
+        raise LifecycleError("security-violation", f"{label} is a symlink: {relative}")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise LifecycleError(
+            "infrastructure-error",
+            f"{label} is unavailable: {relative}: {error}",
+        ) from error
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise LifecycleError("security-violation", f"{label} escapes Atoll: {relative}")
+    return resolved
+
+
+def _compile_timeout_seconds(context: _RunContext) -> int:
+    """Return the case override or tier default for each Atoll invocation."""
+    case = context.case
+    defaults = context.manifest.defaults
+    if context.options.tier == "performance":
+        return case.performance_timeout_seconds or defaults.performance_timeout_seconds
+    return case.compile_timeout_seconds or defaults.compile_timeout_seconds
+
+
+def classify_compile_process(
+    result: ProcessResult,
+    report: dict[str, object],
+    tier: CorpusTier,
+    label: str,
+    project_root: Path,
+) -> CaseStatus:
+    """Normalize one compile process and report without hiding rejections.
+
+    Args:
+        result: Bounded process outcome for one cold or warm invocation.
+        report: Copied schema-v6 report emitted by that invocation.
+        tier: Corpus role determining whether performance evidence is required.
+        label: ``cold`` or ``warm`` for diagnostics.
+        project_root: Disposable target root used to resolve report-relative payloads.
+
+    Returns:
+        CaseStatus: Successful, no-op, unprofitable, or unstable outcome.
+
+    Raises:
+        LifecycleError: If the process timed out, the report is malformed, a
+            semantic gate regressed, or a non-performance compile failed.
+    """
+    _validate_compile_report(report)
+    if result.timed_out:
+        raise LifecycleError("timeout", f"{label} Atoll compile exceeded its timeout")
+    if _is_clean_noop_report(report):
+        _require_rejected_compile_process(result, report, label)
+        return "supported-no-op"
+    if tier != "performance":
+        _require_success(result, "compile-error", f"{label} Atoll compile")
+        _require_successful_compile_report(report, label)
+        return classify_compile_report(report, tier)
+
+    performance = _mapping_field(report, "performance")
+    performance_status = performance.get("status")
+    if performance_status == "passed":
+        _require_success(result, "compile-error", f"{label} Atoll compile")
+        _require_successful_compile_report(report, label)
+        _validate_performance_summary(performance, "passed")
+        _validate_performance_samples(report, project_root)
+        return "accelerated"
+    if performance_status == "not-profitable":
+        _require_rejected_compile_process(result, report, label)
+        _validate_performance_summary(performance, "not-profitable")
+        _validate_performance_samples(report, project_root)
+        return "not-profitable"
+    if performance_status == "invalid":
+        _require_rejected_compile_process(result, report, label)
+        reason = performance.get("reason")
+        reason_text = reason if isinstance(reason, str) else "invalid performance gate"
+        if "compiled semantic test command failed" in reason_text:
+            raise LifecycleError("compatibility-regression", reason_text)
+        if "baseline semantic test command failed" in reason_text:
+            raise LifecycleError("upstream-broken", reason_text)
+        if "too noisy" in reason_text:
+            _validate_performance_summary(performance, "invalid")
+            _validate_performance_samples(report, project_root)
+            return "unstable"
+        raise LifecycleError("compile-error", f"{label} performance gate: {reason_text}")
+    _require_success(result, "compile-error", f"{label} Atoll compile")
+    raise LifecycleError(
+        "compile-error",
+        f"{label} performance compile reported unexpected status {performance_status!r}",
+    )
+
+
+def _agreed_compile_status(cold: CaseStatus, warm: CaseStatus) -> CaseStatus:
+    """Require deterministic compile shape while tolerating timing variance."""
+    if cold == warm:
+        return warm
+    measured = {"accelerated", "not-profitable", "unstable"}
+    if cold in measured and warm in measured:
+        return "unstable"
+    raise LifecycleError(
+        "compile-error",
+        f"cold and warm compile classifications differed: {cold} versus {warm}",
+    )
+
+
+def _compiled_wheel_for_status(
+    paths: _Paths,
+    baseline_wheel: Path,
+    status: CaseStatus,
+) -> Path | None:
+    """Locate only wheels that the status contract permits corpus verification."""
+    if status == "supported-no-op":
+        return baseline_wheel
+    if status in {"accelerated", "compiled-unbenchmarked"}:
+        return _single_wheel(paths.project / ".atoll" / "dist")
+    return None
 
 
 def _compile_cold_and_warm(
@@ -346,9 +688,14 @@ def _compile_cold_and_warm(
     compiler_environment: dict[str, str],
     compiler_log: Path,
     baseline_wheel: Path,
-) -> tuple[dict[str, object], Path]:
-    """Run identical cold and warm compiles and prove native cache reuse."""
-    manifest = context.manifest
+) -> _CompileOutcome:
+    """Run identical cold and warm compiles and prove native cache reuse.
+
+    A schema-backed no-op, profitability rejection, or noisy benchmark is a
+    completed corpus outcome even though ``atoll compile`` intentionally exits
+    nonzero and does not publish a wheel. Compiler, semantic, and malformed
+    report failures still abort with their precise lifecycle classification.
+    """
     options = context.options
     paths = context.paths
     state = context.state
@@ -362,11 +709,8 @@ def _compile_cold_and_warm(
         "--root",
         str(paths.project),
     )
-    compile_timeout = (
-        manifest.defaults.performance_timeout_seconds
-        if options.tier == "performance"
-        else manifest.defaults.compile_timeout_seconds
-    )
+    compile_timeout = _compile_timeout_seconds(context)
+    _remove_compile_reports(paths)
     cold = _phase(
         context,
         _PhaseRequest(
@@ -380,10 +724,15 @@ def _compile_cold_and_warm(
     _retain_compiler_probe(paths, compiler_log)
     state.cold_report_path = _copy_compile_report(paths, "cold")
     cold_report = _read_json_object(paths.evidence / "cold.compile-report.json")
-    cold_noop = _is_clean_noop_report(cold_report)
-    if not cold_noop:
-        _require_success(cold, "compile-error", "cold Atoll compile")
+    cold_status = classify_compile_process(
+        cold,
+        cold_report,
+        options.tier,
+        "cold",
+        paths.project,
+    )
     state.cold_compiler_invocations = _line_count(compiler_log)
+    _remove_compile_reports(paths)
     warm = _phase(
         context,
         _PhaseRequest(
@@ -397,11 +746,13 @@ def _compile_cold_and_warm(
     _retain_compiler_probe(paths, compiler_log)
     state.warm_report_path = _copy_compile_report(paths, "warm")
     warm_report = _read_json_object(paths.evidence / "warm.compile-report.json")
-    warm_noop = _is_clean_noop_report(warm_report)
-    if warm_noop != cold_noop:
-        raise LifecycleError("compile-error", "cold and warm no-op classification differed")
-    if not warm_noop:
-        _require_success(warm, "compile-error", "warm Atoll compile")
+    warm_status = classify_compile_process(
+        warm,
+        warm_report,
+        options.tier,
+        "warm",
+        paths.project,
+    )
     state.warm_compiler_invocations = _line_count(compiler_log) - state.cold_compiler_invocations
     if state.warm_compiler_invocations:
         raise LifecycleError(
@@ -411,11 +762,15 @@ def _compile_cold_and_warm(
     _validate_warm_report(warm_report)
     state.source_after = tracked_source_manifest(paths.checkout)
     _write_source_manifest(state.source_after, paths.evidence / "source-manifest-after.json")
-    compiled_wheel = (
-        baseline_wheel if warm_noop else _single_wheel(paths.project / ".atoll" / "dist")
-    )
-    state.compiled_wheel_digest = _sha256_file(compiled_wheel)
-    return warm_report, compiled_wheel
+    status = _agreed_compile_status(cold_status, warm_status)
+    if status == "unstable" and cold_status != warm_status:
+        state.diagnostics.append(
+            f"cold and warm performance outcomes differed: {cold_status} versus {warm_status}"
+        )
+    wheel = _compiled_wheel_for_status(paths, baseline_wheel, status)
+    if wheel is not None:
+        state.compiled_wheel_digest = _sha256_file(wheel)
+    return _CompileOutcome(report=warm_report, status=status, wheel=wheel)
 
 
 def _verify_compiled_wheel(
@@ -849,17 +1204,9 @@ def _run_oracle(
     arm: _Arm,
 ) -> str:
     case = context.case
-    options = context.options
     paths = context.paths
     state = context.state
-    adapter_root = options.adapter_root or options.atoll_root / "benchmarks" / "corpus" / "adapters"
-    root = adapter_root.resolve(strict=True)
-    adapter = root.joinpath(*case.oracle_adapter.split(".")).with_suffix(".py").resolve(strict=True)
-    if not adapter.is_relative_to(root) or not adapter.is_file() or adapter.is_symlink():
-        raise LifecycleError(
-            "security-violation",
-            f"oracle adapter is not a reviewed regular file: {case.oracle_adapter}",
-        )
+    adapter = _reviewed_adapter_path(context, case.oracle_adapter)
     oracle_cwd = paths.workspace / "oracle-cwd"
     oracle_cwd.mkdir(exist_ok=True)
     command = (
@@ -899,6 +1246,44 @@ def _run_oracle(
             )
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _reviewed_adapter_path(context: _RunContext, adapter_name: str) -> Path:
+    """Resolve one adapter while rejecting symlinks and directory escape.
+
+    Args:
+        context: Case paths and optional test adapter-root override.
+        adapter_name: Dotted adapter stem from reviewed corpus configuration.
+
+    Returns:
+        Path: Absolute regular Python source inside the adapter root.
+
+    Raises:
+        LifecycleError: If the adapter is missing, linked, or resolves outside
+            the reviewed root.
+    """
+    options = context.options
+    adapter_root = options.adapter_root or options.atoll_root / "benchmarks" / "corpus" / "adapters"
+    root = adapter_root.resolve(strict=True)
+    unresolved = root.joinpath(*adapter_name.split(".")).with_suffix(".py")
+    if unresolved.is_symlink():
+        raise LifecycleError(
+            "security-violation",
+            f"adapter is a symlink: {adapter_name}",
+        )
+    try:
+        adapter = unresolved.resolve(strict=True)
+    except OSError as error:
+        raise LifecycleError(
+            "infrastructure-error",
+            f"reviewed adapter is unavailable: {adapter_name}: {error}",
+        ) from error
+    if not adapter.is_relative_to(root) or not adapter.is_file():
+        raise LifecycleError(
+            "security-violation",
+            f"adapter is not a reviewed regular file: {adapter_name}",
+        )
+    return adapter
 
 
 def _probe_environment(
@@ -1078,6 +1463,37 @@ def _require_success(result: ProcessResult, status: CaseStatus, description: str
         raise LifecycleError(status, f"{description} exited {result.exit_code}")
 
 
+def _require_successful_compile_report(report: dict[str, object], label: str) -> None:
+    """Match a zero process exit to an explicitly successful report."""
+    if report.get("success") is not True:
+        raise LifecycleError(
+            "compile-error",
+            f"{label} Atoll compile exited successfully but its report did not",
+        )
+
+
+def _require_rejected_compile_process(
+    result: ProcessResult,
+    report: dict[str, object],
+    label: str,
+) -> None:
+    """Accept only Atoll's intentional exit-one, unsuccessful-report contract."""
+    if result.timed_out:
+        raise LifecycleError("timeout", f"{label} Atoll compile exceeded its timeout")
+    if result.exit_code != 1 or report.get("success") is not False:
+        raise LifecycleError(
+            "compile-error",
+            f"{label} rejected compile has inconsistent process/report status",
+        )
+
+
+def _remove_compile_reports(paths: _Paths) -> None:
+    """Remove the prior invocation's reports so a crashed warm run cannot reuse them."""
+    report_root = paths.project / ".atoll"
+    for suffix in ("json", "md"):
+        (report_root / f"compile-report.{suffix}").unlink(missing_ok=True)
+
+
 def _copy_compile_report(paths: _Paths, label: str) -> PurePosixPath:
     report_root = paths.project / ".atoll"
     for suffix in ("json", "md"):
@@ -1155,17 +1571,23 @@ def _case_result(
         compiled_oracle_digest=state.compiled_oracle_digest,
         cold_compiler_invocations=state.cold_compiler_invocations,
         warm_compiler_invocations=state.warm_compiler_invocations,
-        ratios=RatioEvidence(),
+        ratios=state.ratios,
     )
 
 
-def _validate_warm_report(report: dict[str, object]) -> None:
+def _validate_compile_report(report: dict[str, object]) -> None:
+    """Require the report schema consumed by the corpus runner."""
     version = report.get("version")
     if version != _COMPILE_REPORT_SCHEMA_VERSION:
         raise LifecycleError(
             "compile-error",
-            f"warm compile report schema is {version!r}, expected {_COMPILE_REPORT_SCHEMA_VERSION}",
+            f"compile report schema is {version!r}, expected {_COMPILE_REPORT_SCHEMA_VERSION}",
         )
+
+
+def _validate_warm_report(report: dict[str, object]) -> None:
+    """Reject cache evidence that still contains a native compiler phase."""
+    _validate_compile_report(report)
     build = _mapping_field(report, "build")
     timings = build.get("phase_timings")
     if isinstance(timings, list) and any(
@@ -1175,6 +1597,269 @@ def _validate_warm_report(report: dict[str, object]) -> None:
             "compatibility-regression",
             "warm compile report contains a native compiler phase",
         )
+
+
+def _validate_performance_summary(
+    performance: dict[str, object],
+    status: Literal["passed", "not-profitable", "invalid"],
+) -> None:
+    """Require internally consistent final-gate medians, ratio, and threshold."""
+    minimum = _positive_finite_float(performance.get("minimum_speedup"))
+    baseline = _positive_finite_float(performance.get("baseline_median_seconds"))
+    compiled = _positive_finite_float(performance.get("compiled_median_seconds"))
+    if minimum is None or minimum <= 1.0 or baseline is None or compiled is None:
+        raise LifecycleError("compile-error", "performance summary has invalid gate medians")
+    speedup = _positive_finite_float(performance.get("speedup"))
+    if status == "invalid":
+        if performance.get("speedup") is not None:
+            raise LifecycleError("compile-error", "noisy performance summary has a speedup")
+        return
+    if speedup is None or not math.isclose(speedup, baseline / compiled, rel_tol=1e-9):
+        raise LifecycleError("compile-error", "performance summary speedup is inconsistent")
+    passed = speedup >= minimum
+    if passed != (status == "passed"):
+        raise LifecycleError(
+            "compile-error",
+            f"performance status {status} contradicts its threshold",
+        )
+
+
+def _validate_performance_samples(report: dict[str, object], project_root: Path) -> None:
+    """Verify measured arms produced one canonical result from their payloads.
+
+    The final Atoll gate owns timing, but corpus evidence additionally proves
+    that every measured subprocess imported the intended baseline or candidate
+    payload and returned the same structured workload result. This closes the
+    gap where a wrong-but-fast wheel could otherwise pass on exit code alone.
+
+    Args:
+        report: Schema-v6 report with final performance samples.
+        project_root: Target root used for relative ``payload_root`` fields.
+
+    Raises:
+        LifecycleError: If sample evidence is incomplete, malformed, routed
+            outside its payload, or semantically different between arms.
+    """
+    performance = _mapping_field(report, "performance")
+    raw_samples = performance.get("samples")
+    if not isinstance(raw_samples, list):
+        raise LifecycleError("compile-error", "performance samples are not an array")
+    counts = {"baseline": 0, "compiled": 0}
+    canonical_digest: str | None = None
+    for index, raw_sample in enumerate(cast(list[object], raw_samples)):
+        mode, digest = _validated_performance_sample(raw_sample, project_root, index)
+        if canonical_digest is None:
+            canonical_digest = digest
+        elif digest != canonical_digest:
+            raise LifecycleError(
+                "compatibility-regression",
+                "baseline and compiled performance samples returned different canonical output",
+            )
+        counts[mode] += 1
+    if any(count != _BENCHMARK_SAMPLES for count in counts.values()):
+        raise LifecycleError(
+            "compile-error",
+            "performance report does not contain seven measured runs for each arm",
+        )
+
+
+def _validated_performance_sample(
+    raw_sample: object,
+    project_root: Path,
+    index: int,
+) -> tuple[PerformanceMode, str]:
+    """Validate one measured command and return its arm plus canonical digest."""
+    if not isinstance(raw_sample, dict):
+        raise LifecycleError("compile-error", f"performance sample {index} is not an object")
+    sample = cast(dict[str, object], raw_sample)
+    raw_mode = sample.get("mode")
+    if raw_mode == "baseline":
+        mode: PerformanceMode = "baseline"
+    elif raw_mode == "compiled":
+        mode = "compiled"
+    else:
+        raise LifecycleError(
+            "compile-error",
+            f"performance sample {index} has invalid mode {raw_mode!r}",
+        )
+    if sample.get("success") is not True or sample.get("returncode") != 0:
+        raise LifecycleError("compile-error", f"performance sample {index} was not successful")
+    if _positive_finite_float(sample.get("duration_seconds")) is None:
+        raise LifecycleError(
+            "compile-error",
+            f"performance sample {index} has invalid duration",
+        )
+    payload_root = _reported_payload_root(sample.get("payload_root"), project_root, index)
+    payload = _performance_sample_payload(sample.get("stdout"), index)
+    _validate_performance_imports(payload.get("imports"), payload_root, index)
+    canonical = json.dumps(payload.get("canonical"), sort_keys=True, separators=(",", ":"))
+    return mode, hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _validate_performance_imports(value: object, payload_root: Path, index: int) -> None:
+    """Prove every reported target import came from the measured payload root."""
+    if not isinstance(value, list) or not value:
+        raise LifecycleError(
+            "compatibility-regression",
+            f"performance sample {index} reported no imported payload paths",
+        )
+    for raw_import in cast(list[object], value):
+        if not isinstance(raw_import, str) or not Path(raw_import).is_absolute():
+            raise LifecycleError(
+                "compatibility-regression",
+                f"performance sample {index} reported an invalid import path",
+            )
+        imported = Path(raw_import).resolve()
+        if not imported.is_relative_to(payload_root):
+            raise LifecycleError(
+                "compatibility-regression",
+                f"performance sample {index} imported project code outside its payload",
+            )
+
+
+def _reported_payload_root(value: object, project_root: Path, index: int) -> Path:
+    """Resolve one report payload root without requiring retained scratch files."""
+    if not isinstance(value, str) or not value:
+        raise LifecycleError(
+            "compile-error",
+            f"performance sample {index} has invalid payload_root",
+        )
+    path = Path(value)
+    return (path if path.is_absolute() else project_root / path).resolve()
+
+
+def _performance_sample_payload(value: object, index: int) -> dict[str, object]:
+    """Parse one exact JSON object emitted by a reviewed workload adapter."""
+    if not isinstance(value, str) or not value.strip():
+        raise LifecycleError(
+            "compatibility-regression",
+            f"performance sample {index} emitted no structured output",
+        )
+    try:
+        parsed: object = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise LifecycleError(
+            "compatibility-regression",
+            f"performance sample {index} emitted invalid JSON",
+        ) from error
+    if not isinstance(parsed, dict):
+        raise LifecycleError(
+            "compatibility-regression",
+            f"performance sample {index} output is not an object",
+        )
+    payload = cast(dict[str, object], parsed)
+    if set(payload) != {"canonical", "imports"} or not isinstance(payload.get("canonical"), dict):
+        raise LifecycleError(
+            "compatibility-regression",
+            f"performance sample {index} output lacks its canonical object",
+        )
+    return payload
+
+
+def ratio_evidence_from_report(report: dict[str, object]) -> RatioEvidence:
+    """Extract labeled performance ratios and successful raw samples.
+
+    Schema v6 does not expose raw source-only search samples, so that tuple
+    remains empty rather than fabricating observations from a median. Source
+    and native-layer ratios are retained only when the final composition proves
+    the corresponding layers were accepted.
+
+    Args:
+        report: Valid schema-v6 compile report.
+
+    Returns:
+        RatioEvidence: Raw final-gate samples and available composition ratios.
+    """
+    performance_value = report.get("performance")
+    if not isinstance(performance_value, dict):
+        return RatioEvidence()
+    performance = cast(dict[str, object], performance_value)
+    samples = performance.get("samples")
+    baseline_samples = _successful_sample_durations(samples, "baseline")
+    final_samples = _successful_sample_durations(samples, "compiled")
+    final_speedup = _positive_finite_float(performance.get("speedup"))
+
+    composition_value = report.get("final_composition")
+    composition = (
+        cast(dict[str, object], composition_value) if isinstance(composition_value, dict) else {}
+    )
+    source_ids = _string_list(composition.get("source_plan_ids"))
+    native_ids = _string_list(composition.get("native_variant_ids"))
+    source_speedup = _accepted_source_speedup(report, source_ids)
+    native_speedup = (
+        final_speedup / source_speedup
+        if final_speedup is not None and source_speedup is not None and native_ids
+        else None
+    )
+    return RatioEvidence(
+        python_rewrite_vs_original=source_speedup,
+        final_wheel_vs_original=final_speedup,
+        native_vs_source_only=native_speedup,
+        baseline_samples_seconds=baseline_samples,
+        source_only_samples_seconds=(),
+        final_wheel_samples_seconds=final_samples,
+    )
+
+
+def _accepted_source_speedup(
+    report: dict[str, object],
+    accepted_plan_ids: tuple[str, ...],
+) -> float | None:
+    """Return the last accepted source-plan ratio represented in the payload."""
+    if not accepted_plan_ids:
+        return None
+    source_value = report.get("source_optimization")
+    if not isinstance(source_value, dict):
+        return None
+    trials = cast(dict[str, object], source_value).get("trials")
+    if not isinstance(trials, list):
+        return None
+    speedup: float | None = None
+    for value in cast(list[object], trials):
+        if not isinstance(value, dict):
+            continue
+        trial = cast(dict[str, object], value)
+        if trial.get("status") != "accepted" or trial.get("plan_id") not in accepted_plan_ids:
+            continue
+        candidate = _positive_finite_float(trial.get("source_speedup"))
+        if candidate is not None:
+            speedup = candidate
+    return speedup
+
+
+def _successful_sample_durations(value: object, mode: str) -> tuple[float, ...]:
+    """Retain successful measured durations for one final-gate arm."""
+    if not isinstance(value, list):
+        return ()
+    durations: list[float] = []
+    for item in cast(list[object], value):
+        if not isinstance(item, dict):
+            continue
+        run = cast(dict[str, object], item)
+        if run.get("mode") != mode or run.get("success") is not True:
+            continue
+        duration = _positive_finite_float(run.get("duration_seconds"))
+        if duration is not None:
+            durations.append(duration)
+    return tuple(durations)
+
+
+def _positive_finite_float(value: object) -> float | None:
+    """Normalize a positive JSON number without accepting booleans or NaN."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if number > 0.0 and math.isfinite(number) else None
+
+
+def _string_list(value: object) -> tuple[str, ...]:
+    """Return text-only list entries, otherwise an empty conservative value."""
+    if not isinstance(value, list):
+        return ()
+    items = cast(list[object], value)
+    if any(not isinstance(item, str) for item in items):
+        return ()
+    return tuple(cast(list[str], items))
 
 
 def _is_clean_noop_report(report: dict[str, object]) -> bool:
@@ -1207,40 +1892,6 @@ def _strict_routing_environment(report: dict[str, object]) -> dict[str, str]:
     if isinstance(source, list) and source:
         environment["ATOLL_REQUIRE_OPTIMIZED"] = "1"
     return environment
-
-
-def _comparison_key(
-    case: CorpusCase,
-    environment: EnvironmentEvidence,
-    policy: PolicyEvidence,
-) -> str:
-    workload = None if case.workload is None else asdict(case.workload)
-    payload = {
-        "architecture": environment.architecture,
-        "compiler": environment.compiler,
-        "cython": environment.cython,
-        "dependency_lock": environment.dependency_lock_digest,
-        "hardware_class": environment.hardware_class,
-        "mypy": environment.mypy,
-        "operating_system": environment.operating_system,
-        "platform": environment.runner_image,
-        "policy": policy.digest,
-        "python": environment.python,
-        "revision": case.revision,
-        "workload": workload,
-    }
-    encoded = json.dumps(payload, default=_json_default, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def _case_digest(case: CorpusCase) -> str:
-    encoded = json.dumps(
-        asdict(case),
-        default=_json_default,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def _write_source_manifest(manifest: TrackedSourceManifest, path: Path) -> None:

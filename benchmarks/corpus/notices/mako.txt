@@ -1,0 +1,9 @@
+Mako performance workload notice
+
+Project: Mako
+Repository: https://github.com/sqlalchemy/mako.git
+Revision: d58a9208fd62a816e9609a35be55aa6d3c5b14e7
+License: MIT
+
+The workload is original adapter code that exercises Mako's public template
+API. No upstream source or benchmark body is copied.

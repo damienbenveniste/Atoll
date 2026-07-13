@@ -1,0 +1,9 @@
+SymPy performance workload notice
+
+Project: SymPy
+Repository: https://github.com/sympy/sympy.git
+Revision: 15e21aca70f79e9b45e05ac1b474aafd05c919a6
+License: BSD-3-Clause
+
+The workload is original adapter code that exercises SymPy's public symbolic
+expansion API. No upstream source or benchmark body is copied.

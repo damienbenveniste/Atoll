@@ -1,0 +1,9 @@
+Rich performance workload notice
+
+Project: Rich
+Repository: https://github.com/Textualize/rich.git
+Revision: 9d8f9a372cc5916fd4781fec207ced7ddac2f08f
+License: MIT
+
+The workload is original adapter code that exercises Rich's public console and
+table APIs. No upstream source or benchmark body is copied.

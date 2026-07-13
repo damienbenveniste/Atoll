@@ -27,11 +27,11 @@ def classify_compile_report(report: dict[str, object], tier: CorpusTier) -> Case
     if tier == "performance":
         performance = _mapping_field(report, "performance")
         status = performance.get("status")
-        if status == "accepted":
+        if status == "passed":
             return "accelerated"
         if status == "not-profitable":
             return "not-profitable"
-        if status == "unstable":
+        if status == "invalid" and "too noisy" in str(performance.get("reason", "")):
             return "unstable"
     composition = _mapping_field(report, "final_composition")
     active = any(

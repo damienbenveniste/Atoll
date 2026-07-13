@@ -1,0 +1,9 @@
+Pydantic performance workload notice
+
+Project: Pydantic
+Repository: https://github.com/pydantic/pydantic.git
+Revision: f59e929c999e8b2efc7b12fd0bc1685c1a186be3
+License: MIT
+
+The workload is original adapter code that exercises Pydantic's public model
+validation API. No upstream source or benchmark body is copied.

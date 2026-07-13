@@ -140,14 +140,15 @@ def test_case_result_json_and_markdown_are_derived_from_same_evidence(tmp_path: 
 
 
 @pytest.mark.parametrize(
-    ("tier", "performance_status", "composition", "expected"),
+    ("tier", "performance_status", "performance_reason", "composition", "expected"),
     [
-        ("performance", "accepted", {}, "accelerated"),
-        ("performance", "not-profitable", {}, "not-profitable"),
-        ("performance", "unstable", {}, "unstable"),
-        ("compatibility", None, {}, "supported-no-op"),
+        ("performance", "passed", "threshold met", {}, "accelerated"),
+        ("performance", "not-profitable", "below threshold", {}, "not-profitable"),
+        ("performance", "invalid", "benchmark medians are too noisy", {}, "unstable"),
+        ("compatibility", None, None, {}, "supported-no-op"),
         (
             "compatibility",
+            None,
             None,
             {"native_variant_ids": ["variant-1"]},
             "compiled-unbenchmarked",
@@ -157,13 +158,17 @@ def test_case_result_json_and_markdown_are_derived_from_same_evidence(tmp_path: 
 def test_classify_compile_report_preserves_every_success_outcome(
     tier: CorpusTier,
     performance_status: str | None,
+    performance_reason: str | None,
     composition: dict[str, object],
     expected: CaseStatus,
 ) -> None:
     """Compatible no-op and rejected acceleration remain visible outcomes."""
     report: dict[str, object] = {"final_composition": composition}
     if performance_status is not None:
-        report["performance"] = {"status": performance_status}
+        report["performance"] = {
+            "status": performance_status,
+            "reason": performance_reason,
+        }
 
     assert classify_compile_report(report, tier) == expected
 

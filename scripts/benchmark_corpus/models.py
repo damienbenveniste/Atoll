@@ -57,7 +57,8 @@ class WorkloadProvenance:
         repository: Canonical repository containing the original workload.
         revision: Full immutable commit SHA for the workload source.
         path: Source-relative path of the original workload.
-        sha256: Digest of the reviewed workload body or minimal adapter.
+        sha256: Digest of the reviewed workload, case adapter, shared runner,
+            golden result, and third-party notice bundle.
         notice: Repository-relative third-party notice retained by Atoll.
     """
 

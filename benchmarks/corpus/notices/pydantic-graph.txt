@@ -1,0 +1,9 @@
+Pydantic Graph performance workload notice
+
+Project: Pydantic AI (pydantic-graph distribution)
+Repository: https://github.com/pydantic/pydantic-ai.git
+Revision: e6ff64409f74124de581068be644a3dbf8999e7d
+License: MIT
+
+The workload is original adapter code that exercises Pydantic Graph's public
+graph builder and execution APIs. No upstream source or benchmark body is copied.

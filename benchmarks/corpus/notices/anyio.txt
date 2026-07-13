@@ -1,0 +1,9 @@
+AnyIO performance workload notice
+
+Project: AnyIO
+Repository: https://github.com/agronholm/anyio.git
+Revision: c384f99687c64c59ed8a11c3a0f11a2d57daff71
+License: MIT
+
+The workload is original adapter code that exercises AnyIO's public in-memory
+object-stream API. No upstream source or benchmark body is copied.

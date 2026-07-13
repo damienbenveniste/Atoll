@@ -45,9 +45,45 @@ machine whose external code risk is understood.
 
 Repository cases are added only after their dependency lock and canonical oracle
 are present. External code is executed by the isolated lifecycle runner, never by
-manifest validation, lock inspection, or matrix generation. Successful runs
+manifest validation, lock inspection, matrix generation, or aggregation. Successful runs
 delete cloned sources and wheels while retaining bounded logs, source manifests,
 policy evidence, toolchain identity, compile reports, and wheel digests.
+
+Twelve cases also carry the `performance` tier. Each uses one reviewed workload,
+the fixed seed `1729`, one warmup, and seven measured baseline/compiled pairs.
+Manifest validation and the lifecycle verify a bundle digest covering the
+workload, case adapter, shared runner, golden output, and notice before use. The
+adapter rejects any default result that differs from `workloads/golden.json`, and
+the lifecycle independently verifies that every timed run imports from its
+declared payload and produces the same canonical output. Run one measured case
+with the same command shape:
+
+```bash
+uv run python -m scripts.benchmark_corpus run pydantic \
+  --tier performance \
+  --platform ubuntu-24.04 \
+  --workspace-root .atoll/corpus-work \
+  --evidence-root .atoll/corpus-results/pydantic
+```
+
+Aggregate a complete tier and platform slice only after every expected case has
+produced `case-result.json`:
+
+```bash
+uv run python -m scripts.benchmark_corpus aggregate \
+  --tier performance \
+  --platform ubuntu-24.04 \
+  --results-root .atoll/corpus-results \
+  --output-root .atoll/corpus-aggregate
+```
+
+Aggregation rejects missing, duplicate, malformed, stale, or cross-platform
+evidence. It reports an accepted-case geometric mean and an effective corpus
+speedup where supported no-ops, unsupported cases, and unprofitable candidates
+contribute `1.0x`. Infrastructure and semantic failures remain separate and make
+the aggregate command exit nonzero. Case reports label ratios as "Python rewrite
+versus original," "final wheel versus original," and "native layer versus
+source-only wheel."
 
 The version-1 compatibility matrix contains all 25 planned repositories on both
 Ubuntu 24.04 and macOS 14. Pins use the inspected default-branch revision when it

@@ -1,7 +1,7 @@
 """Command-line entry point for repository-local corpus tooling.
 
-Validation, lock inspection, and matrix projection remain network-free.
-Aggregation and promotion are added by their later delivery milestones.
+Validation, lock inspection, matrix projection, and strict aggregation remain
+network-free. Promotion is added by its later delivery milestone.
 """
 
 from __future__ import annotations
@@ -18,7 +18,17 @@ from tempfile import TemporaryDirectory
 
 from packaging.requirements import InvalidRequirement, Requirement
 
-from scripts.benchmark_corpus.lifecycle import LifecycleOptions, run_case
+from scripts.benchmark_corpus.aggregation import (
+    AggregationError,
+    aggregate_case_results,
+    render_aggregate_json,
+    render_aggregate_markdown,
+)
+from scripts.benchmark_corpus.lifecycle import (
+    LifecycleOptions,
+    run_case,
+    validate_performance_assets,
+)
 from scripts.benchmark_corpus.manifest import ManifestError, load_manifest, manifest_matrix
 from scripts.benchmark_corpus.models import CorpusManifest, CorpusPlatform, CorpusTier
 
@@ -34,13 +44,19 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         argv: Optional arguments replacing ``sys.argv``.
 
     Returns:
-        int: Zero on success and two for invalid corpus input.
+        int: Zero for valid outcomes, one for retained case/aggregate failures,
+            and two for invalid corpus input or command infrastructure.
     """
     parser = _parser()
     args = parser.parse_args(tuple(sys.argv[1:] if argv is None else argv))
     try:
         manifest = load_manifest(args.manifest)
         if args.command == "validate":
+            atoll_root = args.manifest.resolve(strict=True).parents[2]
+            adapter_root = atoll_root / "benchmarks" / "corpus" / "adapters"
+            for case in manifest.cases:
+                if "performance" in case.tiers:
+                    validate_performance_assets(atoll_root, case, adapter_root)
             print(
                 json.dumps(
                     {
@@ -107,8 +123,40 @@ def main(argv: tuple[str, ...] | None = None) -> int:
                 )
             )
             return 0 if summary.result.status not in _FAILED_STATUSES else 1
+        if args.command == "aggregate":
+            result_paths = _case_result_paths(args.results_root)
+            aggregate = aggregate_case_results(
+                manifest,
+                result_paths,
+                tier=args.tier,
+                platform=args.platform,
+            )
+            output_root = args.output_root or args.results_root
+            json_path, markdown_path = _write_aggregate(
+                aggregate_json=render_aggregate_json(aggregate),
+                aggregate_markdown=render_aggregate_markdown(aggregate),
+                output_root=output_root,
+                tier=args.tier,
+                platform=args.platform,
+            )
+            print(
+                json.dumps(
+                    {
+                        "json": str(json_path),
+                        "markdown": str(markdown_path),
+                        "platform": aggregate.platform,
+                        "tier": aggregate.tier,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            invalid = (
+                aggregate.infrastructure_invalid_case_ids or aggregate.semantic_invalid_case_ids
+            )
+            return 1 if invalid else 0
         parser.error(f"unsupported command: {args.command}")
-    except (ManifestError, OSError, RuntimeError) as error:
+    except (AggregationError, ManifestError, OSError, RuntimeError) as error:
         print(f"benchmark corpus error: {error}", file=sys.stderr)
         return 2
 
@@ -139,7 +187,65 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--evidence-root", type=Path, required=True)
     run.add_argument("--allow-unsandboxed", action="store_true")
     run.add_argument("--keep-workspace", action="store_true")
+    aggregate = commands.add_parser(
+        "aggregate",
+        help="strictly aggregate one complete tier and platform result slice",
+    )
+    aggregate.add_argument("--tier", choices=_tier_choices(), required=True)
+    aggregate.add_argument("--platform", choices=_platform_choices(), required=True)
+    aggregate.add_argument("--results-root", type=Path, required=True)
+    aggregate.add_argument("--output-root", type=Path)
     return parser
+
+
+def _case_result_paths(results_root: Path) -> tuple[Path, ...]:
+    """Discover regular, non-symlink case envelopes beneath one evidence root.
+
+    Args:
+        results_root: Workflow artifact tree containing case-specific evidence.
+
+    Returns:
+        tuple[Path, ...]: Deterministically sorted ``case-result.json`` paths.
+
+    Raises:
+        AggregationError: If the root or a discovered result is unsafe.
+    """
+    if results_root.is_symlink():
+        raise AggregationError(f"results root is a symlink: {results_root}")
+    try:
+        root = results_root.resolve(strict=True)
+    except OSError as error:
+        raise AggregationError(f"results root is unavailable: {results_root}") from error
+    if not root.is_dir():
+        raise AggregationError(f"results root is not a directory: {root}")
+    paths: list[Path] = []
+    for candidate in root.rglob("case-result.json"):
+        if candidate.is_symlink():
+            raise AggregationError(f"case result is a symlink: {candidate}")
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            raise AggregationError(f"case result escapes the results root: {candidate}")
+        paths.append(resolved)
+    return tuple(sorted(paths))
+
+
+def _write_aggregate(
+    *,
+    aggregate_json: str,
+    aggregate_markdown: str,
+    output_root: Path,
+    tier: CorpusTier,
+    platform: CorpusPlatform,
+) -> tuple[Path, Path]:
+    """Write canonical aggregate reports beneath an explicit output root."""
+    output = output_root.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    stem = f"aggregate-{tier}-{platform}"
+    json_path = output / f"{stem}.json"
+    markdown_path = output / f"{stem}.md"
+    json_path.write_text(aggregate_json, encoding="utf-8")
+    markdown_path.write_text(aggregate_markdown, encoding="utf-8")
+    return json_path, markdown_path
 
 
 _FAILED_STATUSES = frozenset(

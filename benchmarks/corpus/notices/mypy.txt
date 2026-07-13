@@ -1,0 +1,9 @@
+mypy performance workload notice
+
+Project: mypy
+Repository: https://github.com/python/mypy.git
+Revision: 40b75e09260905b3ade37e5bf36d795b733605d4
+License: MIT
+
+The workload is original adapter code that exercises mypy's documented build
+entry points. No upstream source or benchmark body is copied.

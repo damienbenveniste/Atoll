@@ -1,0 +1,9 @@
+SQLGlot performance workload notice
+
+Project: SQLGlot
+Repository: https://github.com/tobymao/sqlglot.git
+Revision: 21a2a5773717f675963dddbdba3df9343da60abe
+License: MIT
+
+The workload is original adapter code that exercises SQLGlot's public parser
+and optimizer APIs. No upstream source or benchmark body is copied.

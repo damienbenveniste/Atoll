@@ -1,0 +1,66 @@
+{
+  "cases": {
+    "anyio": {
+      "checksum": 66021768,
+      "consumers": 8,
+      "items": 24144,
+      "rounds": 12
+    },
+    "html5lib": {
+      "element_visits": 80000,
+      "parses": 1000
+    },
+    "mako": {
+      "checksum": 12522000,
+      "last_length": 418,
+      "renders": 30000
+    },
+    "mypy": {
+      "checks": 1,
+      "modules": 48,
+      "source_bytes": 2059
+    },
+    "networkx": {
+      "checksum": 1267200,
+      "components": 11,
+      "nodes": 880,
+      "scans": 240
+    },
+    "pydantic": {
+      "checksum": 234959983,
+      "validated": 20000
+    },
+    "pydantic-graph": {
+      "builds": 80,
+      "checksum": 144684,
+      "fan_out": 3012,
+      "runs": 4
+    },
+    "rich": {
+      "checksum": 135200,
+      "last_length": 676,
+      "renders": 200
+    },
+    "sqlalchemy": {
+      "checksum": 517097392,
+      "columns": 4,
+      "constructions": 30000
+    },
+    "sqlglot": {
+      "checksum": 80700,
+      "operations": 300,
+      "sql": "SELECT \"orders\".\"customer_id\" AS \"customer_id\", SUM(\"orders\".\"amount\") AS \"total\" FROM \"orders\" AS \"orders\" WHERE \"orders\".\"amount\" > 11 AND \"orders\".\"status\" = 'paid' GROUP BY \"orders\".\"customer_id\" HAVING SUM(\"orders\".\"amount\") > 100 ORDER BY \"total\" DESC"
+    },
+    "sympy": {
+      "checksum": 85190,
+      "expansions": 200,
+      "last_terms": 66
+    },
+    "tomli": {
+      "checksum": 320170000,
+      "parses": 10000
+    }
+  },
+  "repetitions": 1,
+  "seed": 1729
+}

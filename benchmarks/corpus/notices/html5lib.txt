@@ -1,0 +1,9 @@
+html5lib performance workload notice
+
+Project: html5lib
+Repository: https://github.com/html5lib/html5lib-python.git
+Revision: f87487a4ada2d6cf223bdd182774a01ba3c84618
+License: MIT
+
+The workload is original adapter code that exercises html5lib's public parsing
+API. No upstream source or benchmark body is copied.

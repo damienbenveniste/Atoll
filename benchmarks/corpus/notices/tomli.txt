@@ -1,0 +1,9 @@
+Tomli performance workload notice
+
+Project: Tomli
+Repository: https://github.com/hukkin/tomli.git
+Revision: 5a77b12a7a9f052ce5a20c335d2825658f6aea52
+License: MIT
+
+The workload is original adapter code that exercises Tomli's public parsing
+API. No upstream source or benchmark body is copied.

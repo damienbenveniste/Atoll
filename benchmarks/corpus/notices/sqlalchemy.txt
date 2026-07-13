@@ -1,0 +1,9 @@
+SQLAlchemy performance workload notice
+
+Project: SQLAlchemy
+Repository: https://github.com/sqlalchemy/sqlalchemy.git
+Revision: 149572707d5332df77838e9014616dedb0f416e5
+License: MIT
+
+The workload is original adapter code that exercises SQLAlchemy's public
+declarative mapping API. No upstream source or benchmark body is copied.

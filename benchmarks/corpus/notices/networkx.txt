@@ -1,0 +1,9 @@
+NetworkX performance workload notice
+
+Project: NetworkX
+Repository: https://github.com/networkx/networkx.git
+Revision: b1f956344071ba1adfad17d56d62a7a78dfd37e6
+License: BSD-3-Clause
+
+The workload is original adapter code that exercises NetworkX's public graph
+and connected-components APIs. No upstream source or benchmark body is copied.
