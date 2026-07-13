@@ -156,6 +156,10 @@ class _Subject(Protocol):
 
 
 _MEMBERS = vars(implementation)
+_active_mapping_use_rejection = cast(
+    Callable[[ast.Attribute, ast.AST | None, dict[ast.AST, ast.AST]], str | None],
+    _MEMBERS["_active_mapping_use_rejection"],
+)
 subject = cast(
     _Subject,
     SimpleNamespace(
@@ -346,6 +350,32 @@ def test_shape_entry_rejects_missing_consumer_and_unshared_owner() -> None:
             SymbolId("owner", "Outer.Owner.submit"),
             SymbolId("owner", "Outer.Owner.worker"),
         )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("self.active = {}", "has unsupported mutation"),
+        ("value = self.active[0]", "subscript escapes ownership"),
+        ("value = self.active.copy", "attribute escapes ownership"),
+        ("consume(self.active)", "escapes through a call"),
+        ("value = self.active or {}", "has unsupported observation"),
+    ],
+)
+def test_completion_accounting_classifies_every_unowned_active_map_use(
+    source: str,
+    expected: str,
+) -> None:
+    """Every mutation or escape shape has deterministic rejection evidence."""
+    tree = ast.parse(source)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    active = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and subject.expression_path(node) == "self.active"
+    )
+
+    assert _active_mapping_use_rejection(active, parents.get(active), parents) == expected
 
 
 @pytest.mark.parametrize(

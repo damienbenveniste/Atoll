@@ -28,6 +28,7 @@ from atoll.source_optimization import (
 )
 from atoll.source_optimization.anyio_stream_lowering import lower_anyio_stream_plan
 from atoll.source_optimization.lowering import (
+    SourceLoweringResult,
     lower_residual_state_machine_plan,
     lower_state_machine_plan,
 )
@@ -167,6 +168,45 @@ def test_anyio_search_forms_every_cumulative_residual_variant() -> None:
     assert len(rejections) == 1
 
 
+def test_anyio_search_retains_unavailable_residual_variant_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected residual prefix remains a trial rejection without poisoning the base."""
+    plan, assessment = _plan_and_assessment()
+    plan_variants = cast(
+        Callable[
+            [Path, SourceOptimizationPlan, SourceOptimizationAssessment],
+            tuple[tuple[_SourceVariantView, ...], tuple[object, ...]],
+        ],
+        vars(source_search)["_plan_variants"],
+    )
+
+    def reject_residual(
+        _root: Path,
+        source_plan: SourceOptimizationPlan,
+        _assessment: SourceOptimizationAssessment,
+        _enabled: tuple[SourceTransformationKind, ...],
+    ) -> SourceLoweringResult:
+        return SourceLoweringResult(
+            plan_id=source_plan.id,
+            status="unsupported",
+            request=None,
+            rejections=("residual prefix unavailable",),
+            mode="residual-state-machine",
+        )
+
+    monkeypatch.setattr(
+        source_search,
+        "lower_residual_state_machine_plan",
+        reject_residual,
+    )
+
+    variants, rejections = plan_variants(FIXTURE_ROOT, plan, assessment)
+
+    assert len(variants) == 1
+    assert len(rejections) == len(RESIDUAL_STEPS) + 1
+
+
 def test_anyio_residual_context_elision_rejects_context_mutation() -> None:
     """Context-copy elision cannot proceed with mutation evidence in the slice."""
     plan, assessment = _plan_and_assessment()
@@ -191,21 +231,29 @@ def test_anyio_residual_context_elision_rejects_context_mutation() -> None:
 
 
 @pytest.mark.parametrize(
-    ("needle", "replacement"),
+    ("needle", "replacement", "expected_rejection"),
     [
         (
             "                    self.active.pop(record.source.item_id)\n",
             "                    self.active.pop(record.source.item_id)\n"
             "                    self.active.clear()\n",
+            "active mapping",
         ),
         (
             "                    self.active.pop(record.source.item_id)\n",
             "                    self.active.pop(record.source.item_id)\n"
             "                    self.active[record.source.item_id] = record.source\n",
+            "active mapping",
         ),
         (
             "        del source, active\n        return ()\n",
             "        del source, active\n        self.active.clear()\n        return ()\n",
+            "active mapping",
+        ),
+        (
+            "                    if not self.active:\n                        break\n",
+            "                    if record.source.item_id < 0:\n                        break\n",
+            "one pop and one terminal check",
         ),
     ],
 )
@@ -213,6 +261,7 @@ def test_anyio_residual_completion_accounting_rejects_extra_active_mutation(
     tmp_path: Path,
     needle: str,
     replacement: str,
+    expected_rejection: str,
 ) -> None:
     """The local completion counter requires one exclusive active-map pop."""
     plan, assessment = _plan_and_assessment()
@@ -243,7 +292,7 @@ def test_anyio_residual_completion_accounting_rejects_extra_active_mutation(
 
     assert lowering.status == "unsupported"
     assert lowering.request is None
-    assert "active mapping" in " ".join(lowering.rejections)
+    assert expected_rejection in " ".join(lowering.rejections)
 
 
 def test_anyio_lowering_rejects_stale_capacity_and_run_arity(tmp_path: Path) -> None:
