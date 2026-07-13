@@ -72,6 +72,30 @@ def test_explain_module_lists_module_blockers_without_suppressing_candidates(
     assert "infer_variance" in output
 
 
+def test_explain_symbol_reports_native_proofs_and_fallback_boundaries(tmp_path: Path) -> None:
+    """Symbol output exposes fixed-width domains instead of only island safety scores."""
+    package = tmp_path / "src" / "pkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "kernels.py").write_text(
+        "def polynomial(value: int) -> int:\n    return value * value + 1\n",
+        encoding="utf-8",
+    )
+
+    output = execute_explain(
+        ExplainOptions(
+            root=tmp_path,
+            target="pkg.kernels::polynomial",
+            mypy_enabled=False,
+        )
+    )
+
+    assert "Native optimization:" in output
+    assert "Fixed-width i32:" in output
+    assert "return=" in output
+    assert "Fallback: buffer/unsupported-annotation" in output
+
+
 def test_explain_missing_module_and_symbol_fail() -> None:
     """Invalid explain targets fail with useful errors."""
     with pytest.raises(ValueError, match="module not found"):

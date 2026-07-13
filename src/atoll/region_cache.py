@@ -13,7 +13,9 @@ import hashlib
 import json
 import shutil
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from itertools import count
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -45,6 +47,49 @@ class _CacheIdentity:
     region_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class _CacheProbe:
+    """One independently fingerprinted cache lookup before backend execution.
+
+    Attributes:
+        identity: Stable cache location and backend identity for the unit.
+        lookup_duration_seconds: Time spent fingerprinting and reading cache evidence.
+        cached_result: Restored result, or `None` when compilation is required.
+    """
+
+    identity: _CacheIdentity
+    lookup_duration_seconds: float
+    cached_result: BackendCompileResult | None
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchMiss:
+    """One ordered cache miss eligible for a shared backend invocation.
+
+    Attributes:
+        index: Original unit position used to restore deterministic result order.
+        unit: Compilation unit that was absent from the success cache.
+        probe: Lookup evidence retained for the eventual per-unit result.
+    """
+
+    index: int
+    unit: CompilationUnit
+    probe: _CacheProbe
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchInvocation:
+    """Shared physical invocation identity for per-unit attempt views.
+
+    Attributes:
+        number: One-based invocation number within recursive failure isolation.
+        unit_count: Number of logical units sharing the physical compiler process.
+    """
+
+    number: int
+    unit_count: int
+
+
 def compile_with_region_cache(
     backend: CompilerBackend,
     unit: CompilationUnit,
@@ -67,61 +112,154 @@ def compile_with_region_cache(
     Returns:
         BackendCompileResult: Cached or newly compiled result with an accurate cache status.
     """
+    probe = _probe_cache(backend, unit, context, cache_root=cache_root)
+    if probe.cached_result is not None:
+        return probe.cached_result
+    result = backend.compile((unit,), context)
+    return _finalize_miss(
+        probe,
+        result,
+        context=context,
+        cache_root=cache_root,
+    )
+
+
+def compile_many_with_region_cache(
+    backend: CompilerBackend,
+    units: tuple[CompilationUnit, ...],
+    context: BackendCompileContext,
+    *,
+    cache_root: Path,
+) -> tuple[BackendCompileResult, ...]:
+    """Restore independent entries and batch compatible cold Cython misses.
+
+    A fully warm call never reaches the backend. Cold Cython misses share one
+    compiler invocation; deterministic batch failures are recursively bisected
+    in isolated output roots until successful subsets and failing singletons can
+    be cached independently. Other backends retain their one-unit behavior.
+
+    Args:
+        backend: Compiler backend selected for every supplied unit.
+        units: Ordered backend units with independent fingerprints and cache entries.
+        context: Shared source and toolchain context for compilation.
+        cache_root: Root directory for typed-region artifact and decision entries.
+
+    Returns:
+        tuple[BackendCompileResult, ...]: One result per input unit in matching order.
+
+    Raises:
+        ValueError: If units mix backends or duplicate identities needed for partitioning.
+    """
+    if not units:
+        return ()
+    if any(unit.backend != backend.name for unit in units):
+        raise ValueError("batched cache units must use the selected backend")
+    if backend.name != "cython" or len(units) == 1:
+        return tuple(
+            compile_with_region_cache(
+                backend,
+                unit,
+                context,
+                cache_root=cache_root,
+            )
+            for unit in units
+        )
+    _validate_batch_identities(units)
+    results: list[BackendCompileResult | None] = [None] * len(units)
+    misses: list[_BatchMiss] = []
+    for index, unit in enumerate(units):
+        probe = _probe_cache(backend, unit, context, cache_root=cache_root)
+        if probe.cached_result is not None:
+            results[index] = probe.cached_result
+        else:
+            misses.append(_BatchMiss(index=index, unit=unit, probe=probe))
+    if misses:
+        for miss, result in _compile_cython_misses(
+            backend,
+            tuple(misses),
+            context,
+            cache_root=cache_root,
+            sequence=count(1),
+        ):
+            results[miss.index] = result
+    if any(result is None for result in results):
+        raise AssertionError("batched region cache left an input without a result")
+    return tuple(cast(BackendCompileResult, result) for result in results)
+
+
+def _probe_cache(
+    backend: CompilerBackend,
+    unit: CompilationUnit,
+    context: BackendCompileContext,
+    *,
+    cache_root: Path,
+) -> _CacheProbe:
     lookup_started = time.perf_counter()
     key = backend.fingerprint(unit, context)
-    entry_root = cache_root / backend.name / key
     identity = _CacheIdentity(
-        entry_root=entry_root,
+        entry_root=cache_root / backend.name / key,
         key=key,
         backend=backend.name,
         region_id=unit.region_id,
     )
-    restored = _restore_entry(
-        identity=identity,
-        context=context,
-    )
+    restored = _restore_entry(identity=identity, context=context)
     lookup_duration = time.perf_counter() - lookup_started
     if restored is not None:
         restore_duration, artifact_paths, artifact_records = restored
-        return BackendCompileResult(
-            attempt=CompileAttempt(
-                success=True,
-                command=("atoll", "cache", "restore", backend.name, unit.region_id),
-                stdout="",
-                stderr="",
-                artifact_paths=artifact_paths,
-                duration_seconds=lookup_duration + restore_duration,
-                phase_timings=(
-                    CompilePhaseTiming(
-                        name="cache_lookup",
-                        duration_seconds=lookup_duration,
-                        detail=f"hit; {unit.region_id}",
+        return _CacheProbe(
+            identity=identity,
+            lookup_duration_seconds=lookup_duration,
+            cached_result=BackendCompileResult(
+                attempt=CompileAttempt(
+                    success=True,
+                    command=("atoll", "cache", "restore", backend.name, unit.region_id),
+                    stdout="",
+                    stderr="",
+                    artifact_paths=artifact_paths,
+                    duration_seconds=lookup_duration + restore_duration,
+                    phase_timings=(
+                        CompilePhaseTiming(
+                            name="cache_lookup",
+                            duration_seconds=lookup_duration,
+                            detail=f"hit; {unit.region_id}",
+                        ),
+                        CompilePhaseTiming(
+                            name="cache_restore",
+                            duration_seconds=restore_duration,
+                            detail=f"{len(artifact_paths)} artifact(s); {unit.region_id}",
+                        ),
                     ),
-                    CompilePhaseTiming(
-                        name="cache_restore",
-                        duration_seconds=restore_duration,
-                        detail=f"{len(artifact_paths)} artifact(s); {unit.region_id}",
-                    ),
+                    cache_status="hit",
                 ),
-                cache_status="hit",
+                artifacts=artifact_records,
             ),
-            artifacts=artifact_records,
         )
-
-    decision_path = _decision_path(cache_root, identity)
     cached_rejection = _restore_rejection(
-        path=decision_path,
+        path=_decision_path(cache_root, identity),
         identity=identity,
         duration_seconds=lookup_duration,
     )
-    if cached_rejection is not None:
-        return cached_rejection
+    return _CacheProbe(
+        identity=identity,
+        lookup_duration_seconds=lookup_duration,
+        cached_result=cached_rejection,
+    )
 
-    result = backend.compile((unit,), context)
+
+def _finalize_miss(
+    probe: _CacheProbe,
+    result: BackendCompileResult,
+    *,
+    context: BackendCompileContext,
+    cache_root: Path,
+) -> BackendCompileResult:
+    identity = probe.identity
+    lookup_duration = probe.lookup_duration_seconds
+    decision_path = _decision_path(cache_root, identity)
     miss_timing = CompilePhaseTiming(
         name="cache_lookup",
         duration_seconds=lookup_duration,
-        detail=f"miss; {unit.region_id}",
+        detail=f"miss; {identity.region_id}",
     )
     attempt = replace(
         result.attempt,
@@ -141,7 +279,7 @@ def compile_with_region_cache(
         store_timing = CompilePhaseTiming(
             name="backend_decision_store",
             duration_seconds=time.perf_counter() - store_started,
-            detail=f"{store_detail}; {unit.region_id}",
+            detail=f"{store_detail}; {identity.region_id}",
         )
         return replace(
             result,
@@ -163,7 +301,7 @@ def compile_with_region_cache(
     store_timing = CompilePhaseTiming(
         name="cache_store",
         duration_seconds=time.perf_counter() - store_started,
-        detail=f"{store_detail}; {unit.region_id}",
+        detail=f"{store_detail}; {identity.region_id}",
     )
     return replace(
         result,
@@ -173,6 +311,211 @@ def compile_with_region_cache(
             phase_timings=(*attempt.phase_timings, store_timing),
         ),
     )
+
+
+def _compile_cython_misses(
+    backend: CompilerBackend,
+    misses: tuple[_BatchMiss, ...],
+    context: BackendCompileContext,
+    *,
+    cache_root: Path,
+    sequence: Iterator[int],
+) -> tuple[tuple[_BatchMiss, BackendCompileResult], ...]:
+    """Compile one miss subset and bisect deterministic aggregate failures.
+
+    Args:
+        backend: Cython adapter used for the physical build.
+        misses: Ordered cache misses submitted together.
+        context: Parent compile context whose output tree remains disposable.
+        cache_root: Independent per-unit cache namespace.
+        sequence: Monotonic invocation IDs used to isolate recursive output roots.
+
+    Returns:
+        tuple[tuple[_BatchMiss, BackendCompileResult], ...]: Per-unit results in miss order.
+    """
+    invocation = next(sequence)
+    batch_context = _batch_context(context, invocation=invocation, unit_count=len(misses))
+    physical = backend.compile(tuple(miss.unit for miss in misses), batch_context)
+    if physical.attempt.success:
+        try:
+            split_results = _split_successful_batch(
+                misses,
+                physical,
+                invocation=invocation,
+            )
+        except ValueError as error:
+            physical = BackendCompileResult(
+                attempt=replace(
+                    physical.attempt,
+                    success=False,
+                    stderr=f"CYTHON_COMPILE_ERROR: invalid batch artifact parity: {error}",
+                    artifact_paths=(),
+                ),
+                artifacts=(),
+            )
+        else:
+            return tuple(
+                (
+                    miss,
+                    _finalize_miss(
+                        miss.probe,
+                        result,
+                        context=batch_context,
+                        cache_root=cache_root,
+                    ),
+                )
+                for miss, result in zip(misses, split_results, strict=True)
+            )
+    deterministic = _deterministic_diagnostic_code(physical.attempt.stderr) is not None
+    if deterministic and len(misses) > 1:
+        midpoint = len(misses) // 2
+        return (
+            *_compile_cython_misses(
+                backend,
+                misses[:midpoint],
+                context,
+                cache_root=cache_root,
+                sequence=sequence,
+            ),
+            *_compile_cython_misses(
+                backend,
+                misses[midpoint:],
+                context,
+                cache_root=cache_root,
+                sequence=sequence,
+            ),
+        )
+    failures = _split_failed_batch(misses, physical, invocation=invocation)
+    return tuple(
+        (
+            miss,
+            _finalize_miss(
+                miss.probe,
+                result,
+                context=batch_context,
+                cache_root=cache_root,
+            ),
+        )
+        for miss, result in zip(misses, failures, strict=True)
+    )
+
+
+def _split_successful_batch(
+    misses: tuple[_BatchMiss, ...],
+    physical: BackendCompileResult,
+    *,
+    invocation: int,
+) -> tuple[BackendCompileResult, ...]:
+    artifact_by_digest = {_file_digest(path): path for path in physical.attempt.artifact_paths}
+    results: list[BackendCompileResult] = []
+    batch = _BatchInvocation(number=invocation, unit_count=len(misses))
+    for index, miss in enumerate(misses):
+        unit = miss.unit
+        records = tuple(
+            record
+            for record in physical.artifacts
+            if record.region_id == unit.region_id
+            or (
+                record.region_id == "__shared__"
+                and _record_belongs_to_install_dir(record, unit.install_relative_dir)
+            )
+        )
+        if not any(
+            record.region_id == unit.region_id and record.role == "primary" for record in records
+        ):
+            raise ValueError(f"{unit.region_id} has no primary artifact record")
+        try:
+            artifact_paths = tuple(
+                dict.fromkeys(artifact_by_digest[record.digest] for record in records)
+            )
+        except KeyError as error:
+            raise ValueError(
+                f"{unit.region_id} references an unavailable artifact digest"
+            ) from error
+        attempt = _unit_batch_attempt(
+            physical.attempt,
+            artifact_paths=artifact_paths,
+            batch=batch,
+            unit_index=index,
+            region_id=unit.region_id,
+        )
+        results.append(BackendCompileResult(attempt=attempt, artifacts=records))
+    return tuple(results)
+
+
+def _split_failed_batch(
+    misses: tuple[_BatchMiss, ...],
+    physical: BackendCompileResult,
+    *,
+    invocation: int,
+) -> tuple[BackendCompileResult, ...]:
+    batch = _BatchInvocation(number=invocation, unit_count=len(misses))
+    return tuple(
+        BackendCompileResult(
+            attempt=_unit_batch_attempt(
+                physical.attempt,
+                artifact_paths=(),
+                batch=batch,
+                unit_index=index,
+                region_id=miss.unit.region_id,
+            ),
+            artifacts=(),
+        )
+        for index, miss in enumerate(misses)
+    )
+
+
+def _unit_batch_attempt(
+    physical: CompileAttempt,
+    *,
+    artifact_paths: tuple[Path, ...],
+    batch: _BatchInvocation,
+    unit_index: int,
+    region_id: str,
+) -> CompileAttempt:
+    owner = unit_index == 0
+    batch_timing = CompilePhaseTiming(
+        name="cython_batch" if owner else "cython_batch_member",
+        duration_seconds=0.0,
+        detail=(
+            f"invocation {batch.number}; {batch.unit_count} unit(s); {region_id}; "
+            f"physical_timing={'owner' if owner else 'reported-on-first-unit'}"
+        ),
+    )
+    return replace(
+        physical,
+        stdout=physical.stdout if owner else "",
+        artifact_paths=artifact_paths,
+        duration_seconds=physical.duration_seconds if owner else 0.0,
+        phase_timings=(*physical.phase_timings, batch_timing) if owner else (batch_timing,),
+    )
+
+
+def _batch_context(
+    context: BackendCompileContext,
+    *,
+    invocation: int,
+    unit_count: int,
+) -> BackendCompileContext:
+    root = context.build_dir.parent / "cython-batches" / f"{invocation:04d}-{unit_count}"
+    shutil.rmtree(root, ignore_errors=True)
+    return replace(context, build_dir=root / "build")
+
+
+def _record_belongs_to_install_dir(record: ArtifactRecord, install_relative_dir: str) -> bool:
+    record_parts = PurePosixPath(record.install_relative_path).parts
+    install_parts = PurePosixPath(install_relative_dir).parts
+    return not install_parts or record_parts[: len(install_parts)] == install_parts
+
+
+def _validate_batch_identities(units: tuple[CompilationUnit, ...]) -> None:
+    for label, values in (
+        ("region IDs", tuple(unit.region_id for unit in units)),
+        ("logical modules", tuple(unit.logical_module for unit in units)),
+        ("install directories", tuple(unit.install_relative_dir for unit in units)),
+    ):
+        if len(set(values)) != len(values):
+            raise ValueError(f"batched Cython units require unique {label}")
 
 
 def _decision_path(cache_root: Path, identity: _CacheIdentity) -> Path:

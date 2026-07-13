@@ -355,7 +355,7 @@ def test_benchmark_gate_passes_distinct_region_allowlists_to_each_side(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: list[tuple[str, str, str]] = []
-    monkeypatch.setattr(performance, "_perf_counter", _clock([1.0, 1.0, 1.0, 1.0]))
+    monkeypatch.setattr(performance, "_perf_counter", _clock([2.0, 1.0, 1.0, 2.0]))
 
     def fake_run(
         invocation: SubprocessInvocationView,
@@ -372,7 +372,7 @@ def test_benchmark_gate_passes_distinct_region_allowlists_to_each_side(
             command=("python", "bench.py"),
             warmups=0,
             samples=2,
-            minimum_speedup=1.0,
+            minimum_speedup=1.01,
         ),
         project_root=tmp_path,
         baseline_payload_root=tmp_path / "baseline",
@@ -396,7 +396,7 @@ def test_benchmark_gate_passes_distinct_variant_allowlists_to_each_side(
 ) -> None:
     """Marginal gates independently select dispatcher variants on each arm."""
     captured: list[str] = []
-    monkeypatch.setattr(performance, "_perf_counter", _clock([1.0, 1.0]))
+    monkeypatch.setattr(performance, "_perf_counter", _clock([2.0, 1.0]))
 
     def fake_run(
         invocation: SubprocessInvocationView,
@@ -412,7 +412,7 @@ def test_benchmark_gate_passes_distinct_variant_allowlists_to_each_side(
             command=("python", "bench.py"),
             warmups=0,
             samples=1,
-            minimum_speedup=1.0,
+            minimum_speedup=1.01,
         ),
         project_root=tmp_path,
         baseline_payload_root=tmp_path / "baseline",

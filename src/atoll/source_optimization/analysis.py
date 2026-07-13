@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 
 from atoll.execution_plans.models import ExecutionPlan, PlanRejection
 from atoll.models import CompileConfig, ModuleScan, SymbolId, SymbolRecord
+from atoll.optimization_policy import HARD_BENCHMARK_MINIMUM_SPEEDUP
 from atoll.runtime.profiling import ProfiledMember, ProfileResult
 from atoll.source_optimization.models import (
     SourceAccessKind,
@@ -32,7 +33,7 @@ from atoll.source_optimization.models import (
 )
 
 SOURCE_OPTIMIZATION_LOWERING_VERSION = "source-optimization-analysis-v1"
-MINIMUM_SOURCE_OPTIMIZATION_SPEEDUP = 3.0
+MINIMUM_SOURCE_OPTIMIZATION_SPEEDUP = HARD_BENCHMARK_MINIMUM_SPEEDUP
 MINIMUM_OBSERVED_WORK_ITEMS = 10_000
 MINIMUM_ATTRIBUTED_HOT_SHARE = 0.70
 MAX_SOURCE_OPTIMIZATION_PLANS = 2

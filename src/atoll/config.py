@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast
 
 from atoll.models import Backend, CompileConfig, EnabledIslandConfig
+from atoll.optimization_policy import DEFAULT_MINIMUM_FINAL_SPEEDUP
 
 CONFIG_PATH = ".atoll.toml"
 
@@ -75,7 +76,7 @@ def _load_compile_config(root: Path) -> CompileConfig:
         minimum_speedup=_number(
             compile_data.get("minimum_speedup"),
             field="minimum_speedup",
-            default=1.10,
+            default=DEFAULT_MINIMUM_FINAL_SPEEDUP,
         ),
     )
 

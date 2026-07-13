@@ -7,6 +7,7 @@ import shutil
 import sys
 import zipfile
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -14,14 +15,20 @@ from atoll.cli import main
 from atoll.commands import package as package_command
 from atoll.commands.package import PackageCommandResult, PackageOptions, PackagePreflightFailure
 from atoll.models import Blocker, CompileAttempt, ModuleId, ModuleScan
-from atoll.runtime.performance import run_performance_command
+from atoll.report import COMPILE_REPORT_SCHEMA_VERSION
+from atoll.runtime.performance import (
+    BenchmarkGateConfig,
+    BenchmarkGateResult,
+    CommandRunEvidence,
+    run_performance_command,
+)
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXIT_USAGE = 2
 RANKING_SYMBOL_COUNT = 3
 GATE_FAILURE_CODE = 7
 PROFILE_BENCHMARK_ITERATIONS = 100_000
-PROFILE_REPORT_SCHEMA_VERSION = 5
+PROFILE_REPORT_SCHEMA_VERSION = COMPILE_REPORT_SCHEMA_VERSION
 MINIMUM_PROFILE_SAMPLES = 100
 CLASS_DEPENDENCY_COMPILED_SYMBOLS = 2
 
@@ -219,7 +226,7 @@ def test_compile_profiles_configured_benchmark_before_hot_region_selection(
 ) -> None:
     """A real workload profiles hot symbols and packages only profitable trial results."""
     project_root = tmp_path / "profiled_project"
-    monkeypatch.setattr(package_command, "_CANDIDATE_MINIMUM_SPEEDUP", 0.01)
+    monkeypatch.setattr(package_command, "_CANDIDATE_MINIMUM_SPEEDUP", 1.01)
     shutil.copytree(FIXTURE_ROOT, project_root)
     benchmark_path = project_root / "benchmark.py"
     benchmark_path.write_text(
@@ -248,12 +255,53 @@ for _ in range(ITERATIONS):
                 (f'benchmark_command = [{json.dumps(sys.executable)}, "benchmark.py"]'),
                 "benchmark_warmups = 0",
                 "benchmark_samples = 1",
-                "minimum_speedup = 0.01",
+                "minimum_speedup = 1.01",
                 "",
             )
         ),
         encoding="utf-8",
     )
+
+    def accept_measured_gate(
+        config: BenchmarkGateConfig,
+        **kwargs: object,
+    ) -> BenchmarkGateResult:
+        project = cast(Path, kwargs["project_root"])
+        baseline = cast(Path, kwargs["baseline_payload_root"])
+        compiled = cast(Path, kwargs["compiled_payload_root"])
+        return BenchmarkGateResult(
+            status="passed",
+            reason="stable fixture benchmark passed",
+            minimum_speedup=config.minimum_speedup,
+            baseline_median_seconds=0.5,
+            compiled_median_seconds=0.4,
+            speedup=1.25,
+            warmups=(),
+            samples=(
+                CommandRunEvidence(
+                    config.command or (),
+                    project,
+                    baseline,
+                    "baseline",
+                    0,
+                    "",
+                    "",
+                    0.5,
+                ),
+                CommandRunEvidence(
+                    config.command or (),
+                    project,
+                    compiled,
+                    "compiled",
+                    0,
+                    "",
+                    "",
+                    0.4,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(package_command, "run_benchmark_gate", accept_measured_gate)
 
     exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
 

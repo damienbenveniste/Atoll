@@ -22,6 +22,11 @@ from statistics import median
 from typing import Literal
 
 from atoll.models import CompileAttempt, CompileConfig, CompilePhaseTiming
+from atoll.optimization_policy import (
+    DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+    HARD_BENCHMARK_MINIMUM_SPEEDUP,
+    assess_speedup,
+)
 from atoll.runtime.performance import (
     BenchmarkGateResult,
     BenchmarkStatus,
@@ -64,14 +69,13 @@ from atoll.wheel_overlay import (
 SourceOptimizationProgress = Callable[[str], None]
 SourceSearchArm = Literal["baseline", "current", "candidate"]
 
-HARD_MINIMUM_SOURCE_SPEEDUP = 3.0
+HARD_MINIMUM_SOURCE_SPEEDUP = HARD_BENCHMARK_MINIMUM_SPEEDUP
 SOURCE_SEARCH_BEAM_WIDTH = 2
 SOURCE_SEARCH_MAX_DEPTH = 4
 SOURCE_SEARCH_MAX_TRIALS = 8
 SOURCE_SEARCH_WARMUPS = 1
 SOURCE_SEARCH_SAMPLES = 3
-SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP = 1.05
-_MINIMUM_STABLE_MEDIAN_SECONDS = 0.25
+SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP = DEFAULT_MINIMUM_MARGINAL_SPEEDUP
 _RESIDUAL_TRANSFORMATIONS: tuple[SourceTransformationKind, ...] = (
     "run-scoped-guard-amortization",
     "transparent-quiescent-await-chain-collapse",
@@ -640,9 +644,18 @@ def _evaluate_candidate(
             _invalid_benchmark_trial(candidate, patch, options, semantic, benchmark),
             tuple(timings),
         )
-    source_speedup = baseline_median / benchmark.candidate_median_seconds
-    marginal_speedup = current_median / benchmark.candidate_median_seconds
-    improves_current = marginal_speedup >= SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP
+    source_assessment = assess_speedup(
+        baseline_median,
+        benchmark.candidate_median_seconds,
+        minimum_speedup=SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP,
+    )
+    marginal_assessment = assess_speedup(
+        current_median,
+        benchmark.candidate_median_seconds,
+        minimum_speedup=SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP,
+    )
+    source_speedup = source_assessment.speedup or 0.0
+    improves_current = marginal_assessment.passed
     residual_profile: ProfileResult | None = None
     profile_diagnostics: tuple[str, ...] = ()
     profile_failed = False
@@ -1035,14 +1048,26 @@ def _run_pair_gate(context: _PairGateContext) -> BenchmarkGateResult:
         )
     baseline_median = median(run.duration_seconds for run in sample_runs if run.mode == "baseline")
     optimized_median = median(run.duration_seconds for run in sample_runs if run.mode == "compiled")
-    speedup = baseline_median / optimized_median
-    if baseline_median < _MINIMUM_STABLE_MEDIAN_SECONDS:
+    assessment = assess_speedup(
+        baseline_median,
+        optimized_median,
+        minimum_speedup=context.minimum_speedup,
+    )
+    speedup = assessment.speedup
+    if not assessment.stable:
         status: BenchmarkStatus = "invalid"
-        reason = f"{context.label} baseline median is too noisy: baseline={baseline_median:.3f}s"
-    elif speedup >= context.minimum_speedup:
+        reason = (
+            f"{context.label} medians are too noisy: baseline={baseline_median:.3f}s "
+            f"optimized={optimized_median:.3f}s"
+        )
+    elif assessment.passed:
+        if speedup is None:
+            raise AssertionError("stable source assessment must include speedup")
         status = "passed"
         reason = f"{context.label} speedup {speedup:.3f}x met {context.minimum_speedup:.3f}x"
     else:
+        if speedup is None:
+            raise AssertionError("stable source assessment must include speedup")
         status = "not-profitable"
         reason = f"{context.label} speedup {speedup:.3f}x missed {context.minimum_speedup:.3f}x"
     return BenchmarkGateResult(

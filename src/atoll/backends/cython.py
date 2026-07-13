@@ -50,7 +50,7 @@ from atoll.models import (
     TypedRegion,
 )
 
-_CYTHON_ADAPTER_VERSION = "3"
+_CYTHON_ADAPTER_VERSION = "4"
 _DIRECTIVES: dict[str, object] = {
     "language_level": 3,
     "annotation_typing": False,
@@ -78,6 +78,7 @@ class _CythonizeFunction(Protocol):
         compiler_directives: Mapping[str, object],
         quiet: bool,
         build_dir: str,
+        nthreads: int,
     ) -> list[Extension]:
         """Return setuptools extension modules generated from Cython inputs.
 
@@ -86,6 +87,7 @@ class _CythonizeFunction(Protocol):
             compiler_directives: Cython compiler directives applied to the build.
             quiet: Whether progress output should be suppressed.
             build_dir: Directory containing disposable native build inputs.
+            nthreads: Number of independent Cython translation workers.
 
         Returns:
             list[Extension]: Filtered compiler output with duplicate path noise removed.
@@ -491,10 +493,12 @@ def _build_units(
             native_stderr,
         ):
             active_phase = ("cythonize", time.perf_counter())
+            workers = _parallel_worker_count(len(units))
             extensions = _cythonize_extensions(
                 units,
                 build_dir,
                 project_root=context.project_root,
+                workers=workers,
             )
             phase_timings.append(_phase_timing(active_phase))
             active_phase = ("build_ext", time.perf_counter())
@@ -505,13 +509,21 @@ def _build_units(
             command_obj.inplace = False
             command_obj.build_lib = str(artifact_dir)
             command_obj.build_temp = str(build_dir / "temp")
+            command_obj.parallel = workers
             _prepare_build_temp_source_dir(
                 Path(command_obj.build_temp),
                 _project_path(build_dir / "cythonized", context.project_root),
             )
             command_obj.ensure_finalized()
             command_obj.run()
-            phase_timings.append(_phase_timing(active_phase))
+            build_ext_timing = _phase_timing(active_phase)
+            phase_timings.append(
+                CompilePhaseTiming(
+                    name=build_ext_timing.name,
+                    duration_seconds=build_ext_timing.duration_seconds,
+                    detail=f"{workers} worker(s); {len(units)} extension(s)",
+                )
+            )
             active_phase = None
     except SystemExit as error:
         return _failed_attempt(
@@ -586,6 +598,7 @@ def _cythonize_extensions(
     build_dir: Path,
     *,
     project_root: Path,
+    workers: int,
 ) -> list[Extension]:
     cython_build = importlib.import_module("Cython.Build")
     cythonize = cast(_CythonizeFunction, cython_build.cythonize)
@@ -604,7 +617,20 @@ def _cythonize_extensions(
         compiler_directives=_DIRECTIVES,
         quiet=True,
         build_dir=_project_path(cythonized_dir, project_root),
+        nthreads=workers,
     )
+
+
+def _parallel_worker_count(unit_count: int) -> int:
+    """Bound translation and object-build workers by units and host CPUs.
+
+    Args:
+        unit_count: Number of independent extension units in one physical batch.
+
+    Returns:
+        int: Positive worker count suitable for Cython and setuptools.
+    """
+    return max(1, min(unit_count, os.cpu_count() or 1))
 
 
 def _project_path(path: Path, project_root: Path) -> str:

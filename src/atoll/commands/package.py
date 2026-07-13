@@ -129,8 +129,12 @@ from atoll.native_optimization.scalar_analysis import (
     ScalarWidthProof,
     analyze_scalar_scan,
 )
+from atoll.optimization_policy import (
+    DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+    PROFILE_GUIDED_MINIMUM_MARGINAL_SPEEDUP,
+)
 from atoll.project import DiscoveredProject, discover_project
-from atoll.region_cache import compile_with_region_cache
+from atoll.region_cache import compile_many_with_region_cache, compile_with_region_cache
 from atoll.runtime.execution_plan_performance import (
     ExecutionPlanBenchmarkConfig,
     ExecutionPlanBenchmarkProgress,
@@ -202,16 +206,17 @@ _EXECUTION_PLAN_BACKENDS: tuple[ExecutionPlanBackend, ...] = (
 
 _CANDIDATE_BENCHMARK_WARMUPS = 1
 _CANDIDATE_BENCHMARK_SAMPLES = 3
-_CANDIDATE_MINIMUM_SPEEDUP = 1.01
-_SPECIALIZED_VARIANT_MINIMUM_SPEEDUP = 1.05
+_CANDIDATE_MINIMUM_SPEEDUP = PROFILE_GUIDED_MINIMUM_MARGINAL_SPEEDUP
+_SPECIALIZED_VARIANT_MINIMUM_SPEEDUP = DEFAULT_MINIMUM_MARGINAL_SPEEDUP
 _EXECUTION_PLAN_BENCHMARK_SAMPLES = 7
-_EXECUTION_PLAN_MINIMUM_SPEEDUP = 1.05
+_EXECUTION_PLAN_MINIMUM_SPEEDUP = DEFAULT_MINIMUM_MARGINAL_SPEEDUP
 _WHEEL_TAG_COMPONENT_COUNT = 3
 _SCALAR_INT32_WIDTH = 32
 _SCALAR_INT32_DISPATCH_RANK = 10
 _SCALAR_INT64_DISPATCH_RANK = 20
 _BUFFER_DISPATCH_RANK = 30
 _MAX_PROFILED_CALL_CHAIN_ROOTS = 4
+_MINIMUM_CYTHON_BATCH_SIZE = 2
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -1839,15 +1844,10 @@ def _source_result_with_composition_fallback(
         source_result,
         build=build,
         typed_regions=rebased.typed_regions,
-        compiled_regions=rebased.compiled_regions,
-        compiled_bindings=rebased.compiled_bindings,
-        compiled_variants=rebased.compiled_variants,
         backend_assessments=rebased.backend_assessments,
-        artifact_records=rebased.artifact_records,
         region_skipped=rebased.region_skipped,
         candidate_trials=rebased.candidate_trials,
         execution_plans=rebased.execution_plans,
-        applied_execution_plans=rebased.applied_execution_plans,
         execution_plan_trials=rebased.execution_plan_trials,
         fusion_plans=rebased.fusion_plans,
         fusion_trials=rebased.fusion_trials,
@@ -3581,6 +3581,12 @@ def _build_typed_regions(
             ("buffer_kernel_generator", BUFFER_KERNEL_GENERATOR_VERSION),
         ),
     )
+    batched_cython = _compile_batched_cython_variants(
+        prepared,
+        backend_context,
+        cache_root=context.compile_cache_dir,
+        progress=context.progress,
+    )
     for index, item in enumerate(prepared, start=1):
         if (
             item.conditional_on_failure_of is not None
@@ -3602,10 +3608,14 @@ def _build_typed_regions(
                     f"{candidate.unit.region_id}"
                 ),
             )
-            result = _compile_typed_variant(
-                candidate,
-                backend_context,
-                cache_root=context.compile_cache_dir,
+            result = (
+                batched_cython[index - 1]
+                if candidate is item and index - 1 in batched_cython
+                else _compile_typed_variant(
+                    candidate,
+                    backend_context,
+                    cache_root=context.compile_cache_dir,
+                )
             )
             if result.attempt.cache_status == "hit":
                 _progress(
@@ -3677,6 +3687,60 @@ def _build_typed_regions(
         skipped=tuple(skipped),
         cache_statuses=tuple(cache_statuses),
     )
+
+
+def _compile_batched_cython_variants(
+    prepared: tuple[_PreparedTypedRegion, ...],
+    context: BackendCompileContext,
+    *,
+    cache_root: Path,
+    progress: PackageProgress | None,
+) -> dict[int, BackendCompileResult]:
+    """Compile independent top-level Cython variants through one cache frontier.
+
+    Fallback chains and conditional class/method variants retain sequential
+    orchestration because their eligibility depends on an earlier result. Every
+    other Cython variant is independent and can share cold compiler startup while
+    preserving its own fingerprint, artifact manifest, and rejection decision.
+
+    Args:
+        prepared: Ordered native variants ready for backend execution.
+        context: Shared typed-region backend context.
+        cache_root: Persistent region cache root.
+        progress: Optional user-facing compile progress callback.
+
+    Returns:
+        dict[int, BackendCompileResult]: Prepared indexes resolved by the batch frontier.
+    """
+    eligible = tuple(
+        (index, item)
+        for index, item in enumerate(prepared)
+        if item.generation.backend == "cython"
+        and item.fallback is None
+        and item.conditional_on_failure_of is None
+    )
+    if len(eligible) < _MINIMUM_CYTHON_BATCH_SIZE:
+        return {}
+    _progress(progress, f"probing compile cache for {len(eligible)} Cython variant(s)")
+    results = compile_many_with_region_cache(
+        CYTHON_BACKEND,
+        tuple(item.unit for _index, item in eligible),
+        context,
+        cache_root=cache_root,
+    )
+    batch_invocations = sum(
+        timing.name == "cython_batch"
+        for result in results
+        for timing in result.attempt.phase_timings
+    )
+    if batch_invocations:
+        _progress(
+            progress,
+            f"compiled Cython cache misses in {batch_invocations} physical batch(es)",
+        )
+    else:
+        _progress(progress, "restored all Cython variants from compile cache")
+    return {index: result for (index, _item), result in zip(eligible, results, strict=True)}
 
 
 def _compile_typed_variant(
@@ -5868,6 +5932,8 @@ def _run_conditional_task_fusion_research(
                     plan_id=plan.id,
                     command=config.benchmark_command,
                     semantic_command=config.test_command,
+                    minimum_over_unfused=DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+                    minimum_overall=config.minimum_speedup,
                 ),
                 project_root=context.baseline.quality_project_root,
                 baseline_payload_root=context.baseline.baseline_install_root,
@@ -6068,6 +6134,13 @@ def _select_profitable_candidates(
     for index, candidate in enumerate(candidates, start=1):
         prepared = candidate.prepared
         variant_id = prepared.unit.region_id
+        minimum_speedup = (
+            prepared.minimum_marginal_speedup
+            if prepared.minimum_marginal_speedup is not None
+            else _CANDIDATE_MINIMUM_SPEEDUP
+        )
+        baseline_median_seconds: float | None = None
+        candidate_median_seconds: float | None = None
         baseline_ids = tuple(item.unit.region_id for item in accepted)
         trial_ids = (*baseline_ids, variant_id)
         _progress(
@@ -6107,11 +6180,7 @@ def _select_profitable_candidates(
                     command=benchmark_command,
                     warmups=_CANDIDATE_BENCHMARK_WARMUPS,
                     samples=_CANDIDATE_BENCHMARK_SAMPLES,
-                    minimum_speedup=(
-                        prepared.minimum_marginal_speedup
-                        if prepared.minimum_marginal_speedup is not None
-                        else _CANDIDATE_MINIMUM_SPEEDUP
-                    ),
+                    minimum_speedup=minimum_speedup,
                 ),
                 project_root=quality_root,
                 baseline_payload_root=context.payload_root,
@@ -6123,6 +6192,8 @@ def _select_profitable_candidates(
             timings.extend(_candidate_benchmark_timings(variant_id, benchmark))
             benchmark_status = benchmark.status
             marginal_speedup = benchmark.speedup
+            baseline_median_seconds = benchmark.baseline_median_seconds
+            candidate_median_seconds = benchmark.compiled_median_seconds
             reason = benchmark.reason
             if benchmark.status == "passed":
                 status = "accepted"
@@ -6156,6 +6227,9 @@ def _select_profitable_candidates(
                 semantic_test_exit_code=semantic.returncode,
                 semantic_test_duration_seconds=semantic.duration_seconds,
                 benchmark_status=benchmark_status,
+                baseline_median_seconds=baseline_median_seconds,
+                candidate_median_seconds=candidate_median_seconds,
+                minimum_speedup=minimum_speedup,
             )
         )
         _progress(

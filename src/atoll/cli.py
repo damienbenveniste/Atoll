@@ -684,6 +684,7 @@ def _print_source_clean_success(
     _print_candidate_trial_summary(result)
     _print_execution_plan_trial_summary(result)
     _print_source_optimization_trial_summary(result)
+    _print_final_composition_summary(result)
     if result.performance is not None:
         if result.performance.status == "passed" and result.performance.speedup is not None:
             print(f"Performance: {result.performance.speedup:.3f}x median speedup (passed).")
@@ -691,6 +692,29 @@ def _print_source_clean_success(
             print(f"Performance: {result.performance.status}.")
     print(f"Wheel: {result.wheel_path}")
     _print_compile_report_paths(report_paths)
+
+
+def _print_final_composition_summary(result: PackageCommandResult) -> None:
+    """Print the independently retained source, native, and plan layers.
+
+    Args:
+        result: Successful source-clean result after every profitability gate.
+    """
+    source_candidates = tuple(
+        trial.candidate_id
+        for trial in result.source_optimization_trials
+        if trial.status == "accepted"
+    )
+    native_variants = tuple(variant.id for variant in result.compiled_variants)
+    execution_plans = result.applied_execution_plans
+    if not source_candidates and not native_variants and not execution_plans:
+        return
+    print(
+        "Composition: "
+        f"{len(source_candidates)} source optimization(s), "
+        f"{len(native_variants)} native variant(s), "
+        f"{len(execution_plans)} execution plan(s)."
+    )
 
 
 def _print_source_optimization_trial_summary(result: PackageCommandResult) -> None:

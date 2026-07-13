@@ -12,9 +12,13 @@ concurrency:
 
 jobs:
   benchmark:
-    name: Schema v5 source optimizer 3x acceptance
-    runs-on: macos-14
-    timeout-minutes: 45
+    name: Schema v6 composed optimizer 3x acceptance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
     steps:
       - name: Check out Atoll
         uses: actions/checkout@v7.0.0
@@ -33,14 +37,14 @@ jobs:
       - name: Run pinned hard benchmark
         run: >-
           uv run --python 3.12 python scripts/run_pydantic_graph_benchmark.py
-          --workspace "$RUNNER_TEMP/pydantic-ai"
-          --evidence-root "$RUNNER_TEMP/pydantic-graph-evidence"
+          --workspace "$RUNNER_TEMP/pydantic-ai-${{ runner.os }}"
+          --evidence-root "$RUNNER_TEMP/pydantic-graph-evidence-${{ runner.os }}"
 
-      - name: Upload schema v5 source-optimization evidence
+      - name: Upload schema v6 composition evidence
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: pydantic-graph-hard-benchmark-schema-v5
-          path: ${{ runner.temp }}/pydantic-graph-evidence
+          name: pydantic-graph-hard-benchmark-schema-v6-${{ matrix.os }}
+          path: ${{ runner.temp }}/pydantic-graph-evidence-${{ runner.os }}
           if-no-files-found: warn
           retention-days: 30

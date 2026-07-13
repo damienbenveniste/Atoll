@@ -14,11 +14,16 @@ from pathlib import Path
 from statistics import median
 from typing import Literal, Protocol, TypedDict, cast
 
+from atoll.optimization_policy import (
+    HARD_BENCHMARK_MINIMUM_SPEEDUP,
+    MINIMUM_STABLE_MEDIAN_SECONDS,
+)
+
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "residual_async_profile"
 DEFAULT_WARMUPS = 1
 DEFAULT_SAMPLES = 7
-DEFAULT_MINIMUM_SECONDS = 0.25
-DEFAULT_MINIMUM_SPEEDUP = 3.0
+DEFAULT_MINIMUM_SECONDS = MINIMUM_STABLE_MEDIAN_SECONDS
+DEFAULT_MINIMUM_SPEEDUP = HARD_BENCHMARK_MINIMUM_SPEEDUP
 DEFAULT_SEMANTIC_REPETITIONS = 8
 DEFAULT_ITERATIONS = 2
 MAX_CALIBRATION_ITERATIONS = 4096

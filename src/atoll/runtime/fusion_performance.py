@@ -14,12 +14,16 @@ from pathlib import Path
 from statistics import median
 from typing import Literal, TypedDict, Unpack
 
+from atoll.optimization_policy import (
+    DEFAULT_MINIMUM_FINAL_SPEEDUP,
+    DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+    assess_speedup,
+    validate_acceleration_threshold,
+)
 from atoll.runtime.performance import CommandRunEvidence, run_performance_command
 
 FusionArm = Literal["baseline", "unfused", "fused"]
 FusionStatus = Literal["passed", "not-profitable", "invalid", "unavailable"]
-
-_MINIMUM_STABLE_MEDIAN_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,8 +52,8 @@ class FusionBenchmarkConfig:
     semantic_command: tuple[str, ...] | None = None
     warmups: int = 1
     samples: int = 3
-    minimum_over_unfused: float = 1.05
-    minimum_overall: float = 1.10
+    minimum_over_unfused: float = DEFAULT_MINIMUM_MARGINAL_SPEEDUP
+    minimum_overall: float = DEFAULT_MINIMUM_FINAL_SPEEDUP
 
     def __post_init__(self) -> None:
         """Reject invalid trial policy before launching child commands.
@@ -74,10 +78,14 @@ class FusionBenchmarkConfig:
             raise ValueError("fusion benchmark warmups must be at least 0")
         if self.samples < 1:
             raise ValueError("fusion benchmark samples must be at least 1")
-        if self.minimum_over_unfused <= 0:
-            raise ValueError("minimum over unfused must be greater than 0")
-        if self.minimum_overall <= 0:
-            raise ValueError("minimum overall must be greater than 0")
+        validate_acceleration_threshold(
+            self.minimum_over_unfused,
+            field="minimum over unfused",
+        )
+        validate_acceleration_threshold(
+            self.minimum_overall,
+            field="minimum overall",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +310,17 @@ def _decision_trial(
     baseline_median = _arm_median(samples, "baseline")
     unfused_median = _arm_median(samples, "unfused")
     fused_median = _arm_median(samples, "fused")
-    if min(baseline_median, unfused_median, fused_median) < _MINIMUM_STABLE_MEDIAN_SECONDS:
+    marginal = assess_speedup(
+        unfused_median,
+        fused_median,
+        minimum_speedup=config.minimum_over_unfused,
+    )
+    overall = assess_speedup(
+        baseline_median,
+        fused_median,
+        minimum_speedup=config.minimum_overall,
+    )
+    if not marginal.stable or not overall.stable:
         return FusionTrial(
             plan_id=config.plan_id,
             status="invalid",
@@ -324,12 +342,11 @@ def _decision_trial(
         )
 
     baseline_over_unfused = baseline_median / unfused_median
-    baseline_over_fused = baseline_median / fused_median
-    unfused_over_fused = unfused_median / fused_median
-    if (
-        unfused_over_fused >= config.minimum_over_unfused
-        and baseline_over_fused >= config.minimum_overall
-    ):
+    baseline_over_fused = overall.speedup
+    unfused_over_fused = marginal.speedup
+    if baseline_over_fused is None or unfused_over_fused is None:
+        raise AssertionError("stable fusion assessments must include speedups")
+    if marginal.passed and overall.passed:
         return FusionTrial(
             plan_id=config.plan_id,
             status="passed",

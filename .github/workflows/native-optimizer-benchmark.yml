@@ -1,0 +1,58 @@
+name: Generic Native Optimizer Hard Benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: generic-native-optimizer-hard-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Native families and cold batching (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    steps:
+      - name: Check out Atoll
+        uses: actions/checkout@v7.0.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Sync Atoll
+        run: uv sync --frozen --all-groups --python 3.12
+
+      - name: Verify representative cold Cython batching
+        run: >-
+          uv run --python 3.12 python scripts/run_cython_batch_benchmark.py
+          --workspace "$RUNNER_TEMP/cython-batch-${{ runner.os }}"
+          --evidence "$RUNNER_TEMP/cython-batch-${{ runner.os }}.json"
+
+      - name: Run native family hard gates
+        run: >-
+          uv run --python 3.12 python scripts/run_native_optimizer_benchmark.py
+          --workspace "$RUNNER_TEMP/native-optimizer-${{ runner.os }}"
+          --evidence-root "$RUNNER_TEMP/native-optimizer-evidence-${{ runner.os }}"
+
+      - name: Upload native optimizer evidence
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: native-optimizer-hard-benchmark-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/cython-batch-${{ runner.os }}.json
+            ${{ runner.temp }}/native-optimizer-evidence-${{ runner.os }}
+          if-no-files-found: warn
+          retention-days: 30

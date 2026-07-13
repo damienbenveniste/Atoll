@@ -2371,7 +2371,7 @@ def test_source_clean_success_summary_lists_every_fallback_kind(
     shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
     scan = _selected_scans(project, "typed_region_project.worker")[0]
-    selection = _selected_typed_regions((scan,))[0]
+    selection = next(item for item in _selected_typed_regions((scan,)) if item.region.bindings)
     island = EnabledIslandConfig(
         source_module=scan.module.name,
         source_path=scan.module.path,
@@ -2487,6 +2487,9 @@ def test_plan_only_success_output_names_applied_plan_and_cache_hit(
     output = capsys.readouterr().out
     assert "applied 1 async execution plan(s); no native regions were retained" in output
     assert "Execution-plan trials: 1/1 accepted; 1 staging cache hit(s)." in output
+    assert (
+        "Composition: 0 source optimization(s), 0 native variant(s), 1 execution plan(s)." in output
+    )
 
 
 def test_plan_only_promotion_preserves_the_baseline_pure_wheel_tag(tmp_path: Path) -> None:
@@ -3067,6 +3070,8 @@ def test_conditional_task_fusion_trials_disposable_payload_after_safe_miss(
         **kwargs: object,
     ) -> FusionTrial:
         calls.append(config.plan_id)
+        assert config.minimum_over_unfused == pytest.approx(1.05)
+        assert config.minimum_overall == pytest.approx(project.config.compile.minimum_speedup)
         fused_root = cast(Path, kwargs["fused_payload_root"])
         transformed = (fused_root / "app" / "fusion_case.py").read_text(encoding="utf-8")
         assert "_atoll_eager_spawn_fixture" in transformed
@@ -3808,8 +3813,26 @@ def test_composition_fallback_preserves_source_success_and_rejection_evidence(
 ) -> None:
     """A rejected later arm cannot invalidate an accepted source optimization."""
     project_root = tmp_path / "project"
-    project_root.mkdir()
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
+    scan = _selected_scans(project, "typed_region_project.worker")[0]
+    selection = next(item for item in _selected_typed_regions((scan,)) if item.region.bindings)
+    variant = CompiledRegionVariant(
+        id=selection.variant_id,
+        region=selection.region,
+        backend=selection.backend,
+        bindings=selection.region.bindings,
+    )
+    artifact = ArtifactRecord(
+        region_id=variant.id,
+        backend=variant.backend,
+        logical_module="_atoll_fixture",
+        role="primary",
+        install_relative_path=".atoll/artifacts/_atoll_fixture.so",
+        digest="0" * 64,
+        abi="cp312",
+        platform_tag="test-platform",
+    )
     source_result = package_command.PackageCommandResult(
         success=True,
         project_root=project_root,
@@ -3841,6 +3864,11 @@ def test_composition_fallback_preserves_source_success_and_rejection_evidence(
         wheel_path=None,
         build=rejected_attempt,
         error="native benchmark rejected",
+        compiled_regions=(variant.region,),
+        compiled_bindings=variant.bindings,
+        compiled_variants=(variant,),
+        artifact_records=(artifact,),
+        applied_execution_plans=("rejected-plan",),
     )
 
     recovered = _source_result_with_composition_fallback(
@@ -3852,6 +3880,11 @@ def test_composition_fallback_preserves_source_success_and_rejection_evidence(
     assert recovered.success is True
     assert recovered.wheel_path == source_result.wheel_path
     assert recovered.performance == source_result.performance
+    assert recovered.compiled_regions == ()
+    assert recovered.compiled_bindings == ()
+    assert recovered.compiled_variants == ()
+    assert recovered.artifact_records == ()
+    assert recovered.applied_execution_plans == ()
     assert "composition fallback retained: native benchmark rejected" in recovered.build.stdout
     assert recovered.build.duration_seconds == pytest.approx(2.5)
     assert recovered.build.phase_timings[-1].name == "native_trial"
@@ -4079,6 +4112,7 @@ def test_composed_source_arm_restores_source_wheel_after_native_rejection(
             islands=(),
             build=replace(_successful_attempt(), success=False, stderr="not profitable"),
             error="not profitable",
+            applied_execution_plans=("rejected-plan",),
         )
 
     monkeypatch.setattr(package_command, "_execute_typed_region_package", reject_native)
@@ -4095,6 +4129,11 @@ def test_composed_source_arm_restores_source_wheel_after_native_rejection(
     assert result.wheel_path == wheel_path
     assert wheel_path.read_bytes() == b"accepted-source-wheel"
     assert "composition fallback retained: not profitable" in result.build.stdout
+    assert result.compiled_regions == ()
+    assert result.compiled_bindings == ()
+    assert result.compiled_variants == ()
+    assert result.artifact_records == ()
+    assert result.applied_execution_plans == ()
 
 
 def test_package_returns_source_application_failure_before_native_fallback(

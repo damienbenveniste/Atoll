@@ -183,7 +183,7 @@ def test_execution_plan_benchmark_forwards_variant_allowlists(
     monkeypatch.setattr(
         execution_plan_performance,
         "run_performance_command",
-        _fake_runner([1.0] * 6, calls),
+        _fake_runner([3.0, 2.0, 1.0, 3.0, 2.0, 1.0], calls),
     )
 
     run_execution_plan_benchmark(
@@ -191,8 +191,8 @@ def test_execution_plan_benchmark_forwards_variant_allowlists(
             plan_id=PLAN_ID,
             command=("python", "bench.py"),
             samples=1,
-            minimum_marginal_speedup=1.0,
-            minimum_overall_speedup=1.0,
+            minimum_marginal_speedup=1.01,
+            minimum_overall_speedup=1.01,
         ),
         project_root=tmp_path,
         baseline_payload_root=tmp_path / "baseline",

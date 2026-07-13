@@ -11,6 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from atoll.optimization_policy import (
+    DEFAULT_MINIMUM_FINAL_SPEEDUP,
+    validate_acceleration_threshold,
+)
+
 ArtifactRole = Literal["primary", "support"]
 Backend = Literal["mypyc", "cython"]
 BackendAssessmentStatus = Literal["supported", "partial", "unsupported"]
@@ -101,14 +106,15 @@ class CompileConfig:
     benchmark_command: tuple[str, ...] | None = None
     benchmark_warmups: int = 1
     benchmark_samples: int = 7
-    minimum_speedup: float = 1.10
+    minimum_speedup: float = DEFAULT_MINIMUM_FINAL_SPEEDUP
 
     def __post_init__(self) -> None:
         """Reject incomplete or ambiguous compile policy at discovery time.
 
         Raises:
             ValueError: If backends are empty or duplicated, commands are malformed, benchmark
-                policy is incomplete, counts are invalid, or the speedup threshold is not positive.
+                policy is incomplete, counts are invalid, or the speedup threshold does not
+                require acceleration.
         """
         if not self.backends or len(set(self.backends)) != len(self.backends):
             raise ValueError("tool.atoll.compile.backends must be a non-empty unique list")
@@ -126,8 +132,10 @@ class CompileConfig:
             raise ValueError("tool.atoll.compile.benchmark_warmups must be at least 0")
         if self.benchmark_samples < 1:
             raise ValueError("tool.atoll.compile.benchmark_samples must be at least 1")
-        if self.minimum_speedup <= 0:
-            raise ValueError("tool.atoll.compile.minimum_speedup must be greater than 0")
+        validate_acceleration_threshold(
+            self.minimum_speedup,
+            field="tool.atoll.compile.minimum_speedup",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1030,6 +1038,9 @@ class CandidateTrial:
         semantic_test_exit_code: Exit code from the candidate semantic test, when run.
         semantic_test_duration_seconds: Candidate semantic-test duration, when run.
         benchmark_status: Marginal benchmark gate status, or unavailable when not run.
+        baseline_median_seconds: Current accepted-arm median used by the marginal gate.
+        candidate_median_seconds: Candidate-composition median used by the marginal gate.
+        minimum_speedup: Marginal acceleration threshold applied to the candidate.
     """
 
     id: str
@@ -1050,6 +1061,9 @@ class CandidateTrial:
     semantic_test_exit_code: int | None
     semantic_test_duration_seconds: float | None
     benchmark_status: str
+    baseline_median_seconds: float | None = None
+    candidate_median_seconds: float | None = None
+    minimum_speedup: float | None = None
 
     def __post_init__(self) -> None:
         """Reject malformed trial evidence before it reaches a report.
@@ -1075,6 +1089,18 @@ class CandidateTrial:
             raise ValueError("candidate semantic-test duration must be non-negative")
         if self.marginal_speedup is not None and self.marginal_speedup <= 0:
             raise ValueError("candidate marginal speedup must be positive")
+        _validate_candidate_trial_performance(self)
+
+
+def _validate_candidate_trial_performance(trial: CandidateTrial) -> None:
+    for median_seconds in (trial.baseline_median_seconds, trial.candidate_median_seconds):
+        if median_seconds is not None and median_seconds < 0:
+            raise ValueError("candidate benchmark medians must be non-negative")
+    if trial.minimum_speedup is not None:
+        validate_acceleration_threshold(
+            trial.minimum_speedup,
+            field="candidate minimum speedup",
+        )
 
 
 @dataclass(frozen=True, slots=True)

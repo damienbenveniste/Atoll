@@ -2,8 +2,8 @@
 
 Atoll finds typed, CPU-bound regions in Python projects that can be extracted into native
 extensions without rewriting the original source tree. It explains why code is accepted or
-rejected, compiles eligible functions and methods with mypyc, and preserves interpreted Python as
-the fallback.
+rejected, compiles eligible functions and methods with mypyc or Cython, composes guarded native and
+source optimizations, and preserves interpreted Python as the fallback.
 
 ## Quickstart
 
@@ -33,9 +33,10 @@ uv run atoll scan . --source-root src
 
 Reports are written to `.atoll/report.json` and `.atoll/report.md`.
 
-Report schema v2 records exact callable annotations, type parameters, class ownership,
+Report schema v3 records exact callable annotations, type parameters, class ownership,
 descriptor and execution kinds, class fields, and connected typed regions. These regions preserve
-source typing for backend assessment and method-level source-clean compilation.
+source typing for backend assessment, fixed-width and buffer proofs, directed call-chain slices,
+and method-level source-clean compilation.
 
 Atoll's compiler boundary is backend-neutral. `CompilerBackend` separates per-member capability
 assessment, registration of prepared compilation units, native compilation, strict fingerprinting,
@@ -83,10 +84,10 @@ associated with that variant. Each variant also reports `lowering_mode`; an `out
 variant lists the private synchronous `native_helpers` called by its staged Python suspension
 shell. Typed-region entries retain the original generic declaration plus the specialization origin,
 substitutions, and concrete type bindings.
-Compile report schema v5 includes profile coverage, exact scheduler spawn-site invocation evidence,
-candidate decisions, backend decisions, suspension plans, candidate trials, execution-plan
-candidates and trials, task-fusion research, source-optimization plans and assessments, and accepted
-or rejected variants. Source optimization remains report-only without configured semantic and
+Compile report schema v6 includes profile coverage, backend decisions, integer and buffer proofs,
+dispatch order, suspension plans, candidate trials, execution-plan and source-optimization
+evidence, cache decisions, stage medians, the active optimization policy, and the final accepted
+composition. Source optimization remains report-only without configured semantic and
 benchmark commands. With both commands, Atoll may emit a patch only after the transformed source
 and its normally built PEP 517 wheel pass the hard source-optimization gate. Execution plans are
 reported separately from mypyc and Cython typed regions. It lists discovered and rejected plans,
@@ -94,8 +95,8 @@ reported separately from mypyc and Cython typed regions. It lists discovered and
 evidence, marginal speedup over the unplanned payload, and overall speedup over the interpreted
 baseline. Until a report lists a plan in `applied_execution_plans` with passing semantic and
 benchmark evidence, the plan is discovery evidence only and does not change runtime behavior. The
-schema retains the v2
-compatibility fields `islands` and `native_readiness`; for source-clean typed-region compile they
+schema retains all v5 fields plus the legacy v2 compatibility fields `islands` and
+`native_readiness`; for source-clean typed-region compile they
 are legacy views and normally remain empty with zero counts. Region members also expose ordered
 call sites, runtime imports, and suspension points; dependency records state the invocation mode
 and whether a dependency must share a native compilation unit. Suspension plans include each
@@ -140,6 +141,20 @@ conflicting call sites, unresolved TypeVars, semantic `Any`, subclass overrides,
 classes are not specialized. Profile-hot boxed callables can still be compiled without pretending
 that their types became concrete.
 
+Pure synchronous functions and static methods with exact `int` inputs can receive guarded Cython
+`int32_t` and `int64_t` variants when interval analysis proves every intermediate and return value.
+Dispatch checks exact `int` types and decimal-string proof bounds before native entry, then tries
+32-bit, 64-bit, a generic compiled target, and Python in deterministic order. `bool`, integer
+subclasses, negative or oversized values, opaque calls, external mutation, and unproved arithmetic
+fall back before native execution; overflow is never retried.
+
+For an acyclic same-module call chain, Atoll can lower the root plus proven helpers into one Cython
+unit with private `cdef inline` calls. Callable and code identities, exact receiver class, and any
+direct scalar fields are checked before entry. Atoll-managed helper dispatchers are compared through
+their original Python fallback identity so independently composed variants do not disable a valid
+chain. Recursion, indirect dispatch, changed helpers, subclasses, and custom attribute behavior
+retain normal Python dispatch.
+
 For exact `bytes`, `bytearray`, `memoryview`, and `array.array` parameters, Atoll can lower a
 conservatively proved read-only sum, XOR, or conditional-count loop through a Cython typed
 memoryview without copying. Dispatch first checks the exact runtime type, one-dimensional
@@ -157,7 +172,11 @@ class object and descriptor kind.
 
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
 staging, cache lookup or restore, backend compilation, wheel writing, verification, and cleanup.
-Compile reports include cache status plus subphase timings such as `mypycify` and `build_ext`.
+Compile reports include cache status plus subphase timings such as `mypycify`, `cythonize`, and
+`build_ext`. Compatible cold Cython misses share one build and use bounded parallel translation and
+object compilation; deterministic failures are bisected to individual variants. The representative
+cold-build gate requires at least a 20% reduction with artifact parity. A fully warm batch restores
+each variant independently and invokes no native compiler.
 Duplicate macOS linker `-rpath` warnings are filtered from terminal output; other native compiler
 diagnostics are still captured in Atoll's build diagnostics. Atoll keeps strict reusable compile
 and mypy cache state under `.atoll/cache/`. Typed artifacts are cached independently by backend and
@@ -242,6 +261,11 @@ benchmark_samples = 7
 minimum_speedup = 1.10
 ```
 
+`minimum_speedup` must be greater than `1.0`. Specialized native and execution-plan candidates
+must improve the current accepted arm by at least `1.05x`; profile-guided generic regions retain
+their `1.01x` exploratory gate. Both compared medians must be at least 0.25 seconds. Source patches
+and representative family promotion use the separate `3.0x` hard floor.
+
 Commands run directly with `shell=False`. For `python script.py` and `python -m module` benchmark
 commands, Atoll first builds and tests the baseline wheel, then runs unmeasured profile passes before
 selecting regions. A 2 ms statistical leaf-frame sampler identifies project hot paths. A bounded
@@ -290,7 +314,7 @@ A linked hot reducer may replace
 `len(inspect.signature(function).parameters)` with an exact code-object parameter count only for an
 unwrapped Python function under the original `inspect` implementation. Every other callable uses
 the original reflection expression. Cross-module plan members and their complete source hashes are
-recorded in schema v5.
+recorded in schema v6.
 
 Execution-plan staging cache entries live under `.atoll/cache/execution-plans/`. A cache hit restores
 the planned payload files but does not skip semantic or profitability gates: profile collection,
@@ -314,6 +338,11 @@ gates.
 The manual [generic source-optimizer benchmark](benchmarks/source_optimization/README.md) enforces
 the copied-context semantic matrix and `3.0x` guarded feasibility floor independently of any target
 project.
+
+The manual [native optimizer benchmark](benchmarks/native_optimization/README.md) builds the generic
+fixture cold and warm, verifies a zero-compiler warm cache hit, and applies one warmup plus seven
+rotating pairs to mixed scalar, direct call-chain, and standard-buffer workloads. Every family must
+independently reach `3.0x`; one fast polynomial cannot stand in for the other families.
 
 Atoll's manual [Pydantic Graph hard benchmark](benchmarks/pydantic_graph/README.md) pins a difficult
 async orchestration workload, compiles it twice, and retains cold/warm reports, source hashes, and
@@ -391,6 +420,10 @@ uv run atoll trial --candidate app.ranking::score_user,rank_candidates --test "p
 uv run atoll trial --top 3 --test "pytest tests" --benchmark "pytest benchmarks"
 uv run atoll clean --all
 ```
+
+`explain` includes fixed-width proof bounds, direct call-chain helpers, zero-copy buffer plans, and
+the specific fallback reason for each rejected specialization. These are static capability facts,
+not performance predictions.
 
 Trial mode preserves the scan-candidate selection UX from `--candidate` and `--top`, then compiles
 the selected callable closure through the same source-clean package pipeline used by `atoll

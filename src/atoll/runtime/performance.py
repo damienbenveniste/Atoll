@@ -18,11 +18,11 @@ from pathlib import Path
 from statistics import median
 from typing import Literal, TypedDict, Unpack
 
+from atoll.optimization_policy import assess_speedup, validate_acceleration_threshold
+
 RuntimeMode = Literal["baseline", "compiled"]
 BenchmarkPhase = Literal["warmup", "sample"]
 BenchmarkStatus = Literal["passed", "not-profitable", "invalid", "unbenchmarked"]
-
-_MINIMUM_STABLE_MEDIAN_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,8 +127,8 @@ class BenchmarkGateConfig:
         """Reject invalid benchmark policy before launching subprocesses.
 
         Raises:
-            ValueError: If the command is empty, counts are invalid, or the speedup threshold is
-                not positive.
+            ValueError: If the command is empty, counts are invalid, or the speedup threshold does
+                not require acceleration.
         """
         if self.command is not None and (
             not self.command or any(not part.strip() for part in self.command)
@@ -138,8 +138,7 @@ class BenchmarkGateConfig:
             raise ValueError("benchmark warmups must be at least 0")
         if self.samples < 1:
             raise ValueError("benchmark samples must be at least 1")
-        if self.minimum_speedup <= 0:
-            raise ValueError("minimum speedup must be greater than 0")
+        validate_acceleration_threshold(self.minimum_speedup, field="minimum speedup")
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +374,9 @@ def run_benchmark_gate(
 
     Returns:
         BenchmarkGateResult: Paired baseline and compiled samples plus the derived speedup decision.
+
+    Raises:
+        AssertionError: If a stable policy assessment omits its required speedup ratio.
     """
     _reject_unexpected_benchmark_options(options)
     progress = options.get("progress")
@@ -433,10 +435,12 @@ def run_benchmark_gate(
 
     baseline_median = median(run.duration_seconds for run in sample_runs if run.mode == "baseline")
     compiled_median = median(run.duration_seconds for run in sample_runs if run.mode == "compiled")
-    if (
-        baseline_median < _MINIMUM_STABLE_MEDIAN_SECONDS
-        or compiled_median < _MINIMUM_STABLE_MEDIAN_SECONDS
-    ):
+    assessment = assess_speedup(
+        baseline_median,
+        compiled_median,
+        minimum_speedup=config.minimum_speedup,
+    )
+    if not assessment.stable:
         return BenchmarkGateResult(
             status="invalid",
             reason=(
@@ -451,8 +455,10 @@ def run_benchmark_gate(
             samples=sample_runs,
         )
 
-    speedup = baseline_median / compiled_median
-    if speedup >= config.minimum_speedup:
+    speedup = assessment.speedup
+    if speedup is None:
+        raise AssertionError("stable benchmark assessment must include speedup")
+    if assessment.passed:
         return BenchmarkGateResult(
             status="passed",
             reason=(

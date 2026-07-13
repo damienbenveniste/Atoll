@@ -507,8 +507,9 @@ def test_cython_compile_normalizes_build_failures(
         build_dir: Path,
         *,
         project_root: Path,
+        workers: int,
     ) -> list[object]:
-        _ = (units, build_dir, project_root)
+        _ = (units, build_dir, project_root, workers)
         raise error
 
     monkeypatch.setattr(cython_backend_module, "_cythonize_extensions", fail_cythonize)

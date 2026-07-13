@@ -1,4 +1,4 @@
-"""Deterministic checks for the schema-v5 Pydantic Graph hard-benchmark gate."""
+"""Deterministic checks for the schema-v6 Pydantic Graph hard-benchmark gate."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from scripts.run_pydantic_graph_benchmark import (
     BENCHMARK_SAMPLES,
     COLD_MYPYC_BASELINE_SECONDS,
     COLD_MYPYC_TARGET_SECONDS,
+    COMPILE_REPORT_VERSION,
+    MINIMUM_COMPOSED_MARGINAL_SPEEDUP,
     MINIMUM_FINAL_SPEEDUP,
     MINIMUM_SOURCE_SPEEDUP,
     BenchmarkEvidenceInputs,
@@ -26,6 +28,8 @@ CANDIDATE_ID = "source-candidate-fixture"
 PATCH_PATH = f".atoll/patches/{CANDIDATE_ID}.patch"
 SOURCE_SPEEDUP = 3.6
 WHEEL_SPEEDUP = 3.5
+COMPOSED_MARGINAL_SPEEDUP = 1.25
+FINAL_SPEEDUP = WHEEL_SPEEDUP * COMPOSED_MARGINAL_SPEEDUP
 TRANSFORMATION_IDS = [
     "private-transport-batch-drain:batch-drain-v1:fixture.Owner.consume",
     "quiescent-callable-execution:quiescent-callable-v1:fixture.Owner.worker",
@@ -46,7 +50,8 @@ def test_evaluate_reports_accepts_reproducible_3x_source_patch() -> None:
     assert evaluation.errors == ()
     assert evaluation.cold_patch_cache_status == "miss"
     assert evaluation.warm_patch_cache_status == "hit"
-    assert evaluation.final_speedup == WHEEL_SPEEDUP
+    assert evaluation.final_speedup == FINAL_SPEEDUP
+    assert evaluation.composed_marginal_speedup == COMPOSED_MARGINAL_SPEEDUP
     assert evaluation.source_speedup == SOURCE_SPEEDUP
     assert evaluation.wheel_speedup == WHEEL_SPEEDUP
     assert evaluation.source_plan_count == 1
@@ -65,6 +70,7 @@ def test_evaluate_reports_rejects_every_source_promotion_boundary() -> None:
         cache_status="miss",
         source_speedup=MINIMUM_SOURCE_SPEEDUP - 0.01,
         wheel_speedup=MINIMUM_FINAL_SPEEDUP - 0.01,
+        composed_marginal_speedup=0.9,
     )
     warm["version"] = 4
     cast(dict[str, object], warm["profile"])["status"] = "static-fallback"
@@ -106,7 +112,7 @@ def test_evaluate_reports_rejects_every_source_promotion_boundary() -> None:
     assert evaluation.succeeded is False
     message = "\n".join(evaluation.errors)
     assert "cold compile did not succeed" in message
-    assert "warm report is not schema version 5" in message
+    assert f"warm report is not schema version {COMPILE_REPORT_VERSION}" in message
     assert "warm profile status is static-fallback" in message
     assert "warm performance status is not-profitable" in message
     assert "warm source-optimization status is not-profitable" in message
@@ -132,6 +138,7 @@ def test_evaluate_reports_rejects_every_source_promotion_boundary() -> None:
     assert "transformed source speedup is below 3.00x" in message
     assert "normal wheel speedup is below 3.00x" in message
     assert "final speedup is below 3.00x" in message
+    assert "accepted source-only arm by less than 1.05x" in message
 
 
 def test_evaluate_reports_requires_source_plan_and_accepted_trial() -> None:
@@ -266,21 +273,62 @@ def _report(
     cache_status: str,
     source_speedup: float = SOURCE_SPEEDUP,
     wheel_speedup: float = WHEEL_SPEEDUP,
+    composed_marginal_speedup: float = COMPOSED_MARGINAL_SPEEDUP,
 ) -> dict[str, object]:
+    baseline_median = wheel_speedup
+    wheel_median = 1.0
+    composed_median = wheel_median / composed_marginal_speedup
     samples = [
         {"mode": mode, "duration_seconds": 1.0}
         for _ in range(BENCHMARK_SAMPLES)
         for mode in ("baseline", "compiled")
     ]
     return {
-        "version": 5,
+        "version": COMPILE_REPORT_VERSION,
         "success": True,
         "build": {"cache_status": "disabled", "phase_timings": []},
         "profile": {"status": "profiled"},
         "performance": {
             "status": "passed",
-            "speedup": wheel_speedup,
+            "baseline_median_seconds": wheel_median,
+            "compiled_median_seconds": composed_median,
+            "speedup": composed_marginal_speedup,
             "samples": samples,
+        },
+        "optimization_policy": {
+            "version": 1,
+            "stability_floor_seconds": 0.25,
+            "profile_guided_minimum_marginal_speedup": 1.01,
+            "specialized_minimum_marginal_speedup": MINIMUM_COMPOSED_MARGINAL_SPEEDUP,
+            "final_minimum_speedup": MINIMUM_FINAL_SPEEDUP,
+            "hard_benchmark_minimum_speedup": MINIMUM_FINAL_SPEEDUP,
+        },
+        "stage_medians": [
+            {
+                "stage": "source-final",
+                "status": "accepted",
+                "baseline_median_seconds": baseline_median,
+                "candidate_median_seconds": wheel_median,
+                "speedup": wheel_speedup,
+                "minimum_speedup": MINIMUM_SOURCE_SPEEDUP,
+            },
+            {
+                "stage": "final-payload",
+                "status": "passed",
+                "baseline_median_seconds": wheel_median,
+                "candidate_median_seconds": composed_median,
+                "speedup": composed_marginal_speedup,
+                "minimum_speedup": MINIMUM_COMPOSED_MARGINAL_SPEEDUP,
+            },
+        ],
+        "final_composition": {
+            "source_plan_ids": [PLAN_ID],
+            "transformation_ids": TRANSFORMATION_IDS,
+            "native_variant_ids": ["fixture::native@cython"],
+            "execution_plan_ids": [],
+            "artifacts": [".atoll/artifacts/fixture.so"],
+            "wheel_path": ".atoll/dist/fixture.whl",
+            "retained_previous_arm": False,
         },
         "source_optimization": {
             "status": "accepted",
@@ -314,6 +362,9 @@ def _report(
                     "candidate_id": CANDIDATE_ID,
                     "source_speedup": source_speedup,
                     "wheel_speedup": wheel_speedup,
+                    "baseline_median_seconds": baseline_median,
+                    "source_median_seconds": baseline_median / source_speedup,
+                    "wheel_median_seconds": wheel_median,
                     "patch_path": PATCH_PATH,
                     "source_edits": [
                         {

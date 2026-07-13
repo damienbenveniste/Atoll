@@ -42,6 +42,7 @@ from atoll.models import (
     VerifyResult,
 )
 from atoll.report import (
+    COMPILE_REPORT_SCHEMA_VERSION,
     CompilationPreflightBlockerInput,
     CompilationReportInput,
     CompilationSkippedModuleInput,
@@ -79,7 +80,7 @@ from atoll.source_optimization.models import (
     TransformationStep,
 )
 
-REPORT_SCHEMA_VERSION = 5
+REPORT_SCHEMA_VERSION = COMPILE_REPORT_SCHEMA_VERSION
 PROFILE_MAPPED_COVERAGE = 0.75
 PROFILE_SELECTED_HOT_COVERAGE = 0.8
 PROFILE_SAMPLING_INTERVAL_MS = 2
@@ -429,7 +430,7 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
 def test_compilation_report_serializes_profile_guided_selection_without_values(
     tmp_path: Path,
 ) -> None:
-    """Schema v3 emits canonical profile evidence without object values or reprs."""
+    """Compile schema v6 emits canonical profile evidence without values or reprs."""
     profile = ProfileResult(
         status="profiled",
         reason="baseline profile collected",
@@ -583,6 +584,9 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                     semantic_test_exit_code=0,
                     semantic_test_duration_seconds=0.2,
                     benchmark_status="passed",
+                    baseline_median_seconds=0.52,
+                    candidate_median_seconds=0.5,
+                    minimum_speedup=1.01,
                 ),
             ),
             fusion_plans=(
@@ -661,8 +665,29 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
             "semantic_test_exit_code": 0,
             "semantic_test_duration_seconds": 0.2,
             "benchmark_status": "passed",
+            "baseline_median_seconds": 0.52,
+            "candidate_median_seconds": 0.5,
+            "minimum_speedup": 1.01,
         }
     ]
+    assert report["optimization_policy"] == {
+        "version": 1,
+        "stability_floor_seconds": 0.25,
+        "profile_guided_minimum_marginal_speedup": 1.01,
+        "specialized_minimum_marginal_speedup": 1.05,
+        "final_minimum_speedup": 1.1,
+        "hard_benchmark_minimum_speedup": 3.0,
+    }
+    assert report["stage_medians"][0] == {
+        "stage": "native:score-cython",
+        "status": "passed",
+        "baseline_median_seconds": 0.52,
+        "candidate_median_seconds": 0.5,
+        "speedup": 1.04,
+        "minimum_speedup": 1.01,
+    }
+    assert "## Optimization Policy" in markdown
+    assert "## Stage Medians" in markdown
     assert report["profile"]["sampling_policy"]["interval_ms"] == PROFILE_SAMPLING_INTERVAL_MS
     assert report["profile"]["child_passes"] == [
         {
@@ -1071,6 +1096,16 @@ def test_compilation_report_accepts_explicit_compiled_variants(tmp_path: Path) -
             "artifacts": [".atoll/artifacts/_atoll_variant_score.so"],
         }
     ]
+    assert report["cache_decisions"] == [
+        {
+            "variant_id": variant_id,
+            "backend": "mypyc",
+            "status": "hit",
+            "batched": False,
+        }
+    ]
+    assert report["final_composition"]["native_variant_ids"] == [variant_id]
+    assert report["final_composition"]["artifacts"] == [".atoll/artifacts/_atoll_variant_score.so"]
     assert report["accepted_variants"] == [
         {
             "region_id": region.id,
@@ -1086,7 +1121,7 @@ def test_compilation_report_accepts_explicit_compiled_variants(tmp_path: Path) -
     ]
 
 
-def test_compilation_report_serializes_execution_plan_schema_v4(tmp_path: Path) -> None:
+def test_compilation_report_serializes_execution_plan_compatibility_fields(tmp_path: Path) -> None:
     """Execution plans remain distinct from native regions and fusion research."""
     owner = SymbolId(module="app.scheduler", qualname="run")
     producer = SymbolId(module="app.scheduler", qualname="_produce")
@@ -1211,10 +1246,10 @@ def test_compilation_report_serializes_execution_plan_schema_v4(tmp_path: Path) 
     assert "Runtime status: report-only unless an applied plan" in markdown
 
 
-def test_compilation_report_serializes_source_optimization_schema_v5(
+def test_compilation_report_serializes_source_optimization_schema_v6(
     tmp_path: Path,
 ) -> None:
-    """Schema v5 reports source optimization plans, assessments, trials, and Markdown."""
+    """Schema v6 retains source plans, assessments, trials, and Markdown."""
     owner = SymbolId(module="app.scheduler", qualname="run")
     worker = SymbolId(module="app.scheduler", qualname="_produce")
     consumer = SymbolId(module="app.scheduler", qualname="_consume")
@@ -1457,6 +1492,10 @@ def test_compilation_report_serializes_source_optimization_schema_v5(
     assert report["summary"]["source_optimization_plans"] == 1
     assert report["summary"]["source_optimization_trial_ready_assessments"] == 1
     assert report["summary"]["source_optimization_trials"] == 1
+    assert report["final_composition"]["source_plan_ids"] == [plan.id]
+    assert report["final_composition"]["transformation_ids"] == [step.stable_id]
+    assert report["final_composition"]["native_variant_ids"] == []
+    assert "## Final Composition" in markdown
     assert report["source_optimization"]["plans"][0]["identity"]["source_hashes"] == {
         "app/scheduler.py": "a" * 64
     }

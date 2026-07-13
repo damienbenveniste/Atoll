@@ -19,9 +19,10 @@ from atoll.models import (
     CompileAttempt,
     SymbolId,
 )
-from atoll.region_cache import compile_with_region_cache
+from atoll.region_cache import compile_many_with_region_cache, compile_with_region_cache
 
 EXPECTED_DOUBLE_COMPILE_COUNT = 2
+EXPECTED_BATCH_ARTIFACT_COUNT = 2
 
 
 class _FakeBackend:
@@ -87,6 +88,101 @@ class _FakeBackend:
                 ),
             ),
         )
+
+
+class _BatchBackend:
+    """Cython-shaped compiler double with per-unit artifacts and failure controls."""
+
+    name: Backend = "cython"
+
+    def __init__(self) -> None:
+        self.compile_calls: list[tuple[str, ...]] = []
+        self.deterministic_bad_region: str | None = None
+        self.transient_failure = False
+        self.raise_on_compile = False
+        self.emit_shared_artifact = False
+
+    def fingerprint(self, unit: CompilationUnit, context: BackendCompileContext) -> str:
+        _ = context
+        return hashlib.sha256(f"batch:{unit.region_id}".encode()).hexdigest()
+
+    def compile(
+        self,
+        units: tuple[CompilationUnit, ...],
+        context: BackendCompileContext,
+    ) -> BackendCompileResult:
+        if self.raise_on_compile:
+            raise AssertionError("warm cache reached native compiler")
+        self.compile_calls.append(tuple(unit.region_id for unit in units))
+        if self.transient_failure or any(
+            unit.region_id == self.deterministic_bad_region for unit in units
+        ):
+            stderr = (
+                "transient compiler outage"
+                if self.transient_failure
+                else "CYTHON_COMPILE_ERROR: rejected generated unit"
+            )
+            return BackendCompileResult(
+                attempt=CompileAttempt(
+                    success=False,
+                    command=("fake-cython", *self.compile_calls[-1]),
+                    stdout="",
+                    stderr=stderr,
+                    artifact_paths=(),
+                    duration_seconds=0.1,
+                ),
+                artifacts=(),
+            )
+        artifact_root = context.build_dir.parent / "artifacts"
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        paths: list[Path] = []
+        records: list[ArtifactRecord] = []
+        for unit in units:
+            artifact = artifact_root / f"{unit.logical_module}.so"
+            artifact.write_bytes(unit.region_id.encode())
+            paths.append(artifact)
+            records.append(_artifact_record(unit, artifact))
+        if self.emit_shared_artifact:
+            shared = artifact_root / "shared-support.so"
+            shared.write_bytes(b"shared")
+            paths.append(shared)
+            records.extend(
+                ArtifactRecord(
+                    region_id="__shared__",
+                    backend="cython",
+                    logical_module="shared-support",
+                    role="support",
+                    install_relative_path=(f"{unit.install_relative_dir}/{shared.name}"),
+                    digest=hashlib.sha256(shared.read_bytes()).hexdigest(),
+                    abi="cp312",
+                    platform_tag="test-platform",
+                )
+                for unit in units
+            )
+        return BackendCompileResult(
+            attempt=CompileAttempt(
+                success=True,
+                command=("fake-cython", *self.compile_calls[-1]),
+                stdout="",
+                stderr="",
+                artifact_paths=tuple(paths),
+                duration_seconds=0.1,
+            ),
+            artifacts=tuple(records),
+        )
+
+
+def _artifact_record(unit: CompilationUnit, artifact: Path) -> ArtifactRecord:
+    return ArtifactRecord(
+        region_id=unit.region_id,
+        backend="cython",
+        logical_module=unit.logical_module,
+        role="primary",
+        install_relative_path=f"{unit.install_relative_dir}/{artifact.name}",
+        digest=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        abi="cp312",
+        platform_tag="test-platform",
+    )
 
 
 def test_region_cache_restores_successful_artifact_and_record(tmp_path: Path) -> None:
@@ -173,6 +269,173 @@ def test_region_cache_never_stores_failures(tmp_path: Path) -> None:
     assert second.attempt.cache_status == "miss"
     assert not (tmp_path / "cache" / "mypyc" / backend.key).exists()
     assert not (tmp_path / "cache" / "decisions" / "mypyc" / f"{backend.key}.json").exists()
+
+
+def test_batched_region_cache_handles_empty_and_mismatched_inputs(tmp_path: Path) -> None:
+    """Batch orchestration is empty-safe and rejects units for another backend."""
+    backend = _BatchBackend()
+    context = _context(tmp_path)
+
+    assert (
+        compile_many_with_region_cache(
+            cast(CompilerBackend, backend),
+            (),
+            context,
+            cache_root=tmp_path / "cache",
+        )
+        == ()
+    )
+    mismatched = _unit(tmp_path)
+    with pytest.raises(ValueError, match="selected backend"):
+        compile_many_with_region_cache(
+            cast(CompilerBackend, backend),
+            (mismatched,),
+            context,
+            cache_root=tmp_path / "cache",
+        )
+
+
+def test_batched_region_cache_delegates_non_cython_units(tmp_path: Path) -> None:
+    """A non-Cython batch retains the established independent compile path."""
+    backend = _FakeBackend()
+    context = _context(tmp_path)
+
+    results = compile_many_with_region_cache(
+        cast(CompilerBackend, backend),
+        (_unit(tmp_path),),
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert backend.compile_count == 1
+    assert len(results) == 1
+    assert results[0].attempt.cache_status == "miss"
+
+
+def test_region_cache_batches_only_misses_and_warm_run_never_compiles(tmp_path: Path) -> None:
+    """One warm entry is restored while cold peers share one physical invocation."""
+    backend = _BatchBackend()
+    context = _context(tmp_path)
+    units = _units(tmp_path, 3)
+    compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        units[0],
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    backend.compile_calls.clear()
+
+    mixed = compile_many_with_region_cache(
+        cast(CompilerBackend, backend),
+        units,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert backend.compile_calls == [(units[1].region_id, units[2].region_id)]
+    assert [result.attempt.cache_status for result in mixed] == ["hit", "miss", "miss"]
+    backend.raise_on_compile = True
+    warm = compile_many_with_region_cache(
+        cast(CompilerBackend, backend),
+        units,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    assert all(result.attempt.cache_status == "hit" for result in warm)
+
+
+def test_region_cache_bisects_deterministic_cython_failure(tmp_path: Path) -> None:
+    """One bad unit cannot discard good peers or poison an aggregate cache entry."""
+    backend = _BatchBackend()
+    context = _context(tmp_path)
+    units = _units(tmp_path, 4)
+    backend.deterministic_bad_region = units[1].region_id
+
+    results = compile_many_with_region_cache(
+        cast(CompilerBackend, backend),
+        units,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert backend.compile_calls == [
+        tuple(unit.region_id for unit in units),
+        (units[0].region_id, units[1].region_id),
+        (units[0].region_id,),
+        (units[1].region_id,),
+        (units[2].region_id, units[3].region_id),
+    ]
+    assert [result.attempt.success for result in results] == [True, False, True, True]
+    assert results[1].attempt.phase_timings[-1].name == "backend_decision_store"
+    backend.compile_calls.clear()
+    backend.raise_on_compile = True
+    warm = compile_many_with_region_cache(
+        cast(CompilerBackend, backend),
+        units,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    assert [result.attempt.success for result in warm] == [True, False, True, True]
+    assert all(result.attempt.cache_status == "hit" for result in warm)
+
+
+def test_region_cache_does_not_bisect_transient_batch_failure(tmp_path: Path) -> None:
+    """Environment failures remain one uncached physical attempt for every miss."""
+    backend = _BatchBackend()
+    backend.transient_failure = True
+    context = _context(tmp_path)
+    units = _units(tmp_path, 3)
+
+    first = compile_many_with_region_cache(
+        cast(CompilerBackend, backend),
+        units,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    second = compile_many_with_region_cache(
+        cast(CompilerBackend, backend),
+        units,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert backend.compile_calls == [
+        tuple(unit.region_id for unit in units),
+        tuple(unit.region_id for unit in units),
+    ]
+    assert all(not result.attempt.success for result in (*first, *second))
+    assert not (tmp_path / "cache" / "decisions").exists()
+
+
+def test_region_cache_partitions_shared_artifacts_per_unit(tmp_path: Path) -> None:
+    """Primary and colocated support records survive independent warm restores."""
+    backend = _BatchBackend()
+    backend.emit_shared_artifact = True
+    context = _context(tmp_path)
+    units = _units(tmp_path, 2)
+
+    cold = compile_many_with_region_cache(
+        cast(CompilerBackend, backend),
+        units,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    backend.raise_on_compile = True
+    warm = compile_many_with_region_cache(
+        cast(CompilerBackend, backend),
+        units,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert all(
+        tuple(record.role for record in result.artifacts) == ("primary", "support")
+        for result in cold
+    )
+    assert tuple(result.artifacts for result in warm) == tuple(result.artifacts for result in cold)
+    assert all(
+        len(result.attempt.artifact_paths) == EXPECTED_BATCH_ARTIFACT_COUNT for result in warm
+    )
 
 
 def test_region_cache_restores_deterministic_backend_rejection(tmp_path: Path) -> None:
@@ -529,3 +792,22 @@ def _unit(root: Path) -> CompilationUnit:
         members=(SymbolId(module="pkg.module", qualname="value"),),
         install_relative_dir=".atoll/artifacts/region",
     )
+
+
+def _units(root: Path, count: int) -> tuple[CompilationUnit, ...]:
+    units: list[CompilationUnit] = []
+    for index in range(count):
+        source = root / f"generated_{index}.py"
+        source.write_text(f"def value_{index}() -> int:\n    return {index}\n", encoding="utf-8")
+        units.append(
+            CompilationUnit(
+                region_id=f"pkg.module::value_{index}@cython",
+                backend="cython",
+                logical_module=f"_atoll_value_{index}",
+                source_paths=(source,),
+                source_hash=hashlib.sha256(source.read_bytes()).hexdigest(),
+                members=(SymbolId(module="pkg.module", qualname=f"value_{index}"),),
+                install_relative_dir=f".atoll/artifacts/region-{index}",
+            )
+        )
+    return tuple(units)

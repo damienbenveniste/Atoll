@@ -15,13 +15,17 @@ from pathlib import Path
 from statistics import median
 from typing import Literal, TypedDict, Unpack
 
+from atoll.optimization_policy import (
+    DEFAULT_MINIMUM_FINAL_SPEEDUP,
+    DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+    assess_speedup,
+    validate_acceleration_threshold,
+)
 from atoll.runtime.performance import CommandRunEvidence, run_performance_command
 
 ExecutionPlanBenchmarkArm = Literal["baseline", "unplanned", "planned"]
 ExecutionPlanBenchmarkPhase = Literal["warmup", "sample"]
 ExecutionPlanBenchmarkStatus = Literal["passed", "not-profitable", "invalid", "unavailable"]
-
-_MINIMUM_STABLE_MEDIAN_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,8 +51,8 @@ class ExecutionPlanBenchmarkConfig:
     plan_id: str
     command: tuple[str, ...] | None
     samples: int = 7
-    minimum_marginal_speedup: float = 1.05
-    minimum_overall_speedup: float = 1.10
+    minimum_marginal_speedup: float = DEFAULT_MINIMUM_MARGINAL_SPEEDUP
+    minimum_overall_speedup: float = DEFAULT_MINIMUM_FINAL_SPEEDUP
 
     def __post_init__(self) -> None:
         """Reject invalid benchmark policy before launching child commands.
@@ -65,10 +69,14 @@ class ExecutionPlanBenchmarkConfig:
             raise ValueError("execution-plan benchmark command must be a non-empty argv tuple")
         if self.samples < 1:
             raise ValueError("execution-plan benchmark samples must be at least 1")
-        if self.minimum_marginal_speedup <= 0:
-            raise ValueError("minimum marginal speedup must be greater than 0")
-        if self.minimum_overall_speedup <= 0:
-            raise ValueError("minimum overall speedup must be greater than 0")
+        validate_acceleration_threshold(
+            self.minimum_marginal_speedup,
+            field="minimum marginal speedup",
+        )
+        validate_acceleration_threshold(
+            self.minimum_overall_speedup,
+            field="minimum overall speedup",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,7 +312,17 @@ def _decision_result(
     baseline_median = _arm_median(samples, "baseline")
     unplanned_median = _arm_median(samples, "unplanned")
     planned_median = _arm_median(samples, "planned")
-    if min(baseline_median, unplanned_median, planned_median) < _MINIMUM_STABLE_MEDIAN_SECONDS:
+    marginal = assess_speedup(
+        unplanned_median,
+        planned_median,
+        minimum_speedup=config.minimum_marginal_speedup,
+    )
+    overall = assess_speedup(
+        baseline_median,
+        planned_median,
+        minimum_speedup=config.minimum_overall_speedup,
+    )
+    if not marginal.stable or not overall.stable:
         return ExecutionPlanBenchmarkResult(
             plan_id=config.plan_id,
             status="invalid",
@@ -325,12 +343,14 @@ def _decision_result(
             samples=samples,
         )
 
-    marginal_speedup = unplanned_median / planned_median
-    overall_speedup = baseline_median / planned_median
-    if marginal_speedup >= config.minimum_marginal_speedup:
+    marginal_speedup = marginal.speedup
+    overall_speedup = overall.speedup
+    if marginal_speedup is None or overall_speedup is None:
+        raise AssertionError("stable execution-plan assessments must include speedups")
+    if marginal.passed:
         overall_reason = (
             f"overall_speedup={overall_speedup:.3f}"
-            if overall_speedup >= config.minimum_overall_speedup
+            if overall.passed
             else (
                 f"provisional overall_speedup={overall_speedup:.3f} is below final target "
                 f"{config.minimum_overall_speedup:.3f}; final payload gate decides promotion"

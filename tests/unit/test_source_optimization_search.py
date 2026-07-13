@@ -210,7 +210,7 @@ def test_candidate_without_dynamic_profile_cannot_advance_beam(
 
 @pytest.mark.parametrize(
     ("optimized_seconds", "accepted"),
-    [(0.1, True), (0.4, False)],
+    [(1.0, True), (4.0, False)],
 )
 def test_search_promotes_only_source_and_wheel_results_above_three_x(
     tmp_path: Path,
@@ -237,7 +237,7 @@ def test_search_promotes_only_source_and_wheel_results_above_three_x(
         nonlocal command_calls
         command_calls += 1
         duration = (
-            0.05 if command == ("test",) else (0.8 if mode == "baseline" else optimized_seconds)
+            0.05 if command == ("test",) else (8.0 if mode == "baseline" else optimized_seconds)
         )
         return _command_evidence(command, (project_root, payload_root), mode, duration)
 
@@ -311,7 +311,7 @@ def test_apply_source_revalidates_in_isolated_quality_copy(
     ) -> CommandRunEvidence:
         if "applied-quality" in project_root.parts:
             application_runs.append((project_root, payload_root, mode))
-        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.1)
+        duration = 0.05 if command == ("test",) else (8.0 if mode == "baseline" else 1.0)
         return _command_evidence(command, (project_root, payload_root), mode, duration)
 
     def fake_wheel(_winner: object) -> tuple[WheelBuildEvidence, Path, Path]:
@@ -400,7 +400,7 @@ def test_failed_source_application_never_promotes_custom_output_wheel(
         mode: str,
         **_options: object,
     ) -> CommandRunEvidence:
-        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.1)
+        duration = 0.05 if command == ("test",) else (8.0 if mode == "baseline" else 1.0)
         return _command_evidence(command, (project_root, payload_root), mode, duration)
 
     def fake_wheel(_winner: object) -> tuple[WheelBuildEvidence, Path, Path]:
@@ -788,11 +788,11 @@ def test_candidate_that_does_not_improve_current_beam_is_rejected(
         if command == ("test",):
             duration = 0.05
         elif mode == "baseline":
-            duration = 0.8
+            duration = 8.0
         else:
             duration = candidate_payload_durations.setdefault(
                 payload_root,
-                0.1 if not candidate_payload_durations else 0.2,
+                1.0 if not candidate_payload_durations else 2.0,
             )
         return _command_evidence(command, (project_root, payload_root), mode, duration)
 
@@ -815,7 +815,7 @@ def test_candidate_that_does_not_improve_current_beam_is_rejected(
     rejected_trials = [trial for trial in result.trials if trial.status == "not-profitable"]
     assert rejected_trials
     assert rejected_trials[0].reason == "candidate did not meet the 1.05x marginal speedup floor"
-    assert rejected_trials[0].current_median_seconds == pytest.approx(0.1)
+    assert rejected_trials[0].current_median_seconds == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("fail_on_sample", [False, True])
@@ -864,7 +864,7 @@ def test_final_source_gate_command_failures_are_invalid(
                 and benchmark_calls_after_search == search_benchmark_calls + failing_call
             ):
                 returncode = 5
-        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.1)
+        duration = 0.05 if command == ("test",) else (8.0 if mode == "baseline" else 1.0)
         return _command_evidence(
             command,
             (project_root, payload_root),
@@ -897,6 +897,7 @@ def test_final_source_gate_rejects_noisy_baseline(
     _copy_fixture(project_root)
     plan, assessment = _plan_and_assessment(project_root)
     options = _search_options(project_root, tmp_path)
+    benchmark_calls = 0
 
     def fake_run(
         command: tuple[str, ...],
@@ -906,7 +907,17 @@ def test_final_source_gate_rejects_noisy_baseline(
         mode: str,
         **_options: object,
     ) -> CommandRunEvidence:
-        duration = 0.05 if command == ("test",) else (0.2 if mode == "baseline" else 0.01)
+        nonlocal benchmark_calls
+        if command == ("test",):
+            duration = 0.05
+        else:
+            benchmark_calls += 1
+            final_gate = benchmark_calls > SEARCH_BENCHMARK_RUNS_FOR_ONE_CANDIDATE
+            duration = (
+                (0.2 if mode == "baseline" else 0.1)
+                if final_gate
+                else (8.0 if mode == "baseline" else 1.0)
+            )
         return _command_evidence(command, (project_root, payload_root), mode, duration)
 
     monkeypatch.setattr("atoll.source_optimization.search.run_performance_command", fake_run)
@@ -916,7 +927,7 @@ def test_final_source_gate_rejects_noisy_baseline(
     assert result.accepted is False
     assert result.performance is not None
     assert result.performance.status == "invalid"
-    assert "baseline median is too noisy" in result.performance.reason
+    assert "medians are too noisy" in result.performance.reason
     assert any(trial.status == "not-profitable" for trial in result.trials)
 
 
@@ -938,7 +949,7 @@ def test_candidate_wheel_build_failure_rejects_winner(
         mode: str,
         **_options: object,
     ) -> CommandRunEvidence:
-        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.1)
+        duration = 0.05 if command == ("test",) else (8.0 if mode == "baseline" else 1.0)
         return _command_evidence(command, (project_root, payload_root), mode, duration)
 
     def fail_build(_project_root: Path, _output_dir: Path) -> WheelBuildEvidence:
@@ -984,7 +995,7 @@ def test_candidate_wheel_unpack_failure_rejects_winner(
         mode: str,
         **_options: object,
     ) -> CommandRunEvidence:
-        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.1)
+        duration = 0.05 if command == ("test",) else (8.0 if mode == "baseline" else 1.0)
         return _command_evidence(command, (project_root, payload_root), mode, duration)
 
     def fake_build(_project_root: Path, output_dir: Path) -> WheelBuildEvidence:
@@ -1056,7 +1067,7 @@ def test_wheel_semantic_and_final_gate_failures_reject_promotion(
         **_options: object,
     ) -> CommandRunEvidence:
         wheel_semantic = command == ("test",) and payload_root == tmp_path / "wheel-payload"
-        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.1)
+        duration = 0.05 if command == ("test",) else (8.0 if mode == "baseline" else 1.0)
         return _command_evidence(
             command,
             (project_root, payload_root),
@@ -1092,11 +1103,11 @@ def test_wheel_semantic_and_final_gate_failures_reject_promotion(
         if command == ("test",):
             duration = 0.05
         elif payload_root == wheel_payload and mode == "compiled":
-            duration = 0.4
+            duration = 4.0
         elif mode == "baseline":
-            duration = 0.8
+            duration = 8.0
         else:
-            duration = 0.1
+            duration = 1.0
         return _command_evidence(command, (options.project_root, payload_root), mode, duration)
 
     monkeypatch.setattr(
@@ -1131,7 +1142,7 @@ def test_application_exception_cleans_scratch_and_preserves_source(
         mode: str,
         **_options: object,
     ) -> CommandRunEvidence:
-        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.1)
+        duration = 0.05 if command == ("test",) else (8.0 if mode == "baseline" else 1.0)
         return _command_evidence(command, (project_root, payload_root), mode, duration)
 
     def fake_wheel(_winner: object) -> tuple[WheelBuildEvidence, Path, Path]:
@@ -1203,7 +1214,7 @@ def test_applied_validation_semantic_failure_rolls_back(
         **_options: object,
     ) -> CommandRunEvidence:
         applied_semantic = command == ("test",) and "applied-quality" in project_root.parts
-        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.1)
+        duration = 0.05 if command == ("test",) else (8.0 if mode == "baseline" else 1.0)
         return _command_evidence(
             command,
             (project_root, payload_root),
@@ -1323,7 +1334,7 @@ def test_workspace_copy_ignores_outputs_and_rejects_unsafe_module_paths(
                 and (payload_root / "standalone.py").is_file()
                 and (payload_root / "extra_pkg").is_dir()
             )
-        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.1)
+        duration = 0.05 if command == ("test",) else (8.0 if mode == "baseline" else 1.0)
         return _command_evidence(command, (project_root, payload_root), mode, duration)
 
     monkeypatch.setattr("atoll.source_optimization.search.run_performance_command", fake_run)

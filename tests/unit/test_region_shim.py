@@ -109,6 +109,17 @@ class _CallableGuardModule(Protocol):
         ...
 
 
+class _ManagedCallableProtocol(Protocol):
+    """Callable metadata installed by an Atoll transactional dispatcher."""
+
+    __atoll_python_fallback__: Callable[[int], int]
+    __atoll_binding_variants__: tuple[dict[str, str], ...]
+
+    def __call__(self, value: int) -> int:
+        """Return the managed helper result."""
+        ...
+
+
 class _BufferGuardModule(Protocol):
     """Dynamic module surface used by zero-copy buffer dispatcher tests."""
 
@@ -248,6 +259,15 @@ def root(value: int) -> tuple[str, int]:
     module = cast(_CallableGuardModule, _load_region_module(config, source, compiled, monkeypatch))
     original_helper = module.helper
 
+    assert module.root(3) == ("compiled", 4)
+
+    def managed_helper(value: int) -> int:
+        return original_helper(value)
+
+    managed = cast(_ManagedCallableProtocol, managed_helper)
+    managed.__atoll_python_fallback__ = original_helper
+    managed.__atoll_binding_variants__ = ({"variant_id": "managed-helper"},)
+    module.helper = managed
     assert module.root(3) == ("compiled", 4)
 
     def replacement(value: int) -> int:

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
 DEFAULT_CALLS = 300_000
-DEFAULT_DEPTH = 64
+DEFAULT_DEPTH = 512
 
 
 class CallChainBenchmarkPayload(TypedDict):

@@ -10,11 +10,11 @@ from typing import cast
 import pytest
 
 from atoll.cli import main
-from atoll.report import ScanReport
+from atoll.report import SCAN_REPORT_SCHEMA_VERSION, ScanReport
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXPECTED_MODULE_COUNT = 3
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = SCAN_REPORT_SCHEMA_VERSION
 
 
 def test_scan_command_writes_reports(tmp_path: Path) -> None:

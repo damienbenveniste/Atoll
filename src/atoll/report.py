@@ -68,6 +68,13 @@ from atoll.models import (
     VerifyResult,
     Visibility,
 )
+from atoll.optimization_policy import (
+    DEFAULT_MINIMUM_FINAL_SPEEDUP,
+    DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+    HARD_BENCHMARK_MINIMUM_SPEEDUP,
+    MINIMUM_STABLE_MEDIAN_SECONDS,
+    PROFILE_GUIDED_MINIMUM_MARGINAL_SPEEDUP,
+)
 from atoll.runtime.fusion_performance import FusionArmRunEvidence, FusionTrial
 from atoll.runtime.package_verify import PackageVerificationResult
 from atoll.runtime.performance import BenchmarkGateResult, CommandRunEvidence
@@ -89,6 +96,10 @@ _GOOD_SCORE = 80
 _POSSIBLE_SCORE = 70
 _ATOLL_PART_INDEX = 0
 _ATOLL_GENERATED_INPUT_DIR_INDEX = 1
+
+SCAN_REPORT_SCHEMA_VERSION = 3
+COMPILE_REPORT_SCHEMA_VERSION = 6
+OPTIMIZATION_POLICY_VERSION = 1
 
 
 class BlockerReport(TypedDict):
@@ -1072,6 +1083,9 @@ class CompilationCandidateTrialReport(TypedDict):
         semantic_test_exit_code: Exit code from the candidate semantic command.
         semantic_test_duration_seconds: Candidate semantic-test wall-clock duration.
         benchmark_status: Marginal benchmark status, or not-run after semantic failure.
+        baseline_median_seconds: Current accepted-arm median used by the marginal gate.
+        candidate_median_seconds: Candidate-composition median used by the marginal gate.
+        minimum_speedup: Marginal threshold applied to this candidate.
     """
 
     id: str
@@ -1093,6 +1107,9 @@ class CompilationCandidateTrialReport(TypedDict):
     semantic_test_exit_code: int | None
     semantic_test_duration_seconds: float | None
     benchmark_status: str
+    baseline_median_seconds: float | None
+    candidate_median_seconds: float | None
+    minimum_speedup: float | None
 
 
 class CompilationFusionGateRejectionReport(TypedDict):
@@ -1610,7 +1627,7 @@ class CompilationSourceOptimizationTrialReport(TypedDict):
 
 
 class CompilationSourceOptimizationReport(TypedDict):
-    """Top-level source-optimization report section for schema v5.
+    """Top-level source-optimization section retained by compile schema v6.
 
     Attributes:
         status: Overall source-optimization milestone status.
@@ -2023,6 +2040,105 @@ class CompilationPerformanceReport(TypedDict):
     samples: list[CompilationCommandRunReport]
 
 
+class CompilationOptimizationPolicyReport(TypedDict):
+    """Numerical policy snapshot used for every compile profitability decision.
+
+    Attributes:
+        version: Policy schema version independent of report schema versions.
+        stability_floor_seconds: Minimum credible median for each compared arm.
+        profile_guided_minimum_marginal_speedup: Legacy hot-region incremental gate.
+        specialized_minimum_marginal_speedup: Scalar, call-chain, buffer, and plan gate.
+        final_minimum_speedup: Configured final wheel promotion threshold.
+        hard_benchmark_minimum_speedup: Representative family and source-patch floor.
+    """
+
+    version: int
+    stability_floor_seconds: float
+    profile_guided_minimum_marginal_speedup: float
+    specialized_minimum_marginal_speedup: float
+    final_minimum_speedup: float
+    hard_benchmark_minimum_speedup: float
+
+
+class CompilationStageMedianReport(TypedDict):
+    """Normalized median comparison for one optimization stage or final gate.
+
+    Attributes:
+        stage: Stable stage label including the variant or plan identity when applicable.
+        status: Profitability or execution outcome reported by the owning optimizer.
+        baseline_median_seconds: Median duration before applying this stage.
+        candidate_median_seconds: Median duration after applying this stage.
+        speedup: Baseline median divided by candidate median.
+        minimum_speedup: Threshold this stage had to meet for promotion.
+    """
+
+    stage: str
+    status: str
+    baseline_median_seconds: float
+    candidate_median_seconds: float
+    speedup: float
+    minimum_speedup: float
+
+
+class CompilationCacheDecisionReport(TypedDict):
+    """Per-variant cache outcome and whether it shared physical Cython startup.
+
+    Attributes:
+        variant_id: Stable compiled variant or typed-region identity.
+        backend: Backend selected for the variant, when compilation was attempted.
+        status: Success-cache, decision-cache, or cold-compile outcome.
+        batched: Whether the variant shared one physical Cython invocation.
+    """
+
+    variant_id: str
+    backend: Backend | None
+    status: CompileCacheStatus
+    batched: bool
+
+
+class CompilationFinalCompositionReport(TypedDict):
+    """Authoritative optimization layers present in the promoted wheel.
+
+    Attributes:
+        source_plan_ids: Accepted source-optimization plans materialized in the payload.
+        transformation_ids: Individual accepted source transformation identities.
+        native_variant_ids: Native dispatch variants present in the final payload.
+        execution_plan_ids: Accepted async execution plans present in the payload.
+        artifacts: Install-relative native artifact paths included in the wheel.
+        wheel_path: Promoted wheel path, or `None` when no payload passed all gates.
+        retained_previous_arm: Whether a rejected later stage preserved an earlier arm.
+    """
+
+    source_plan_ids: list[str]
+    transformation_ids: list[str]
+    native_variant_ids: list[str]
+    execution_plan_ids: list[str]
+    artifacts: list[str]
+    wheel_path: str | None
+    retained_previous_arm: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _StageMedianInput:
+    stage: str
+    status: str
+    baseline: float | None
+    candidate: float | None
+    speedup: float | None
+    minimum: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalCompositionInput:
+    root: Path
+    wheel_path: Path | None
+    accepted_variants: list[CompilationAcceptedVariantReport]
+    applied_execution_plans: tuple[str, ...]
+    source_optimization: CompilationSourceOptimizationReport
+    artifact_records: tuple[ArtifactRecord, ...]
+    build: CompileAttempt
+
+
 class CompilationReport(TypedDict):
     """Top-level stable JSON report for build and source-clean compile commands.
 
@@ -2041,6 +2157,10 @@ class CompilationReport(TypedDict):
         test_results: Target-project command evidence used by quality gates.
         verification_steps: Isolated wheel and payload verification evidence.
         performance: Paired performance-gate evidence.
+        optimization_policy: Numerical policy applied by every profitability gate.
+        stage_medians: Normalized ordered comparisons across optimization stages.
+        cache_decisions: Per-native-variant cache and batching outcomes.
+        final_composition: Optimization layers actually present in the promoted wheel.
         profile: Profile-guided selection evidence or explicit static fallback.
         candidate_trials: Candidate variants evaluated by profitability selection.
         execution_plans: Selected and rejected scheduler execution-plan candidates.
@@ -2076,6 +2196,10 @@ class CompilationReport(TypedDict):
     test_results: list[CompilationCommandRunReport]
     verification_steps: list[CompilationVerificationStepReport]
     performance: CompilationPerformanceReport
+    optimization_policy: CompilationOptimizationPolicyReport
+    stage_medians: list[CompilationStageMedianReport]
+    cache_decisions: list[CompilationCacheDecisionReport]
+    final_composition: CompilationFinalCompositionReport
     profile: CompilationProfileReport
     candidate_trials: list[CompilationCandidateTrialReport]
     execution_plans: list[CompilationExecutionPlanReport]
@@ -2245,7 +2369,7 @@ def build_scan_report(result: ScanResult) -> ScanReport:
     hard_count = sum(blocker.severity == "hard" for blocker in all_blockers)
     soft_count = sum(blocker.severity == "soft" for blocker in all_blockers)
     return {
-        "version": 2,
+        "version": SCAN_REPORT_SCHEMA_VERSION,
         "tool": "atoll",
         "project_root": str(result.config.root),
         "source_roots": [str(path) for path in result.config.source_roots],
@@ -2382,6 +2506,26 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     )
     accepted_variants = _accepted_variant_reports(compiled_regions)
     rejected_variants = _rejected_variant_reports(report_input.skipped_modules)
+    optimization_policy = _optimization_policy_report(performance)
+    stage_medians = _stage_median_reports(
+        candidate_trials=candidate_trials,
+        execution_plan_trials=execution_plan_trials,
+        fusion_trials=fusion_trials,
+        source_optimization=source_optimization,
+        performance=performance,
+    )
+    cache_decisions = _cache_decision_reports(compiled_regions, report_input.build)
+    final_composition = _final_composition_report(
+        _FinalCompositionInput(
+            root=report_input.root,
+            wheel_path=report_input.wheel_path,
+            accepted_variants=accepted_variants,
+            applied_execution_plans=report_input.applied_execution_plans,
+            source_optimization=source_optimization,
+            artifact_records=report_input.artifact_records,
+            build=report_input.build,
+        )
+    )
     performance_failed = performance["status"] not in {"passed", "unbenchmarked"}
     wheel_missing = report_input.mode == "source-clean" and report_input.wheel_path is None
     success = (
@@ -2393,7 +2537,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         and not wheel_missing
     )
     return {
-        "version": 5,
+        "version": COMPILE_REPORT_SCHEMA_VERSION,
         "tool": "atoll",
         "operation": report_input.operation,
         "mode": report_input.mode,
@@ -2480,6 +2624,10 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             for result in report_input.verification_steps
         ],
         "performance": performance,
+        "optimization_policy": optimization_policy,
+        "stage_medians": stage_medians,
+        "cache_decisions": cache_decisions,
+        "final_composition": final_composition,
         "profile": profile,
         "candidate_trials": candidate_trials,
         "execution_plans": execution_plans,
@@ -2734,6 +2882,9 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         _verification_scope_text(report["mode"]),
         "",
     ]
+    _append_final_composition_markdown(lines, report["final_composition"])
+    _append_optimization_policy_markdown(lines, report["optimization_policy"])
+    _append_stage_medians_markdown(lines, report["stage_medians"])
     _append_profile_guided_selection_markdown(lines, report["profile"])
     _append_candidate_trials_markdown(lines, report["candidate_trials"])
     _append_execution_plans_markdown(
@@ -2753,6 +2904,7 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
             for region in report["typed_regions"]
         )
     _append_compiled_regions_markdown(lines, report["compiled_regions"])
+    _append_cache_decisions_markdown(lines, report["cache_decisions"])
     lines.extend(
         [
             "",
@@ -2789,6 +2941,107 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
     for island in report["islands"]:
         lines.extend(_compilation_markdown_island(island))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _append_final_composition_markdown(
+    lines: list[str],
+    composition: CompilationFinalCompositionReport,
+) -> None:
+    """Explain which accepted layers and artifacts are present in the wheel.
+
+    Args:
+        lines: Mutable Markdown output receiving the rendered section.
+        composition: Accepted source, native, and execution-plan layers.
+    """
+    lines.extend(
+        [
+            "## Final Composition",
+            "",
+            f"- Wheel: {_optional_path(composition['wheel_path'])}",
+            f"- Source plans: {_inline_code_list(composition['source_plan_ids'])}",
+            f"- Source transformations: {_inline_code_list(composition['transformation_ids'])}",
+            f"- Native variants: {_inline_code_list(composition['native_variant_ids'])}",
+            f"- Execution plans: {_inline_code_list(composition['execution_plan_ids'])}",
+            f"- Native artifacts: {_inline_code_list(composition['artifacts'])}",
+            f"- Retained previous accepted arm: {_yes_no(composition['retained_previous_arm'])}",
+            "",
+        ]
+    )
+
+
+def _append_optimization_policy_markdown(
+    lines: list[str],
+    policy: CompilationOptimizationPolicyReport,
+) -> None:
+    """Render the centralized stability and promotion thresholds.
+
+    Args:
+        lines: Mutable Markdown output receiving the rendered section.
+        policy: Numerical thresholds used for every profitability decision.
+    """
+    lines.extend(
+        [
+            "## Optimization Policy",
+            "",
+            f"- Policy version: {policy['version']}",
+            f"- Stability floor: {policy['stability_floor_seconds']:.3f}s per median",
+            (
+                "- Profile-guided marginal floor: "
+                f"{policy['profile_guided_minimum_marginal_speedup']:.3f}x"
+            ),
+            (
+                "- Specialized marginal floor: "
+                f"{policy['specialized_minimum_marginal_speedup']:.3f}x"
+            ),
+            f"- Final payload floor: {policy['final_minimum_speedup']:.3f}x",
+            f"- Hard benchmark floor: {policy['hard_benchmark_minimum_speedup']:.3f}x",
+            "",
+        ]
+    )
+
+
+def _append_stage_medians_markdown(
+    lines: list[str],
+    medians: list[CompilationStageMedianReport],
+) -> None:
+    """Render normalized stage medians in optimization order.
+
+    Args:
+        lines: Mutable Markdown output receiving the rendered section.
+        medians: Ordered credible median comparisons from optimizer stages.
+    """
+    if not medians:
+        return
+    lines.extend(["## Stage Medians", ""])
+    lines.extend(
+        (
+            f"- `{item['stage']}`: {item['baseline_median_seconds']:.3f}s -> "
+            f"{item['candidate_median_seconds']:.3f}s, {item['speedup']:.3f}x "
+            f"against {item['minimum_speedup']:.3f}x ({item['status']})"
+        )
+        for item in medians
+    )
+    lines.append("")
+
+
+def _append_cache_decisions_markdown(
+    lines: list[str],
+    decisions: list[CompilationCacheDecisionReport],
+) -> None:
+    """Render per-variant cache restoration and physical batching evidence.
+
+    Args:
+        lines: Mutable Markdown output receiving the rendered section.
+        decisions: Ordered cache outcomes for compiled variants.
+    """
+    if not decisions:
+        return
+    lines.extend(["", "## Cache Decisions", ""])
+    lines.extend(
+        f"- `{item['variant_id']}` [{item['backend']}]: {item['status']}; "
+        f"batched {_yes_no(item['batched'])}"
+        for item in decisions
+    )
 
 
 def _append_test_gate_markdown(lines: list[str], report: CompilationReport) -> None:
@@ -3709,7 +3962,7 @@ def _compilation_performance_report(
         return {
             "status": "unbenchmarked",
             "reason": "no benchmark command configured",
-            "minimum_speedup": 1.10,
+            "minimum_speedup": DEFAULT_MINIMUM_FINAL_SPEEDUP,
             "baseline_median_seconds": None,
             "compiled_median_seconds": None,
             "speedup": None,
@@ -3725,6 +3978,208 @@ def _compilation_performance_report(
         "speedup": result.speedup,
         "warmups": [_compilation_command_run_report(root, run) for run in result.warmups],
         "samples": [_compilation_command_run_report(root, run) for run in result.samples],
+    }
+
+
+def _optimization_policy_report(
+    performance: CompilationPerformanceReport,
+) -> CompilationOptimizationPolicyReport:
+    """Serialize the single numerical policy applied across optimizer families.
+
+    Args:
+        performance: Final gate evidence carrying the configured payload threshold.
+
+    Returns:
+        Stable policy fields embedded in JSON and Markdown compilation reports.
+    """
+    return {
+        "version": OPTIMIZATION_POLICY_VERSION,
+        "stability_floor_seconds": MINIMUM_STABLE_MEDIAN_SECONDS,
+        "profile_guided_minimum_marginal_speedup": (PROFILE_GUIDED_MINIMUM_MARGINAL_SPEEDUP),
+        "specialized_minimum_marginal_speedup": DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+        "final_minimum_speedup": performance["minimum_speedup"],
+        "hard_benchmark_minimum_speedup": HARD_BENCHMARK_MINIMUM_SPEEDUP,
+    }
+
+
+def _stage_median_reports(
+    *,
+    candidate_trials: list[CompilationCandidateTrialReport],
+    execution_plan_trials: list[CompilationExecutionPlanTrialReport],
+    fusion_trials: list[CompilationFusionTrialReport],
+    source_optimization: CompilationSourceOptimizationReport,
+    performance: CompilationPerformanceReport,
+) -> list[CompilationStageMedianReport]:
+    """Normalize family-specific timing evidence into one ordered progression.
+
+    Args:
+        candidate_trials: Native variant benchmark evidence.
+        execution_plan_trials: Async execution-plan benchmark evidence.
+        fusion_trials: Experimental fusion benchmark evidence.
+        source_optimization: Source transformation search and final-gate evidence.
+        performance: Final promoted-payload benchmark evidence.
+
+    Returns:
+        Credible timing comparisons in optimizer application order.
+    """
+    reports: list[CompilationStageMedianReport] = []
+    for candidate_trial in candidate_trials:
+        _append_stage_median(
+            reports,
+            _StageMedianInput(
+                stage=f"native:{candidate_trial['variant_id']}",
+                status=candidate_trial["benchmark_status"],
+                baseline=candidate_trial["baseline_median_seconds"],
+                candidate=candidate_trial["candidate_median_seconds"],
+                speedup=candidate_trial["marginal_speedup"],
+                minimum=candidate_trial["minimum_speedup"],
+            ),
+        )
+    for execution_plan_trial in execution_plan_trials:
+        _append_stage_median(
+            reports,
+            _StageMedianInput(
+                stage=f"execution-plan:{execution_plan_trial['plan_id']}",
+                status=execution_plan_trial["benchmark_status"],
+                baseline=execution_plan_trial["unplanned_median_seconds"],
+                candidate=execution_plan_trial["planned_median_seconds"],
+                speedup=execution_plan_trial["marginal_speedup"],
+                minimum=execution_plan_trial["minimum_speedup"],
+            ),
+        )
+    for source_trial in source_optimization["trials"]:
+        current_median = source_trial["current_median_seconds"]
+        source_median = source_trial["source_median_seconds"]
+        _append_stage_median(
+            reports,
+            _StageMedianInput(
+                stage=f"source-search:{source_trial['candidate_id']}",
+                status=source_trial["status"],
+                baseline=current_median,
+                candidate=source_median,
+                speedup=_median_speedup_ratio(current_median, source_median),
+                minimum=DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+            ),
+        )
+        _append_stage_median(
+            reports,
+            _StageMedianInput(
+                stage=f"source-final:{source_trial['candidate_id']}",
+                status=source_trial["status"],
+                baseline=source_trial["baseline_median_seconds"],
+                candidate=source_trial["wheel_median_seconds"],
+                speedup=source_trial["wheel_speedup"],
+                minimum=source_optimization["minimum_speedup"],
+            ),
+        )
+    for fusion_trial in fusion_trials:
+        _append_stage_median(
+            reports,
+            _StageMedianInput(
+                stage=f"fusion:{fusion_trial['plan_id']}",
+                status=fusion_trial["status"],
+                baseline=fusion_trial["unfused_median_seconds"],
+                candidate=fusion_trial["fused_median_seconds"],
+                speedup=fusion_trial["unfused_over_fused"],
+                minimum=DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+            ),
+        )
+    _append_stage_median(
+        reports,
+        _StageMedianInput(
+            stage="final-payload",
+            status=performance["status"],
+            baseline=performance["baseline_median_seconds"],
+            candidate=performance["compiled_median_seconds"],
+            speedup=performance["speedup"],
+            minimum=performance["minimum_speedup"],
+        ),
+    )
+    return reports
+
+
+def _median_speedup_ratio(baseline: float | None, candidate: float | None) -> float | None:
+    """Return a report ratio only when both medians permit division.
+
+    Args:
+        baseline: Median duration before the candidate transformation.
+        candidate: Median duration after the candidate transformation.
+
+    Returns:
+        Baseline divided by candidate, or `None` for incomplete or zero evidence.
+    """
+    if baseline is None or candidate is None or candidate == 0.0:
+        return None
+    return baseline / candidate
+
+
+def _append_stage_median(
+    reports: list[CompilationStageMedianReport],
+    item: _StageMedianInput,
+) -> None:
+    if (
+        item.baseline is None
+        or item.candidate is None
+        or item.speedup is None
+        or item.minimum is None
+    ):
+        return
+    reports.append(
+        {
+            "stage": item.stage,
+            "status": item.status,
+            "baseline_median_seconds": item.baseline,
+            "candidate_median_seconds": item.candidate,
+            "speedup": item.speedup,
+            "minimum_speedup": item.minimum,
+        }
+    )
+
+
+def _cache_decision_reports(
+    compiled_regions: list[CompilationCompiledRegionReport],
+    build: CompileAttempt,
+) -> list[CompilationCacheDecisionReport]:
+    return [
+        {
+            "variant_id": region["variant_id"],
+            "backend": region["backend"],
+            "status": region["cache_status"],
+            "batched": any(
+                timing.name in {"cython_batch", "cython_batch_member"}
+                and timing.detail is not None
+                and region["variant_id"] in timing.detail
+                for timing in build.phase_timings
+            ),
+        }
+        for region in compiled_regions
+    ]
+
+
+def _final_composition_report(
+    inputs: _FinalCompositionInput,
+) -> CompilationFinalCompositionReport:
+    accepted_source_trials = tuple(
+        trial for trial in inputs.source_optimization["trials"] if trial["status"] == "accepted"
+    )
+    return {
+        "source_plan_ids": list(
+            dict.fromkeys(trial["plan_id"] for trial in accepted_source_trials)
+        ),
+        "transformation_ids": list(
+            dict.fromkeys(
+                transformation_id
+                for trial in accepted_source_trials
+                for transformation_id in trial["transformation_ids"]
+            )
+        ),
+        "native_variant_ids": [variant["variant_id"] for variant in inputs.accepted_variants],
+        "execution_plan_ids": list(inputs.applied_execution_plans),
+        "artifacts": sorted(record.install_relative_path for record in inputs.artifact_records),
+        "wheel_path": (
+            _path_text(inputs.root, inputs.wheel_path) if inputs.wheel_path is not None else None
+        ),
+        "retained_previous_arm": "composition fallback retained:" in inputs.build.stdout,
     }
 
 
@@ -3760,6 +4215,9 @@ def _candidate_trial_reports(
             "semantic_test_exit_code": trial.semantic_test_exit_code,
             "semantic_test_duration_seconds": trial.semantic_test_duration_seconds,
             "benchmark_status": trial.benchmark_status,
+            "baseline_median_seconds": trial.baseline_median_seconds,
+            "candidate_median_seconds": trial.candidate_median_seconds,
+            "minimum_speedup": trial.minimum_speedup,
         }
         for trial in trials
     ]
@@ -4022,7 +4480,7 @@ def _source_optimization_report(
     assessments: tuple[SourceOptimizationAssessment, ...],
     trials: tuple[SourceOptimizationTrial, ...],
 ) -> CompilationSourceOptimizationReport:
-    """Serialize source-optimization milestone evidence for schema v5.
+    """Serialize source-optimization evidence retained by compile schema v6.
 
     The aggregate status is derived from planning, trial, and application
     evidence. Only an accepted trial has a patch path, and command success
@@ -4059,7 +4517,10 @@ def _source_optimization_report(
     application_status = _source_optimization_application_status(trial_reports)
     return {
         "status": _source_optimization_status(plan_reports, assessment_reports, trial_reports),
-        "minimum_speedup": max(minimum_speedups, default=3.0),
+        "minimum_speedup": max(
+            minimum_speedups,
+            default=HARD_BENCHMARK_MINIMUM_SPEEDUP,
+        ),
         "headroom_speedup": max(headroom_speedups, default=None),
         "attributed_hot_share": max(
             (assessment["attributed_hot_share"] for assessment in assessment_reports),
@@ -4697,6 +5158,18 @@ def _path_text(root: Path, path: Path) -> str:
 
 def _optional_path(path: str | None) -> str:
     return f"`{path}`" if path is not None else "none"
+
+
+def _inline_code_list(values: list[str]) -> str:
+    """Render a compact list of stable IDs or report paths.
+
+    Args:
+        values: Stable identifiers or paths to format as inline code.
+
+    Returns:
+        Comma-separated inline-code values, or `none` for an empty input.
+    """
+    return ", ".join(f"`{value}`" for value in values) if values else "none"
 
 
 def _optional_seconds(value: float | None) -> str:

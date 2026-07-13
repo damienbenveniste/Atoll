@@ -19,8 +19,27 @@ class ScalarBenchmarkPayload(TypedDict):
     checksum: int
 
 
+class ScalarArithmeticProtocol(Protocol):
+    """Static weighted-reduction surface used by the scalar benchmark."""
+
+    def weighted_sum(self, limit: int, factor: int = ...) -> int:
+        """Return one guarded weighted reduction."""
+        ...
+
+
+class BranchArithmeticProtocol(Protocol):
+    """Static branch-arithmetic surface used by the scalar benchmark."""
+
+    def mixed(self, value: int, *, scale: int = ..., bias: int = ...) -> int:
+        """Return one branch-dependent arithmetic result."""
+        ...
+
+
 class FixtureModule(Protocol):
     """Fixture callable surface used by the hard benchmark."""
+
+    ScalarArithmetic: ScalarArithmeticProtocol
+    BranchArithmetic: BranchArithmeticProtocol
 
     def scalar_polynomial(self, limit: int, rounds: int = ..., *, bias: int = ...) -> int:
         """Return one guarded scalar polynomial reduction."""
@@ -35,10 +54,20 @@ def main() -> int:
     if args.calls < 1:
         return 2
 
-    scalar_polynomial = _fixture_module().scalar_polynomial
+    fixture = _fixture_module()
     checksum = 0
     for index in range(args.calls):
-        checksum ^= scalar_polynomial(96 + (index & 7), bias=index & 3)
+        checksum ^= fixture.scalar_polynomial(200 + (index & 7), bias=index & 3)
+        checksum += fixture.ScalarArithmetic.weighted_sum(
+            512 + (index & 15),
+            factor=2 + (index & 3),
+        )
+        checksum ^= fixture.BranchArithmetic.mixed(
+            index & 255,
+            scale=3,
+            bias=index & 7,
+        )
+        checksum &= (1 << 61) - 1
     print(json.dumps(ScalarBenchmarkPayload(calls=args.calls, checksum=checksum), sort_keys=True))
     return 0
 

@@ -26,7 +26,7 @@ from atoll.generation.typed_region import (
     TypedRegionGenerationOptions,
     generate_typed_method_region,
 )
-from atoll.models import BackendCompileContext, BackendLoweringRequest, ModuleId
+from atoll.models import BackendCompileContext, BackendLoweringRequest, CompilationUnit, ModuleId
 from atoll.native_optimization.scalar_analysis import analyze_scalar_scan
 
 SENT_VALUE = 3
@@ -35,6 +35,75 @@ SCALAR_VALUE = 12
 SCALAR_BIAS = 3
 SCALAR_EXPECTED = 147
 SCALAR_BOOL_EXPECTED = 4
+BATCH_SECOND_VALUE = 2
+
+
+def test_cython_batches_two_units_with_owned_artifacts(tmp_path: Path) -> None:
+    """One adapter invocation builds two independently owned importable extensions."""
+    backend = CythonBackend()
+    units: list[CompilationUnit] = []
+    logical_modules = ("_atoll_batch_one", "_atoll_batch_two")
+    for index, logical_module in enumerate(logical_modules, start=1):
+        source_path = tmp_path / f"batch_source_{index}.py"
+        source_path.write_text(
+            f"def value() -> int:\n    return {index}\n",
+            encoding="utf-8",
+        )
+        scan = enrich_island_analysis(
+            scan_module(ModuleId(name=f"batch_source_{index}", path=source_path))
+        )
+        region = next(
+            region
+            for region in scan.typed_regions
+            if any(member.id.qualname == "value" for member in region.members)
+        )
+        units.append(
+            backend.lower(
+                BackendLoweringRequest(
+                    region=region,
+                    source_path=source_path,
+                    logical_module=logical_module,
+                    install_relative_dir=f"compiled/{index}",
+                    members=tuple(member.id for member in region.members),
+                    variant_id=f"{region.id}@cython-batch-{index}",
+                )
+            )
+        )
+
+    result = backend.compile(
+        tuple(units),
+        BackendCompileContext(
+            project_root=tmp_path,
+            build_dir=tmp_path / ".atoll" / "build",
+            source_roots=(tmp_path,),
+        ),
+    )
+
+    assert result.attempt.success is True, result.attempt.stderr
+    assert result.attempt.command[0] == "cython"
+    assert result.attempt.command[-1] == "build_ext"
+    build_ext_timing = next(
+        timing for timing in result.attempt.phase_timings if timing.name == "build_ext"
+    )
+    assert build_ext_timing.detail is not None
+    assert build_ext_timing.detail.endswith("; 2 extension(s)")
+    assert len(result.attempt.artifact_paths) == len(logical_modules)
+    primary = tuple(record for record in result.artifacts if record.role == "primary")
+    assert len(primary) == len(logical_modules)
+    assert {record.region_id for record in primary} == {unit.region_id for unit in units}
+    assert {record.install_relative_path.split("/", maxsplit=2)[1] for record in primary} == {
+        "1",
+        "2",
+    }
+    artifact_root = tmp_path / ".atoll" / "artifacts"
+    sys.path.insert(0, str(artifact_root))
+    try:
+        assert importlib.import_module(logical_modules[0]).value() == 1
+        assert importlib.import_module(logical_modules[1]).value() == BATCH_SECOND_VALUE
+    finally:
+        sys.path.remove(str(artifact_root))
+        for logical_module in logical_modules:
+            sys.modules.pop(logical_module, None)
 
 
 def test_cython_compiles_guarded_fixed_width_scalar_variant(

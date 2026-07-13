@@ -3,10 +3,20 @@
 from pathlib import Path
 
 
-def test_product_execution_plan_code_contains_no_pydantic_graph_special_cases() -> None:
-    """Pydantic Graph remains benchmark evidence, never compiler product logic."""
+def test_product_code_contains_no_benchmark_project_or_symbol_special_cases() -> None:
+    """Benchmark fixtures and pinned targets never become compiler product logic."""
     source_root = Path(__file__).resolve().parents[2] / "src" / "atoll"
-    forbidden = ("pydantic_graph", "_graphiterator", "graphtask")
+    forbidden = (
+        "pydantic_graph",
+        "_graphiterator",
+        "graphtask",
+        "_run_tracked_task",
+        "native_optimization_fixture",
+        "scalar_polynomial",
+        "direct_chain_root",
+        "residual_async_profile",
+        "source_optimization_fixture",
+    )
     matches = [
         f"{path.relative_to(source_root)}: {term}"
         for path in sorted(source_root.rglob("*.py"))

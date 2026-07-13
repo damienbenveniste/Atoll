@@ -21,7 +21,7 @@ Each measured sample runs eight executions of the 5,000-item fan-out and sets
 `--build-repetitions 0`. The semantic command still verifies graph construction, but the hard
 performance gate isolates the async execution pipeline that the source plan transforms.
 
-Evidence includes cold and warm schema-v5 JSON/Markdown reports, compile logs, compiler-probe
+Evidence includes cold and warm schema-v6 JSON/Markdown reports, compile logs, compiler-probe
 events, source manifests, the accepted patch, and an acceptance summary. The run fails unless:
 
 - both compiles rerun profile collection and report a selected source plan with valid per-file
@@ -30,6 +30,8 @@ events, source manifests, the accepted patch, and an acceptance summary. The run
 - one accepted trial contains private transport draining, copied-context quiescent execution,
   local state-machine fusion, and private protocol forwarding;
 - both transformed source and its normal PEP 517 wheel measure at least `3.0x` over baseline;
+- the final composed payload retains a native variant and improves the accepted source-only wheel
+  by at least `1.05x`;
 - cold and warm runs each contain seven fresh baseline/optimized timing pairs;
 - source-plan identity, source hashes, candidate ID, transformation IDs, and patch path remain
   identical between runs;
@@ -44,11 +46,11 @@ The July 11, 2026 Apple Silicon acceptance run measured `4.982x` for the cold fi
 `5.008x` for the warm final wheel; the warm transformed-source ratio was `5.001x`. These ratios are
 paired same-machine evidence for the pinned workload, not a universal Python or Pydantic claim.
 `baseline.json` retains the older native-compiler reference only as historical regression data.
-Task-fusion and execution-plan fields remain compatibility and research evidence; schema-v5 source
-trial evidence controls this benchmark's promotion.
+Task-fusion and execution-plan fields remain compatibility and research evidence; schema-v6 policy,
+stage-median, final-composition, and source-trial evidence control this benchmark's promotion.
 
 The GitHub workflow **Pydantic Graph Hard Benchmark** exposes the same gate through
-`workflow_dispatch` and uploads schema-v5 cold/warm reports, logs, source manifests, compiler-probe
+`workflow_dispatch` and uploads schema-v6 cold/warm reports, logs, source manifests, compiler-probe
 events, and the acceptance summary even when an acceptance condition fails.
 
 ## Optimization ceiling experiment

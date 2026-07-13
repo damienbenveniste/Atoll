@@ -155,7 +155,7 @@ def test_fusion_trial_forwards_variant_allowlists(
     monkeypatch.setattr(
         fusion_performance,
         "run_performance_command",
-        _fake_runner([1.0] * 6, calls),
+        _fake_runner([0.1, 0.1, 0.1, 3.0, 2.0, 1.0], calls),
     )
 
     run_fusion_trial(
@@ -165,8 +165,8 @@ def test_fusion_trial_forwards_variant_allowlists(
             semantic_command=("python", "verify.py"),
             warmups=0,
             samples=1,
-            minimum_over_unfused=1.0,
-            minimum_overall=1.0,
+            minimum_over_unfused=1.01,
+            minimum_overall=1.01,
         ),
         project_root=tmp_path,
         baseline_payload_root=tmp_path / "baseline",

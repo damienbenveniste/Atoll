@@ -14,14 +14,22 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
 
+from atoll.optimization_policy import (
+    DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+    HARD_BENCHMARK_MINIMUM_SPEEDUP,
+    MINIMUM_STABLE_MEDIAN_SECONDS,
+)
+from atoll.report import COMPILE_REPORT_SCHEMA_VERSION, OPTIMIZATION_POLICY_VERSION
+
 PYDANTIC_AI_REPOSITORY = "https://github.com/pydantic/pydantic-ai.git"
 PYDANTIC_AI_REVISION = "e6ff64409f74124de581068be644a3dbf8999e7d"
 COLD_MYPYC_BASELINE_SECONDS = 192.70191520900698
 COLD_MYPYC_TARGET_SECONDS = COLD_MYPYC_BASELINE_SECONDS / 2
-MINIMUM_SOURCE_SPEEDUP = 3.0
-MINIMUM_FINAL_SPEEDUP = 3.0
+MINIMUM_SOURCE_SPEEDUP = HARD_BENCHMARK_MINIMUM_SPEEDUP
+MINIMUM_FINAL_SPEEDUP = HARD_BENCHMARK_MINIMUM_SPEEDUP
+MINIMUM_COMPOSED_MARGINAL_SPEEDUP = DEFAULT_MINIMUM_MARGINAL_SPEEDUP
 BENCHMARK_SAMPLES = 7
-COMPILE_REPORT_VERSION = 5
+COMPILE_REPORT_VERSION = COMPILE_REPORT_SCHEMA_VERSION
 MINIMUM_OBSERVED_WORK_ITEMS = 10_000
 MINIMUM_ATTRIBUTED_HOT_SHARE = 0.70
 ATOLL_PATCH_PATH_PARTS = 3
@@ -61,6 +69,7 @@ class BenchmarkEvaluation:
     cold_patch_cache_status: str
     warm_patch_cache_status: str
     final_speedup: float | None
+    composed_marginal_speedup: float | None
     source_speedup: float | None
     wheel_speedup: float | None
     source_plan_count: int
@@ -85,6 +94,7 @@ class BenchmarkEvaluation:
             "cold_patch_cache_status": self.cold_patch_cache_status,
             "errors": list(self.errors),
             "final_speedup": self.final_speedup,
+            "composed_marginal_speedup": self.composed_marginal_speedup,
             "source_speedup": self.source_speedup,
             "wheel_speedup": self.wheel_speedup,
             "source_plan_count": self.source_plan_count,
@@ -93,6 +103,7 @@ class BenchmarkEvaluation:
             "patch_path": self.patch_path,
             "application_status": self.application_status,
             "minimum_final_speedup": MINIMUM_FINAL_SPEEDUP,
+            "minimum_composed_marginal_speedup": MINIMUM_COMPOSED_MARGINAL_SPEEDUP,
             "minimum_source_speedup": MINIMUM_SOURCE_SPEEDUP,
             "succeeded": self.succeeded,
             "warm_patch_cache_status": self.warm_patch_cache_status,
@@ -341,7 +352,7 @@ class BenchmarkEvidenceInputs:
 
 
 def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
-    """Evaluate schema-v5 source-patch reproducibility and 3x profitability gates."""
+    """Evaluate schema-v6 composition, cache, stability, and profitability gates."""
     cold_native_phase_count = sum(
         _phase_count(inputs.cold_report, phase) for phase in NATIVE_PHASES
     )
@@ -354,9 +365,8 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
     cold_accepted = _accepted_source_optimization_trials(inputs.cold_report)
     warm_accepted = _accepted_source_optimization_trials(inputs.warm_report)
     accepted_trial = _final_accepted_source_trial(inputs.warm_report)
-    final_speedup = _optional_number_field(
-        _mapping_field(inputs.warm_report, "performance"), "speedup"
-    )
+    performance = _mapping_field(inputs.warm_report, "performance")
+    final_candidate_median = _optional_number_field(performance, "compiled_median_seconds")
     source_speedup = (
         _optional_number_field(accepted_trial, "source_speedup")
         if accepted_trial is not None
@@ -367,6 +377,18 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
         if accepted_trial is not None
         else None
     )
+    source_baseline_median = (
+        _optional_number_field(accepted_trial, "baseline_median_seconds")
+        if accepted_trial is not None
+        else None
+    )
+    source_wheel_median = (
+        _optional_number_field(accepted_trial, "wheel_median_seconds")
+        if accepted_trial is not None
+        else None
+    )
+    final_speedup = _safe_ratio(source_baseline_median, final_candidate_median)
+    composed_marginal_speedup = _safe_ratio(source_wheel_median, final_candidate_median)
     patch_path = _reported_patch_path(inputs.warm_report)
     application_status = _string_field(warm_source, "application_status")
     errors = _evaluation_errors(
@@ -383,6 +405,7 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
             warm_native_phase_count=warm_native_phase_count,
             warm_compiler_probe_count=inputs.warm_compiler_probe_count,
             final_speedup=final_speedup,
+            composed_marginal_speedup=composed_marginal_speedup,
             source_speedup=source_speedup,
             wheel_speedup=wheel_speedup,
             cold_source=cold_source,
@@ -399,6 +422,7 @@ def evaluate_reports(inputs: BenchmarkEvidenceInputs) -> BenchmarkEvaluation:
         cold_patch_cache_status=_source_patch_cache_status(cold_accepted),
         warm_patch_cache_status=_source_patch_cache_status(warm_accepted),
         final_speedup=final_speedup,
+        composed_marginal_speedup=composed_marginal_speedup,
         source_speedup=source_speedup,
         wheel_speedup=wheel_speedup,
         source_plan_count=len(_source_optimization_plans(inputs.warm_report)),
@@ -428,6 +452,7 @@ class _EvaluationInputs:
     warm_native_phase_count: int
     warm_compiler_probe_count: int
     final_speedup: float | None
+    composed_marginal_speedup: float | None
     source_speedup: float | None
     wheel_speedup: float | None
     cold_source: dict[str, object]
@@ -439,9 +464,11 @@ class _EvaluationInputs:
 def _evaluation_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
     return (
         *_report_errors(inputs),
+        *_policy_errors(inputs),
         *_cache_errors(inputs),
         *_source_errors(inputs),
         *_source_optimization_errors(inputs),
+        *_composition_errors(inputs),
         *_profitability_errors(inputs),
     )
 
@@ -474,6 +501,53 @@ def _report_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
                 f"{label} source-optimization floor is {minimum_speedup:.3f}x, "
                 f"below {MINIMUM_SOURCE_SPEEDUP:.3f}x"
             )
+    return tuple(errors)
+
+
+def _policy_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+    errors: list[str] = []
+    for label, report in (("cold", inputs.cold_report), ("warm", inputs.warm_report)):
+        policy = _mapping_field(report, "optimization_policy")
+        expected = {
+            "version": float(OPTIMIZATION_POLICY_VERSION),
+            "stability_floor_seconds": MINIMUM_STABLE_MEDIAN_SECONDS,
+            "specialized_minimum_marginal_speedup": MINIMUM_COMPOSED_MARGINAL_SPEEDUP,
+            "hard_benchmark_minimum_speedup": MINIMUM_FINAL_SPEEDUP,
+        }
+        for field, expected_value in expected.items():
+            actual = _number_field(policy, field)
+            if actual != expected_value:
+                errors.append(
+                    f"{label} optimization policy {field} is {actual}, expected {expected_value}"
+                )
+        for item in _list_field(report, "stage_medians"):
+            stage = _mapping(item, "stage_medians[]")
+            baseline = _number_field(stage, "baseline_median_seconds")
+            candidate = _number_field(stage, "candidate_median_seconds")
+            if min(baseline, candidate) < MINIMUM_STABLE_MEDIAN_SECONDS:
+                errors.append(
+                    f"{label} stage {_string_field(stage, 'stage')} has an unstable median"
+                )
+    return tuple(errors)
+
+
+def _composition_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
+    composition = _mapping_field(inputs.warm_report, "final_composition")
+    errors: list[str] = []
+    if not _list_field(composition, "source_plan_ids"):
+        errors.append("warm final composition contains no accepted source plan")
+    if not _list_field(composition, "native_variant_ids"):
+        errors.append("warm final composition contains no accepted native variant")
+    if not _list_field(composition, "artifacts"):
+        errors.append("warm final composition contains no native artifact")
+    if (
+        inputs.composed_marginal_speedup is None
+        or inputs.composed_marginal_speedup < MINIMUM_COMPOSED_MARGINAL_SPEEDUP
+    ):
+        errors.append(
+            "composed payload improves the accepted source-only arm by less than "
+            f"{MINIMUM_COMPOSED_MARGINAL_SPEEDUP:.2f}x"
+        )
     return tuple(errors)
 
 
@@ -659,12 +733,18 @@ def _profitability_errors(inputs: _EvaluationInputs) -> tuple[str, ...]:
             if wheel_speedup is None or wheel_speedup < MINIMUM_FINAL_SPEEDUP:
                 errors.append(f"{label} normal wheel speedup is below 3.00x")
     if inputs.final_speedup is None or inputs.final_speedup < MINIMUM_FINAL_SPEEDUP:
-        errors.append("warm final speedup is below 3.00x")
+        errors.append(f"warm final speedup is below {MINIMUM_FINAL_SPEEDUP:.2f}x")
     if inputs.source_speedup is None or inputs.source_speedup < MINIMUM_SOURCE_SPEEDUP:
         errors.append("warm accepted source speedup is below 3.00x")
     if inputs.wheel_speedup is None or inputs.wheel_speedup < MINIMUM_FINAL_SPEEDUP:
         errors.append("warm accepted wheel speedup is below 3.00x")
     return tuple(errors)
+
+
+def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0.0:
+        return None
+    return numerator / denominator
 
 
 def source_manifest(source_root: Path) -> dict[str, str]:

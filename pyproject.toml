@@ -99,6 +99,8 @@ convention = "google"
 "scripts/pydantic_graph_ceiling.py" = ["S603"]
 "scripts/run_pydantic_graph_ceiling_experiment.py" = ["S603"]
 "scripts/run_pydantic_graph_benchmark.py" = ["S603"]
+"scripts/run_cython_batch_benchmark.py" = ["S603"]
+"scripts/run_native_optimizer_benchmark.py" = ["S603"]
 "tests/**/*.py" = ["D", "S101"]
 "tests/unit/test_source_optimization_transforms.py" = ["S603"]
 
