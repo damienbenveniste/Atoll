@@ -165,8 +165,9 @@ successful compilation is not a speedup claim.
 With both `test_command` and `benchmark_command`, `atoll compile` evaluates source rewrites for hot
 async fan-out and fan-in pipelines. Trial eligibility requires 10,000 observed work items, no
 observed suspension for the fused callable shape, and at least 70% mapped hot-path coverage. Atoll
-ranks at most two plans and tests no more than eight cumulative candidates with beam width two and
-depth four.
+ranks at most two plans and tests no more than eight ordered compositions with beam width two and
+depth four. An unsafe residual remains report evidence and does not block a later independently
+proven transformation.
 
 LibCST applies each candidate only in a temporary project copy. The guarded path can drain a private
 transport in batches, execute proven quiescent coroutine work in one copied `Context` per logical
@@ -182,10 +183,18 @@ profiling against that staged payload with optimized routing enabled. Only a com
 can seed another search depth. The gate uses the median of corresponding current/candidate ratios
 from each rotating three-arm sample group, preventing one order-biased current measurement from
 changing the accepted patch. Unsupported launchers, insufficient samples, and failed passes stay in
-the report as rejection evidence. Structurally owned AnyIO-on-asyncio streams can receive cumulative
+the report as rejection evidence. Structurally owned AnyIO-on-asyncio streams can receive ordered
 residual trials for run-scoped guard amortization, quiescent await-chain collapse, proven-safe context
 copy elision, incremental completion accounting, and private result-record projection. Each trial's
 fresh residual profile is included in the compile report.
+
+A separate structural proof recognizes private exact-dictionary completion scans that test stack-run
+and node membership. The transformed source maintains a private count and index at every proven map
+write and removal while its fallback still creates the original value snapshot and invokes the
+original predicate. When profitable, one transactional Cython unit replaces the cached run guard,
+snapshot, and indexed query. Exact owner and predicate-code identities and the active-count invariant
+are checked before native routing, so missing artifacts, stale state, changed code, and
+`ATOLL_DISABLE=1` retain the source scan.
 
 Source-patch promotion requires `max(3.0, minimum_speedup)` for both the transformed source tree and
 its normally built PEP 517 wheel over seven alternating pairs. Default compile leaves checkout

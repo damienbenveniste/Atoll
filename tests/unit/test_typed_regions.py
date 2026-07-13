@@ -73,6 +73,37 @@ def test_directed_region_slice_keeps_runtime_boundaries_outside_native_unit(
     assert {member.id for member in required_slice.members} == {hot, helper}
 
 
+def test_typed_region_retains_caller_across_interpreted_blocked_boundary(
+    tmp_path: Path,
+) -> None:
+    """A blocked local callee stays interpreted when ordinary dispatch is sufficient."""
+    scan = _scan_source(
+        tmp_path,
+        "interpreted_boundary",
+        [
+            "import inspect",
+            "",
+            "def unsafe() -> object | None:",
+            "    return inspect.currentframe()",
+            "",
+            "def hot() -> object | None:",
+            "    return unsafe()",
+            "",
+        ],
+    )
+    hot = SymbolId("interpreted_boundary", "hot")
+    unsafe = SymbolId("interpreted_boundary", "unsafe")
+
+    region = next(item for item in scan.typed_regions if hot in {m.id for m in item.members})
+    sliced = build_directed_region_slice(region, hot)
+
+    assert tuple(member.id for member in sliced.members) == (hot,)
+    dependency = next(item for item in sliced.dependencies if item.dst == unsafe)
+    assert dependency.role == "runtime"
+    assert dependency.requires_same_unit is False
+    assert all(unsafe not in {member.id for member in item.members} for item in scan.typed_regions)
+
+
 def test_directed_region_slice_rejects_invalid_roots_dependencies_and_bindings(
     tmp_path: Path,
 ) -> None:

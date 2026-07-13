@@ -436,7 +436,7 @@ def _validate_units(
     )
     if unproven_pyx:
         raise ValueError(
-            f"{expected_backend} backend received .pyx unit(s) without scalar proof provenance: "
+            f"{expected_backend} backend received .pyx unit(s) without Atoll proof provenance: "
             f"{', '.join(unproven_pyx)}"
         )
 
@@ -448,7 +448,7 @@ def _is_proof_generated_pyx(path: Path) -> bool:
         path: Candidate `.pyx` source supplied to the backend.
 
     Returns:
-        bool: Whether the file was emitted by Atoll's scalar proof generator.
+        bool: Whether the file was emitted by a recognized Atoll proof generator.
     """
     source = path.read_text(encoding="utf-8")
     return any(marker in source for marker in _PROOF_GENERATED_PYX_MARKERS)

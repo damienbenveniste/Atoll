@@ -30,6 +30,16 @@ from atoll.native_optimization.models import (
     NativeVariantPlan,
     stable_native_variant_plan_id,
 )
+from atoll.native_optimization.run_guard import (
+    RUN_GUARD_LOWERING_VERSION,
+    CompletionIndexNativePlan,
+    RunGuardNativePlan,
+    build_run_guard_region,
+    compiled_completion_query_source,
+    compiled_completion_snapshot_source,
+    compiled_run_guard_function_source,
+    run_guard_function_source,
+)
 from atoll.native_optimization.scalar_analysis import (
     ScalarAnalysisResult,
     ScalarKernelPlan,
@@ -43,6 +53,7 @@ from atoll.native_optimization.scalar_analysis import (
 )
 
 __all__ = (
+    "RUN_GUARD_LOWERING_VERSION",
     "AccumulatorEvidence",
     "BindingDispatchPlan",
     "BufferAccessEvidence",
@@ -55,6 +66,7 @@ __all__ = (
     "CallableCodeIdentityGuardPayload",
     "CompiledBindingVariant",
     "CompiledVariantKind",
+    "CompletionIndexNativePlan",
     "DirectFieldGuardPayload",
     "DispatchTargetKind",
     "ExactTypeGuardPayload",
@@ -65,6 +77,7 @@ __all__ = (
     "IntegerDomainGuardPayload",
     "NativeVariantPlan",
     "ReturnEvidence",
+    "RunGuardNativePlan",
     "ScalarAnalysisResult",
     "ScalarKernelPlan",
     "ScalarMemberAnalysisOptions",
@@ -77,5 +90,10 @@ __all__ = (
     "analyze_buffer_scan",
     "analyze_scalar_member",
     "analyze_scalar_scan",
+    "build_run_guard_region",
+    "compiled_completion_query_source",
+    "compiled_completion_snapshot_source",
+    "compiled_run_guard_function_source",
+    "run_guard_function_source",
     "stable_native_variant_plan_id",
 )

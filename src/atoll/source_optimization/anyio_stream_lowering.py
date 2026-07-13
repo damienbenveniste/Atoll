@@ -27,9 +27,14 @@ from typing import cast, override
 import libcst as cst
 
 from atoll.models import SymbolId
+from atoll.native_optimization.run_guard import (
+    CompletionIndexNativePlan,
+    RunGuardNativePlan,
+)
 from atoll.source_optimization.models import SourceOptimizationPlan
 from atoll.source_optimization.transforms import (
     CallableBodyReplacement,
+    DeclarationKind,
     SourceTransformationRequest,
 )
 
@@ -38,6 +43,9 @@ _REDUCER_ARGUMENT_COUNT = 4
 _REDUCER_PROPERTY_READ_COUNT = 3
 _CONSUMER_REDUCER_ARGUMENT_COUNT = 3
 _RESULT_FIELD_COUNT = 3
+_COMPLETION_ARGUMENT_COUNT = 4
+_COMPLETION_STATEMENT_COUNT = 3
+_COMPLETION_QUERY_ARGUMENT_COUNT = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,10 +57,13 @@ class AnyioStreamLowering:
             initializer while inserting module-level guarded helpers.
         helper_names: Generated guard, driver, and route-counter names exposed
             to strict optimized-routing tests.
+        native_plans: Source-fused native helpers that may be trialed after the
+            source patch itself passes semantic and profitability gates.
     """
 
     request: SourceTransformationRequest
     helper_names: tuple[str, ...]
+    native_plans: tuple[RunGuardNativePlan, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +120,7 @@ class _AnyioShape:
     reducer: _ReducerShape | None
     protocol: _ProtocolShape | None
     completion: _CompletionShape | None
+    native_completion: _NativeCompletionShape | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +148,75 @@ class _CompletionShape:
 
 
 @dataclass(frozen=True, slots=True)
+class _CompletionMethodShape:
+    """Expected indexed-completion edits for one exact owner method.
+
+    Attributes:
+        name: Unqualified method name within the proven owner class.
+        asynchronous: Whether the source declaration is asynchronous.
+        assignments: Exact active-map subscript writes to replace.
+        pops: Exact active-map removals to replace.
+        snapshots: Exact active-value snapshots to route through the fallback helper.
+        queries: Exact completion-predicate calls to route through the fallback helper.
+    """
+
+    name: str
+    asynchronous: bool
+    assignments: int = 0
+    pops: int = 0
+    snapshots: int = 0
+    queries: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeCompletionShape:
+    """Structurally proven full-scan completion predicate and owned mapping.
+
+    Attributes:
+        active_attribute: Exact-dict owner field containing active work.
+        predicate_method: Original same-class full-scan completion predicate.
+        graph_attribute: Owner field containing topology lookup behavior.
+        parent_lookup_method: Topology method resolving the parent group.
+        intermediate_nodes_attribute: Parent field containing relevant node identities.
+        task_stack_attribute: Task field containing stack-run records.
+        stack_run_attribute: Stack-record field containing one run identity.
+        task_node_attribute: Task field containing one node identity.
+        methods: Exact method-level mutation, snapshot, and query edit counts.
+    """
+
+    active_attribute: str
+    predicate_method: str
+    graph_attribute: str
+    parent_lookup_method: str
+    intermediate_nodes_attribute: str
+    task_stack_attribute: str
+    stack_run_attribute: str
+    task_node_attribute: str
+    methods: tuple[_CompletionMethodShape, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletionPredicateShape:
+    """Fields extracted from one exact full-scan completion predicate.
+
+    Attributes:
+        graph_attribute: Owner field containing topology lookup behavior.
+        parent_lookup_method: Topology method resolving the parent group.
+        intermediate_nodes_attribute: Parent field containing relevant node identities.
+        task_stack_attribute: Task field containing stack-run records.
+        stack_run_attribute: Stack-record field containing one run identity.
+        task_node_attribute: Task field containing one node identity.
+    """
+
+    graph_attribute: str
+    parent_lookup_method: str
+    intermediate_nodes_attribute: str
+    task_stack_attribute: str
+    stack_run_attribute: str
+    task_node_attribute: str
+
+
+@dataclass(frozen=True, slots=True)
 class _Names:
     suffix: str
     collections: str
@@ -145,6 +226,7 @@ class _Names:
     inspect: str
     os: str
     sys: str
+    types: str
     typing: str
     weakref: str
     anyio_backend: str
@@ -156,7 +238,25 @@ class _Names:
     fast_record: str
     route_hits: str
     guard: str
+    original_guard: str
+    cached_guard: str
+    guard_fallback_attribute: str
+    guard_state_attribute: str
+    guard_run_identity_attribute: str
+    completion_index_attribute: str
+    completion_count_attribute: str
+    completion_sentinel: str
+    completion_add: str
+    completion_remove: str
+    completion_set: str
+    completion_pop: str
+    completion_snapshot: str
+    completion_query: str
+    clear_guard: str
+    resume_await: str
+    protocol_await: str
     no_monitoring: str
+    binding_matches: str
     eligible: str
     safe_callable: str
     safe_code: str
@@ -232,9 +332,15 @@ def lower_anyio_stream_plan(
     shape = _analyze_shape(project_root, tree, plan, residual=selected)
     module = cst.parse_module(source)
     names = _names(plan.id)
-    owner_body = _owner_body(module, plan.owner.qualname, shape, names)
+    owner_body = _owner_body(
+        module,
+        plan.owner.qualname,
+        shape,
+        names,
+        residual=selected,
+    )
     consumer_body = _consumer_body(module, plan.consumer, shape, names, residual=selected)
-    initializer_body = _initializer_body(module, shape, names)
+    initializer_body = _initializer_body(module, shape, names, residual=selected)
     request = SourceTransformationRequest(
         path=plan.source,
         expected_sha256=expected_hash,
@@ -268,11 +374,27 @@ def lower_anyio_stream_plan(
                 if shape.protocol is not None
                 else ()
             ),
+            *_completion_additional_replacements(
+                module,
+                plan,
+                shape,
+                names,
+            ),
         ),
         summary="add a guarded residual fast path for a private AnyIO result stream",
         transformation_id=_transformation_id(plan.id, selected),
     )
-    return AnyioStreamLowering(request=request, helper_names=names.public)
+    native_plans = (
+        (_run_guard_native_plan(plan, names, shape.native_completion),)
+        if shape.protocol is not None
+        or (shape.native_completion is not None and selected.guard_amortization)
+        else ()
+    )
+    return AnyioStreamLowering(
+        request=request,
+        helper_names=names.public,
+        native_plans=native_plans,
+    )
 
 
 def _source_path(project_root: Path, relative: PurePosixPath) -> Path:
@@ -394,6 +516,7 @@ def _analyze_shape(
         if residual.incremental_completion_accounting
         else None
     )
+    native_completion = _native_completion_shape(class_node, consumer)
     reducer = _reducer_shape(project_root, tree, plan, consumer)
     protocol = _protocol_shape(tree, class_name, consumer.name)
     return _AnyioShape(
@@ -427,6 +550,7 @@ def _analyze_shape(
         reducer=reducer,
         protocol=protocol,
         completion=completion,
+        native_completion=native_completion,
     )
 
 
@@ -1218,6 +1342,526 @@ def _completion_shape(
     return _CompletionShape(active_attribute=active_path.rsplit(".", maxsplit=1)[-1])
 
 
+def _native_completion_shape(
+    class_node: ast.ClassDef,
+    consumer: ast.AsyncFunctionDef,
+) -> _NativeCompletionShape | None:
+    """Return an indexed completion opportunity or leave the source unchanged.
+
+    The proof is deliberately narrower than the residual local counter. It
+    recognizes one repeated snapshot passed to a same-class scanner whose
+    predicate checks a task's stack run identity and node membership. Any
+    ambiguous ownership, mutation, or predicate shape simply leaves this
+    optional native residual unavailable.
+
+    Args:
+        class_node: Exact owner class containing the private active mapping.
+        consumer: Async consumer containing the repeated active-value snapshot.
+
+    Returns:
+        _NativeCompletionShape | None: Complete source-edit proof when available.
+    """
+    try:
+        return _analyze_native_completion_shape(class_node, consumer)
+    except (TypeError, ValueError):
+        return None
+
+
+def _analyze_native_completion_shape(
+    class_node: ast.ClassDef,
+    consumer: ast.AsyncFunctionDef,
+) -> _NativeCompletionShape:
+    snapshot_name, active_attribute = _active_snapshot_shape(consumer)
+    if not class_node.name.startswith("_") and not active_attribute.startswith("_"):
+        raise ValueError("indexed completion requires a private owner or mapping")
+    if not _exact_dict_field(class_node, active_attribute):
+        raise ValueError("indexed completion requires an exact dict field")
+    scan_method, active_parameter = _completion_scan_method(
+        class_node,
+        consumer,
+        snapshot_name,
+    )
+    predicate_method = _completion_predicate_method(
+        class_node,
+        scan_method,
+        active_parameter,
+    )
+    predicate = _completion_predicate_shape(predicate_method)
+    methods = _completion_mutation_methods(class_node, active_attribute)
+    methods = _merge_completion_method_shape(
+        methods,
+        _CompletionMethodShape(
+            name=consumer.name,
+            asynchronous=True,
+            snapshots=1,
+        ),
+    )
+    methods = _merge_completion_method_shape(
+        methods,
+        _CompletionMethodShape(
+            name=scan_method.name,
+            asynchronous=False,
+            queries=1,
+        ),
+    )
+    return _NativeCompletionShape(
+        active_attribute=active_attribute,
+        predicate_method=predicate_method.name,
+        graph_attribute=predicate.graph_attribute,
+        parent_lookup_method=predicate.parent_lookup_method,
+        intermediate_nodes_attribute=predicate.intermediate_nodes_attribute,
+        task_stack_attribute=predicate.task_stack_attribute,
+        stack_run_attribute=predicate.stack_run_attribute,
+        task_node_attribute=predicate.task_node_attribute,
+        methods=methods,
+    )
+
+
+def _active_snapshot_shape(consumer: ast.AsyncFunctionDef) -> tuple[str, str]:
+    matches: list[tuple[str, str]] = []
+    for node in ast.walk(consumer):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        value = node.value
+        if not (
+            isinstance(target, ast.Name)
+            and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "list"
+            and len(value.args) == 1
+            and not value.keywords
+            and isinstance(value.args[0], ast.Call)
+        ):
+            continue
+        values = value.args[0]
+        path = _expression_path(values.func)
+        if values.args or values.keywords or path is None:
+            continue
+        matched = re.fullmatch(r"self\.([A-Za-z_]\w*)\.values", path)
+        if matched is not None:
+            matches.append((target.id, matched.group(1)))
+    if len(matches) != 1:
+        raise ValueError("indexed completion requires one active-value snapshot")
+    return matches[0]
+
+
+def _completion_scan_method(
+    class_node: ast.ClassDef,
+    consumer: ast.AsyncFunctionDef,
+    snapshot_name: str,
+) -> tuple[ast.FunctionDef, str]:
+    calls = tuple(
+        node
+        for node in ast.walk(consumer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and any(
+            isinstance(argument, ast.Name) and argument.id == snapshot_name
+            for argument in node.args
+        )
+        and not node.keywords
+    )
+    if len(calls) != 1:
+        raise ValueError("indexed completion snapshot must feed one same-class scan")
+    call = calls[0]
+    scan_name = cast(ast.Attribute, call.func).attr
+    method = cast(
+        ast.FunctionDef,
+        _named_method(class_node, scan_name, ast.FunctionDef, role="completion scanner"),
+    )
+    positions = tuple(
+        index
+        for index, argument in enumerate(call.args)
+        if isinstance(argument, ast.Name) and argument.id == snapshot_name
+    )
+    positional = (*method.args.posonlyargs, *method.args.args)
+    if len(positions) != 1 or positions[0] + 1 >= len(positional):
+        raise ValueError("indexed completion scanner argument binding is ambiguous")
+    return method, positional[positions[0] + 1].arg
+
+
+def _completion_predicate_method(
+    class_node: ast.ClassDef,
+    scan_method: ast.FunctionDef,
+    active_parameter: str,
+) -> ast.FunctionDef:
+    calls = tuple(
+        node
+        for node in ast.walk(scan_method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and len(node.args) == _COMPLETION_QUERY_ARGUMENT_COUNT
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == active_parameter
+        and not node.keywords
+    )
+    if len(calls) != 1:
+        raise ValueError("indexed completion scanner must call one completion predicate")
+    predicate_name = cast(ast.Attribute, calls[0].func).attr
+    return cast(
+        ast.FunctionDef,
+        _named_method(
+            class_node,
+            predicate_name,
+            ast.FunctionDef,
+            role="completion predicate",
+        ),
+    )
+
+
+def _completion_predicate_shape(method: ast.FunctionDef) -> _CompletionPredicateShape:
+    positional = (*method.args.posonlyargs, *method.args.args)
+    if (
+        len(positional) != _COMPLETION_ARGUMENT_COUNT
+        or method.args.vararg is not None
+        or method.args.kwarg is not None
+        or method.args.kwonlyargs
+    ):
+        raise ValueError("completion predicate requires four positional parameters")
+    self_name, tasks_name, join_name, run_name = (parameter.arg for parameter in positional)
+    statements = tuple(
+        statement
+        for statement in method.body
+        if not (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        )
+    )
+    if (
+        len(statements) != _COMPLETION_STATEMENT_COUNT
+        or not isinstance(statements[0], ast.Assign)
+        or not isinstance(statements[1], ast.For)
+        or not _literal_bool_return(statements[2], True)
+    ):
+        raise ValueError("completion predicate has unsupported control flow")
+    parent_name, graph_attribute, parent_lookup = _parent_lookup_shape(
+        statements[0],
+        self_name,
+        join_name,
+    )
+    loop = statements[1]
+    if (
+        not isinstance(loop.target, ast.Name)
+        or not isinstance(loop.iter, ast.Name)
+        or loop.iter.id != tasks_name
+        or loop.orelse
+        or len(loop.body) != 1
+        or not isinstance(loop.body[0], ast.If)
+    ):
+        raise ValueError("completion predicate requires one direct task scan")
+    task_name = loop.target.id
+    outer = loop.body[0]
+    task_stack, stack_run = _run_membership_shape(outer.test, task_name, run_name)
+    if len(outer.body) != 1 or not isinstance(outer.body[0], ast.If):
+        raise ValueError("completion predicate run membership must guard one node test")
+    if outer.orelse and not all(isinstance(statement, ast.Pass) for statement in outer.orelse):
+        raise ValueError("completion predicate run miss branch must be inert")
+    inner = outer.body[0]
+    task_node, intermediate = _node_membership_shape(
+        inner.test,
+        task_name,
+        parent_name,
+        join_name,
+    )
+    if len(inner.body) != 1 or not _literal_bool_return(inner.body[0], False) or inner.orelse:
+        raise ValueError("completion predicate node match must return False")
+    return _CompletionPredicateShape(
+        graph_attribute=graph_attribute,
+        parent_lookup_method=parent_lookup,
+        intermediate_nodes_attribute=intermediate,
+        task_stack_attribute=task_stack,
+        stack_run_attribute=stack_run,
+        task_node_attribute=task_node,
+    )
+
+
+def _parent_lookup_shape(
+    statement: ast.Assign,
+    self_name: str,
+    join_name: str,
+) -> tuple[str, str, str]:
+    if (
+        len(statement.targets) != 1
+        or not isinstance(statement.targets[0], ast.Name)
+        or not isinstance(statement.value, ast.Call)
+        or len(statement.value.args) != 1
+        or statement.value.keywords
+        or not isinstance(statement.value.args[0], ast.Name)
+        or statement.value.args[0].id != join_name
+        or not isinstance(statement.value.func, ast.Attribute)
+        or not isinstance(statement.value.func.value, ast.Attribute)
+        or not isinstance(statement.value.func.value.value, ast.Name)
+        or statement.value.func.value.value.id != self_name
+    ):
+        raise ValueError("completion predicate parent lookup is not direct")
+    return (
+        statement.targets[0].id,
+        statement.value.func.value.attr,
+        statement.value.func.attr,
+    )
+
+
+def _run_membership_shape(test: ast.expr, task_name: str, run_name: str) -> tuple[str, str]:
+    if (
+        not isinstance(test, ast.Compare)
+        or not isinstance(test.left, ast.Name)
+        or test.left.id != run_name
+        or len(test.ops) != 1
+        or not isinstance(test.ops[0], ast.In)
+        or len(test.comparators) != 1
+        or not isinstance(test.comparators[0], ast.SetComp)
+    ):
+        raise ValueError("completion predicate run membership is unsupported")
+    comprehension = test.comparators[0]
+    if (
+        len(comprehension.generators) != 1
+        or comprehension.generators[0].ifs
+        or comprehension.generators[0].is_async
+        or not isinstance(comprehension.generators[0].target, ast.Name)
+        or not isinstance(comprehension.generators[0].iter, ast.Attribute)
+        or not isinstance(comprehension.generators[0].iter.value, ast.Name)
+        or comprehension.generators[0].iter.value.id != task_name
+        or not isinstance(comprehension.elt, ast.Attribute)
+        or not isinstance(comprehension.elt.value, ast.Name)
+        or comprehension.elt.value.id != comprehension.generators[0].target.id
+    ):
+        raise ValueError("completion predicate stack projection is unsupported")
+    return comprehension.generators[0].iter.attr, comprehension.elt.attr
+
+
+def _node_membership_shape(
+    test: ast.expr,
+    task_name: str,
+    parent_name: str,
+    join_name: str,
+) -> tuple[str, str]:
+    if (
+        not isinstance(test, ast.BoolOp)
+        or not isinstance(test.op, ast.Or)
+        or len(test.values) != _PAIR_SIZE
+    ):
+        raise ValueError("completion predicate node test must be one disjunction")
+    membership = next(
+        (
+            value
+            for value in test.values
+            if isinstance(value, ast.Compare)
+            and len(value.ops) == 1
+            and isinstance(value.ops[0], ast.In)
+        ),
+        None,
+    )
+    equality = next(
+        (
+            value
+            for value in test.values
+            if isinstance(value, ast.Compare)
+            and len(value.ops) == 1
+            and isinstance(value.ops[0], ast.Eq)
+        ),
+        None,
+    )
+    if membership is None or equality is None or len(membership.comparators) != 1:
+        raise ValueError("completion predicate node comparisons are unsupported")
+    node = membership.left
+    intermediate = membership.comparators[0]
+    if (
+        not isinstance(node, ast.Attribute)
+        or not isinstance(node.value, ast.Name)
+        or node.value.id != task_name
+        or not isinstance(intermediate, ast.Attribute)
+        or not isinstance(intermediate.value, ast.Name)
+        or intermediate.value.id != parent_name
+        or not _same_equality_operands(equality, node, join_name)
+    ):
+        raise ValueError("completion predicate node projection is unsupported")
+    return node.attr, intermediate.attr
+
+
+def _same_equality_operands(compare: ast.Compare, node: ast.Attribute, name: str) -> bool:
+    if len(compare.comparators) != 1:
+        return False
+    right = compare.comparators[0]
+    return (
+        ast.dump(compare.left, include_attributes=False) == ast.dump(node, include_attributes=False)
+        and isinstance(right, ast.Name)
+        and right.id == name
+    ) or (
+        isinstance(compare.left, ast.Name)
+        and compare.left.id == name
+        and ast.dump(right, include_attributes=False) == ast.dump(node, include_attributes=False)
+    )
+
+
+def _literal_bool_return(statement: ast.stmt, value: bool) -> bool:
+    return (
+        isinstance(statement, ast.Return)
+        and isinstance(statement.value, ast.Constant)
+        and statement.value.value is value
+    )
+
+
+def _exact_dict_field(class_node: ast.ClassDef, attribute: str) -> bool:
+    fields = tuple(
+        statement
+        for statement in class_node.body
+        if isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+        and statement.target.id == attribute
+    )
+    if len(fields) != 1 or not isinstance(fields[0].annotation, ast.Subscript):
+        return False
+    annotation = _expression_path(fields[0].annotation.value)
+    if annotation not in {"dict", "builtins.dict"}:
+        return False
+    initializer = _named_method(class_node, "__post_init__", ast.FunctionDef, role="initializer")
+    assignments = tuple(
+        node
+        for node in ast.walk(initializer)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and _expression_path(node.targets[0]) == f"self.{attribute}"
+    )
+    return (
+        len(assignments) == 1
+        and isinstance(assignments[0].value, ast.Dict)
+        and not assignments[0].value.keys
+    )
+
+
+def _completion_mutation_methods(
+    class_node: ast.ClassDef,
+    active_attribute: str,
+) -> tuple[_CompletionMethodShape, ...]:
+    active_path = f"self.{active_attribute}"
+    shapes: list[_CompletionMethodShape] = []
+    total_assignments = 0
+    total_pops = 0
+    for method in class_node.body:
+        if not isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        shape = _completion_method_mutations(method, active_path)
+        if shape is not None:
+            shapes.append(shape)
+            total_assignments += shape.assignments
+            total_pops += shape.pops
+    if total_assignments < 1 or total_pops != 1:
+        raise ValueError("indexed completion requires owned assignments and one removal")
+    return tuple(shapes)
+
+
+def _completion_method_mutations(
+    method: ast.FunctionDef | ast.AsyncFunctionDef,
+    active_path: str,
+) -> _CompletionMethodShape | None:
+    parents = {
+        child: parent for parent in ast.walk(method) for child in ast.iter_child_nodes(parent)
+    }
+    assignments = 0
+    pops = 0
+    mutators = frozenset({"clear", "pop", "popitem", "setdefault", "update"})
+    for node in ast.walk(method):
+        if isinstance(node, ast.Assign) and any(
+            _expression_path(target) == active_path for target in node.targets
+        ):
+            if method.name != "__post_init__":
+                raise ValueError("active completion mapping is rebound after initialization")
+            continue
+        if isinstance(node, ast.Subscript) and _expression_path(node.value) == active_path:
+            assignments += _validated_completion_assignment(node, parents)
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if _expression_path(node.func.value) != active_path or node.func.attr not in mutators:
+            continue
+        _validate_completion_pop(node, parents)
+        pops += 1
+    if not assignments and not pops:
+        return None
+    return _CompletionMethodShape(
+        name=method.name,
+        asynchronous=isinstance(method, ast.AsyncFunctionDef),
+        assignments=assignments,
+        pops=pops,
+    )
+
+
+def _validated_completion_assignment(
+    node: ast.Subscript,
+    parents: dict[ast.AST, ast.AST],
+) -> int:
+    if isinstance(node.ctx, ast.Del):
+        raise TypeError("active completion mapping uses direct deletion")
+    if not isinstance(node.ctx, ast.Store):
+        return 0
+    parent = parents.get(node)
+    if (
+        not isinstance(parent, ast.Assign)
+        or len(parent.targets) != 1
+        or parent.targets[0] is not node
+        or not _direct_index_expression(node.slice)
+        or not _direct_index_expression(parent.value)
+    ):
+        raise ValueError("active completion assignment is not directly indexable")
+    return 1
+
+
+def _validate_completion_pop(
+    node: ast.Call,
+    parents: dict[ast.AST, ast.AST],
+) -> None:
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "pop":
+        raise ValueError("active completion mapping uses an unsupported mutator")
+    if (
+        not isinstance(parents.get(node), ast.Expr)
+        or len(node.args) != _PAIR_SIZE
+        or not isinstance(node.args[1], ast.Constant)
+        or node.args[1].value is not None
+        or node.keywords
+        or not _direct_index_expression(node.args[0])
+    ):
+        raise ValueError("active completion pop must be an ignored pop with None default")
+
+
+def _direct_index_expression(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name | ast.Constant):
+        return True
+    return isinstance(node, ast.Attribute) and _expression_path(node) is not None
+
+
+def _merge_completion_method_shape(
+    shapes: tuple[_CompletionMethodShape, ...],
+    added: _CompletionMethodShape,
+) -> tuple[_CompletionMethodShape, ...]:
+    merged: list[_CompletionMethodShape] = []
+    found = False
+    for shape in shapes:
+        if shape.name != added.name:
+            merged.append(shape)
+            continue
+        if shape.asynchronous != added.asynchronous:
+            raise ValueError("completion method execution kind changed")
+        merged.append(
+            _CompletionMethodShape(
+                name=shape.name,
+                asynchronous=shape.asynchronous,
+                assignments=shape.assignments + added.assignments,
+                pops=shape.pops + added.pops,
+                snapshots=shape.snapshots + added.snapshots,
+                queries=shape.queries + added.queries,
+            )
+        )
+        found = True
+    if not found:
+        merged.append(added)
+    return tuple(merged)
+
+
 def _validate_active_mapping_ownership(
     class_node: ast.ClassDef,
     consumer: ast.AsyncFunctionDef,
@@ -1656,6 +2300,8 @@ def _owner_body(
     qualname: str,
     shape: _AnyioShape,
     names: _Names,
+    *,
+    residual: AnyioResidualOptions,
 ) -> str:
     method = _cst_method(module, qualname)
     body = cast(cst.IndentedBlock, method.body)
@@ -1680,12 +2326,16 @@ def _owner_body(
         orelse=cst.Else(body=cst.IndentedBlock(body=(fallback_loop,))),
         leading_lines=spawn_loop.leading_lines,
     )
-    guard = cst.parse_statement(f"{names.fast_local} = {names.guard}(self, {shape.request_name})\n")
+    run_guard_enabled = residual.guard_amortization or shape.protocol is not None
+    guard_name = names.cached_guard if run_guard_enabled else names.guard
+    guard = cst.parse_statement(f"{names.fast_local} = {guard_name}(self, {shape.request_name})\n")
     insertion = _after_docstring(body.body)
     statements = list(body.body)
     statements[index] = branch
     statements.insert(insertion, guard)
-    return _body_source(module, body.with_changes(body=tuple(statements)))
+    updated = body.with_changes(body=tuple(statements))
+    updated = _apply_completion_index_body(updated, shape, shape.owner.name, names)
+    return _body_source(module, updated)
 
 
 def _cst_spawn_loop(node: cst.For, shape: _AnyioShape) -> bool:
@@ -1743,6 +2393,7 @@ def _consumer_body(
         )
         updated = cast(cst.IndentedBlock, updated.visit(accounting))
         accounting.validate()
+    updated = _apply_completion_index_body(updated, shape, shape.consumer.name, names)
     return _body_source(module, updated)
 
 
@@ -1864,6 +2515,200 @@ class _CompletionAccountingTransformer(cst.CSTTransformer):
         self.pop_replacements += 1
         decrement = cst.parse_statement(f"{self._remaining_name} -= 1\n")
         return cst.FlattenSentinel((updated_node, decrement))
+
+
+def _apply_completion_index_body(
+    body: cst.IndentedBlock,
+    shape: _AnyioShape,
+    method_name: str,
+    names: _Names,
+) -> cst.IndentedBlock:
+    completion = shape.native_completion
+    if completion is None:
+        return body
+    method = next((item for item in completion.methods if item.name == method_name), None)
+    if method is None:
+        return body
+    transformer = _CompletionIndexTransformer(completion, method, names)
+    updated = cast(cst.IndentedBlock, body.visit(transformer))
+    transformer.validate()
+    return updated
+
+
+class _CompletionIndexTransformer(cst.CSTTransformer):
+    """Route every proven mapping mutation and repeated scan through private helpers."""
+
+    def __init__(
+        self,
+        completion: _NativeCompletionShape,
+        method: _CompletionMethodShape,
+        names: _Names,
+    ) -> None:
+        self._completion = completion
+        self._method = method
+        self._names = names
+        self.assignments = 0
+        self.pops = 0
+        self.snapshots = 0
+        self.queries = 0
+
+    def validate(self) -> None:
+        """Require LibCST edits to match every site proven by the AST frontend.
+
+        Raises:
+            ValueError: If formatting-aware matching diverges from the semantic proof.
+        """
+        actual = (self.assignments, self.pops, self.snapshots, self.queries)
+        expected = (
+            self._method.assignments,
+            self._method.pops,
+            self._method.snapshots,
+            self._method.queries,
+        )
+        if actual != expected:
+            raise ValueError(
+                f"indexed completion rewrite counts for {self._method.name} "
+                f"were {actual!r}, expected {expected!r}"
+            )
+
+    @override
+    def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.Call:
+        """Replace the exact scanner predicate call with the source fallback helper.
+
+        Args:
+            original_node: Original call used for structural identity matching.
+            updated_node: Call after child transformations.
+
+        Returns:
+            cst.Call: Original call or generated completion-query call.
+        """
+        expected = f"self.{self._completion.predicate_method}"
+        if self._method.queries == 0 or _cst_path(original_node.func) != expected:
+            return updated_node
+        self.queries += 1
+        return updated_node.with_changes(
+            func=cst.Name(self._names.completion_query),
+            args=(cst.Arg(cst.Name("self")), *updated_node.args),
+        )
+
+    @override
+    def leave_SimpleStatementLine(
+        self,
+        original_node: cst.SimpleStatementLine,
+        updated_node: cst.SimpleStatementLine,
+    ) -> cst.BaseStatement:
+        """Replace one direct dict mutation or active-value snapshot.
+
+        Args:
+            original_node: Original statement used for structural matching.
+            updated_node: Statement after child transformations.
+
+        Returns:
+            cst.BaseStatement: Original statement or one generated helper call.
+        """
+        if len(original_node.body) != 1 or len(updated_node.body) != 1:
+            return updated_node
+        original = original_node.body[0]
+        updated = updated_node.body[0]
+        assignment = self._indexed_assignment(original, updated)
+        if assignment is not None:
+            return updated_node.with_changes(body=(assignment,))
+        snapshot = self._indexed_snapshot(original, updated)
+        if snapshot is not None:
+            return updated_node.with_changes(body=(snapshot,))
+        popped = self._indexed_pop(original, updated)
+        if popped is not None:
+            return updated_node.with_changes(body=(popped,))
+        return updated_node
+
+    def _indexed_assignment(
+        self,
+        original: cst.BaseSmallStatement,
+        updated: cst.BaseSmallStatement,
+    ) -> cst.Expr | None:
+        if not (
+            isinstance(original, cst.Assign)
+            and isinstance(updated, cst.Assign)
+            and len(original.targets) == 1
+            and len(updated.targets) == 1
+            and isinstance(original.targets[0].target, cst.Subscript)
+            and isinstance(updated.targets[0].target, cst.Subscript)
+        ):
+            return None
+        original_target = original.targets[0].target
+        updated_target = updated.targets[0].target
+        if _cst_path(original_target.value) != f"self.{self._completion.active_attribute}":
+            return None
+        if len(updated_target.slice) != 1 or not isinstance(
+            updated_target.slice[0].slice, cst.Index
+        ):
+            raise ValueError("indexed completion assignment lost its direct key")
+        self.assignments += 1
+        return cst.Expr(
+            cst.Call(
+                func=cst.Name(self._names.completion_set),
+                args=(
+                    cst.Arg(cst.Name("self")),
+                    cst.Arg(updated_target.slice[0].slice.value),
+                    cst.Arg(updated.value),
+                ),
+            )
+        )
+
+    def _indexed_snapshot(
+        self,
+        original: cst.BaseSmallStatement,
+        updated: cst.BaseSmallStatement,
+    ) -> cst.Assign | None:
+        if not (
+            isinstance(original, cst.Assign)
+            and isinstance(updated, cst.Assign)
+            and _completion_snapshot_call(
+                original.value,
+                self._completion.active_attribute,
+            )
+        ):
+            return None
+        self.snapshots += 1
+        return updated.with_changes(
+            value=cst.Call(
+                func=cst.Name(self._names.completion_snapshot),
+                args=(cst.Arg(cst.Name("self")),),
+            )
+        )
+
+    def _indexed_pop(
+        self,
+        original: cst.BaseSmallStatement,
+        updated: cst.BaseSmallStatement,
+    ) -> cst.Expr | None:
+        if not (
+            isinstance(original, cst.Expr)
+            and isinstance(updated, cst.Expr)
+            and isinstance(original.value, cst.Call)
+            and isinstance(updated.value, cst.Call)
+            and _cst_path(original.value.func) == f"self.{self._completion.active_attribute}.pop"
+        ):
+            return None
+        self.pops += 1
+        return updated.with_changes(
+            value=updated.value.with_changes(
+                func=cst.Name(self._names.completion_pop),
+                args=(cst.Arg(cst.Name("self")), *updated.value.args),
+            )
+        )
+
+
+def _completion_snapshot_call(node: cst.BaseExpression, active_attribute: str) -> bool:
+    if (
+        not isinstance(node, cst.Call)
+        or _cst_path(node.func) != "list"
+        or len(node.args) != 1
+        or not isinstance(node.args[0].value, cst.Call)
+    ):
+        return False
+    values = node.args[0].value
+    return _cst_path(values.func) == f"self.{active_attribute}.values" and not values.args
 
 
 class _ConsumerBodyTransformer(cst.CSTTransformer):
@@ -2136,6 +2981,46 @@ def _protocol_body(
     return _body_source(module, updated)
 
 
+def _completion_additional_replacements(
+    module: cst.Module,
+    plan: SourceOptimizationPlan,
+    shape: _AnyioShape,
+    names: _Names,
+) -> tuple[CallableBodyReplacement, ...]:
+    """Return indexed-completion edits not already owned by primary replacements.
+
+    Args:
+        module: Formatting-preserving source module.
+        plan: Source plan providing the logical module identity.
+        shape: Proven source pipeline and optional indexed-completion shape.
+        names: Collision-resistant generated helper names.
+
+    Returns:
+        tuple[CallableBodyReplacement, ...]: Extra owner-method body replacements.
+    """
+    completion = shape.native_completion
+    if completion is None:
+        return ()
+    primary = {shape.owner.name, shape.consumer.name, "__post_init__"}
+    replacements: list[CallableBodyReplacement] = []
+    for method in completion.methods:
+        if method.name in primary:
+            continue
+        qualname = f"{shape.class_name}.{method.name}"
+        source_method = _cst_method(module, qualname)
+        body = cast(cst.IndentedBlock, source_method.body)
+        updated = _apply_completion_index_body(body, shape, method.name, names)
+        declaration_kind: DeclarationKind = "async_method" if method.asynchronous else "method"
+        replacements.append(
+            CallableBodyReplacement(
+                target=SymbolId(plan.owner.module, qualname),
+                declaration_kind=declaration_kind,
+                replacement_body=_body_source(module, updated),
+            )
+        )
+    return tuple(replacements)
+
+
 class _ProtocolNextTransformer(cst.CSTTransformer):
     def __init__(self, protocol: _ProtocolShape, names: _Names) -> None:
         self._protocol = protocol
@@ -2173,16 +3058,45 @@ class _ProtocolNextTransformer(cst.CSTTransformer):
         )
 
 
-def _initializer_body(module: cst.Module, shape: _AnyioShape, names: _Names) -> str:
+def _initializer_body(
+    module: cst.Module,
+    shape: _AnyioShape,
+    names: _Names,
+    *,
+    residual: AnyioResidualOptions,
+) -> str:
     method = _cst_method(module, f"{shape.class_name}.__post_init__")
     body = cast(cst.IndentedBlock, method.body)
     assignment = cst.parse_statement(
         f"self.{names.deque_attribute} = {names.collections}.deque()\n"
     )
     cache_assignment = cst.parse_statement(f"self.{names.eligibility_cache_attribute} = {{}}\n")
+    guard_assignments: tuple[cst.BaseStatement, ...] = ()
+    if residual.guard_amortization or shape.protocol is not None:
+        guard_assignments = (
+            cst.parse_statement(
+                f"self.{names.guard_fallback_attribute} = {names.original_guard}\n"
+            ),
+            cst.parse_statement(f"self.{names.guard_state_attribute} = False\n"),
+            cst.parse_statement(f"self.{names.guard_run_identity_attribute} = None\n"),
+        )
+    completion_assignments: tuple[cst.BaseStatement, ...] = ()
+    if shape.native_completion is not None:
+        completion_assignments = (
+            cst.parse_statement(f"self.{names.completion_index_attribute} = {{}}\n"),
+            cst.parse_statement(f"self.{names.completion_count_attribute} = 0\n"),
+        )
     return _body_source(
         module,
-        body.with_changes(body=(*body.body, assignment, cache_assignment)),
+        body.with_changes(
+            body=(
+                *body.body,
+                assignment,
+                cache_assignment,
+                *guard_assignments,
+                *completion_assignments,
+            )
+        ),
     )
 
 
@@ -2285,6 +3199,18 @@ def _helper_statements(
     )
     reducer_support = _reducer_support(shape.reducer, names)
     protocol_support = _protocol_support(shape.protocol, names)
+    standalone_protocol_context = (
+        f"{names.protocol_context} = {names.contextvars}.ContextVar("
+        f'"{names.protocol_context}", default=None)'
+        if shape.native_completion is not None and shape.protocol is None
+        else ""
+    )
+    run_guard_support = (
+        _run_guard_support(names)
+        if residual.guard_amortization or shape.protocol is not None
+        else ""
+    )
+    completion_support = _completion_index_support(shape.native_completion, names)
     synchronous_run = _synchronous_run_source(shape, names)
     excluded_node_guard = _excluded_node_guard(shape.excluded_node_types)
     if residual.context_copy_elision:
@@ -2320,6 +3246,7 @@ import dis as {names.dis}
 import inspect as {names.inspect}
 import os as {names.os}
 import sys as {names.sys}
+import types as {names.types}
 import typing as {names.typing}
 import weakref as {names.weakref}
 import anyio as {names.typing}_anyio
@@ -2333,6 +3260,8 @@ from anyio.streams.memory import (
 {record_declaration}
 {reducer_support}
 {protocol_support}
+{standalone_protocol_context}
+{completion_support}
 
 
 def {names.safe_code}(function, seen):
@@ -2344,12 +3273,14 @@ def {names.safe_code}(function, seen):
     blocked_names = {{
         "ContextVar", "cancel", "cancelled", "cancelling", "checkpoint",
         "copy_context", "create_task", "current_task", "ensure_future",
-        "get_event_loop", "get_running_loop", "reset", "set", "set_task_factory",
-        "shield", "sleep", "start_soon", "uncancel",
+        "delattr", "get_event_loop", "get_running_loop", "reset", "set", "set_debug",
+        "set_task_factory", "setattr", "setprofile", "settrace", "shield", "sleep",
+        "start_soon", "uncancel",
     }}
     blocked_opcodes = {{
-        "DELETE_DEREF", "DELETE_GLOBAL", "IMPORT_NAME", "SEND", "STORE_DEREF",
-        "STORE_GLOBAL", "YIELD_FROM", "YIELD_VALUE",
+        "DELETE_ATTR", "DELETE_DEREF", "DELETE_GLOBAL", "DELETE_SUBSCR", "IMPORT_NAME",
+        "LOAD_METHOD", "SEND", "STORE_ATTR", "STORE_DEREF", "STORE_GLOBAL",
+        "STORE_SUBSCR", "YIELD_FROM", "YIELD_VALUE",
     }}
     if blocked_names.intersection(code.co_names):
         return False
@@ -2363,6 +3294,8 @@ def {names.safe_code}(function, seen):
         referenced = globals_map.get(referenced_name)
         if {names.inspect}.isfunction(referenced) and not {names.safe_code}(referenced, seen):
             return False
+        if callable(referenced) and not {names.inspect}.isfunction(referenced):
+            return False
     closure = getattr(function, "__closure__", None) or ()
     for cell in closure:
         try:
@@ -2370,6 +3303,8 @@ def {names.safe_code}(function, seen):
         except ValueError:
             return False
         if {names.inspect}.isfunction(referenced) and not {names.safe_code}(referenced, seen):
+            return False
+        if callable(referenced) and not {names.inspect}.isfunction(referenced):
             return False
     return True
 
@@ -2389,6 +3324,18 @@ def {names.no_monitoring}(sys_module):
         except ValueError:
             continue
     return True
+
+
+def {names.binding_matches}(current, expected, expected_code):
+    if current is expected:
+        return getattr(expected, "__code__", None) is expected_code
+    fallback = getattr(current, "__atoll_python_fallback__", None)
+    compiled_targets = getattr(current, "__atoll_compiled_targets__", ())
+    return (
+        fallback is expected
+        and getattr(fallback, "__code__", None) is expected_code
+        and bool(compiled_targets)
+    )
 
 
 def {names.safe_callable}(call):
@@ -2496,18 +3443,21 @@ def {names.guard}(self, request):
             {names.os}.getenv("ATOLL_DISABLE") != "1"
             and type(request) in (list, tuple)
             and owner_type is {names.expected_owner_class}
-            and getattr(owner_type, "{shape.worker_method}", None)
-            is {names.expected_worker}
-            and getattr({names.expected_worker}, "__code__", None)
-            is {names.expected_worker_code}
-            and getattr(owner_type, "{shape.run_method_name}", None)
-            is {names.expected_run}
-            and getattr({names.expected_run}, "__code__", None)
-            is {names.expected_run_code}
-            and getattr(owner_type, "{shape.consumer.name}", None)
-            is {names.expected_consumer}
-            and getattr({names.expected_consumer}, "__code__", None)
-            is {names.expected_consumer_code}
+            and {names.binding_matches}(
+                getattr(owner_type, "{shape.worker_method}", None),
+                {names.expected_worker},
+                {names.expected_worker_code},
+            )
+            and {names.binding_matches}(
+                getattr(owner_type, "{shape.run_method_name}", None),
+                {names.expected_run},
+                {names.expected_run_code},
+            )
+            and {names.binding_matches}(
+                getattr(owner_type, "{shape.consumer.name}", None),
+                {names.expected_consumer},
+                {names.expected_consumer_code},
+            )
             and {shape.result_constructor} is {names.expected_result_constructor}
             and type(getattr(self, "{names.deque_attribute}", None))
             is {names.collections}.deque
@@ -2545,6 +3495,9 @@ def {names.guard}(self, request):
     return enabled
 
 
+{run_guard_support}
+
+
 def {names.drive}(self, {shape.run_task_name}):
     global {names.route_hits}
     try:
@@ -2560,6 +3513,131 @@ def {names.drive}(self, {shape.run_task_name}):
     {names.route_hits} += 1
 '''
     return (textwrap.dedent(support).strip(),)
+
+
+def _completion_index_support(
+    shape: _NativeCompletionShape | None,
+    names: _Names,
+) -> str:
+    """Generate exact-dict index maintenance and source fallback helpers.
+
+    Args:
+        shape: Structurally proven completion scan, or ``None`` when unavailable.
+        names: Collision-resistant generated helper and state names.
+
+    Returns:
+        str: Module-level helpers kept in the transformed source payload.
+    """
+    if shape is None:
+        return ""
+    return f"""
+{names.completion_sentinel} = object()
+
+
+def {names.completion_add}(owner, task):
+    index = owner.{names.completion_index_attribute}
+    node_id = task.{shape.task_node_attribute}
+    for stack_item in task.{shape.task_stack_attribute}:
+        run_id = stack_item.{shape.stack_run_attribute}
+        by_node = index.setdefault(run_id, {{}})
+        by_node[node_id] = by_node.get(node_id, 0) + 1
+
+
+def {names.completion_remove}(owner, task):
+    index = owner.{names.completion_index_attribute}
+    node_id = task.{shape.task_node_attribute}
+    for stack_item in task.{shape.task_stack_attribute}:
+        run_id = stack_item.{shape.stack_run_attribute}
+        by_node = index[run_id]
+        remaining = by_node[node_id] - 1
+        if remaining:
+            by_node[node_id] = remaining
+        else:
+            del by_node[node_id]
+        if not by_node:
+            del index[run_id]
+
+
+def {names.completion_set}(owner, key, task):
+    active = owner.{shape.active_attribute}
+    previous = active.get(key, {names.completion_sentinel})
+    active[key] = task
+    if previous is not {names.completion_sentinel}:
+        {names.completion_remove}(owner, previous)
+    else:
+        owner.{names.completion_count_attribute} += 1
+    {names.completion_add}(owner, task)
+
+
+def {names.completion_pop}(owner, key, default):
+    active = owner.{shape.active_attribute}
+    previous = active.get(key, {names.completion_sentinel})
+    result = active.pop(key, default)
+    if previous is not {names.completion_sentinel}:
+        {names.completion_remove}(owner, previous)
+        owner.{names.completion_count_attribute} -= 1
+    return result
+
+
+def {names.completion_snapshot}(owner):
+    return list(owner.{shape.active_attribute}.values())
+
+
+def {names.completion_query}(owner, active_tasks, join_id, fork_run_id):
+    return owner.{shape.predicate_method}(active_tasks, join_id, fork_run_id)
+"""
+
+
+def _run_guard_support(names: _Names) -> str:
+    """Generate exact Python fallback and cache invalidation helpers.
+
+    The fallback helper performs no amortization by itself.  Packaging may bind
+    its source-fused Cython implementation after semantic and marginal benchmark
+    gates.  Cache invalidation remains in Python because it is coupled to the
+    private protocol's actual suspension lifecycle.
+
+    Args:
+        names: Collision-resistant generated helper and state names.
+
+    Returns:
+        str: Module-level fallback, clear, and suspension-aware await helpers.
+    """
+    return f"""
+{names.original_guard} = {names.guard}
+
+
+def {names.cached_guard}(self, request):
+    return self.{names.guard_fallback_attribute}(self, request)
+
+
+def {names.clear_guard}(owner):
+    if owner is not None:
+        setattr(owner, {names.guard_state_attribute!r}, False)
+
+
+@{names.types}.coroutine
+def {names.resume_await}(iterator, pending):
+    while True:
+        try:
+            try:
+                value = yield pending
+            except BaseException as error:
+                pending = iterator.throw(error)
+            else:
+                pending = iterator.send(value)
+        except StopIteration as completed:
+            return completed.value
+
+
+async def {names.protocol_await}(owner, awaitable):
+    iterator = awaitable.__await__()
+    try:
+        pending = next(iterator)
+    except StopIteration as completed:
+        return completed.value
+    {names.clear_guard}(owner)
+    return await {names.resume_await}(iterator, pending)
+""".strip()
 
 
 def _excluded_node_guard(excluded_node_types: tuple[str, ...]) -> str:
@@ -2752,7 +3830,10 @@ def {names.reducer}(owner, context, current, inputs):
 '''.strip()
 
 
-def _protocol_support(protocol: _ProtocolShape | None, names: _Names) -> str:
+def _protocol_support(
+    protocol: _ProtocolShape | None,
+    names: _Names,
+) -> str:
     """Generate private run-to-completion auto-forwarding support.
 
     Args:
@@ -2764,6 +3845,14 @@ def _protocol_support(protocol: _ProtocolShape | None, names: _Names) -> str:
     """
     if protocol is None:
         return ""
+    fallback_clear = f"        {names.clear_guard}(owner)\n"
+    guarded_await = f"{names.protocol_await}(owner, next_call(*args))"
+    exception_clear = f"            {names.clear_guard}(owner)\n"
+    run_scope = (
+        f"    if getattr(owner, {names.guard_run_identity_attribute!r}, None) is not runner:\n"
+        f"        {names.clear_guard}(owner)\n"
+        f"        setattr(owner, {names.guard_run_identity_attribute!r}, runner)\n"
+    )
     return f'''
 {names.protocol_context} = {names.contextvars}.ContextVar(
     "{names.protocol_context}", default=None
@@ -2775,25 +3864,23 @@ async def {names.protocol_next}(entry_owner, runner, *args):
     owner = getattr(runner, "{protocol.owner_attribute}", None)
     enabled = {names.os}.getenv("ATOLL_DISABLE") != "1"
     enabled = enabled and type(entry_owner) is {names.expected_entry_class}
-    enabled = enabled and (
-        type(entry_owner).__dict__.get("{protocol.entry_method}")
-        is {names.expected_entry_method}
-    )
-    enabled = enabled and (
-        getattr({names.expected_entry_method}, "__code__", None)
-        is {names.expected_entry_code}
+    enabled = enabled and {names.binding_matches}(
+        type(entry_owner).__dict__.get("{protocol.entry_method}"),
+        {names.expected_entry_method},
+        {names.expected_entry_code},
     )
     enabled = enabled and type(runner) is {names.expected_runner_class}
-    enabled = enabled and (
-        type(runner).__dict__.get("{protocol.next_method}")
-        is {names.expected_runner_next}
-    )
-    enabled = enabled and (
-        getattr({names.expected_runner_next}, "__code__", None)
-        is {names.expected_runner_next_code}
+    enabled = enabled and {names.binding_matches}(
+        type(runner).__dict__.get("{protocol.next_method}"),
+        {names.expected_runner_next},
+        {names.expected_runner_next_code},
     )
     enabled = enabled and getattr(next_call, "__self__", None) is runner
-    enabled = enabled and getattr(next_call, "__func__", None) is {names.expected_runner_next}
+    enabled = enabled and {names.binding_matches}(
+        getattr(next_call, "__func__", None),
+        {names.expected_runner_next},
+        {names.expected_runner_next_code},
+    )
     enabled = enabled and type(owner) is {names.expected_owner_class}
     enabled = enabled and (
         type(owner).__dict__.get("{protocol.owner_attribute}") is None
@@ -2802,13 +3889,13 @@ async def {names.protocol_next}(entry_owner, runner, *args):
         type(owner).__dict__.get("{protocol.next_method}") is None
     )
     if not enabled:
-        return await next_call(*args)
-    token = {names.protocol_context}.set(owner)
+{fallback_clear}        return await next_call(*args)
+{run_scope}    token = {names.protocol_context}.set(owner)
     try:
         try:
-            return await next_call(*args)
+            return await {guarded_await}
         except StopAsyncIteration:
-            if len(args) == 1 and args[0] is None:
+{exception_clear}            if len(args) == 1 and args[0] is None:
                 terminal_values = [
                     value
                     for value in vars(runner).values()
@@ -2817,6 +3904,8 @@ async def {names.protocol_next}(entry_owner, runner, *args):
                 if len(terminal_values) == 1:
                     return terminal_values[0]
             raise
+        except BaseException:
+{exception_clear}            raise
     finally:
         {names.protocol_context}.reset(token)
 
@@ -2842,6 +3931,7 @@ def _names(plan_id: str) -> _Names:
         inspect=f"{prefix}_inspect",
         os=f"{prefix}_os",
         sys=f"{prefix}_sys",
+        types=f"{prefix}_types",
         typing=f"{prefix}_typing",
         weakref=f"{prefix}_weakref",
         anyio_backend=f"{prefix}_anyio_backend",
@@ -2853,7 +3943,25 @@ def _names(plan_id: str) -> _Names:
         fast_record=f"{prefix}_fast_record",
         route_hits=f"{prefix}_route_hits",
         guard=f"{prefix}_guard",
+        original_guard=f"{prefix}_original_guard",
+        cached_guard=f"{prefix}_cached_guard",
+        guard_fallback_attribute=f"{prefix}_guard_fallback",
+        guard_state_attribute=f"{prefix}_run_guard_passed",
+        guard_run_identity_attribute=f"{prefix}_run_guard_identity",
+        completion_index_attribute=f"{prefix}_completion_index",
+        completion_count_attribute=f"{prefix}_completion_count",
+        completion_sentinel=f"{prefix}_completion_missing",
+        completion_add=f"{prefix}_completion_add",
+        completion_remove=f"{prefix}_completion_remove",
+        completion_set=f"{prefix}_completion_set",
+        completion_pop=f"{prefix}_completion_pop",
+        completion_snapshot=f"{prefix}_completion_snapshot",
+        completion_query=f"{prefix}_completion_query",
+        clear_guard=f"{prefix}_clear_guard",
+        resume_await=f"{prefix}_resume_await",
+        protocol_await=f"{prefix}_protocol_await",
         no_monitoring=f"{prefix}_no_monitoring",
+        binding_matches=f"{prefix}_binding_matches",
         eligible=f"{prefix}_eligible",
         safe_callable=f"{prefix}_safe_callable",
         safe_code=f"{prefix}_safe_code",
@@ -2890,6 +3998,56 @@ def _names(plan_id: str) -> _Names:
     )
 
 
+def _run_guard_native_plan(
+    plan: SourceOptimizationPlan,
+    names: _Names,
+    completion: _NativeCompletionShape | None,
+) -> RunGuardNativePlan:
+    """Describe the generated fallback helper for later native composition.
+
+    Args:
+        plan: Accepted-source candidate plan that owns the generated names.
+        names: Collision-resistant helper and instance-state identifiers.
+        completion: Optional indexed full-scan replacement proven from source.
+
+    Returns:
+        RunGuardNativePlan: Structured source-fused Cython opportunity whose
+        identity excludes runtime profile counts.
+    """
+    module = plan.owner.module
+    completion_plan = (
+        CompletionIndexNativePlan(
+            snapshot=SymbolId(module, names.completion_snapshot),
+            query=SymbolId(module, names.completion_query),
+            index_attribute=names.completion_index_attribute,
+            count_attribute=names.completion_count_attribute,
+            active_attribute=completion.active_attribute,
+            fallback_predicate_method=completion.predicate_method,
+            graph_attribute=completion.graph_attribute,
+            parent_lookup_method=completion.parent_lookup_method,
+            intermediate_nodes_attribute=completion.intermediate_nodes_attribute,
+        )
+        if completion is not None
+        else None
+    )
+    return RunGuardNativePlan(
+        source_plan_id=plan.id,
+        source=plan.source,
+        owner=plan.owner,
+        helper=SymbolId(module, names.cached_guard),
+        source_guard=SymbolId(module, names.original_guard),
+        eligibility_helper=SymbolId(module, names.eligible),
+        protocol_context=SymbolId(module, names.protocol_context),
+        disable_module=SymbolId(module, names.os),
+        clear_helper=SymbolId(module, names.clear_guard),
+        protocol_await_helper=SymbolId(module, names.protocol_await),
+        fallback_attribute=names.guard_fallback_attribute,
+        state_attribute=names.guard_state_attribute,
+        run_identity_attribute=names.guard_run_identity_attribute,
+        completion_index=completion_plan,
+    )
+
+
 def _transformation_id(plan_id: str, residual: AnyioResidualOptions) -> str:
     enabled = tuple(
         name
@@ -2902,7 +4060,7 @@ def _transformation_id(plan_id: str, residual: AnyioResidualOptions) -> str:
         )
         if active
     )
-    return f"anyio-stream-state-machine-v2:{plan_id}:{'+'.join(enabled)}"
+    return f"anyio-stream-state-machine-v3:{plan_id}:{'+'.join(enabled)}"
 
 
 def _expression_path(node: ast.expr) -> str | None:

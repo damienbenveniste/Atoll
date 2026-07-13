@@ -6,7 +6,9 @@ import asyncio
 import importlib
 import inspect
 import sys
-from pathlib import Path
+from collections.abc import Callable, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Protocol, cast
 
 import pytest
 
@@ -18,6 +20,7 @@ from atoll.generation.region_shim import (
     RegionShimConfig,
     insert_or_replace_region_shim,
 )
+from atoll.generation.run_guard import RunGuardGenerationRequest, generate_run_guard
 from atoll.generation.scalar_kernel import (
     ScalarKernelGenerationRequest,
     generate_scalar_kernel,
@@ -26,7 +29,18 @@ from atoll.generation.typed_region import (
     TypedRegionGenerationOptions,
     generate_typed_method_region,
 )
-from atoll.models import BackendCompileContext, BackendLoweringRequest, CompilationUnit, ModuleId
+from atoll.models import (
+    BackendCompileContext,
+    BackendLoweringRequest,
+    CompilationUnit,
+    ModuleId,
+    SymbolId,
+)
+from atoll.native_optimization.run_guard import (
+    CompletionIndexNativePlan,
+    RunGuardNativePlan,
+    build_run_guard_region,
+)
 from atoll.native_optimization.scalar_analysis import analyze_scalar_scan
 
 SENT_VALUE = 3
@@ -36,6 +50,84 @@ SCALAR_BIAS = 3
 SCALAR_EXPECTED = 147
 SCALAR_BOOL_EXPECTED = 4
 BATCH_SECOND_VALUE = 2
+
+
+class _RunGuardOwner(Protocol):
+    _passed: bool
+    _completion_index: dict[object, dict[object, int]]
+    _completion_count: int
+    active: dict[object, object]
+    eligibility_calls: list[object]
+
+    def __post_init__(self) -> None:
+        """Initialize the transformed helper state."""
+
+
+class _RunGuardCallable(Protocol):
+    def __call__(self, owner: _RunGuardOwner, request: object) -> bool:
+        """Return whether the request may enter the accepted source fast path."""
+
+        ...
+
+
+class _CompletionSnapshotCallable(Protocol):
+    def __call__(self, owner: _RunGuardOwner) -> Sequence[object]:
+        """Return the native empty snapshot replacing a proven indexed scan."""
+
+        ...
+
+
+class _CompletionQueryCallable(Protocol):
+    def __call__(
+        self,
+        owner: _RunGuardOwner,
+        active_tasks: list[object],
+        join_id: object,
+        fork_run_id: object,
+    ) -> bool:
+        """Return whether the maintained index proves one fork run complete."""
+
+        ...
+
+
+class _ContextVariable(Protocol):
+    def set(self, value: object) -> object:
+        """Set the private protocol owner and return its reset token."""
+
+    def reset(self, token: object) -> None:
+        """Restore the previous private protocol owner."""
+
+
+def _assert_indexed_completion_routing(
+    owner: _RunGuardOwner,
+    snapshot: _CompletionSnapshotCallable,
+    query: _CompletionQueryCallable,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise indexed routing, stale-count fallback, and predicate replacement."""
+    owner.active["active"] = object()
+    state = vars(owner)
+    completion_index = cast(dict[object, dict[object, int]], state["_completion_index"])
+    completion_index["run"] = {"join": 1}
+    state["_completion_count"] = 1
+    assert snapshot(owner) == ()
+    assert query(owner, list(owner.active.values()), "join", "run") is False
+    completion_index["run"] = {"other": 1}
+    assert query(owner, list(owner.active.values()), "join", "run") is True
+    state["_completion_count"] = 0
+    assert snapshot(owner) == list(owner.active.values())
+    state["_completion_count"] = 1
+
+    def replaced_predicate(
+        _owner: object,
+        _active_tasks: list[object],
+        _join_id: object,
+        _fork_run_id: object,
+    ) -> bool:
+        return False
+
+    monkeypatch.setattr(type(owner), "_is_complete", replaced_predicate)
+    assert query(owner, [], "join", "missing") is False
 
 
 def test_cython_batches_two_units_with_owned_artifacts(tmp_path: Path) -> None:
@@ -104,6 +196,212 @@ def test_cython_batches_two_units_with_owned_artifacts(tmp_path: Path) -> None:
         sys.path.remove(str(artifact_root))
         for logical_module in logical_modules:
             sys.modules.pop(logical_module, None)
+
+
+def test_cython_compiles_source_fused_run_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boxed helper amortizes one guard while retaining per-item and disable checks."""
+    module_name = "cython_run_guard_source"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        """from __future__ import annotations
+
+import contextvars as _contextvars
+import os as _os
+
+_protocol_context = _contextvars.ContextVar("guard", default=None)
+fallback_calls = []
+
+
+def _complete_guard(self: object, request: object) -> bool:
+    fallback_calls.append(request)
+    return type(request) in (list, tuple) and all(_eligible(self, item) for item in request)
+
+
+_source_guard = _complete_guard
+
+
+def _eligible(self: object, item: object) -> bool:
+    self.eligibility_calls.append(item)
+    return type(item) is int
+
+
+def _clear_guard(owner: object) -> None:
+    setattr(owner, "_passed", False)
+
+
+async def _protocol_await(owner: object, awaitable: object) -> object:
+    return await awaitable
+
+
+def _cached_guard(self: object, request: object) -> bool:
+    return self._fallback(self, request)
+
+
+def _completion_snapshot(owner: object) -> list[object]:
+    return list(owner.active.values())
+
+
+def _completion_query(
+    owner: object,
+    active_tasks: list[object],
+    join_id: object,
+    fork_run_id: object,
+) -> bool:
+    return owner._is_complete(active_tasks, join_id, fork_run_id)
+
+
+class Parent:
+    intermediate_nodes = {"middle"}
+
+
+class Graph:
+    def get_parent(self, join_id: object) -> Parent:
+        del join_id
+        return Parent()
+
+
+class Owner:
+    def __post_init__(self) -> None:
+        self._fallback = _source_guard
+        self._passed = False
+        self._run_identity = None
+        self._completion_index = {}
+        self._completion_count = 0
+        self.active = {}
+        self.graph = Graph()
+        self.eligibility_calls = []
+
+    def submit(self, request: object) -> bool:
+        return _cached_guard(self, request)
+
+    def _is_complete(
+        self,
+        active_tasks: list[object],
+        join_id: object,
+        fork_run_id: object,
+    ) -> bool:
+        del join_id, fork_run_id
+        return not active_tasks
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name=module_name, path=source_path)))
+    plan = RunGuardNativePlan(
+        source_plan_id="source-plan",
+        source=PurePosixPath(source_path.name),
+        owner=SymbolId(module_name, "Owner.submit"),
+        helper=SymbolId(module_name, "_cached_guard"),
+        source_guard=SymbolId(module_name, "_source_guard"),
+        eligibility_helper=SymbolId(module_name, "_eligible"),
+        protocol_context=SymbolId(module_name, "_protocol_context"),
+        disable_module=SymbolId(module_name, "_os"),
+        clear_helper=SymbolId(module_name, "_clear_guard"),
+        protocol_await_helper=SymbolId(module_name, "_protocol_await"),
+        fallback_attribute="_fallback",
+        state_attribute="_passed",
+        run_identity_attribute="_run_identity",
+        completion_index=CompletionIndexNativePlan(
+            snapshot=SymbolId(module_name, "_completion_snapshot"),
+            query=SymbolId(module_name, "_completion_query"),
+            index_attribute="_completion_index",
+            count_attribute="_completion_count",
+            active_attribute="active",
+            fallback_predicate_method="_is_complete",
+            graph_attribute="graph",
+            parent_lookup_method="get_parent",
+            intermediate_nodes_attribute="intermediate_nodes",
+        ),
+    )
+    assert plan.completion_index is not None
+    region = build_run_guard_region(scan, plan)
+    logical_module = "_atoll_cython_run_guard"
+    variant_id = f"{plan.stable_id}@cython-source-fused"
+    generated = generate_run_guard(
+        RunGuardGenerationRequest(
+            scan=scan,
+            region=region,
+            plan=plan,
+            logical_module=logical_module,
+            output_path=tmp_path / f"{logical_module}.py",
+        )
+    )
+    backend = CythonBackend()
+    unit = backend.lower(
+        BackendLoweringRequest(
+            region=region,
+            source_path=generated.source_path,
+            logical_module=logical_module,
+            install_relative_dir="compiled",
+            members=generated.selected_members,
+            variant_id=variant_id,
+        )
+    )
+
+    assert generated.source_path.suffix == ".py"
+    assert unit.members == generated.selected_members
+    result = backend.compile(
+        (unit,),
+        BackendCompileContext(
+            project_root=tmp_path,
+            build_dir=tmp_path / ".atoll" / "build",
+            source_roots=(tmp_path,),
+        ),
+    )
+
+    assert result.attempt.success is True, result.attempt.stderr
+    artifact_root = tmp_path / ".atoll" / "artifacts"
+    monkeypatch.setattr(sys, "path", [str(artifact_root), str(tmp_path), *sys.path])
+    sys.modules.pop(module_name, None)
+    sys.modules.pop(logical_module, None)
+    source_module = importlib.import_module(module_name)
+    native_module = importlib.import_module(logical_module)
+    owner_factory = cast(Callable[[], _RunGuardOwner], vars(source_module)["Owner"])
+    helper = cast(_RunGuardCallable, vars(native_module)[plan.helper.qualname])
+    snapshot = cast(
+        _CompletionSnapshotCallable,
+        vars(native_module)[plan.completion_index.snapshot.qualname],
+    )
+    query = cast(
+        _CompletionQueryCallable,
+        vars(native_module)[plan.completion_index.query.qualname],
+    )
+    owner = owner_factory()
+    owner.__post_init__()
+    protocol_context = cast(
+        _ContextVariable,
+        vars(source_module)[plan.protocol_context.qualname],
+    )
+    token = protocol_context.set(owner)
+    try:
+        assert helper(owner, [1, 2]) is True
+        assert helper(owner, [3, 4]) is True
+        fallback_calls = cast(list[object], vars(source_module)["fallback_calls"])
+        assert fallback_calls == [[1, 2]]
+        assert owner.eligibility_calls == [1, 2, 3, 4]
+
+        _assert_indexed_completion_routing(owner, snapshot, query, monkeypatch)
+
+        replacement_calls: list[object] = []
+
+        def replacement(_owner: object, item: object) -> bool:
+            replacement_calls.append(item)
+            return False
+
+        original_eligibility = vars(source_module)[plan.eligibility_helper.qualname]
+        setattr(source_module, plan.eligibility_helper.qualname, replacement)
+        assert helper(owner, [6]) is False
+        assert fallback_calls[-1] == [6]
+        assert replacement_calls == [6]
+        setattr(source_module, plan.eligibility_helper.qualname, original_eligibility)
+
+        monkeypatch.setenv("ATOLL_DISABLE", "1")
+        assert helper(owner, [5]) is True
+        assert fallback_calls[-1] == [5]
+    finally:
+        protocol_context.reset(token)
 
 
 def test_cython_compiles_guarded_fixed_width_scalar_variant(

@@ -22,6 +22,7 @@ from statistics import median
 from typing import Literal
 
 from atoll.models import CompileAttempt, CompileConfig, CompilePhaseTiming
+from atoll.native_optimization.run_guard import RunGuardNativePlan
 from atoll.optimization_policy import (
     DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
     HARD_BENCHMARK_MINIMUM_SPEEDUP,
@@ -151,6 +152,8 @@ class SourceOptimizationSearchResult:
         patch_path: Reviewable accepted patch under `.atoll/patches`, when accepted.
         materialization_patch: Immutable accepted patch payload for recreating
             transformed sources after scratch cleanup, when accepted.
+        native_plans: Source-fused helpers introduced by the accepted patch and
+            available to the later composable native stage.
         trials: Ordered candidate, final-gate, and application evidence.
         test_results: Semantic command evidence for the promoted source and wheel.
         performance: Authoritative final wheel performance result.
@@ -168,6 +171,7 @@ class SourceOptimizationSearchResult:
     build: CompileAttempt
     error: str | None = None
     materialization_patch: GeneratedSourcePatch | None = None
+    native_plans: tuple[RunGuardNativePlan, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +181,7 @@ class _PlanVariant:
     transformation_ids: tuple[str, ...]
     depth: int
     hot_share: float
+    native_plans: tuple[RunGuardNativePlan, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +192,7 @@ class _SourceCandidate:
     transformation_ids: tuple[str, ...]
     depth: int
     hot_share: float
+    native_plans: tuple[RunGuardNativePlan, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,17 +447,25 @@ def _plan_variants(
                 transformation_ids=transformation_ids,
                 depth=depth,
                 hot_share=assessment.attributed_hot_share,
+                native_plans=result.native_plans,
             )
         )
-    available_residual: list[SourceTransformationKind] = [
+    available_residual: tuple[SourceTransformationKind, ...] = tuple(
         kind for kind in _RESIDUAL_TRANSFORMATIONS if any(step.kind == kind for step in plan.steps)
-    ]
-    for residual_depth in range(1, len(available_residual) + 1):
-        enabled = tuple(available_residual[:residual_depth])
-        result = lower_residual_state_machine_plan(project_root, plan, assessment, enabled)
+    )
+    enabled: tuple[SourceTransformationKind, ...] = ()
+    for kind in available_residual:
+        trial_steps = (*enabled, kind)
+        result = lower_residual_state_machine_plan(
+            project_root,
+            plan,
+            assessment,
+            trial_steps,
+        )
         if result.request is None:
             rejections.append(_lowering_rejection(plan, result))
             continue
+        enabled = trial_steps
         variants.append(
             _PlanVariant(
                 plan=plan,
@@ -459,10 +473,11 @@ def _plan_variants(
                 transformation_ids=_variant_transformation_ids(
                     plan,
                     result,
-                    residual_steps=enabled,
+                    residual_steps=trial_steps,
                 ),
-                depth=min(2 + residual_depth, SOURCE_SEARCH_MAX_DEPTH),
+                depth=min(2 + len(trial_steps), SOURCE_SEARCH_MAX_DEPTH),
                 hot_share=assessment.attributed_hot_share,
+                native_plans=result.native_plans,
             )
         )
     return tuple(variants), tuple(rejections)
@@ -520,9 +535,22 @@ def _source_candidate(variants: tuple[_PlanVariant, ...]) -> _SourceCandidate:
     transformation_ids = tuple(
         sorted(identifier for variant in variants for identifier in variant.transformation_ids)
     )
+    native_plans = tuple(
+        sorted(
+            {
+                native_plan.stable_id: native_plan
+                for variant in variants
+                for native_plan in variant.native_plans
+            }.values(),
+            key=lambda native_plan: native_plan.stable_id,
+        )
+    )
     digest = hashlib.blake2b(digest_size=16)
     for value in (*plan_ids, *transformation_ids):
         digest.update(value.encode("utf-8"))
+        digest.update(b"\0")
+    for native_plan in native_plans:
+        digest.update(native_plan.stable_id.encode("utf-8"))
         digest.update(b"\0")
     for request in sorted((variant.request for variant in variants), key=lambda item: item.path):
         digest.update(_request_fingerprint(request).encode("ascii"))
@@ -536,6 +564,7 @@ def _source_candidate(variants: tuple[_PlanVariant, ...]) -> _SourceCandidate:
         transformation_ids=transformation_ids,
         depth=max(variant.depth for variant in variants),
         hot_share=min(sum(variant.hot_share for variant in variants), 1.0),
+        native_plans=native_plans,
     )
 
 
@@ -1039,6 +1068,7 @@ def _finalize_candidate(
         build=build,
         error=application_error,
         materialization_patch=winner.patch if application_error is None else None,
+        native_plans=winner.candidate.native_plans if application_error is None else (),
     )
 
 

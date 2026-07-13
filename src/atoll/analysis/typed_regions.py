@@ -158,7 +158,16 @@ def build_typed_regions(
     """
     source = module.module.path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(module.module.path), type_comments=True)
-    eligible = {symbol.id: symbol for symbol in module.symbols if _eligible(symbol)}
+    blocked = frozenset(
+        symbol.id
+        for symbol in module.symbols
+        if any(blocker.severity == "hard" for blocker in symbol.blockers)
+    )
+    eligible = {
+        symbol.id: symbol
+        for symbol in module.symbols
+        if _eligible(symbol, blocked=blocked, edges=edges)
+    }
     if not eligible:
         return ()
     adjacency = _adjacency(eligible, edges)
@@ -283,8 +292,31 @@ def build_directed_region_slice(region: TypedRegion, root: SymbolId) -> TypedReg
     )
 
 
-def _eligible(symbol: SymbolRecord) -> bool:
-    if any(blocker.severity == "hard" for blocker in symbol.blockers):
+def _eligible(
+    symbol: SymbolRecord,
+    *,
+    blocked: frozenset[SymbolId],
+    edges: tuple[DependencyEdge, ...],
+) -> bool:
+    hard_blockers = tuple(blocker for blocker in symbol.blockers if blocker.severity == "hard")
+    if any(blocker.code != "LOCAL_BLOCKED_DEP" for blocker in hard_blockers):
+        return False
+    if any(
+        edge.src == symbol.id
+        and edge.kind == "calls"
+        and isinstance(edge.dst, SymbolId)
+        and edge.dst in blocked
+        and edge.requires_same_unit
+        for edge in edges
+    ):
+        return False
+    if hard_blockers and not any(
+        edge.src == symbol.id
+        and edge.kind == "calls"
+        and isinstance(edge.dst, SymbolId)
+        and edge.dst in blocked
+        for edge in edges
+    ):
         return False
     if any(blocker.code in _UNSAFE_SOFT_BLOCKERS for blocker in symbol.blockers):
         return False

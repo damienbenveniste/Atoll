@@ -58,7 +58,7 @@ ExecutionKind = Literal["sync", "generator", "coroutine", "async_generator", "cl
 InvocationMode = Literal["ordinary", "awaited", "async_iteration"]
 IslandRisk = Literal["low", "medium", "high"]
 LossAction = Literal["preserve", "specialize", "box", "fallback", "reject"]
-LoweringMode = Literal["whole-callable", "outlined-block"]
+LoweringMode = Literal["whole-callable", "outlined-block", "source-fused"]
 ParameterKind = Literal[
     "positional_only",
     "positional",
@@ -980,8 +980,9 @@ class CompiledRegionVariant:
         backend: Native compiler backend selected for this record.
         bindings: Source bindings promised by the compiled region or variant.
         cache_status: Whether compilation used, missed, or partially restored cache state.
-        lowering_mode: Whether the backend owns the complete callable or synchronous blocks.
-        native_helpers: Private native helper names used by an outlined Python shell.
+        lowering_mode: Whether the backend owns the complete callable, outlined
+            synchronous blocks, or one helper introduced by source fusion.
+        native_helpers: Private native helper names used by outlined or source-fused lowering.
     """
 
     id: str
@@ -1003,10 +1004,10 @@ class CompiledRegionVariant:
         member_ids = {member.id for member in self.region.members}
         if not self.bindings or any(binding.source not in member_ids for binding in self.bindings):
             raise ValueError("compiled region variant bindings must belong to the region")
-        if self.lowering_mode == "outlined-block" and not self.native_helpers:
-            raise ValueError("outlined compiled region variants require native helpers")
+        if self.lowering_mode != "whole-callable" and not self.native_helpers:
+            raise ValueError("partial compiled region variants require native helpers")
         if self.lowering_mode == "whole-callable" and self.native_helpers:
-            raise ValueError("whole-callable variants cannot declare outlined native helpers")
+            raise ValueError("whole-callable variants cannot declare private native helpers")
         if len(set(self.native_helpers)) != len(self.native_helpers):
             raise ValueError("compiled region variant native helpers must be unique")
 
@@ -1024,7 +1025,7 @@ class CandidateTrial:
         source_region_id: Backend-neutral source region represented by the candidate.
         variant_id: Backend-specific compiled variant evaluated by the trial.
         backend: Native compiler backend selected for this record.
-        lowering_mode: Whole-callable or outlined-block lowering mode.
+        lowering_mode: Whole-callable, outlined-block, or source-fused lowering mode.
         symbols: Profiled source bindings represented by the candidate.
         status: Accepted, rejected, failed-semantics, or unavailable decision.
         reason: Concrete semantic or benchmark evidence supporting the decision.

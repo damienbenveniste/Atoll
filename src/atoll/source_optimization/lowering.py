@@ -19,6 +19,7 @@ from typing import Literal, cast, override
 import libcst as cst
 
 from atoll.models import SymbolId
+from atoll.native_optimization.run_guard import RunGuardNativePlan
 from atoll.source_optimization.anyio_stream_lowering import (
     AnyioResidualOptions,
     lower_anyio_stream_plan,
@@ -48,6 +49,7 @@ class SourceLoweringResult:
         status: Whether a guarded source request was produced.
         request: LibCST transformation request for a supported plan.
         helper_names: Generated private helpers available to strict routing tests.
+        native_plans: Source-fused native opportunities introduced by this request.
         rejections: Deterministic reasons that kept the plan interpreted.
         mode: Lowering variant attempted for this result.
     """
@@ -56,6 +58,7 @@ class SourceLoweringResult:
     status: SourceLoweringStatus
     request: SourceTransformationRequest | None
     helper_names: tuple[str, ...] = ()
+    native_plans: tuple[RunGuardNativePlan, ...] = ()
     rejections: tuple[str, ...] = ()
     mode: SourceLoweringMode = "batch-quiescent"
 
@@ -336,6 +339,7 @@ def _lower_anyio_source_plan(
         status="lowered",
         request=lowered.request,
         helper_names=lowered.helper_names,
+        native_plans=lowered.native_plans,
         mode=mode,
     )
 
@@ -406,8 +410,11 @@ def _residual_rejections(
             "private-result-record-elision",
         }
     )
-    if residual_steps != expected_order[: len(residual_steps)]:
-        reasons.append("residual transformations must form the declared cumulative prefix")
+    positions = tuple(
+        expected_order.index(step) for step in residual_steps if step in expected_order
+    )
+    if len(positions) != len(residual_steps) or positions != tuple(sorted(set(positions))):
+        reasons.append("residual transformations must preserve their declared order")
     return tuple(reasons)
 
 

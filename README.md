@@ -203,7 +203,8 @@ When both `test_command` and `benchmark_command` are configured, `atoll compile`
 source-to-source optimization for hot async fan-out and fan-in pipelines. It requires at least
 10,000 observed work items, zero observed suspension for the fused callable shape, and 70% mapped
 hot-path coverage before a source plan can be trialed. Atoll ranks at most two plans and searches at
-most eight cumulative variants with beam width two and depth four.
+most eight ordered compositions with beam width two and depth four. An unsafe residual step is
+reported and skipped without blocking a later independently proven step.
 
 The source lowerer uses LibCST in a temporary project copy. Its cumulative guarded path can batch
 drain a private transport, execute proven quiescent coroutine work in one copied `Context` per
@@ -221,10 +222,18 @@ The marginal gate uses the median of corresponding current/candidate ratios from
 three-arm samples, so one order-biased current measurement cannot select a different source patch.
 Only a completed dynamic profile may advance the beam; unsupported launchers, insufficient samples,
 and failed passes remain rejection evidence. For structurally owned AnyIO-on-asyncio streams, later
-cumulative trials can amortize run guards, collapse quiescent await chains, elide context copies only
+ordered trials can amortize run guards, collapse quiescent await chains, elide context copies only
 with context-independent evidence, count private completions incrementally, and replace private
 result records with a fixed projection. The compile report records the fresh residual profile on each
 trial.
+
+Atoll can also recognize a private exact-dictionary completion scan whose predicate checks stack-run
+and node membership. The source fallback maintains a private count and index at every proven mapping
+write and removal, but still materializes the original value snapshot and calls the original
+predicate. A transactional Cython variant may replace the cached run guard, snapshot, and indexed
+query together. Exact owner and predicate-code identities plus the active-count invariant are checked
+before native routing; missing artifacts, changed identities, stale counts, or `ATOLL_DISABLE=1`
+retain the source scan.
 
 The promotion floor is `max(3.0, minimum_speedup)`. Both the transformed source tree and a normal
 PEP 517 wheel built from that tree must meet the floor over seven alternating benchmark pairs. An

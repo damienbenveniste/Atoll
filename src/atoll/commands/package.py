@@ -75,6 +75,11 @@ from atoll.generation.region_shim import (
     insert_or_replace_region_shim,
     remove_region_shim,
 )
+from atoll.generation.run_guard import (
+    RUN_GUARD_GENERATOR_VERSION,
+    RunGuardGenerationRequest,
+    generate_run_guard,
+)
 from atoll.generation.scalar_kernel import (
     SCALAR_KERNEL_GENERATOR_VERSION,
     ScalarKernelGenerationRequest,
@@ -123,6 +128,7 @@ from atoll.native_optimization.call_chains import (
     analyze_call_chain_scan,
     call_chain_runtime_guards,
 )
+from atoll.native_optimization.run_guard import RunGuardNativePlan, build_run_guard_region
 from atoll.native_optimization.scalar_analysis import (
     ScalarAnalysisResult,
     ScalarKernelPlan,
@@ -215,6 +221,7 @@ _SCALAR_INT32_WIDTH = 32
 _SCALAR_INT32_DISPATCH_RANK = 10
 _SCALAR_INT64_DISPATCH_RANK = 20
 _BUFFER_DISPATCH_RANK = 30
+_RUN_GUARD_DISPATCH_RANK = 25
 _MAX_PROFILED_CALL_CHAIN_ROOTS = 4
 _MINIMUM_CYTHON_BATCH_SIZE = 2
 
@@ -484,11 +491,14 @@ class _PreparedTypedRegion:
         shim: Managed region shim edit for the staged source.
         fallback: Fallback variant attempted after the preferred backend fails.
         conditional_on_failure_of: Preferred variant that must fail before this fallback runs.
-        lowering_mode: Whether the compiled target owns the whole callable or native blocks.
-        native_helpers: Private native helper names used by an outlined Python shell.
+        lowering_mode: Whether the target owns a callable, outlined blocks, or
+            one helper introduced by an accepted source transform.
+        native_helpers: Private helper names used by outlined or source-fused lowering.
         fallback_reason: Ordered deterministic backend failures preceding this successful variant.
         minimum_marginal_speedup: Candidate-specific profitability floor, or
             ``None`` for the generic compiler policy.
+        profitability_symbols: Public hot bindings whose workload is represented
+            by a private compiled helper. Empty uses the generated public bindings.
     """
 
     generation: TypedRegionGeneration
@@ -501,6 +511,7 @@ class _PreparedTypedRegion:
     native_helpers: tuple[str, ...] = ()
     fallback_reason: str | None = None
     minimum_marginal_speedup: float | None = None
+    profitability_symbols: tuple[SymbolId, ...] = ()
 
     def __post_init__(self) -> None:
         """Require outlined variants to identify every native helper.
@@ -508,12 +519,14 @@ class _PreparedTypedRegion:
         Raises:
             ValueError: If lowering mode and helper metadata contradict each other.
         """
-        if self.lowering_mode == "outlined-block" and not self.native_helpers:
-            raise ValueError("outlined prepared regions require native helpers")
+        if self.lowering_mode != "whole-callable" and not self.native_helpers:
+            raise ValueError("partial prepared regions require native helpers")
         if self.lowering_mode == "whole-callable" and self.native_helpers:
             raise ValueError("whole-callable prepared regions cannot declare native helpers")
         if self.minimum_marginal_speedup is not None and self.minimum_marginal_speedup <= 1.0:
             raise ValueError("native variant marginal speedup must be greater than 1.0")
+        if len(set(self.profitability_symbols)) != len(self.profitability_symbols):
+            raise ValueError("native variant profitability symbols must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -650,6 +663,25 @@ class _BufferExtensionContext:
 
 
 @dataclass(frozen=True, slots=True)
+class _RunGuardExtensionContext:
+    """Accepted-source run guards and staged roots for Cython composition.
+
+    Attributes:
+        project: Disposable transformed project containing the Python fallback.
+        build_root: Disposable root receiving generated Cython helper units.
+        staged_source_roots: Copied transformed import roots used for compilation.
+        plans: Content-addressed run-guard plans carried by the accepted source arm.
+        progress: Optional callback receiving preparation decisions.
+    """
+
+    project: DiscoveredProject
+    build_root: Path
+    staged_source_roots: tuple[Path, ...]
+    plans: tuple[RunGuardNativePlan, ...]
+    progress: PackageProgress | None
+
+
+@dataclass(frozen=True, slots=True)
 class _TypedRegionPackageContext:
     """Selected analysis evidence carried into source-clean region packaging.
 
@@ -663,6 +695,7 @@ class _TypedRegionPackageContext:
         scalar_analyses: Fixed-width scalar proofs and explicit fallbacks for selected scans.
         call_chain_analyses: Direct call-chain plans and explicit fallbacks for selected scans.
         buffer_analyses: Zero-copy buffer plans and explicit fallbacks for selected scans.
+        run_guard_plans: Source-fused run guards carried by an accepted source patch.
     """
 
     selected: tuple[_SelectedTypedRegion, ...]
@@ -674,6 +707,7 @@ class _TypedRegionPackageContext:
     scalar_analyses: tuple[ScalarAnalysisResult, ...] = ()
     call_chain_analyses: tuple[CallChainAnalysisResult, ...] = ()
     buffer_analyses: tuple[BufferAnalysisResult, ...] = ()
+    run_guard_plans: tuple[RunGuardNativePlan, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1105,6 +1139,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         scans,
         project.config.compile.backends,
         options.selected_members,
+        hot_members=options.selected_members,
     )
     preflight_missing = _missing_requested_members(options.selected_members, preflight_selected)
     profile_candidates = (
@@ -1587,12 +1622,23 @@ def _execute_composed_source_arm(
         )
     )
     selection_members = options.selected_members or profile_members
+    run_guard_plans = search.native_plans
     selected = _selected_typed_regions(
         active_scans,
         arm.active_project.config.compile.backends,
         selection_members,
         hot_members=profile_members,
     )
+    planned_helpers = frozenset(
+        helper for plan in run_guard_plans for helper in _run_guard_member_ids(plan)
+    )
+    if planned_helpers:
+        selected = tuple(
+            selection
+            for selection in selected
+            if selection.slice_root not in planned_helpers
+            and not planned_helpers.intersection(selection.bound_members or ())
+        )
     selected_plans = tuple(
         plan for plan in active_execution_plans if isinstance(plan, ExecutionPlan)
     )
@@ -1600,10 +1646,11 @@ def _execute_composed_source_arm(
         options.progress,
         (
             f"rescanned accepted source arm: {len(active_scans)} module(s), "
-            f"{len(selected)} native variant(s), {len(selected_plans)} execution plan(s)"
+            f"{len(selected)} native variant(s), {len(run_guard_plans)} source-fused "
+            f"guard variant(s), {len(selected_plans)} execution plan(s)"
         ),
     )
-    if not selected and not selected_plans:
+    if not selected and not selected_plans and not run_guard_plans:
         return replace(
             _source_optimization_package_result(
                 options=options,
@@ -1627,7 +1674,7 @@ def _execute_composed_source_arm(
     with tempfile.TemporaryDirectory(prefix="atoll-source-arm-") as backup_dir_text:
         backup_path = Path(backup_dir_text) / search.wheel_path.name
         shutil.copy2(search.wheel_path, backup_path)
-        if selected:
+        if selected or run_guard_plans:
             candidate = _execute_typed_region_package(
                 options=composed_options,
                 project=arm.active_project,
@@ -1641,6 +1688,7 @@ def _execute_composed_source_arm(
                     scalar_analyses=scalar_analyses,
                     call_chain_analyses=call_chain_analyses,
                     buffer_analyses=buffer_analyses,
+                    run_guard_plans=run_guard_plans,
                 ),
                 prepared_baseline=arm.baseline,
                 profile=active_profile,
@@ -2180,6 +2228,17 @@ def _execute_typed_region_package(
         prepared=prepared,
         failures=preparation_failures,
     )
+    prepared, preparation_failures, run_guard_variant_count = _extend_with_run_guard_variants(
+        context=_RunGuardExtensionContext(
+            project=project,
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            plans=context.run_guard_plans,
+            progress=options.progress,
+        ),
+        prepared=prepared,
+        failures=preparation_failures,
+    )
     _progress(
         options.progress,
         (
@@ -2187,6 +2246,7 @@ def _execute_typed_region_package(
             f"including {scalar_variant_count} scalar and "
             f"{call_chain_variant_count} direct call-chain and "
             f"{buffer_variant_count} zero-copy buffer variant(s); "
+            f"{run_guard_variant_count} source-fused guard variant(s); "
             f"kept {len(preparation_failures)} as fallback in {_duration(generation_started)}"
         ),
     )
@@ -3062,6 +3122,241 @@ def _buffer_variant_id(plan: BufferKernelPlan) -> str:
     return f"{plan.id}@cython-buffer-{layout.format}-{layout.itemsize}"
 
 
+def _extend_with_run_guard_variants(
+    *,
+    context: _RunGuardExtensionContext,
+    prepared: list[_PreparedTypedRegion],
+    failures: list[PackageRegionBuildFailure],
+) -> tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure], int]:
+    """Prepend source-fused guard variants carried by an accepted source arm.
+
+    Args:
+        context: Transformed project, copied roots, plans, and progress callback.
+        prepared: Existing generic and specialized native variants.
+        failures: Existing preparation failures retained for reports.
+
+    Returns:
+        tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure], int]:
+        Updated variants, failures, and prepared source-fused guard count.
+    """
+    if not context.plans:
+        return prepared, failures, 0
+    run_guards, run_guard_failures = _prepare_run_guard_variants(context)
+    owned_members = frozenset(
+        member for run_guard in run_guards for member in run_guard.generation.selected_members
+    )
+    retained = [
+        candidate
+        for candidate in prepared
+        if owned_members.isdisjoint(candidate.generation.selected_members)
+    ]
+    redundant_count = len(prepared) - len(retained)
+    if redundant_count:
+        _progress(
+            context.progress,
+            f"removed {redundant_count} generic variant(s) already owned by "
+            "transactional source-fused units",
+        )
+    return (
+        [*run_guards, *retained],
+        [*failures, *run_guard_failures],
+        len(run_guards),
+    )
+
+
+def _run_guard_member_ids(plan: RunGuardNativePlan) -> tuple[SymbolId, ...]:
+    """Return every private or public member owned by a source-fused unit.
+
+    Args:
+        plan: Accepted source-fused run guard and optional completion index.
+
+    Returns:
+        tuple[SymbolId, ...]: Members excluded from duplicate generic selection.
+    """
+    members = [plan.eligibility_helper, plan.helper]
+    if plan.completion_index is not None:
+        members.extend((plan.completion_index.snapshot, plan.completion_index.query))
+    return tuple(members)
+
+
+def _prepare_run_guard_variants(
+    context: _RunGuardExtensionContext,
+) -> tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+    """Revalidate accepted transformed helpers and prepare their Cython units.
+
+    Args:
+        context: Source-fused plans and staged transformed source roots.
+
+    Returns:
+        tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+        Prepared helpers followed by explicit disabled-backend or lowering failures.
+    """
+    cython_enabled = "cython" in context.project.config.compile.backends
+    scans: dict[str, ModuleScan] = {}
+    prepared: list[_PreparedTypedRegion] = []
+    failures: list[PackageRegionBuildFailure] = []
+    for plan in context.plans:
+        source_module = _find_module(context.project.modules, plan.helper.module)
+        scan = scans.get(plan.helper.module)
+        if scan is None:
+            staged_module = _staged_module(
+                source_module,
+                context.project,
+                context.staged_source_roots,
+            )
+            scan = enrich_island_analysis(scan_module(staged_module))
+            scans[plan.helper.module] = scan
+        source_region = next(
+            (
+                region
+                for region in scan.typed_regions
+                if any(member.id == plan.helper for member in region.members)
+            ),
+            None,
+        )
+        variant_id = f"{plan.stable_id}@cython-source-fused"
+        if source_region is None:
+            owner_region = next(
+                (
+                    region
+                    for region in scan.typed_regions
+                    if any(member.id == plan.owner for member in region.members)
+                ),
+                None,
+            )
+            reason = f"source-fused guard helper disappeared: {plan.helper.stable_id}"
+            _progress(context.progress, reason)
+            if owner_region is not None:
+                failures.append(
+                    PackageRegionBuildFailure(
+                        region=owner_region,
+                        variant_id=variant_id,
+                        backend="cython",
+                        assessment=CYTHON_BACKEND.assess(owner_region),
+                        build=_failed_region_attempt(reason),
+                    )
+                )
+            continue
+        try:
+            region = build_run_guard_region(scan, plan)
+        except (OSError, SyntaxError, ValueError) as error:
+            failures.append(
+                PackageRegionBuildFailure(
+                    region=source_region,
+                    variant_id=variant_id,
+                    backend="cython",
+                    assessment=CYTHON_BACKEND.assess(source_region),
+                    build=_failed_region_attempt(f"source-fused guard lowering failed: {error}"),
+                )
+            )
+            continue
+        if not cython_enabled:
+            reason = "source-fused guard skipped because Cython is disabled"
+            _progress(context.progress, reason)
+            failures.append(
+                PackageRegionBuildFailure(
+                    region=region,
+                    variant_id=variant_id,
+                    backend="cython",
+                    assessment=CYTHON_BACKEND.assess(region),
+                    build=_failed_region_attempt(reason),
+                )
+            )
+            continue
+        try:
+            prepared.append(
+                _prepare_run_guard_variant(
+                    context=_ScalarVariantContext(
+                        project=context.project,
+                        build_root=context.build_root,
+                        staged_source_roots=context.staged_source_roots,
+                        scan=scan,
+                        region=region,
+                    ),
+                    plan=plan,
+                    variant_id=variant_id,
+                )
+            )
+        except (OSError, SyntaxError, ValueError) as error:
+            failures.append(
+                PackageRegionBuildFailure(
+                    region=region,
+                    variant_id=variant_id,
+                    backend="cython",
+                    assessment=CYTHON_BACKEND.assess(region),
+                    build=_failed_region_attempt(f"source-fused guard lowering failed: {error}"),
+                )
+            )
+    return tuple(prepared), tuple(failures)
+
+
+def _prepare_run_guard_variant(
+    *,
+    context: _ScalarVariantContext,
+    plan: RunGuardNativePlan,
+    variant_id: str,
+) -> _PreparedTypedRegion:
+    """Generate one transactional boxed Cython helper unit.
+
+    Args:
+        context: Staged transformed source, scan, region, and build roots.
+        plan: Revalidated source-fused guard plan.
+        variant_id: Stable backend variant identity.
+
+    Returns:
+        _PreparedTypedRegion: Compilable helper and transactional dispatcher contract.
+    """
+    logical_module = _typed_region_module_name(context.region, "cython", variant_id)
+    generated_path = context.build_root / f"{logical_module}.py"
+    selected_members = tuple(member.id for member in context.region.members)
+    generation = generate_run_guard(
+        RunGuardGenerationRequest(
+            scan=context.scan,
+            region=context.region,
+            plan=plan,
+            logical_module=logical_module,
+            output_path=generated_path,
+        )
+    )
+    unit = CYTHON_BACKEND.lower(
+        BackendLoweringRequest(
+            region=context.region,
+            source_path=generated_path,
+            logical_module=logical_module,
+            install_relative_dir=_region_artifact_relative_dir(variant_id),
+            members=selected_members,
+            variant_id=variant_id,
+        )
+    )
+    source_module = _find_module(context.project.modules, context.scan.module.name)
+    staged_source_root = _staged_source_root(
+        source_module,
+        context.project,
+        context.staged_source_roots,
+    )
+    return _PreparedTypedRegion(
+        generation=generation,
+        assessment=CYTHON_BACKEND.assess(context.region),
+        unit=unit,
+        shim=RegionShimConfig(
+            source_module=context.scan.module.name,
+            source_path=context.scan.module.path,
+            region_id=context.region.id,
+            variant_id=variant_id,
+            backend="cython",
+            compiled_module=logical_module,
+            artifact_dir=staged_source_root / unit.install_relative_dir,
+            bindings=generation.bindings,
+            dispatch_rank=_RUN_GUARD_DISPATCH_RANK,
+            variant_guards=(),
+        ),
+        lowering_mode="source-fused",
+        native_helpers=tuple(member.qualname for member in selected_members),
+        minimum_marginal_speedup=_SPECIALIZED_VARIANT_MINIMUM_SPEEDUP,
+        profitability_symbols=(plan.owner,),
+    )
+
+
 def _prepare_scalar_variant(
     *,
     context: _ScalarVariantContext,
@@ -3579,6 +3874,7 @@ def _build_typed_regions(
             ("scalar_kernel_generator", SCALAR_KERNEL_GENERATOR_VERSION),
             ("call_chain_generator", CALL_CHAIN_GENERATOR_VERSION),
             ("buffer_kernel_generator", BUFFER_KERNEL_GENERATOR_VERSION),
+            ("run_guard_generator", RUN_GUARD_GENERATOR_VERSION),
         ),
     )
     batched_cython = _compile_batched_cython_variants(
@@ -6251,7 +6547,7 @@ def _profiled_profitability_candidates(
     skipped: tuple[PackageRegionBuildFailure, ...],
     profile: ProfileResult,
 ) -> tuple[_ProfitabilityCandidate, ...]:
-    """Order successful variants by their first profile-selected binding.
+    """Order attributed private helpers before profile-selected public bindings.
 
     Args:
         successful: Successfully compiled variants available for trials.
@@ -6259,40 +6555,51 @@ def _profiled_profitability_candidates(
         profile: Dynamic profile with a descending-hotness selected-symbol order.
 
     Returns:
-        tuple[_ProfitabilityCandidate, ...]: Deduplicated candidates in profile order.
+        tuple[_ProfitabilityCandidate, ...]: Deduplicated candidates with explicit
+        orchestration attribution first, then ordinary profile order.
     """
     profile_samples = {member.symbol: member.samples for member in profile.members}
     selected = frozenset(profile.selected_symbols)
     by_symbol: dict[SymbolId, list[_PreparedTypedRegion]] = {}
     for prepared in successful:
-        for binding in prepared.generation.bindings:
-            if binding.source in selected:
-                by_symbol.setdefault(binding.source, []).append(prepared)
+        for symbol in dict.fromkeys(binding.source for binding in prepared.generation.bindings):
+            if symbol in selected:
+                by_symbol.setdefault(symbol, []).append(prepared)
     ordered: list[_ProfitabilityCandidate] = []
     seen: set[str] = set()
+
+    def append_candidate(
+        prepared: _PreparedTypedRegion,
+        represented: tuple[SymbolId, ...],
+    ) -> None:
+        variant_id = prepared.unit.region_id
+        if variant_id in seen:
+            return
+        seen.add(variant_id)
+        samples = sum(profile_samples.get(member, 0) for member in represented)
+        ordered.append(
+            _ProfitabilityCandidate(
+                prepared=prepared,
+                symbols=tuple(member.stable_id for member in represented),
+                profile_samples=samples,
+                profile_coverage=_sample_coverage(samples, profile.mapped_project_samples),
+                fallback_reason=_candidate_fallback_reason(prepared, skipped),
+            )
+        )
+
+    for prepared in successful:
+        if prepared.profitability_symbols:
+            append_candidate(prepared, prepared.profitability_symbols)
     for symbol in profile.selected_symbols:
         for prepared in by_symbol.get(symbol, ()):
-            variant_id = prepared.unit.region_id
-            if variant_id in seen:
-                continue
-            seen.add(variant_id)
             represented = tuple(
-                dict.fromkeys(
-                    binding.source
-                    for binding in prepared.generation.bindings
-                    if binding.source in selected
+                symbol
+                for symbol in dict.fromkeys(
+                    binding.source for binding in prepared.generation.bindings
                 )
+                if symbol in selected
             )
-            samples = sum(profile_samples.get(member, 0) for member in represented)
-            ordered.append(
-                _ProfitabilityCandidate(
-                    prepared=prepared,
-                    symbols=tuple(member.stable_id for member in represented),
-                    profile_samples=samples,
-                    profile_coverage=_sample_coverage(samples, profile.mapped_project_samples),
-                    fallback_reason=_candidate_fallback_reason(prepared, skipped),
-                )
-            )
+            append_candidate(prepared, represented)
     return tuple(ordered)
 
 

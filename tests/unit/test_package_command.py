@@ -43,6 +43,7 @@ from atoll.models import (
 )
 from atoll.native_optimization.buffer_analysis import BufferAnalysisResult
 from atoll.native_optimization.call_chains import CallChainAnalysisResult
+from atoll.native_optimization.run_guard import CompletionIndexNativePlan, RunGuardNativePlan
 from atoll.project import DiscoveredProject, discover_project
 from atoll.report import CompilationReportInput, build_compilation_report
 from atoll.runtime.fusion_performance import (
@@ -93,6 +94,7 @@ _CANDIDATE_SPEEDUP = 1.01
 EXPECTED_FINAL_TEST_RESULTS = 2
 EXPECTED_CALL_CHAIN_WIDTH_COUNT = 2
 EXPECTED_SINGLE_FAILURE = 1
+OWNER_PROFILE_SAMPLES = 40
 
 
 @pytest.fixture(autouse=True)
@@ -209,6 +211,13 @@ class _PreparedTypedRegion(Protocol):
     native_helpers: tuple[str, ...]
     fallback_reason: str | None
     shim: RegionShimConfig
+    profitability_symbols: tuple[SymbolId, ...]
+
+
+class _ProfitabilityCandidate(Protocol):
+    prepared: _PreparedTypedRegion
+    symbols: tuple[str, ...]
+    profile_samples: int
 
 
 class _TypedRegionOutcome(Protocol):
@@ -342,6 +351,21 @@ _selected_typed_regions = cast(
 _prepare_typed_region = cast(
     Callable[..., _PreparedTypedRegion], _package_attr("_prepare_typed_region")
 )
+_PreparedTypedRegionState = cast(
+    Callable[..., _PreparedTypedRegion],
+    _package_attr("_PreparedTypedRegion"),
+)
+_profiled_profitability_candidates = cast(
+    Callable[
+        [
+            tuple[_PreparedTypedRegion, ...],
+            tuple[_TypedRegionFailure, ...],
+            ProfileResult,
+        ],
+        tuple[_ProfitabilityCandidate, ...],
+    ],
+    _package_attr("_profiled_profitability_candidates"),
+)
 _artifact_records_for_prepared = cast(
     Callable[
         [tuple[_PreparedTypedRegion, ...], tuple[ArtifactRecord, ...]],
@@ -417,6 +441,10 @@ _BufferExtensionContext = cast(
 _extend_with_buffer_variants = cast(
     Callable[..., tuple[list[_PreparedTypedRegion], list[_TypedRegionFailure], int]],
     _package_attr("_extend_with_buffer_variants"),
+)
+_run_guard_member_ids = cast(
+    Callable[[RunGuardNativePlan], tuple[SymbolId, ...]],
+    _package_attr("_run_guard_member_ids"),
 )
 _runtime_member_closure = cast(
     Callable[[TypedRegion, tuple[SymbolId, ...], frozenset[SymbolId]], tuple[SymbolId, ...]],
@@ -1379,6 +1407,110 @@ def test_prepare_typed_region_appends_outlined_cython_fallback(tmp_path: Path) -
     assert outlined.lowering_mode == "outlined-block"
     assert outlined.native_helpers
     assert outlined.unit.region_id.endswith("@cython-outline")
+
+
+def test_private_native_helper_uses_public_owner_for_profile_profitability(
+    tmp_path: Path,
+) -> None:
+    """A source-fused helper is trialed when its owner is outside leaf selection."""
+    prepared, _build_root, _staged_source_roots = _prepare_outlined_coroutine_fixture(tmp_path)
+    owner = SymbolId("typed_region_project.outline_worker", "Owner.submit")
+    selected_leaf = SymbolId("typed_region_project.outline_worker", "hot")
+    attributed = _PreparedTypedRegionState(
+        generation=prepared.generation,
+        assessment=prepared.assessment,
+        unit=prepared.unit,
+        shim=prepared.shim,
+        fallback=prepared.fallback,
+        conditional_on_failure_of=prepared.conditional_on_failure_of,
+        lowering_mode=prepared.lowering_mode,
+        native_helpers=prepared.native_helpers,
+        fallback_reason=prepared.fallback_reason,
+        minimum_marginal_speedup=1.05,
+        profitability_symbols=(owner,),
+    )
+    lifecycle = LifecycleCounts(start=0, return_=0, yield_=0, resume=0, unwind=0, throw=0)
+    profile = replace(
+        unconfigured_profile(),
+        status="profiled",
+        reason="public owner is hot",
+        launch_kind="script",
+        total_samples=60,
+        mapped_project_samples=50,
+        mapped_coverage=5 / 6,
+        selected_hot_samples=10,
+        selected_hot_coverage=0.2,
+        lifecycle=lifecycle,
+        members=(
+            ProfiledMember(
+                module=owner.module,
+                qualname=owner.qualname,
+                samples=OWNER_PROFILE_SAMPLES,
+                coverage=0.8,
+                call_count=10,
+                lifecycle=lifecycle,
+                signatures=(),
+                polymorphic_overflow=False,
+            ),
+            ProfiledMember(
+                module=selected_leaf.module,
+                qualname=selected_leaf.qualname,
+                samples=10,
+                coverage=1 / 6,
+                call_count=10,
+                lifecycle=lifecycle,
+                signatures=(),
+                polymorphic_overflow=False,
+            ),
+        ),
+        selected_symbols=(selected_leaf,),
+    )
+
+    candidates = _profiled_profitability_candidates((attributed,), (), profile)
+
+    assert len(candidates) == 1
+    assert candidates[0].prepared is attributed
+    assert candidates[0].symbols == (owner.stable_id,)
+    assert candidates[0].profile_samples == OWNER_PROFILE_SAMPLES
+
+
+def test_source_fused_member_ownership_includes_completion_helpers() -> None:
+    """Generic selection cannot duplicate members compiled transactionally."""
+    module = "app.pipeline"
+    completion = CompletionIndexNativePlan(
+        snapshot=SymbolId(module, "_snapshot"),
+        query=SymbolId(module, "_query"),
+        index_attribute="_index",
+        count_attribute="_count",
+        active_attribute="active",
+        fallback_predicate_method="_is_complete",
+        graph_attribute="graph",
+        parent_lookup_method="get_parent",
+        intermediate_nodes_attribute="intermediate_nodes",
+    )
+    plan = RunGuardNativePlan(
+        source_plan_id="source-plan",
+        source=PurePosixPath("app/pipeline.py"),
+        owner=SymbolId(module, "Owner.submit"),
+        helper=SymbolId(module, "_guard"),
+        source_guard=SymbolId(module, "_source_guard"),
+        eligibility_helper=SymbolId(module, "_eligible"),
+        protocol_context=SymbolId(module, "_protocol_context"),
+        disable_module=SymbolId(module, "_os"),
+        clear_helper=SymbolId(module, "_clear"),
+        protocol_await_helper=SymbolId(module, "_protocol_await"),
+        fallback_attribute="_fallback",
+        state_attribute="_passed",
+        run_identity_attribute="_run_identity",
+        completion_index=completion,
+    )
+
+    assert _run_guard_member_ids(plan) == (
+        plan.eligibility_helper,
+        plan.helper,
+        completion.snapshot,
+        completion.query,
+    )
 
 
 def test_artifact_filter_keeps_only_accepted_region_support_files(tmp_path: Path) -> None:
