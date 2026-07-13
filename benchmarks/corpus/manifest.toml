@@ -1,0 +1,7 @@
+schema_version = 1
+python_version = "3.12"
+backends = ["mypyc", "cython"]
+test_timeout_seconds = 300
+compile_timeout_seconds = 2700
+performance_timeout_seconds = 5400
+max_log_bytes = 10485760
