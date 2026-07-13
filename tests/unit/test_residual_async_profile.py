@@ -19,6 +19,7 @@ EXPECTED_CHECKSUM = 266732
 EXPECTED_DOUBLE_CHECKSUM = EXPECTED_CHECKSUM * 2
 EXPECTED_FINAL_SPEEDUP = 3.0
 EXPECTED_HEADROOM_ITERATIONS = 4
+WORKFLOW_PATH = Path(".github/workflows/source-optimization-benchmark.yml")
 
 
 class FixtureModule(Protocol):
@@ -124,10 +125,13 @@ def test_calibration_requires_headroom_above_stability_floor(
     monkeypatch.setattr(benchmark, "_time_arm", fake_time_arm)
 
     calibrate = cast(
-        Callable[[benchmark.BenchmarkOptions], int],
+        Callable[[benchmark.BenchmarkOptions], benchmark.ArmIterations],
         vars(benchmark)["_calibrate_iterations"],
     )
-    assert calibrate(benchmark.BenchmarkOptions()) == EXPECTED_HEADROOM_ITERATIONS
+    assert calibrate(benchmark.BenchmarkOptions()) == benchmark.ArmIterations(
+        baseline=EXPECTED_HEADROOM_ITERATIONS,
+        residual=EXPECTED_HEADROOM_ITERATIONS,
+    )
 
 
 def test_benchmark_json_output_reports_hard_policy_and_stage_counters(
@@ -137,19 +141,23 @@ def test_benchmark_json_output_reports_hard_policy_and_stage_counters(
     report = benchmark.BenchmarkReport(
         gate_passed=True,
         semantics_match=True,
-        iterations=64,
+        iterations=benchmark.ArmIterations(baseline=64, residual=256),
         policy=benchmark.BenchmarkOptions(),
         summaries=(
             benchmark.SampleSummary(
                 arm="baseline",
+                iterations=64,
                 samples=(0.81, 0.82, 0.83, 0.84, 0.85, 0.86, 0.87),
                 median_seconds=0.84,
+                seconds_per_iteration=0.013125,
                 speedup_over_baseline=1.0,
             ),
             benchmark.SampleSummary(
                 arm="residual",
-                samples=(0.25, 0.26, 0.27, 0.28, 0.29, 0.30, 0.31),
-                median_seconds=0.28,
+                iterations=256,
+                samples=(1.00, 1.04, 1.08, 1.12, 1.16, 1.20, 1.24),
+                median_seconds=1.12,
+                seconds_per_iteration=0.004375,
                 speedup_over_baseline=3.0,
             ),
         ),
@@ -183,7 +191,17 @@ def test_benchmark_json_output_reports_hard_policy_and_stage_counters(
     }
     assert payload["stage_counters_nonzero"] is True
     assert payload["final_speedup"] == EXPECTED_FINAL_SPEEDUP
+    assert payload["iterations"] == {"baseline": 64, "residual": 256}
+    assert [summary["iterations"] for summary in payload["summaries"]] == [64, 256]
     assert [len(summary["samples"]) for summary in payload["summaries"]] == [7, 7]
+
+
+def test_hard_workflow_propagates_benchmark_failure_through_tee() -> None:
+    """A failed benchmark process must fail the matrix job before evidence upload."""
+    workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "set -o pipefail" in workflow
+    assert "| tee" in workflow
 
 
 def _fixture_module() -> FixtureModule:

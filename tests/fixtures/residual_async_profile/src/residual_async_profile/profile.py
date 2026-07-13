@@ -18,7 +18,6 @@ from typing import Literal, TypedDict
 
 WORK_ITEM_COUNT = 192
 SEMANTIC_REPETITIONS = 16
-STREAMING_REDUCTION_BARRIER_STEPS = 6_500
 STAGE_NAMES: tuple[str, ...] = (
     "run_scoped_guard_amortization",
     "quiescent_await_chain_collapse",
@@ -412,7 +411,6 @@ async def run_residual_once() -> RunResult:
         checksum += value
         completed += 1
         labels.append(item.label)
-    _private_streaming_reduction_barrier(checksum)
     counters = StageCounters(
         run_scoped_guard_amortization=len(_WORK_ITEMS) - 1,
         quiescent_await_chain_collapse=independent_count,
@@ -469,13 +467,6 @@ def _direct_context_independent_value(item: WorkItem) -> int:
 
 def _value_for(item: WorkItem) -> int:
     return (item.ordinal + 5) * item.weight
-
-
-def _private_streaming_reduction_barrier(seed: int) -> int:
-    value = seed
-    for index in range(STREAMING_REDUCTION_BARRIER_STEPS):
-        value = (value + index) & 0xFFFFFFFF
-    return value
 
 
 def _validate_run_guard() -> None:

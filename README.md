@@ -337,7 +337,8 @@ gates.
 
 The manual [generic source-optimizer benchmark](benchmarks/source_optimization/README.md) enforces
 the copied-context semantic matrix and `3.0x` guarded feasibility floor independently of any target
-project.
+project. Each arm calibrates independently above the timing floor, and speedup uses median time per
+logical workload execution.
 
 The manual [native optimizer benchmark](benchmarks/native_optimization/README.md) builds the generic
 fixture cold and warm, verifies a zero-compiler warm cache hit, and applies one warmup plus seven

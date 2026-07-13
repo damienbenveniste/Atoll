@@ -289,7 +289,8 @@ least `1.05x` over unfused plus `1.10x` overall. Normal compile never enables ta
 `experimental_task_fusion` setting is public unless the pinned hard benchmark passes those gates.
 
 The manual generic source-optimizer benchmark runs the copied-context semantic matrix and enforces
-the `3.0x` guarded feasibility floor without target-project rules.
+the `3.0x` guarded feasibility floor without target-project rules. It calibrates each arm
+independently above the stability floor and compares normalized time per logical execution.
 
 The manual native optimizer benchmark builds the generic fixture cold and warm, verifies zero warm
 compiler invocations, and requires independent `3.0x` results for mixed scalar, direct call-chain,

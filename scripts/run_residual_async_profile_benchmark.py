@@ -26,7 +26,7 @@ DEFAULT_MINIMUM_SECONDS = MINIMUM_STABLE_MEDIAN_SECONDS
 DEFAULT_MINIMUM_SPEEDUP = HARD_BENCHMARK_MINIMUM_SPEEDUP
 DEFAULT_SEMANTIC_REPETITIONS = 8
 DEFAULT_ITERATIONS = 2
-MAX_CALIBRATION_ITERATIONS = 4096
+MAX_CALIBRATION_ITERATIONS = 65_536
 CALIBRATION_HEADROOM_FACTOR = 1.25
 
 ArmName = Literal["baseline", "residual"]
@@ -110,14 +110,18 @@ class SampleSummaryPayload(TypedDict):
 
     Attributes:
         arm: Name of the measured benchmark arm.
+        iterations: Logical workload executions in each measured sample.
         samples: Seven rotating measured sample durations.
         median_seconds: Median measured duration for the arm.
-        speedup_over_baseline: Baseline median divided by this arm median.
+        seconds_per_iteration: Median duration normalized by logical executions.
+        speedup_over_baseline: Baseline normalized median divided by this arm's value.
     """
 
     arm: str
+    iterations: int
     samples: list[float]
     median_seconds: float
+    seconds_per_iteration: float
     speedup_over_baseline: float
 
 
@@ -145,7 +149,7 @@ class ReportPayload(TypedDict):
     Attributes:
         gate_passed: Whether semantics, counters, medians, and speed passed.
         semantics_match: Whether residual semantics matched baseline.
-        iterations: Calibrated iterations per measured arm invocation.
+        iterations: Independently calibrated logical executions for each arm.
         policy: Benchmark policy used for the run.
         summaries: Per-arm timing summaries.
         final_speedup: Residual median speedup over baseline.
@@ -156,7 +160,7 @@ class ReportPayload(TypedDict):
 
     gate_passed: bool
     semantics_match: bool
-    iterations: int
+    iterations: dict[str, int]
     policy: PolicyPayload
     summaries: list[SampleSummaryPayload]
     final_speedup: float
@@ -194,15 +198,51 @@ class SampleSummary:
 
     Attributes:
         arm: Name of the measured arm.
+        iterations: Logical workload executions in each measured sample.
         samples: Seven rotating measured durations.
         median_seconds: Median measured duration.
-        speedup_over_baseline: Baseline median divided by this arm median.
+        seconds_per_iteration: Median duration normalized by logical executions.
+        speedup_over_baseline: Baseline normalized median divided by this arm's value.
     """
 
     arm: ArmName
+    iterations: int
     samples: tuple[float, ...]
     median_seconds: float
+    seconds_per_iteration: float
     speedup_over_baseline: float
+
+
+@dataclass(frozen=True, slots=True)
+class ArmIterations:
+    """Independently calibrated logical executions for each benchmark arm.
+
+    Attributes:
+        baseline: Executions per measured baseline sample.
+        residual: Executions per measured residual sample.
+    """
+
+    baseline: int
+    residual: int
+
+    def for_arm(self, arm: ArmName) -> int:
+        """Return the calibrated execution count for one arm.
+
+        Args:
+            arm: Baseline or residual benchmark arm.
+
+        Returns:
+            Logical workload executions for each measured sample of that arm.
+        """
+        return self.baseline if arm == "baseline" else self.residual
+
+    def as_json(self) -> dict[str, int]:
+        """Return stable JSON-compatible arm iteration counts.
+
+        Returns:
+            Mapping from arm name to calibrated executions.
+        """
+        return {"baseline": self.baseline, "residual": self.residual}
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,7 +252,7 @@ class BenchmarkReport:
     Attributes:
         gate_passed: Combined semantic, counter, timing, and speed verdict.
         semantics_match: Deterministic semantic comparison result.
-        iterations: Calibrated iterations per arm invocation.
+        iterations: Independently calibrated logical executions for each arm.
         policy: Validated benchmark policy.
         summaries: Timing summaries for baseline and residual arms.
         final_speedup: Residual median speedup over baseline.
@@ -222,7 +262,7 @@ class BenchmarkReport:
 
     gate_passed: bool
     semantics_match: bool
-    iterations: int
+    iterations: ArmIterations
     policy: BenchmarkOptions
     summaries: tuple[SampleSummary, ...]
     final_speedup: float
@@ -289,7 +329,7 @@ def run_benchmark(options: BenchmarkOptions | None = None) -> BenchmarkReport:
     summaries, stage_counters = _measure_samples(iterations, options)
     baseline = _summary_for(summaries, "baseline")
     residual = _summary_for(summaries, "residual")
-    final_speedup = baseline.median_seconds / residual.median_seconds
+    final_speedup = baseline.seconds_per_iteration / residual.seconds_per_iteration
     gate_passed = (
         semantics_match
         and all(summary.median_seconds >= options.minimum_seconds for summary in summaries)
@@ -320,7 +360,7 @@ def report_as_json(report: BenchmarkReport) -> ReportPayload:
     return ReportPayload(
         gate_passed=report.gate_passed,
         semantics_match=report.semantics_match,
-        iterations=report.iterations,
+        iterations=report.iterations.as_json(),
         policy=PolicyPayload(
             warmups=report.policy.warmups,
             samples=report.policy.samples,
@@ -331,8 +371,10 @@ def report_as_json(report: BenchmarkReport) -> ReportPayload:
         summaries=[
             SampleSummaryPayload(
                 arm=summary.arm,
+                iterations=summary.iterations,
                 samples=list(summary.samples),
                 median_seconds=summary.median_seconds,
+                seconds_per_iteration=summary.seconds_per_iteration,
                 speedup_over_baseline=summary.speedup_over_baseline,
             )
             for summary in report.summaries
@@ -345,7 +387,7 @@ def report_as_json(report: BenchmarkReport) -> ReportPayload:
 
 
 def _measure_samples(
-    iterations: int,
+    iterations: ArmIterations,
     options: BenchmarkOptions,
 ) -> tuple[tuple[SampleSummary, ...], dict[str, int]]:
     fixture = _fixture_module()
@@ -355,35 +397,46 @@ def _measure_samples(
     for sample_index in range(options.warmups + options.samples):
         ordered_arms = arms if sample_index % 2 == 0 else tuple(reversed(arms))
         for arm in ordered_arms:
-            elapsed, counters = _time_arm(arm, iterations)
+            elapsed, counters = _time_arm(arm, iterations.for_arm(arm))
             if sample_index >= options.warmups:
                 measured[arm].append(elapsed)
                 if counters is not None:
                     for name, value in counters.items():
                         stage_counters[name] += value
     baseline_median = median(measured["baseline"])
+    baseline_per_iteration = baseline_median / iterations.baseline
     summaries = tuple(
         SampleSummary(
             arm=arm,
+            iterations=iterations.for_arm(arm),
             samples=tuple(measured[arm]),
             median_seconds=median(measured[arm]),
-            speedup_over_baseline=baseline_median / median(measured[arm]),
+            seconds_per_iteration=(median(measured[arm]) / iterations.for_arm(arm)),
+            speedup_over_baseline=(
+                baseline_per_iteration / (median(measured[arm]) / iterations.for_arm(arm))
+            ),
         )
         for arm in arms
     )
     return summaries, stage_counters
 
 
-def _calibrate_iterations(options: BenchmarkOptions) -> int:
+def _calibrate_iterations(options: BenchmarkOptions) -> ArmIterations:
+    return ArmIterations(
+        baseline=_calibrate_arm("baseline", options),
+        residual=_calibrate_arm("residual", options),
+    )
+
+
+def _calibrate_arm(arm: ArmName, options: BenchmarkOptions) -> int:
     iterations = options.initial_iterations
     target_seconds = options.minimum_seconds * CALIBRATION_HEADROOM_FACTOR
     while iterations <= MAX_CALIBRATION_ITERATIONS:
-        baseline_seconds, _ = _time_arm("baseline", iterations)
-        residual_seconds, _ = _time_arm("residual", iterations)
-        if baseline_seconds >= target_seconds and residual_seconds >= target_seconds:
+        elapsed, _ = _time_arm(arm, iterations)
+        if elapsed >= target_seconds:
             return iterations
         iterations *= 2
-    raise BenchmarkError("could not calibrate both benchmark arms above the median floor")
+    raise BenchmarkError(f"could not calibrate {arm} above the median floor")
 
 
 def _time_arm(

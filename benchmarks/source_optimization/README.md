@@ -11,11 +11,12 @@ Run the promoted residual-stage gate from the Atoll checkout:
 uv run --python 3.12 python scripts/run_residual_async_profile_benchmark.py
 ```
 
-The harness repeats canonical semantic comparisons, calibrates both arms above 0.25 seconds, then
-runs one rotating warmup and seven samples. It fails unless every residual stage is exercised and
-the guarded residual pipeline is at least `3.00x` faster than baseline. The stage counters cover run
-guard amortization, quiescent await-chain collapse, context-copy elision, incremental completion
-accounting, and private result-record projection.
+The harness repeats canonical semantic comparisons, calibrates each arm independently above 0.25
+seconds, then runs one rotating warmup and seven samples. Speedup compares median seconds per
+logical workload execution, so the faster arm needs no synthetic delay. It fails unless every
+residual stage is exercised and the guarded residual pipeline is at least `3.00x` faster than
+baseline. The stage counters cover run guard amortization, quiescent await-chain collapse,
+context-copy elision, incremental completion accounting, and private result-record projection.
 
 The earlier `scripts/async_execution_plan_feasibility.py` command remains a ceiling and semantic
 research harness. Its callback-backed, task-preserving, guarded, and unsafe arms do not replace the
