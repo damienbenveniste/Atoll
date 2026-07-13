@@ -12,10 +12,11 @@ from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from types import ModuleType
-from typing import cast
+from typing import Protocol, cast
 
 import pytest
 
+import atoll.source_optimization.search as source_search
 from atoll.models import SymbolId
 from atoll.source_optimization import (
     SourceCallableEvidence,
@@ -26,7 +27,11 @@ from atoll.source_optimization import (
     stable_source_optimization_plan_id,
 )
 from atoll.source_optimization.anyio_stream_lowering import lower_anyio_stream_plan
-from atoll.source_optimization.lowering import lower_state_machine_plan
+from atoll.source_optimization.lowering import (
+    lower_residual_state_machine_plan,
+    lower_state_machine_plan,
+)
+from atoll.source_optimization.models import SourceTransformationKind
 from atoll.source_optimization.transforms import (
     build_source_transformation_patch,
     materialize_transformed_files,
@@ -38,6 +43,17 @@ MODULE = "source_optimization_fixture.anyio_workflow"
 OWNER = SymbolId(MODULE, "PipelineRunner.submit")
 WORKER = SymbolId(MODULE, "PipelineRunner._worker")
 CONSUMER = SymbolId(MODULE, "PipelineRunner.results")
+RESIDUAL_STEPS: tuple[SourceTransformationKind, ...] = (
+    "run-scoped-guard-amortization",
+    "transparent-quiescent-await-chain-collapse",
+    "context-copy-elision",
+    "incremental-private-completion-accounting",
+    "private-result-record-elision",
+)
+
+
+class _SourceVariantView(Protocol):
+    transformation_ids: tuple[str, ...]
 
 
 def test_anyio_lowering_builds_reproducible_libcst_patch() -> None:
@@ -78,6 +94,156 @@ def test_anyio_lowering_rejects_stale_source_identity() -> None:
 
     with pytest.raises(ValueError, match="stale source"):
         lower_anyio_stream_plan(FIXTURE_ROOT, stale)
+
+
+def test_anyio_residual_lowering_composes_safe_cumulative_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Context, accounting, and record residuals share one guarded request."""
+    plan, assessment = _plan_and_assessment()
+    enabled = RESIDUAL_STEPS
+    lowering = lower_residual_state_machine_plan(FIXTURE_ROOT, plan, assessment, enabled)
+
+    assert lowering.status == "lowered"
+    assert lowering.request is not None
+    patch = build_source_transformation_patch(FIXTURE_ROOT, (lowering.request,))
+    transformed_source = patch.files[0].after_source
+    assert "namedtuple" in transformed_source
+    assert "_remaining = len(self.active)" in transformed_source
+    assert "child_context =" not in transformed_source
+
+    copied_root = tmp_path / "residual-project"
+    shutil.copytree(FIXTURE_ROOT, copied_root)
+    materialize_transformed_files(FIXTURE_ROOT, copied_root, patch)
+    module = _load_module(
+        copied_root / SOURCE_PATH,
+        f"atoll_anyio_residual_{tmp_path.name.replace('-', '_')}",
+    )
+    run = _pipeline_callable(module)
+    worker = _worker_callable(module, "immediate_double")
+    _permit_optimized_runtime(module, monkeypatch)
+    monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+
+    trace = sys.gettrace()
+    profile = sys.getprofile()
+    try:
+        sys.settrace(None)
+        sys.setprofile(None)
+        observed = asyncio.run(run((2, 3, 5), worker))
+    finally:
+        sys.settrace(trace)
+        sys.setprofile(profile)
+
+    assert observed == (4, 6, 10)
+    expected_route_hits = 3
+    assert vars(module)[lowering.helper_names[-1]] == expected_route_hits
+
+
+def test_anyio_search_forms_every_cumulative_residual_variant() -> None:
+    """Bounded search receives one honest variant for each implemented prefix."""
+    plan, assessment = _plan_and_assessment()
+    plan_variants = cast(
+        Callable[
+            [Path, SourceOptimizationPlan, SourceOptimizationAssessment],
+            tuple[tuple[_SourceVariantView, ...], tuple[object, ...]],
+        ],
+        vars(source_search)["_plan_variants"],
+    )
+
+    variants, rejections = plan_variants(FIXTURE_ROOT, plan, assessment)
+    residual_variants = tuple(
+        variant
+        for variant in variants
+        if any(
+            identifier.startswith(f"{kind}:")
+            for kind in RESIDUAL_STEPS
+            for identifier in variant.transformation_ids
+        )
+    )
+
+    assert len(variants) == len(RESIDUAL_STEPS) + 1
+    assert len(residual_variants) == len(RESIDUAL_STEPS)
+    assert len(rejections) == 1
+
+
+def test_anyio_residual_context_elision_rejects_context_mutation() -> None:
+    """Context-copy elision cannot proceed with mutation evidence in the slice."""
+    plan, assessment = _plan_and_assessment()
+    evidence = tuple(
+        replace(item, context_mutation=("context variable mutation",))
+        if item.symbol == OWNER
+        else item
+        for item in assessment.callable_evidence
+    )
+    enabled = RESIDUAL_STEPS[:3]
+
+    lowering = lower_residual_state_machine_plan(
+        FIXTURE_ROOT,
+        plan,
+        replace(assessment, callable_evidence=evidence),
+        enabled,
+    )
+
+    assert lowering.status == "unsupported"
+    assert lowering.request is None
+    assert "context-independent callable evidence" in " ".join(lowering.rejections)
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    [
+        (
+            "                    self.active.pop(record.source.item_id)\n",
+            "                    self.active.pop(record.source.item_id)\n"
+            "                    self.active.clear()\n",
+        ),
+        (
+            "                    self.active.pop(record.source.item_id)\n",
+            "                    self.active.pop(record.source.item_id)\n"
+            "                    self.active[record.source.item_id] = record.source\n",
+        ),
+        (
+            "        del source, active\n        return ()\n",
+            "        del source, active\n        self.active.clear()\n        return ()\n",
+        ),
+    ],
+)
+def test_anyio_residual_completion_accounting_rejects_extra_active_mutation(
+    tmp_path: Path,
+    needle: str,
+    replacement: str,
+) -> None:
+    """The local completion counter requires one exclusive active-map pop."""
+    plan, assessment = _plan_and_assessment()
+    copied_root = tmp_path / "mutation-project"
+    shutil.copytree(FIXTURE_ROOT, copied_root)
+    source_path = copied_root / SOURCE_PATH
+    source = source_path.read_text(encoding="utf-8")
+    changed_source = source.replace(needle, replacement)
+    assert changed_source != source
+    source_path.write_text(changed_source, encoding="utf-8")
+    changed_plan = replace(
+        plan,
+        identity=replace(
+            plan.identity,
+            source_hashes=(
+                (SOURCE_PATH, hashlib.sha256(changed_source.encode("utf-8")).hexdigest()),
+            ),
+        ),
+    )
+    enabled = RESIDUAL_STEPS[:4]
+
+    lowering = lower_residual_state_machine_plan(
+        copied_root,
+        changed_plan,
+        replace(assessment, plan_id=changed_plan.id),
+        enabled,
+    )
+
+    assert lowering.status == "unsupported"
+    assert lowering.request is None
+    assert "active mapping" in " ".join(lowering.rejections)
 
 
 def test_anyio_lowering_rejects_stale_capacity_and_run_arity(tmp_path: Path) -> None:
@@ -296,6 +462,14 @@ def _plan_and_assessment() -> tuple[
             ("private-transport-batch-drain", "batch-drain-v1"),
             ("quiescent-callable-execution", "quiescent-callable-v1"),
             ("local-state-machine-fusion", "state-machine-v1"),
+            ("run-scoped-guard-amortization", "run-guard-v1"),
+            ("transparent-quiescent-await-chain-collapse", "await-collapse-v1"),
+            ("context-copy-elision", "context-elision-v1"),
+            (
+                "incremental-private-completion-accounting",
+                "completion-accounting-v1",
+            ),
+            ("private-result-record-elision", "result-record-elision-v1"),
         ),
     )
     plan_id = stable_source_optimization_plan_id(identity)

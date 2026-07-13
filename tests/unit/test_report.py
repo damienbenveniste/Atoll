@@ -64,6 +64,7 @@ from atoll.runtime.profiling import (
     ProfileResult,
     ProfileSpawnSiteTarget,
     SubprocessPassEvidence,
+    unconfigured_profile,
 )
 from atoll.source_optimization.models import (
     SourceAccessSite,
@@ -91,6 +92,7 @@ PROFILE_MEMBER_SCHEDULER_OVERHEAD_SAMPLES = 8
 PROFILE_MEMBER_SCHEDULER_OVERHEAD_COVERAGE = 0.04
 EXECUTION_PLAN_CANDIDATE_COUNT = 2
 SOURCE_OPTIMIZATION_CURRENT_MEDIAN_SECONDS = 0.92
+SOURCE_OPTIMIZATION_RESIDUAL_SAMPLES = 123
 
 
 @pytest.mark.parametrize(
@@ -1347,6 +1349,12 @@ def test_compilation_report_serializes_source_optimization_schema_v5(
         reason="source and wheel speedups exceeded the profitability gate",
         semantic_exit_code=0,
         semantic_duration_seconds=0.4,
+        residual_profile=replace(
+            unconfigured_profile(),
+            status="profiled",
+            reason="fresh accepted source profile",
+            total_samples=SOURCE_OPTIMIZATION_RESIDUAL_SAMPLES,
+        ),
     )
     report_only = build_compilation_report(
         CompilationReportInput(
@@ -1486,9 +1494,14 @@ def test_compilation_report_serializes_source_optimization_schema_v5(
     )
     assert report["source_optimization"]["trials"][0]["source_speedup"] == pytest.approx(1.43)
     assert report["source_optimization"]["trials"][0]["wheel_speedup"] == pytest.approx(1.54)
+    residual_profile = report["source_optimization"]["trials"][0]["residual_profile"]
+    assert residual_profile is not None
+    assert residual_profile["status"] == "profiled"
+    assert residual_profile["total_samples"] == SOURCE_OPTIMIZATION_RESIDUAL_SAMPLES
     assert "## Source Optimization" in markdown
     assert "Plan `source-opt-fixture`" in markdown
     assert "Trial `source-opt-fixture`: accepted" in markdown
+    assert "residual profile profiled with 123 samples" in markdown
 
 
 @pytest.mark.parametrize(

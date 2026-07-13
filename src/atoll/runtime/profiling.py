@@ -54,6 +54,7 @@ _subprocess_run: _RunSubprocess = subprocess.run
 
 class _BaselineProfileOptions(TypedDict):
     scratch_dir: Path
+    enable_atoll: NotRequired[bool]
     observation_targets: NotRequired[tuple[SymbolId, ...]]
     spawn_targets: NotRequired[tuple[ProfileSpawnSiteTarget, ...]]
     call_edge_targets: NotRequired[tuple[ProfileCallEdgeTarget, ...]]
@@ -78,6 +79,7 @@ class _BootstrapRequest:
     payload_root: Path
     module_paths: tuple[tuple[str, str], ...]
     scratch_dir: Path
+    enable_atoll: bool
     targets: tuple[str, ...]
     spawn_targets: tuple[ProfileSpawnSiteTarget, ...]
     call_edge_targets: tuple[ProfileCallEdgeTarget, ...] = ()
@@ -462,8 +464,10 @@ def run_baseline_profile(
         options: Required `scratch_dir` directory for temporary JSON files removed before
             return, plus optional `observation_targets` symbols to observe even when sampling
             does not identify them as hot members and `spawn_targets` scheduler calls whose exact
-            invocation counts and canonical callable identities must be retained. Optional
-            `call_edge_targets` count exact same-module direct calls without retaining values.
+            invocation counts and canonical callable identities must be retained. Set
+            `enable_atoll` to profile the payload with inherited Atoll routing enabled instead of
+            forcing `ATOLL_DISABLE=1`. Optional `call_edge_targets` count exact same-module direct
+            calls without retaining values.
 
     Returns:
         ProfileResult: Baseline profile evidence without candidate decisions.
@@ -480,6 +484,7 @@ def run_baseline_profile(
     resolved_project_root = project_root.resolve()
     resolved_payload_root = payload_root.resolve()
     resolved_scratch_dir = options["scratch_dir"].resolve()
+    enable_atoll = options.get("enable_atoll", False)
     resolved_scratch_dir.mkdir(parents=True, exist_ok=True)
     sampling_payload, sampling_run = _run_bootstrap_pass(
         _BootstrapRequest(
@@ -489,6 +494,7 @@ def run_baseline_profile(
             payload_root=resolved_payload_root,
             module_paths=module_paths,
             scratch_dir=resolved_scratch_dir,
+            enable_atoll=enable_atoll,
             targets=(),
             spawn_targets=(),
             call_edge_targets=(),
@@ -519,6 +525,7 @@ def run_baseline_profile(
             payload_root=resolved_payload_root,
             module_paths=module_paths,
             scratch_dir=resolved_scratch_dir,
+            enable_atoll=enable_atoll,
             targets=tuple(
                 dict.fromkeys((*hot_targets, *explicit_targets, *call_edge_owner_targets))
             ),
@@ -639,7 +646,10 @@ def _run_bootstrap_pass(request: _BootstrapRequest) -> tuple[JsonObject, Subproc
     try:
         config_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
         command = (sys.executable, str(_BOOTSTRAP_PATH), str(config_path))
-        env = _profile_environment(payload_root=request.payload_root)
+        env = _profile_environment(
+            payload_root=request.payload_root,
+            enable_atoll=request.enable_atoll,
+        )
         started = time.perf_counter()
         completed = _run_subprocess(
             _SubprocessInvocation(
@@ -689,6 +699,7 @@ def _bootstrap_config(request: _BootstrapRequest, *, result_path: Path) -> JsonO
         "payload_root": str(request.payload_root),
         "module_paths": [[module, suffix] for module, suffix in request.module_paths],
         "result_path": str(result_path),
+        "enable_atoll": request.enable_atoll,
         "targets": list(request.targets),
         "spawn_targets": [
             {
@@ -717,15 +728,20 @@ def _bootstrap_config(request: _BootstrapRequest, *, result_path: Path) -> JsonO
     }
 
 
-def _profile_environment(*, payload_root: Path) -> dict[str, str]:
+def _profile_environment(*, payload_root: Path, enable_atoll: bool) -> dict[str, str]:
     child_env = dict(os.environ)
     child_env["PYTHONDONTWRITEBYTECODE"] = "1"
     existing_pythonpath = tuple(
         path for path in child_env.get("PYTHONPATH", "").split(os.pathsep) if path
     )
     child_env["PYTHONPATH"] = os.pathsep.join((str(payload_root), *existing_pythonpath))
-    child_env["ATOLL_DISABLE"] = "1"
+    if enable_atoll:
+        child_env.pop("ATOLL_DISABLE", None)
+    else:
+        child_env["ATOLL_DISABLE"] = "1"
+    child_env.pop("ATOLL_STRICT", None)
     child_env.pop("ATOLL_REQUIRE_COMPILED", None)
+    child_env.pop("ATOLL_REQUIRE_OPTIMIZED", None)
     return child_env
 
 

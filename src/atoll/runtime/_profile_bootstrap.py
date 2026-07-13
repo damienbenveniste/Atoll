@@ -47,6 +47,7 @@ class _Config:
     payload_root: Path
     module_paths: tuple[tuple[str, str], ...]
     result_path: Path
+    enable_atoll: bool
     targets: frozenset[str]
     spawn_targets: tuple[_SpawnTarget, ...]
     call_edge_targets: tuple[_CallEdgeTarget, ...] = ()
@@ -111,7 +112,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         return 2
     config = _read_config(Path(args[0]))
     os.chdir(config.project_root)
-    _configure_import_path(config.payload_root)
+    _configure_import_path(config.payload_root, enable_atoll=config.enable_atoll)
     profiler: _SamplingProfiler | _TypeProfiler
     if config.profile_stage == "sampling":
         profiler = _SamplingProfiler(config)
@@ -660,14 +661,19 @@ def _empty_lifecycle_payload() -> JsonObject:
     return {"start": 0, "return": 0, "yield": 0, "resume": 0, "unwind": 0, "throw": 0}
 
 
-def _configure_import_path(payload_root: Path) -> None:
+def _configure_import_path(payload_root: Path, *, enable_atoll: bool) -> None:
     payload_text = str(payload_root)
     if sys.path[:1] != [payload_text]:
         sys.path.insert(0, payload_text)
     existing = tuple(path for path in os.environ.get("PYTHONPATH", "").split(os.pathsep) if path)
     os.environ["PYTHONPATH"] = os.pathsep.join((payload_text, *existing))
-    os.environ["ATOLL_DISABLE"] = "1"
+    if enable_atoll:
+        os.environ.pop("ATOLL_DISABLE", None)
+    else:
+        os.environ["ATOLL_DISABLE"] = "1"
+    os.environ.pop("ATOLL_STRICT", None)
     os.environ.pop("ATOLL_REQUIRE_COMPILED", None)
+    os.environ.pop("ATOLL_REQUIRE_OPTIMIZED", None)
 
 
 def _read_config(path: Path) -> _Config:
@@ -687,6 +693,7 @@ def _read_config(path: Path) -> _Config:
             if len(parts) == _MODULE_PATH_PARTS
         ),
         result_path=Path(_string_field(payload, "result_path")).resolve(),
+        enable_atoll=_bool_field(payload, "enable_atoll"),
         targets=frozenset(_string_items(payload.get("targets", []))),
         spawn_targets=tuple(
             _spawn_target(_object_value(item))
@@ -769,6 +776,11 @@ def _string_field(payload: JsonObject, key: str) -> str:
 def _int_field(payload: JsonObject, key: str) -> int:
     value = payload.get(key, 0)
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _bool_field(payload: JsonObject, key: str) -> bool:
+    value = payload.get(key, False)
+    return value if isinstance(value, bool) else False
 
 
 def _optional_int_field(payload: JsonObject, key: str) -> int | None:

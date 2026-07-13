@@ -194,6 +194,15 @@ profiling, and monitoring keep the original path. Optimized work is never retrie
 after entry. `ATOLL_DISABLE=1` forces the original path; `ATOLL_REQUIRE_OPTIMIZED=1` makes a failed
 guard visible to strict tests.
 
+After a transformed candidate passes semantics and the `1.05x` marginal search gate, Atoll profiles
+that staged payload again with optimized routing enabled before it can seed another search depth.
+Only a completed dynamic profile may advance the beam; unsupported launchers, insufficient samples,
+and failed passes remain rejection evidence. For structurally owned AnyIO-on-asyncio streams, later
+cumulative trials can amortize run guards, collapse quiescent await chains, elide context copies only
+with context-independent evidence, count private completions incrementally, and replace private
+result records with a fixed projection. The compile report records the fresh residual profile on each
+trial.
+
 The promotion floor is `max(3.0, minimum_speedup)`. Both the transformed source tree and a normal
 PEP 517 wheel built from that tree must meet the floor over seven alternating benchmark pairs. An
 accepted default compile leaves the checkout unchanged and writes the reproducible patch to

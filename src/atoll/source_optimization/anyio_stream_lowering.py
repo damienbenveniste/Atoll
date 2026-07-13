@@ -37,6 +37,7 @@ _PAIR_SIZE = 2
 _REDUCER_ARGUMENT_COUNT = 4
 _REDUCER_PROPERTY_READ_COUNT = 3
 _CONSUMER_REDUCER_ARGUMENT_COUNT = 3
+_RESULT_FIELD_COUNT = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,28 @@ class AnyioStreamLowering:
 
     request: SourceTransformationRequest
     helper_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AnyioResidualOptions:
+    """Residual optimizations composed into one AnyIO source request.
+
+    Attributes:
+        guard_amortization: Whether the plan records one guard decision per run.
+        await_chain_collapse: Whether a proven immediate await chain is collapsed.
+        context_copy_elision: Whether context-independent work skips per-item copies.
+        incremental_completion_accounting: Whether the sole consumer tracks remaining work.
+        result_record_elision: Whether private project records use a fixed tuple projection.
+    """
+
+    guard_amortization: bool = True
+    await_chain_collapse: bool = True
+    context_copy_elision: bool = False
+    incremental_completion_accounting: bool = False
+    result_record_elision: bool = False
+
+
+_DEFAULT_RESIDUAL_OPTIONS = AnyioResidualOptions()
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,12 +101,14 @@ class _AnyioShape:
     result_constructor: str
     result_empty_expression: str
     result_error_keyword: str
+    result_fields: tuple[str, str, str] | None
     async_result_type: str | None
     sender_expression: str
     receiver_expression: str
     transport_capacity: int
     reducer: _ReducerShape | None
     protocol: _ProtocolShape | None
+    completion: _CompletionShape | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +131,11 @@ class _ProtocolShape:
 
 
 @dataclass(frozen=True, slots=True)
+class _CompletionShape:
+    active_attribute: str
+
+
+@dataclass(frozen=True, slots=True)
 class _Names:
     suffix: str
     collections: str
@@ -122,6 +152,8 @@ class _Names:
     anyio_receive_stream: str
     deque_attribute: str
     eligibility_cache_attribute: str
+    remaining: str
+    fast_record: str
     route_hits: str
     guard: str
     no_monitoring: str
@@ -172,12 +204,14 @@ class _Names:
 def lower_anyio_stream_plan(
     project_root: Path,
     plan: SourceOptimizationPlan,
+    residual: AnyioResidualOptions | None = None,
 ) -> AnyioStreamLowering:
     """Lower a structurally proven AnyIO stream pipeline into a patch request.
 
     Args:
         project_root: Target project root containing ``plan.source``.
         plan: Trial-ready AnyIO-on-asyncio source plan.
+        residual: Residual transformations composed after base state-machine lowering.
 
     Returns:
         AnyioStreamLowering: Deterministic transformation request and route helpers.
@@ -194,11 +228,12 @@ def lower_anyio_stream_plan(
     if _sha256(source) != expected_hash:
         raise ValueError(f"stale source for {plan.source.as_posix()}")
     tree = ast.parse(source, filename=str(source_path))
-    shape = _analyze_shape(project_root, tree, plan)
+    selected = residual or AnyioResidualOptions()
+    shape = _analyze_shape(project_root, tree, plan, residual=selected)
     module = cst.parse_module(source)
     names = _names(plan.id)
     owner_body = _owner_body(module, plan.owner.qualname, shape, names)
-    consumer_body = _consumer_body(module, plan.consumer, shape, names)
+    consumer_body = _consumer_body(module, plan.consumer, shape, names, residual=selected)
     initializer_body = _initializer_body(module, shape, names)
     request = SourceTransformationRequest(
         path=plan.source,
@@ -206,7 +241,7 @@ def lower_anyio_stream_plan(
         target=plan.owner,
         declaration_kind="method",
         replacement_body=owner_body,
-        helper_statements=_helper_statements(shape, names),
+        helper_statements=_helper_statements(shape, names, residual=selected),
         trailing_statements=_identity_captures(shape, names),
         additional_replacements=(
             CallableBodyReplacement(
@@ -234,8 +269,8 @@ def lower_anyio_stream_plan(
                 else ()
             ),
         ),
-        summary="add a guarded copied-context fast path for a private AnyIO result stream",
-        transformation_id=f"anyio-stream-state-machine-v1:{plan.id}",
+        summary="add a guarded residual fast path for a private AnyIO result stream",
+        transformation_id=_transformation_id(plan.id, selected),
     )
     return AnyioStreamLowering(request=request, helper_names=names.public)
 
@@ -271,6 +306,8 @@ def _analyze_shape(
     project_root: Path,
     tree: ast.Module,
     plan: SourceOptimizationPlan,
+    *,
+    residual: AnyioResidualOptions = _DEFAULT_RESIDUAL_OPTIONS,
 ) -> _AnyioShape:
     if plan.consumer is None:
         raise ValueError("AnyIO stream lowering requires a distinct consumer")
@@ -347,6 +384,16 @@ def _analyze_shape(
         async_result_type=async_result_type,
     )
     _validate_consumer(consumer, receiver)
+    result_fields = (
+        _result_record_fields(tree, consumer, result_constructor, error_keyword, receiver)
+        if residual.result_record_elision
+        else None
+    )
+    completion = (
+        _completion_shape(class_node, consumer, owner.name, request_name, receiver)
+        if residual.incremental_completion_accounting
+        else None
+    )
     reducer = _reducer_shape(project_root, tree, plan, consumer)
     protocol = _protocol_shape(tree, class_name, consumer.name)
     return _AnyioShape(
@@ -372,12 +419,14 @@ def _analyze_shape(
         result_constructor=result_constructor,
         result_empty_expression=empty_expression,
         result_error_keyword=error_keyword,
+        result_fields=result_fields,
         async_result_type=async_result_type,
         sender_expression=sender,
         receiver_expression=receiver,
         transport_capacity=transport_capacity,
         reducer=reducer,
         protocol=protocol,
+        completion=completion,
     )
 
 
@@ -1025,6 +1074,224 @@ def _validate_consumer(consumer: ast.AsyncFunctionDef, receiver_expression: str)
         raise TypeError("consumer result loop must bind one named record")
 
 
+def _result_record_fields(
+    tree: ast.Module,
+    consumer: ast.AsyncFunctionDef,
+    constructor: str,
+    error_field: str,
+    receiver_expression: str,
+) -> tuple[str, str, str]:
+    """Prove that a private result wrapper is observed only through fixed fields.
+
+    Args:
+        tree: Module containing the result declaration and consumer.
+        consumer: Sole private transport consumer.
+        constructor: Stable result constructor used by the producer.
+        error_field: Keyword used for producer error records.
+        receiver_expression: Private receiver iterated by the consumer.
+
+    Returns:
+        tuple[str, str, str]: Source, value, and error field names in projection order.
+
+    Raises:
+        ValueError: If the result declaration or consumer observations are not fixed and private.
+    """
+    if not re.fullmatch(r"[A-Za-z_]\w*", constructor):
+        raise ValueError("result-record elision requires a same-module nominal record")
+    declarations = tuple(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == constructor
+    )
+    if len(declarations) != 1:
+        raise ValueError("result-record elision requires one same-module record declaration")
+    fields = tuple(
+        statement.target.id
+        for statement in declarations[0].body
+        if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name)
+    )
+    if (
+        len(fields) < _RESULT_FIELD_COUNT
+        or error_field not in fields
+        or error_field in fields[:_PAIR_SIZE]
+    ):
+        raise ValueError("result record must expose positional source/value and one error field")
+    projected = (fields[0], fields[1], error_field)
+    loops = tuple(
+        node
+        for node in ast.walk(consumer)
+        if isinstance(node, ast.AsyncFor) and _expression_path(node.iter) == receiver_expression
+    )
+    if len(loops) != 1 or not isinstance(loops[0].target, ast.Name):
+        raise ValueError("result-record elision requires one named private receive target")
+    record_name = loops[0].target.id
+    parents = {
+        child: parent for parent in ast.walk(consumer) for child in ast.iter_child_nodes(parent)
+    }
+    for node in ast.walk(loops[0]):
+        if not (
+            isinstance(node, ast.Name) and node.id == record_name and isinstance(node.ctx, ast.Load)
+        ):
+            continue
+        parent = parents.get(node)
+        if not (
+            isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in projected
+        ):
+            raise ValueError("consumer observes private result identity outside fixed fields")
+    return projected
+
+
+def _completion_shape(
+    class_node: ast.ClassDef,
+    consumer: ast.AsyncFunctionDef,
+    owner_method: str,
+    request_name: str,
+    receiver_expression: str,
+) -> _CompletionShape:
+    """Prove one sole-consumer completion counter can replace repeated truth scans.
+
+    Args:
+        class_node: Exact owner class used to prove active-map ownership.
+        consumer: Private consumer whose active mapping owns completion state.
+        owner_method: Same-class submission method called before receiving.
+        request_name: Request parameter shared by submission and consumption.
+        receiver_expression: Private receiver iterated inside the completion loop.
+
+    Returns:
+        _CompletionShape: Active mapping attribute updated exactly once per result.
+
+    Raises:
+        ValueError: If ownership, update count, or termination tests are ambiguous.
+    """
+    if len(consumer.args.args) != _PAIR_SIZE or consumer.args.args[1].arg != request_name:
+        raise ValueError("incremental accounting requires one shared request parameter")
+    submit_path = f"self.{owner_method}"
+    submissions = tuple(
+        node
+        for node in consumer.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and _expression_path(node.value.func) == submit_path
+        and len(node.value.args) == 1
+        and isinstance(node.value.args[0], ast.Name)
+        and node.value.args[0].id == request_name
+        and not node.value.keywords
+    )
+    if len(submissions) != 1:
+        raise ValueError("incremental accounting requires one owned submission call")
+    loops = tuple(
+        node
+        for node in ast.walk(consumer)
+        if isinstance(node, ast.While)
+        and isinstance(node.test, ast.Attribute)
+        and _expression_path(node.test) is not None
+        and any(
+            isinstance(child, ast.AsyncFor) and _expression_path(child.iter) == receiver_expression
+            for child in ast.walk(node)
+        )
+    )
+    if len(loops) != 1:
+        raise ValueError("incremental accounting requires one active completion loop")
+    active_path = cast(str, _expression_path(loops[0].test))
+    if not re.fullmatch(r"self\.[A-Za-z_]\w*", active_path):
+        raise ValueError("incremental accounting requires one private active mapping")
+    _validate_active_mapping_ownership(
+        class_node,
+        consumer,
+        active_path,
+        owner_method=owner_method,
+    )
+    pops = tuple(
+        node
+        for node in ast.walk(loops[0])
+        if isinstance(node, ast.Call) and _expression_path(node.func) == f"{active_path}.pop"
+    )
+    termination = tuple(
+        node
+        for node in ast.walk(loops[0])
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and _expression_path(node.test.operand) == active_path
+        and any(isinstance(child, ast.Break) for child in ast.walk(node))
+    )
+    if len(pops) != 1 or len(termination) != 1:
+        raise ValueError("incremental accounting requires one pop and one terminal check")
+    return _CompletionShape(active_attribute=active_path.rsplit(".", maxsplit=1)[-1])
+
+
+def _validate_active_mapping_ownership(
+    class_node: ast.ClassDef,
+    consumer: ast.AsyncFunctionDef,
+    active_path: str,
+    *,
+    owner_method: str,
+) -> None:
+    """Reject active-map mutation or escape outside the proven submit/pop pair.
+
+    Args:
+        class_node: Exact class containing the source pipeline.
+        consumer: Consumer method whose counter is being derived.
+        active_path: Canonical ``self.<attribute>`` mapping path.
+        owner_method: Submission method allowed to populate the mapping before counting.
+
+    Raises:
+        ValueError: If the map can be mutated, exposed, or observed through an unproven shape.
+    """
+    _validate_consumer_active_uses(consumer, active_path)
+    for statement in class_node.body:
+        if not isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if statement is consumer or statement.name in {owner_method, "__post_init__"}:
+            continue
+        if any(
+            isinstance(node, ast.expr) and _expression_path(node) == active_path
+            for node in ast.walk(statement)
+        ):
+            raise ValueError(
+                "incremental accounting active mapping is accessed outside its owner pair"
+            )
+
+
+def _validate_consumer_active_uses(consumer: ast.AsyncFunctionDef, active_path: str) -> None:
+    parents = {
+        child: parent for parent in ast.walk(consumer) for child in ast.iter_child_nodes(parent)
+    }
+    for node in ast.walk(consumer):
+        if not isinstance(node, ast.Attribute) or _expression_path(node) != active_path:
+            continue
+        rejection = _active_mapping_use_rejection(node, parents.get(node), parents)
+        if rejection is not None:
+            raise ValueError(f"incremental accounting active mapping {rejection}")
+
+
+def _active_mapping_use_rejection(
+    node: ast.Attribute,
+    parent: ast.AST | None,
+    parents: dict[ast.AST, ast.AST],
+) -> str | None:
+    rejection: str | None = "has unsupported observation"
+    if isinstance(node.ctx, ast.Store | ast.Del):
+        rejection = "has unsupported mutation"
+    elif isinstance(parent, ast.Subscript):
+        rejection = (
+            "has unsupported mutation"
+            if isinstance(parent.ctx, ast.Store | ast.Del)
+            else "subscript escapes ownership"
+        )
+    elif isinstance(parent, ast.Attribute) and parent.value is node:
+        call = parents.get(parent)
+        if not isinstance(call, ast.Call) or call.func is not parent:
+            rejection = "attribute escapes ownership"
+        else:
+            rejection = None if parent.attr in {"pop", "values"} else "has unsupported mutation"
+    elif isinstance(parent, ast.Call):
+        rejection = "escapes through a call"
+    elif (isinstance(parent, ast.While) and parent.test is node) or (
+        isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not)
+    ):
+        rejection = None
+    return rejection
+
+
 def _reducer_shape(
     project_root: Path,
     owner_tree: ast.Module,
@@ -1431,11 +1698,23 @@ def _cst_spawn_loop(node: cst.For, shape: _AnyioShape) -> bool:
     return any(_cst_path(call.func) == scheduler for call in calls)
 
 
+def _is_exact_call_statement(statement: cst.BaseStatement, path: str) -> bool:
+    return (
+        isinstance(statement, cst.SimpleStatementLine)
+        and len(statement.body) == 1
+        and isinstance(statement.body[0], cst.Expr)
+        and isinstance(statement.body[0].value, cst.Call)
+        and _cst_path(statement.body[0].value.func) == path
+    )
+
+
 def _consumer_body(
     module: cst.Module,
     symbol: SymbolId | None,
     shape: _AnyioShape,
     names: _Names,
+    *,
+    residual: AnyioResidualOptions,
 ) -> str:
     if symbol is None:
         raise ValueError("AnyIO stream consumer is unavailable")
@@ -1454,7 +1733,137 @@ def _consumer_body(
         raise ValueError("LibCST could not resolve exactly one planned reducer call")
     if shape.protocol is not None and transformer.protocol_yield_replacements < 1:
         raise ValueError("LibCST could not resolve private protocol yield assignments")
+    if residual.incremental_completion_accounting:
+        if shape.completion is None:
+            raise ValueError("incremental completion proof is unavailable")
+        accounting = _CompletionAccountingTransformer(
+            owner_method=shape.owner.name,
+            active_attribute=shape.completion.active_attribute,
+            remaining_name=names.remaining,
+        )
+        updated = cast(cst.IndentedBlock, updated.visit(accounting))
+        accounting.validate()
     return _body_source(module, updated)
+
+
+class _CompletionAccountingTransformer(cst.CSTTransformer):
+    """Replace repeated private active-map truth checks with one local counter."""
+
+    def __init__(self, *, owner_method: str, active_attribute: str, remaining_name: str) -> None:
+        self._owner_method = owner_method
+        self._active_path = f"self.{active_attribute}"
+        self._remaining_name = remaining_name
+        self.submission_replacements = 0
+        self.loop_replacements = 0
+        self.pop_replacements = 0
+        self.terminal_replacements = 0
+
+    def validate(self) -> None:
+        """Require every statically proven accounting site to be rewritten once.
+
+        Raises:
+            ValueError: If LibCST matching diverged from the validated AST shape.
+        """
+        counts = (
+            self.submission_replacements,
+            self.loop_replacements,
+            self.pop_replacements,
+            self.terminal_replacements,
+        )
+        if counts != (1, 1, 1, 1):
+            raise ValueError(f"incremental accounting rewrite counts were {counts!r}")
+
+    @override
+    def leave_IndentedBlock(
+        self,
+        original_node: cst.IndentedBlock,
+        updated_node: cst.IndentedBlock,
+    ) -> cst.IndentedBlock:
+        """Initialize remaining work immediately after the owned submission call.
+
+        Args:
+            original_node: Original block used for exact submission matching.
+            updated_node: Block after nested transformations.
+
+        Returns:
+            cst.IndentedBlock: Block with one local counter initialization.
+        """
+        del original_node
+        statements: list[cst.BaseStatement] = []
+        for updated in updated_node.body:
+            statements.append(updated)
+            if not _is_exact_call_statement(updated, f"self.{self._owner_method}"):
+                continue
+            initialization = cst.parse_statement(
+                f"{self._remaining_name} = len({self._active_path})\n"
+            )
+            statements.append(initialization)
+            self.submission_replacements += 1
+        return updated_node.with_changes(body=tuple(statements))
+
+    @override
+    def leave_While(self, original_node: cst.While, updated_node: cst.While) -> cst.While:
+        """Route the exact active-map loop condition through the local counter.
+
+        Args:
+            original_node: Original while loop.
+            updated_node: Loop after nested transformations.
+
+        Returns:
+            cst.While: Original loop or counter-based equivalent.
+        """
+        if _cst_path(original_node.test) != self._active_path:
+            return updated_node
+        self.loop_replacements += 1
+        return updated_node.with_changes(test=cst.Name(self._remaining_name))
+
+    @override
+    def leave_If(self, original_node: cst.If, updated_node: cst.If) -> cst.If:
+        """Replace the sole `not active` break guard with `not remaining`.
+
+        Args:
+            original_node: Original conditional.
+            updated_node: Conditional after nested transformations.
+
+        Returns:
+            cst.If: Original conditional or counter-based equivalent.
+        """
+        test = original_node.test
+        if not (
+            isinstance(test, cst.UnaryOperation)
+            and isinstance(test.operator, cst.Not)
+            and _cst_path(test.expression) == self._active_path
+        ):
+            return updated_node
+        self.terminal_replacements += 1
+        return updated_node.with_changes(
+            test=cst.UnaryOperation(operator=cst.Not(), expression=cst.Name(self._remaining_name))
+        )
+
+    @override
+    def leave_SimpleStatementLine(
+        self,
+        original_node: cst.SimpleStatementLine,
+        updated_node: cst.SimpleStatementLine,
+    ) -> cst.BaseStatement | cst.FlattenSentinel[cst.BaseStatement]:
+        """Decrement the counter after the exact successful private-map pop.
+
+        Args:
+            original_node: Original statement used to match the pop call.
+            updated_node: Statement after nested transformations.
+
+        Returns:
+            cst.BaseStatement | cst.FlattenSentinel[cst.BaseStatement]: Original
+            statement or statement followed by one counter decrement.
+        """
+        if not any(
+            isinstance(node, cst.Call) and _cst_path(node.func) == f"{self._active_path}.pop"
+            for node in _cst_nodes(original_node)
+        ):
+            return updated_node
+        self.pop_replacements += 1
+        decrement = cst.parse_statement(f"{self._remaining_name} -= 1\n")
+        return cst.FlattenSentinel((updated_node, decrement))
 
 
 class _ConsumerBodyTransformer(cst.CSTTransformer):
@@ -1860,7 +2269,12 @@ def _after_docstring(statements: Sequence[cst.BaseStatement]) -> int:
     return 0
 
 
-def _helper_statements(shape: _AnyioShape, names: _Names) -> tuple[str, ...]:
+def _helper_statements(
+    shape: _AnyioShape,
+    names: _Names,
+    *,
+    residual: AnyioResidualOptions,
+) -> tuple[str, ...]:
     async_result_guard = (
         f"        if isinstance(completed_value, {shape.async_result_type}):\n"
         "            raise RuntimeError(\n"
@@ -1873,6 +2287,31 @@ def _helper_statements(shape: _AnyioShape, names: _Names) -> tuple[str, ...]:
     protocol_support = _protocol_support(shape.protocol, names)
     synchronous_run = _synchronous_run_source(shape, names)
     excluded_node_guard = _excluded_node_guard(shape.excluded_node_types)
+    if residual.context_copy_elision:
+        context_execution = (
+            f"        completed_value = {names.synchronous_run}(self, {shape.run_task_name})"
+        )
+    else:
+        context_execution = (
+            f"        child_context = {names.contextvars}.copy_context()\n"
+            "        completed_value = child_context.run(\n"
+            f"            {names.synchronous_run}, self, {shape.run_task_name}\n"
+            "        )"
+        )
+    record_constructor = shape.result_constructor
+    record_declaration = ""
+    success_error_argument = ""
+    if residual.result_record_elision:
+        if shape.result_fields is None:
+            raise ValueError("result-record elision proof is unavailable")
+        field_source = ", ".join(repr(field) for field in shape.result_fields)
+        record_declaration = (
+            f"{names.fast_record} = {names.collections}.namedtuple(\n"
+            f"    {names.fast_record!r}, ({field_source},)\n"
+            ")"
+        )
+        record_constructor = names.fast_record
+        success_error_argument = ", None"
     support = f'''
 import asyncio as {names.asyncio}
 import collections as {names.collections}
@@ -1891,6 +2330,7 @@ from anyio.streams.memory import (
 )
 
 {names.route_hits} = 0
+{record_declaration}
 {reducer_support}
 {protocol_support}
 
@@ -2107,16 +2547,13 @@ def {names.guard}(self, request):
 
 def {names.drive}(self, {shape.run_task_name}):
     global {names.route_hits}
-    child_context = {names.contextvars}.copy_context()
     try:
-        completed_value = child_context.run(
-            {names.synchronous_run}, self, {shape.run_task_name}
-        )
-{async_result_guard}        record = {shape.result_constructor}(
-            {shape.run_task_name}, completed_value
+{context_execution}
+{async_result_guard}        record = {record_constructor}(
+            {shape.run_task_name}, completed_value{success_error_argument}
         )
     except BaseException as exc:
-        record = {shape.result_constructor}(
+        record = {record_constructor}(
             {shape.run_task_name}, {shape.result_empty_expression}, {shape.result_error_keyword}=exc
         )
     self.{names.deque_attribute}.append(record)
@@ -2412,6 +2849,8 @@ def _names(plan_id: str) -> _Names:
         anyio_receive_stream=f"{prefix}_anyio_receive_stream",
         deque_attribute=f"{prefix}_ready_results",
         eligibility_cache_attribute=f"{prefix}_eligibility_cache",
+        remaining=f"{prefix}_remaining",
+        fast_record=f"{prefix}_fast_record",
         route_hits=f"{prefix}_route_hits",
         guard=f"{prefix}_guard",
         no_monitoring=f"{prefix}_no_monitoring",
@@ -2449,6 +2888,21 @@ def _names(plan_id: str) -> _Names:
         expected_runner_next_code=f"{prefix}_expected_runner_next_code",
         expected_terminal_type=f"{prefix}_expected_terminal_type",
     )
+
+
+def _transformation_id(plan_id: str, residual: AnyioResidualOptions) -> str:
+    enabled = tuple(
+        name
+        for name, active in (
+            ("guard", residual.guard_amortization),
+            ("await", residual.await_chain_collapse),
+            ("context", residual.context_copy_elision),
+            ("accounting", residual.incremental_completion_accounting),
+            ("record", residual.result_record_elision),
+        )
+        if active
+    )
+    return f"anyio-stream-state-machine-v2:{plan_id}:{'+'.join(enabled)}"
 
 
 def _expression_path(node: ast.expr) -> str | None:

@@ -72,6 +72,7 @@ from atoll.runtime.profiling import (
     unconfigured_profile,
 )
 from atoll.source_optimization.analysis import SourceOptimizationPlanningResult
+from atoll.source_optimization.models import SourceOptimizationTrial
 from atoll.source_optimization.search import (
     SourceOptimizationSearchOptions,
     SourceOptimizationSearchResult,
@@ -452,6 +453,14 @@ _execute_composed_source_arm = cast(
 _materialize_source_optimization_arm = cast(
     Callable[..., object],
     _package_attr("_materialize_source_optimization_arm"),
+)
+_profile_source_candidate = cast(
+    Callable[[package_command.PackageOptions, Path, Path, Path, str], ProfileResult],
+    _package_attr("_profile_source_candidate"),
+)
+_accepted_source_profile = cast(
+    Callable[[SourceOptimizationSearchResult], ProfileResult | None],
+    _package_attr("_accepted_source_profile"),
 )
 _source_result_with_composition_fallback = cast(
     Callable[
@@ -3671,6 +3680,127 @@ def test_package_routes_accepted_source_wheel_into_composition(
     assert result.compiled_bindings == ()
     assert result.performance is not None
     assert result.performance.status == "passed"
+
+
+def test_transformed_source_candidate_is_profiled_with_optimized_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidate selection receives a fresh profile from the staged optimized payload."""
+    project_root, output_dir, _preparation = _prepared_source_search_project(tmp_path)
+    quality_root = tmp_path / "candidate-quality"
+    payload_root = tmp_path / "candidate-payload"
+    quality_root.mkdir()
+    payload_root.mkdir()
+    candidate_id = "source-candidate-profiled"
+    observed_options: dict[str, object] = {}
+    progress: list[str] = []
+    expected = replace(
+        unconfigured_profile(),
+        status="profiled",
+        reason="fresh optimized profile",
+        total_samples=100,
+    )
+
+    def selected_scans(*_args: object, **_kwargs: object) -> tuple[ModuleScan, ...]:
+        return ()
+
+    def call_chains(*_args: object) -> tuple[CallChainAnalysisResult, ...]:
+        return ()
+
+    def select_profile(
+        profile: ProfileResult,
+        _scans: tuple[ModuleScan, ...],
+        _chains: tuple[CallChainAnalysisResult, ...],
+    ) -> ProfileResult:
+        return profile
+
+    monkeypatch.setattr(package_command, "_selected_scans", selected_scans)
+    monkeypatch.setattr(package_command, "_call_chain_analyses", call_chains)
+    monkeypatch.setattr(package_command, "_select_profile_with_call_chains", select_profile)
+
+    def profile(
+        _command: tuple[str, ...],
+        **kwargs: object,
+    ) -> ProfileResult:
+        observed_options.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(package_command, "run_baseline_profile", profile)
+
+    result = _profile_source_candidate(
+        package_command.PackageOptions(
+            root=project_root,
+            output_dir=output_dir,
+            progress=progress.append,
+        ),
+        project_root,
+        quality_root,
+        payload_root,
+        candidate_id,
+    )
+
+    assert result is expected
+    assert observed_options["project_root"] == quality_root
+    assert observed_options["payload_root"] == payload_root
+    assert observed_options["enable_atoll"] is True
+    assert observed_options["scratch_dir"] == project_root.parent / f"profile-{candidate_id}"
+    assert progress
+
+
+def test_transformed_source_candidate_requires_retained_benchmark(tmp_path: Path) -> None:
+    """A transformed project that loses benchmark configuration cannot seed selection."""
+    project_root = tmp_path / "project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+
+    with pytest.raises(ValueError, match="lost its benchmark command"):
+        _profile_source_candidate(
+            package_command.PackageOptions(root=project_root),
+            project_root,
+            tmp_path / "quality",
+            tmp_path / "payload",
+            "missing-benchmark",
+        )
+
+
+def test_composed_arm_prefers_profile_from_accepted_source_trial(tmp_path: Path) -> None:
+    """Only an accepted trial supplies residual evidence to later native selection."""
+    stale = replace(unconfigured_profile(), reason="baseline profile")
+    fresh = replace(
+        unconfigured_profile(),
+        status="profiled",
+        reason="fresh source profile",
+        total_samples=100,
+    )
+    rejected = SourceOptimizationTrial(
+        plan_id="rejected",
+        status="not-profitable",
+        semantic_command=(),
+        benchmark_command=(),
+        baseline_median_seconds=None,
+        source_median_seconds=None,
+        wheel_median_seconds=None,
+        source_speedup=None,
+        wheel_speedup=None,
+        patch_path=None,
+        source_edits=(),
+        application_status="not-applied",
+        residual_profile=stale,
+    )
+    accepted = replace(rejected, plan_id="accepted", status="accepted", residual_profile=fresh)
+    search = SourceOptimizationSearchResult(
+        attempted=True,
+        accepted=True,
+        wheel_path=tmp_path / "source.whl",
+        patch_path=tmp_path / "source.patch",
+        trials=(rejected, accepted),
+        test_results=(),
+        performance=None,
+        build=_successful_attempt(),
+    )
+
+    assert _accepted_source_profile(search) is fresh
+    assert _accepted_source_profile(replace(search, trials=(rejected,))) is None
 
 
 def test_composition_fallback_preserves_source_success_and_rejection_evidence(

@@ -1356,9 +1356,58 @@ def _run_source_optimization_trials(
             compile_config=config,
             baseline_build=baseline.build,
             apply_source=options.apply_source,
+            candidate_profiler=partial(_profile_source_candidate, options),
             progress=options.progress,
         ),
     )
+
+
+def _profile_source_candidate(
+    options: PackageOptions,
+    source_project_root: Path,
+    quality_project_root: Path,
+    payload_root: Path,
+    candidate_id: str,
+) -> ProfileResult:
+    """Collect a fresh optimized profile before later candidate selection.
+
+    Args:
+        options: Original source-clean command scope and progress callback.
+        source_project_root: Disposable transformed project containing candidate sources.
+        quality_project_root: Source-stripped project copy containing benchmark files.
+        payload_root: Candidate import payload placed first on ``PYTHONPATH``.
+        candidate_id: Stable source candidate identity used for scratch isolation.
+
+    Returns:
+        ProfileResult: Fresh candidate profile with ordinary and call-chain selections.
+
+    Raises:
+        ValueError: If the transformed project no longer has a benchmark command.
+    """
+    active_project = discover_project(source_project_root)
+    benchmark = active_project.config.compile.benchmark_command
+    if benchmark is None:
+        raise ValueError("transformed source candidate lost its benchmark command")
+    scans = _selected_scans(
+        active_project,
+        options.module_name,
+        options.selected_members,
+    )
+    call_chains = _call_chain_analyses(scans, None)
+    profile = run_baseline_profile(
+        benchmark,
+        project_root=quality_project_root,
+        payload_root=payload_root,
+        module_paths=_profile_module_paths(active_project),
+        scratch_dir=source_project_root.parent / f"profile-{candidate_id}",
+        observation_targets=_profile_observation_symbols(scans),
+        spawn_targets=execution_plan_profile_targets(scans),
+        call_edge_targets=_call_chain_profile_targets(call_chains),
+        enable_atoll=True,
+    )
+    selected = _select_profile_with_call_chains(profile, scans, call_chains)
+    _profile_progress(options.progress, selected)
+    return selected
 
 
 def _source_optimization_terminal_result(
@@ -1507,7 +1556,7 @@ def _execute_composed_source_arm(
     scalar_analyses = _scalar_analyses(active_scans, options.progress)
     call_chain_analyses = _call_chain_analyses(active_scans, options.progress)
     buffer_analyses = _buffer_analyses(active_scans, options.progress)
-    active_profile = preparation.profile
+    active_profile = _accepted_source_profile(search) or preparation.profile
     if active_profile is not None:
         active_profile = _select_profile_with_call_chains(
             active_profile,
@@ -1698,6 +1747,25 @@ def _materialize_source_optimization_arm(
         active_project=active_project,
         baseline=baseline,
         source_search=search,
+    )
+
+
+def _accepted_source_profile(search: SourceOptimizationSearchResult) -> ProfileResult | None:
+    """Return the fresh transformed profile retained by the accepted source trial.
+
+    Args:
+        search: Completed source search whose winner may carry residual evidence.
+
+    Returns:
+        ProfileResult | None: Most recent accepted transformed profile, when available.
+    """
+    return next(
+        (
+            trial.residual_profile
+            for trial in reversed(search.trials)
+            if trial.status == "accepted" and trial.residual_profile is not None
+        ),
+        None,
     )
 
 

@@ -19,16 +19,20 @@ from typing import Literal, cast, override
 import libcst as cst
 
 from atoll.models import SymbolId
-from atoll.source_optimization.anyio_stream_lowering import lower_anyio_stream_plan
+from atoll.source_optimization.anyio_stream_lowering import (
+    AnyioResidualOptions,
+    lower_anyio_stream_plan,
+)
 from atoll.source_optimization.models import (
     SourceCallableEvidence,
     SourceOptimizationAssessment,
     SourceOptimizationPlan,
+    SourceTransformationKind,
 )
 from atoll.source_optimization.transforms import SourceTransformationRequest
 
 SourceLoweringStatus = Literal["lowered", "unsupported"]
-SourceLoweringMode = Literal["batch-quiescent", "state-machine"]
+SourceLoweringMode = Literal["batch-quiescent", "state-machine", "residual-state-machine"]
 _PIPELINE_STATEMENT_COUNT = 2
 _WORKER_ARGUMENT_COUNT = 2
 _STATE_OWNER_QUEUE_REFERENCE_COUNT = 3
@@ -84,6 +88,19 @@ class _QueueValidation:
 class _GuardInputs:
     global_names: tuple[str, ...]
     callable_globals: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _BuildRequestOptions:
+    """Cumulative lowering mode passed through request construction.
+
+    Attributes:
+        mode: Base or residual state-machine lowering shape.
+        residual_steps: Ordered residual prefix authorized by static proof.
+    """
+
+    mode: SourceLoweringMode
+    residual_steps: tuple[SourceTransformationKind, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,12 +192,39 @@ def lower_state_machine_plan(
     )
 
 
+def lower_residual_state_machine_plan(
+    project_root: Path,
+    plan: SourceOptimizationPlan,
+    assessment: SourceOptimizationAssessment,
+    enabled_steps: tuple[SourceTransformationKind, ...],
+) -> SourceLoweringResult:
+    """Compose a cumulative residual prefix into one guarded source request.
+
+    Args:
+        project_root: Target project root containing the plan source path.
+        plan: Static source plan whose base state-machine lowering is available.
+        assessment: Current invocation safety and profile evidence.
+        enabled_steps: Ordered residual transformation prefix to compose.
+
+    Returns:
+        SourceLoweringResult: Residual request or deterministic proof rejection.
+    """
+    return _lower_source_plan(
+        project_root,
+        plan,
+        assessment,
+        mode="residual-state-machine",
+        residual_steps=enabled_steps,
+    )
+
+
 def _lower_source_plan(
     project_root: Path,
     plan: SourceOptimizationPlan,
     assessment: SourceOptimizationAssessment,
     *,
     mode: SourceLoweringMode,
+    residual_steps: tuple[SourceTransformationKind, ...] = (),
 ) -> SourceLoweringResult:
     if plan.identity.dialect == "anyio-on-asyncio":
         return _lower_anyio_source_plan(
@@ -188,8 +232,14 @@ def _lower_source_plan(
             plan,
             assessment,
             mode=mode,
+            residual_steps=residual_steps,
         )
-    preflight = _preflight_rejections(plan, assessment, mode=mode)
+    preflight = _preflight_rejections(
+        plan,
+        assessment,
+        mode=mode,
+        residual_steps=residual_steps,
+    )
     if preflight:
         return _unsupported(plan, preflight, mode=mode)
     try:
@@ -197,12 +247,18 @@ def _lower_source_plan(
         source = source_path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(source_path))
         shape = _analyze_pipeline(tree, plan)
-        if mode == "state-machine":
+        if _state_machine_mode(mode):
             _validate_state_owner(shape.owner, queue_name=shape.queue_name)
             _validate_state_worker(shape.worker, queue_name=shape.queue_name)
         module = cst.parse_module(source)
         names = _helper_names(plan.id)
-        request = _build_request(plan, assessment, module, shape, mode=mode)
+        request = _build_request(
+            plan,
+            assessment,
+            module,
+            shape,
+            _BuildRequestOptions(mode=mode, residual_steps=residual_steps),
+        )
     except (OSError, SyntaxError, TypeError, ValueError, cst.ParserSyntaxError) as error:
         return _unsupported(plan, (str(error),), mode=mode)
     return SourceLoweringResult(
@@ -212,7 +268,7 @@ def _lower_source_plan(
         helper_names=(
             (
                 *names.public_tuple,
-                *((names.step,) if mode == "state-machine" else ()),
+                *((names.step,) if _state_machine_mode(mode) else ()),
                 *((names.protocol,) if _has_protocol_step(plan) else ()),
             )
         ),
@@ -226,6 +282,7 @@ def _lower_anyio_source_plan(
     assessment: SourceOptimizationAssessment,
     *,
     mode: SourceLoweringMode,
+    residual_steps: tuple[SourceTransformationKind, ...],
 ) -> SourceLoweringResult:
     """Lower the state-machine variant of a guarded AnyIO stream plan.
 
@@ -234,6 +291,7 @@ def _lower_anyio_source_plan(
         plan: AnyIO-on-asyncio plan selected from current profile evidence.
         assessment: Trial-readiness assessment for the exact plan.
         mode: Candidate lowering mode requested by bounded search.
+        residual_steps: Ordered residual prefix composed into the request.
 
     Returns:
         SourceLoweringResult: Transformation request or deterministic rejection.
@@ -243,7 +301,7 @@ def _lower_anyio_source_plan(
         reasons.append("source assessment belongs to a different plan")
     if assessment.status != "trial-ready":
         reasons.append(f"source assessment is {assessment.status}, not trial-ready")
-    if mode != "state-machine":
+    if not _state_machine_mode(mode):
         reasons.append("AnyIO stream lowering is available only as a state-machine candidate")
     available_steps = {step.kind for step in plan.steps}
     required_steps = {
@@ -253,10 +311,24 @@ def _lower_anyio_source_plan(
     }
     if not required_steps.issubset(available_steps):
         reasons.append("source plan lacks the complete AnyIO state-machine step set")
+    reasons.extend(_residual_rejections(plan, assessment, residual_steps))
     if reasons:
         return _unsupported(plan, tuple(reasons), mode=mode)
     try:
-        lowered = lower_anyio_stream_plan(project_root, plan)
+        selected = frozenset(residual_steps)
+        lowered = lower_anyio_stream_plan(
+            project_root,
+            plan,
+            AnyioResidualOptions(
+                guard_amortization="run-scoped-guard-amortization" in selected,
+                await_chain_collapse=("transparent-quiescent-await-chain-collapse" in selected),
+                context_copy_elision="context-copy-elision" in selected,
+                incremental_completion_accounting=(
+                    "incremental-private-completion-accounting" in selected
+                ),
+                result_record_elision="private-result-record-elision" in selected,
+            ),
+        )
     except (OSError, SyntaxError, TypeError, ValueError, cst.ParserSyntaxError) as error:
         return _unsupported(plan, (str(error),), mode=mode)
     return SourceLoweringResult(
@@ -273,6 +345,7 @@ def _preflight_rejections(
     assessment: SourceOptimizationAssessment,
     *,
     mode: SourceLoweringMode,
+    residual_steps: tuple[SourceTransformationKind, ...],
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     if assessment.plan_id != plan.id:
@@ -281,6 +354,8 @@ def _preflight_rejections(
         reasons.append(f"source assessment is {assessment.status}, not trial-ready")
     if plan.identity.dialect != "asyncio":
         reasons.append(f"source lowering does not support dialect {plan.identity.dialect}")
+    if residual_steps:
+        reasons.append("residual state-machine variants require AnyIO-on-asyncio")
     required_steps = {
         "private-transport-batch-drain",
         "quiescent-callable-execution",
@@ -288,11 +363,51 @@ def _preflight_rejections(
     available_steps = {step.kind for step in plan.steps}
     if not required_steps.issubset(available_steps):
         reasons.append("source plan lacks batch-drain and quiescent-execution steps")
-    if mode == "state-machine" and "local-state-machine-fusion" not in available_steps:
+    if _state_machine_mode(mode) and "local-state-machine-fusion" not in available_steps:
         reasons.append("source plan lacks local-state-machine-fusion step")
     if assessment.immediate_result_ratio != 1.0:
         reasons.append("quiescent lowering requires a 100% immediate-result ratio")
     reasons.extend(_evidence_rejections(plan, assessment.callable_evidence))
+    reasons.extend(_residual_rejections(plan, assessment, residual_steps))
+    return tuple(reasons)
+
+
+def _state_machine_mode(mode: SourceLoweringMode) -> bool:
+    return mode in {"state-machine", "residual-state-machine"}
+
+
+def _residual_rejections(
+    plan: SourceOptimizationPlan,
+    assessment: SourceOptimizationAssessment,
+    residual_steps: tuple[SourceTransformationKind, ...],
+) -> tuple[str, ...]:
+    if not residual_steps:
+        return ()
+    available = {step.kind for step in plan.steps}
+    reasons = [
+        f"source plan lacks residual transformation {step}"
+        for step in residual_steps
+        if step not in available
+    ]
+    if "context-copy-elision" in residual_steps and any(
+        item.context_mutation or "context-mutation" in item.hazards
+        for item in assessment.callable_evidence
+    ):
+        reasons.append("context-copy elision requires context-independent callable evidence")
+    expected_order = tuple(
+        step.kind
+        for step in plan.steps
+        if step.kind
+        in {
+            "run-scoped-guard-amortization",
+            "transparent-quiescent-await-chain-collapse",
+            "context-copy-elision",
+            "incremental-private-completion-accounting",
+            "private-result-record-elision",
+        }
+    )
+    if residual_steps != expected_order[: len(residual_steps)]:
+        reasons.append("residual transformations must form the declared cumulative prefix")
     return tuple(reasons)
 
 
@@ -639,9 +754,10 @@ def _build_request(
     assessment: SourceOptimizationAssessment,
     module: cst.Module,
     shape: _PipelineShape,
-    *,
-    mode: SourceLoweringMode,
+    options: _BuildRequestOptions,
 ) -> SourceTransformationRequest:
+    mode = options.mode
+    residual_steps = options.residual_steps
     names = _helper_names(plan.id)
     owner = _top_level_function(module, plan.owner)
     call_arguments = _call_arguments(owner.params)
@@ -663,9 +779,15 @@ def _build_request(
         returns=None,
         type_parameters=None,
     )
-    fast = _replace_task_group(fast, shape, names, mode=mode)
+    fast = _replace_task_group(
+        fast,
+        shape,
+        names,
+        mode=mode,
+        context_copy_elision="context-copy-elision" in residual_steps,
+    )
     declarations: tuple[cst.FunctionDef, ...] = (original, fast)
-    if mode == "state-machine":
+    if _state_machine_mode(mode):
         worker = _top_level_function(module, plan.worker)
         declarations = (*declarations, _state_step(worker, shape, names))
     protocol = _protocol_lowering(module, plan, names)
@@ -701,11 +823,17 @@ def _build_request(
         replacement_body=wrapper_body,
         trailing_statements=trailing,
         summary=(
-            "add guarded local state-machine fusion"
+            "add guarded residual local state-machine fusion"
+            if mode == "residual-state-machine"
+            else "add guarded local state-machine fusion"
             if mode == "state-machine"
             else "add guarded private batch drain and copied-context quiescent execution"
         ),
-        transformation_id=f"{plan.id}:{mode}-v1",
+        transformation_id=(
+            f"{plan.id}:{mode}-v2:{'+'.join(residual_steps)}"
+            if residual_steps
+            else f"{plan.id}:{mode}-v1"
+        ),
     )
 
 
@@ -992,10 +1120,11 @@ def _replace_task_group(
     names: _HelperNames,
     *,
     mode: SourceLoweringMode,
+    context_copy_elision: bool,
 ) -> cst.FunctionDef:
     generated = (
-        _state_machine_source(shape, names)
-        if mode == "state-machine"
+        _state_machine_source(shape, names, context_copy_elision=context_copy_elision)
+        if _state_machine_mode(mode)
         else _fast_task_group_source(shape, names)
     )
     replacement = tuple(cst.parse_module(generated).body)
@@ -1003,12 +1132,12 @@ def _replace_task_group(
         shape.scheduler_name,
         shape.queue_name,
         replacement,
-        remove_queue=mode == "state-machine",
+        remove_queue=_state_machine_mode(mode),
     )
     transformed_module = cst.Module(body=(fast,)).visit(transformer)
     if transformer.replacements != 1:
         raise ValueError("LibCST could not replace exactly one validated TaskGroup")
-    if mode == "state-machine" and transformer.queue_removals != 1:
+    if _state_machine_mode(mode) and transformer.queue_removals != 1:
         raise ValueError("LibCST could not remove exactly one validated private queue")
     transformed = transformed_module.body[0]
     if not isinstance(transformed, cst.FunctionDef):
@@ -1040,15 +1169,30 @@ def _fast_task_group_source(shape: _PipelineShape, names: _HelperNames) -> str:
     )
 
 
-def _state_machine_source(shape: _PipelineShape, names: _HelperNames) -> str:
+def _state_machine_source(
+    shape: _PipelineShape,
+    names: _HelperNames,
+    *,
+    context_copy_elision: bool,
+) -> str:
+    invocation = (
+        f"{names.step}({shape.item_name})"
+        if context_copy_elision
+        else f"{names.prefix}_context.run({names.step}, {shape.item_name})"
+    )
+    context_setup = (
+        ""
+        if context_copy_elision
+        else f"    {names.prefix}_context = {names.context_module}.copy_context()\n"
+    )
     return (
         f"{shape.receive_target} = []\n"
         f"{names.prefix}_errors = []\n"
         f"for {shape.item_name} in {shape.iterable_name}:\n"
-        f"    {names.prefix}_context = {names.context_module}.copy_context()\n"
+        f"{context_setup}"
         "    try:\n"
         f"        {shape.receive_target}.append(\n"
-        f"            {names.prefix}_context.run({names.step}, {shape.item_name})\n"
+        f"            {invocation}\n"
         "        )\n"
         "    except (KeyboardInterrupt, SystemExit):\n"
         "        raise\n"

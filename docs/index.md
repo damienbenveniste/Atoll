@@ -161,6 +161,14 @@ dynamic scheduling, changed descriptors, tracing, profiling, and monitoring use 
 After optimized entry, Atoll never retries the operation in Python. `ATOLL_DISABLE=1` forces the
 original path; `ATOLL_REQUIRE_OPTIMIZED=1` exposes guard failure to strict tests.
 
+After a transformed candidate passes semantics and the `1.05x` marginal search gate, Atoll reruns
+profiling against that staged payload with optimized routing enabled. Only a completed dynamic profile
+can seed another search depth; unsupported launchers, insufficient samples, and failed passes stay in
+the report as rejection evidence. Structurally owned AnyIO-on-asyncio streams can receive cumulative
+residual trials for run-scoped guard amortization, quiescent await-chain collapse, proven-safe context
+copy elision, incremental completion accounting, and private result-record projection. Each trial's
+fresh residual profile is included in the compile report.
+
 Source-patch promotion requires `max(3.0, minimum_speedup)` for both the transformed source tree and
 its normally built PEP 517 wheel over seven alternating pairs. Default compile leaves checkout
 sources unchanged and writes an accepted patch to `.atoll/patches/<candidate-id>.patch`. Generated

@@ -29,6 +29,7 @@ from atoll.runtime.performance import (
     RuntimeMode,
     run_performance_command,
 )
+from atoll.runtime.profiling import ProfileResult
 from atoll.source_optimization.application import (
     apply_source_patch_transactionally,
     validate_source_application_root,
@@ -37,6 +38,7 @@ from atoll.source_optimization.cache import restore_or_build_source_patch
 from atoll.source_optimization.lowering import (
     SourceLoweringResult,
     lower_batch_quiescent_plan,
+    lower_residual_state_machine_plan,
     lower_state_machine_plan,
 )
 from atoll.source_optimization.models import (
@@ -45,6 +47,7 @@ from atoll.source_optimization.models import (
     SourceOptimizationPlan,
     SourceOptimizationTrial,
     SourceOptimizationTrialStatus,
+    SourceTransformationKind,
 )
 from atoll.source_optimization.transforms import (
     GeneratedSourcePatch,
@@ -67,7 +70,15 @@ SOURCE_SEARCH_MAX_DEPTH = 4
 SOURCE_SEARCH_MAX_TRIALS = 8
 SOURCE_SEARCH_WARMUPS = 1
 SOURCE_SEARCH_SAMPLES = 3
+SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP = 1.05
 _MINIMUM_STABLE_MEDIAN_SECONDS = 0.25
+_RESIDUAL_TRANSFORMATIONS: tuple[SourceTransformationKind, ...] = (
+    "run-scoped-guard-amortization",
+    "transparent-quiescent-await-chain-collapse",
+    "context-copy-elision",
+    "incremental-private-completion-accounting",
+    "private-result-record-elision",
+)
 _IGNORED_PROJECT_NAMES = frozenset(
     {
         ".atoll",
@@ -86,6 +97,8 @@ _IGNORED_PROJECT_NAMES = frozenset(
     }
 )
 
+type SourceCandidateProfiler = Callable[[Path, Path, Path, str], ProfileResult]
+
 
 @dataclass(frozen=True, slots=True)
 class SourceOptimizationSearchOptions:
@@ -103,6 +116,7 @@ class SourceOptimizationSearchOptions:
         compile_config: Validated semantic and benchmark policy.
         baseline_build: Existing baseline PEP 517 build evidence.
         apply_source: Whether an accepted patch should be applied transactionally.
+        candidate_profiler: Optional current-invocation profiler for transformed candidates.
         progress: Optional user-facing progress callback.
     """
 
@@ -117,6 +131,7 @@ class SourceOptimizationSearchOptions:
     compile_config: CompileConfig
     baseline_build: CompileAttempt
     apply_source: bool = False
+    candidate_profiler: SourceCandidateProfiler | None = None
     progress: SourceOptimizationProgress | None = None
 
 
@@ -194,6 +209,7 @@ class _CandidateEvaluation:
     semantic: CommandRunEvidence
     benchmark: _SearchBenchmarkResult
     source_speedup: float
+    residual_profile: ProfileResult | None
     diagnostics: tuple[str, ...]
 
 
@@ -410,7 +426,7 @@ def _plan_variants(
             rejections.append(_lowering_rejection(plan, result))
             continue
         transformation_ids = _variant_transformation_ids(plan, result)
-        depth = min(len(transformation_ids), SOURCE_SEARCH_MAX_DEPTH)
+        depth = 1 if result.mode == "batch-quiescent" else 2
         variants.append(
             _PlanVariant(
                 plan=plan,
@@ -420,12 +436,36 @@ def _plan_variants(
                 hot_share=assessment.attributed_hot_share,
             )
         )
+    available_residual: list[SourceTransformationKind] = [
+        kind for kind in _RESIDUAL_TRANSFORMATIONS if any(step.kind == kind for step in plan.steps)
+    ]
+    for residual_depth in range(1, len(available_residual) + 1):
+        enabled = tuple(available_residual[:residual_depth])
+        result = lower_residual_state_machine_plan(project_root, plan, assessment, enabled)
+        if result.request is None:
+            rejections.append(_lowering_rejection(plan, result))
+            continue
+        variants.append(
+            _PlanVariant(
+                plan=plan,
+                request=result.request,
+                transformation_ids=_variant_transformation_ids(
+                    plan,
+                    result,
+                    residual_steps=enabled,
+                ),
+                depth=min(2 + residual_depth, SOURCE_SEARCH_MAX_DEPTH),
+                hot_share=assessment.attributed_hot_share,
+            )
+        )
     return tuple(variants), tuple(rejections)
 
 
 def _variant_transformation_ids(
     plan: SourceOptimizationPlan,
     result: SourceLoweringResult,
+    *,
+    residual_steps: tuple[SourceTransformationKind, ...] = (),
 ) -> tuple[str, ...]:
     if result.mode == "batch-quiescent":
         enabled = {
@@ -433,7 +473,14 @@ def _variant_transformation_ids(
             "quiescent-callable-execution",
         }
         return tuple(step.stable_id for step in plan.steps if step.kind in enabled)
-    return tuple(step.stable_id for step in plan.steps)
+    base = {
+        "private-transport-batch-drain",
+        "quiescent-callable-execution",
+        "local-state-machine-fusion",
+        "private-protocol-auto-forwarding",
+    }
+    selected = base | set(residual_steps)
+    return tuple(step.stable_id for step in plan.steps if step.kind in selected)
 
 
 def _lowering_rejection(
@@ -594,7 +641,29 @@ def _evaluate_candidate(
             tuple(timings),
         )
     source_speedup = baseline_median / benchmark.candidate_median_seconds
-    improves_current = benchmark.candidate_median_seconds < current_median
+    marginal_speedup = current_median / benchmark.candidate_median_seconds
+    improves_current = marginal_speedup >= SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP
+    residual_profile: ProfileResult | None = None
+    profile_diagnostics: tuple[str, ...] = ()
+    profile_failed = False
+    if improves_current and options.candidate_profiler is not None:
+        try:
+            residual_profile = options.candidate_profiler(
+                workspace.project_root,
+                workspace.quality_root,
+                workspace.source_payload_root,
+                candidate.id,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            improves_current = False
+            profile_failed = True
+            profile_diagnostics = (f"residual profile failed: {error}",)
+        else:
+            profile_diagnostics = (
+                f"residual profile {residual_profile.status}: {residual_profile.reason}",
+            )
+            if residual_profile.status != "profiled":
+                improves_current = False
     evaluation = _CandidateEvaluation(
         candidate=candidate,
         patch=patch,
@@ -602,11 +671,12 @@ def _evaluate_candidate(
         semantic=semantic,
         benchmark=benchmark,
         source_speedup=source_speedup,
-        diagnostics=(*cached.diagnostics, benchmark.reason),
+        residual_profile=residual_profile,
+        diagnostics=(*cached.diagnostics, benchmark.reason, *profile_diagnostics),
     )
     trial = SourceOptimizationTrial(
         plan_id=_trial_plan_id(candidate),
-        status="not-run" if improves_current else "rejected",
+        status="not-run" if improves_current else "not-profitable",
         semantic_command=options.compile_config.test_command or (),
         benchmark_command=options.compile_config.benchmark_command or (),
         baseline_median_seconds=baseline_median,
@@ -617,17 +687,27 @@ def _evaluate_candidate(
         patch_path=None,
         source_edits=patch.source_edits,
         application_status="not-applied",
-        diagnostics=(*cached.diagnostics, benchmark.reason),
+        diagnostics=(*cached.diagnostics, benchmark.reason, *profile_diagnostics),
         candidate_id=candidate.id,
         transformation_ids=candidate.transformation_ids,
         reason=(
             "candidate advanced into the bounded beam"
             if improves_current
-            else "candidate did not improve the current beam payload"
+            else (
+                (
+                    f"candidate residual profile was {residual_profile.status}; "
+                    "profiled evidence is required"
+                )
+                if residual_profile is not None and residual_profile.status != "profiled"
+                else "candidate residual profiling failed"
+                if profile_failed
+                else "candidate did not meet the 1.05x marginal speedup floor"
+            )
         ),
         semantic_exit_code=semantic.returncode,
         semantic_duration_seconds=semantic.duration_seconds,
         current_median_seconds=current_median,
+        residual_profile=residual_profile,
     )
     return (evaluation if improves_current else None), trial, tuple(timings)
 
@@ -1158,6 +1238,7 @@ def _replace_winner_trial(
         semantic_exit_code=(semantic or winner.semantic).returncode,
         semantic_duration_seconds=(semantic or winner.semantic).duration_seconds,
         current_median_seconds=winner.benchmark.current_median_seconds,
+        residual_profile=winner.residual_profile,
     )
     return tuple(
         replacement_trial if trial.candidate_id == winner.candidate.id else trial

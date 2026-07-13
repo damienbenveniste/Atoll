@@ -1584,6 +1584,7 @@ class CompilationSourceOptimizationTrialReport(TypedDict):
         reason: Plain-language acceptance or rejection reason.
         semantic_exit_code: Semantic command exit status, when executed.
         semantic_duration_seconds: Parent-observed semantic command duration.
+        residual_profile: Fresh transformed-candidate profile collected before later selection.
     """
 
     plan_id: str
@@ -1605,6 +1606,7 @@ class CompilationSourceOptimizationTrialReport(TypedDict):
     reason: str
     semantic_exit_code: int | None
     semantic_duration_seconds: float | None
+    residual_profile: CompilationProfileReport | None
 
 
 class CompilationSourceOptimizationReport(TypedDict):
@@ -3116,6 +3118,12 @@ def _append_source_optimization_markdown(
             f"{_optional_speedup(trial['source_speedup'])}; wheel "
             f"{_optional_speedup(trial['wheel_speedup'])}; "
             f"application {trial['application_status']}"
+            + (
+                f"; residual profile {trial['residual_profile']['status']} with "
+                f"{trial['residual_profile']['total_samples']} samples"
+                if trial["residual_profile"] is not None
+                else ""
+            )
             + (f"; {trial['reason']}" if trial["reason"] else "")
         )
         for trial in source_optimization["trials"]
@@ -4307,6 +4315,11 @@ def _source_optimization_trial_report(
         "reason": trial.reason,
         "semantic_exit_code": trial.semantic_exit_code,
         "semantic_duration_seconds": trial.semantic_duration_seconds,
+        "residual_profile": (
+            _compilation_profile_report(trial.residual_profile)
+            if trial.residual_profile is not None
+            else None
+        ),
     }
 
 

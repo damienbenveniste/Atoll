@@ -29,6 +29,7 @@ from atoll.source_optimization.lowering import (
     SourceLoweringMode,
     SourceLoweringResult,
     lower_batch_quiescent_plan,
+    lower_residual_state_machine_plan,
     lower_state_machine_plan,
 )
 from atoll.source_optimization.transforms import (
@@ -65,6 +66,32 @@ def test_lowering_builds_reproducible_patch_without_mutating_checkout() -> None:
     assert "contextvars.copy_context" in patch.files[0].after_source
     assert "ATOLL_REQUIRE_OPTIMIZED" in patch.files[0].after_source
     assert source_file.read_bytes() == before
+
+
+def test_generic_asyncio_lowering_rejects_unimplemented_residual_variants() -> None:
+    """Residual metadata cannot be attached to generic asyncio source with no lowering."""
+    plan, assessment = _plan_and_assessment()
+    residual_step = TransformationStep(
+        kind="run-scoped-guard-amortization",
+        version="run-guard-v1",
+        source_symbol=plan.owner,
+        target_symbol=None,
+        access_sites=(),
+        semantic_boundary="guards before side effects",
+        description="Amortize exact runtime guards.",
+    )
+    changed_plan = replace(plan, steps=(*plan.steps, residual_step))
+
+    lowering = lower_residual_state_machine_plan(
+        FIXTURE_ROOT,
+        changed_plan,
+        assessment,
+        (residual_step.kind,),
+    )
+
+    assert lowering.status == "unsupported"
+    assert lowering.request is None
+    assert "require AnyIO-on-asyncio" in " ".join(lowering.rejections)
 
 
 def test_strict_transformed_pipeline_matches_baseline_and_reflection(

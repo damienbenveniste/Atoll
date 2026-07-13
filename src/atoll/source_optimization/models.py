@@ -15,12 +15,18 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from atoll.models import SymbolId
+from atoll.runtime.profiling import ProfileResult
 
 SourceTransformationKind = Literal[
     "private-transport-batch-drain",
     "quiescent-callable-execution",
     "local-state-machine-fusion",
     "private-protocol-auto-forwarding",
+    "run-scoped-guard-amortization",
+    "transparent-quiescent-await-chain-collapse",
+    "context-copy-elision",
+    "incremental-private-completion-accounting",
+    "private-result-record-elision",
 ]
 SourceOptimizationAssessmentStatus = Literal[
     "unbenchmarked",
@@ -355,6 +361,8 @@ class SourceOptimizationTrial:
         semantic_exit_code: Semantic command exit status, when executed.
         semantic_duration_seconds: Parent-observed semantic command duration.
         current_median_seconds: Current accepted-candidate median before this trial.
+        residual_profile: Fresh profile collected from the transformed candidate
+            after it cleared semantic and marginal benchmark gates.
     """
 
     plan_id: str
@@ -376,3 +384,4 @@ class SourceOptimizationTrial:
     semantic_exit_code: int | None = None
     semantic_duration_seconds: float | None = None
     current_median_seconds: float | None = None
+    residual_profile: ProfileResult | None = None

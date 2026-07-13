@@ -119,6 +119,13 @@ def test_anyio_source_planner_defers_transport_suspension_to_runtime_guards(
     assert assessment.immediate_result_ratio == 0.0
     assert assessment.status == "trial-ready"
     assert not any("zero observed suspension" in reason for reason in assessment.rejections)
+    assert [step.kind for step in result.plans[0].steps[-5:]] == [
+        "run-scoped-guard-amortization",
+        "transparent-quiescent-await-chain-collapse",
+        "context-copy-elision",
+        "incremental-private-completion-accounting",
+        "private-result-record-elision",
+    ]
 
 
 def test_source_planner_rejects_task_introspection(tmp_path: Path) -> None:
@@ -299,6 +306,7 @@ def test_source_planner_detects_simple_private_protocol_forwarder(tmp_path: Path
 
     plan = result.plans[0]
     assert plan.entrypoint.qualname == "stream"
+    assert any(step.kind == "private-protocol-auto-forwarding" for step in plan.steps)
     assert plan.steps[-1].kind == "private-protocol-auto-forwarding"
 
 

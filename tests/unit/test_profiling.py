@@ -122,6 +122,7 @@ class _BootstrapConfigInput:
     target: str
     args: tuple[str, ...] = ()
     module_paths: tuple[tuple[str, str], ...] = ()
+    enable_atoll: bool = False
     targets: tuple[str, ...] = ()
     spawn_targets: tuple[ProfileSpawnSiteTarget, ...] = ()
     call_edge_targets: tuple[ProfileCallEdgeTarget, ...] = ()
@@ -669,6 +670,85 @@ def test_bootstrap_launch_uses_absolute_file_path(
     assert Path(captured[0][1]).is_absolute()
 
 
+def test_baseline_profile_disables_atoll_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_workload_project(tmp_path)
+    monkeypatch.setenv("ATOLL_DISABLE", "0")
+    monkeypatch.setenv("ATOLL_STRICT", "1")
+    monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "1")
+    monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+    requests: list[dict[str, object]] = []
+    environments: list[dict[str, str]] = []
+
+    def fake_run(invocation: SubprocessInvocationView) -> subprocess.CompletedProcess[str]:
+        environments.append(dict(invocation.env))
+        config = cast(
+            dict[str, object],
+            json.loads(Path(invocation.command[-1]).read_text(encoding="utf-8")),
+        )
+        requests.append(config)
+        _write_empty_profile_payload(Path(cast(str, config["result_path"])))
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(profiling, "_run_subprocess", fake_run)
+
+    run_baseline_profile(
+        (sys.executable, "bench_script.py", "9"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("workload", "workload.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    assert [request["enable_atoll"] for request in requests] == [False, False]
+    assert [environment["ATOLL_DISABLE"] for environment in environments] == ["1", "1"]
+    assert all("ATOLL_STRICT" not in environment for environment in environments)
+    assert all("ATOLL_REQUIRE_COMPILED" not in environment for environment in environments)
+    assert all("ATOLL_REQUIRE_OPTIMIZED" not in environment for environment in environments)
+
+
+def test_baseline_profile_can_enable_atoll_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_workload_project(tmp_path)
+    monkeypatch.setenv("ATOLL_DISABLE", "1")
+    monkeypatch.setenv("ATOLL_STRICT", "1")
+    monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "1")
+    monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+    requests: list[dict[str, object]] = []
+    environments: list[dict[str, str]] = []
+
+    def fake_run(invocation: SubprocessInvocationView) -> subprocess.CompletedProcess[str]:
+        environments.append(dict(invocation.env))
+        config = cast(
+            dict[str, object],
+            json.loads(Path(invocation.command[-1]).read_text(encoding="utf-8")),
+        )
+        requests.append(config)
+        _write_empty_profile_payload(Path(cast(str, config["result_path"])))
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(profiling, "_run_subprocess", fake_run)
+
+    run_baseline_profile(
+        (sys.executable, "bench_script.py", "9"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("workload", "workload.py"),),
+        scratch_dir=tmp_path / "scratch",
+        enable_atoll=True,
+    )
+
+    assert [request["enable_atoll"] for request in requests] == [True, True]
+    assert all("ATOLL_DISABLE" not in environment for environment in environments)
+    assert all("ATOLL_STRICT" not in environment for environment in environments)
+    assert all("ATOLL_REQUIRE_COMPILED" not in environment for environment in environments)
+    assert all("ATOLL_REQUIRE_OPTIMIZED" not in environment for environment in environments)
+
+
 def test_signatures_observe_parameters_without_ordinary_locals(tmp_path: Path) -> None:
     _write_signature_project(tmp_path)
 
@@ -714,6 +794,39 @@ def test_profile_bootstrap_sampling_entrypoint_runs_in_process(
     assert exit_code == 0
     assert payload["total_samples"] > 0
     assert payload["sample_counts"]["workload::hot"] > 0
+
+
+def test_profile_bootstrap_enables_optimized_payload_in_child_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bootstrap honors optimized profiling after receiving the parent request."""
+    _write_workload_project(tmp_path)
+    config_path, result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="script",
+            target="bench_script.py",
+            args=("9",),
+            module_paths=(("workload", "workload.py"),),
+            enable_atoll=True,
+        ),
+    )
+    monkeypatch.setenv("ATOLL_DISABLE", "1")
+    monkeypatch.setenv("ATOLL_STRICT", "1")
+    monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "1")
+    monkeypatch.setenv("ATOLL_REQUIRE_OPTIMIZED", "1")
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path, "workload")
+
+    exit_code = _profile_bootstrap().main((str(config_path),))
+
+    assert exit_code == 0
+    assert result_path.exists()
+    assert "ATOLL_DISABLE" not in os.environ
+    assert "ATOLL_STRICT" not in os.environ
+    assert "ATOLL_REQUIRE_COMPILED" not in os.environ
+    assert "ATOLL_REQUIRE_OPTIMIZED" not in os.environ
 
 
 def test_profile_bootstrap_type_entrypoint_bounds_hot_observation(
@@ -1429,6 +1542,7 @@ def _write_bootstrap_config(
                 "payload_root": str(root),
                 "module_paths": [list(item) for item in config.module_paths],
                 "result_path": str(result_path),
+                "enable_atoll": config.enable_atoll,
                 "targets": list(config.targets),
                 "spawn_targets": [
                     {
@@ -1459,6 +1573,31 @@ def _write_bootstrap_config(
         encoding="utf-8",
     )
     return config_path, result_path
+
+
+def _write_empty_profile_payload(result_path: Path) -> None:
+    result_path.write_text(
+        json.dumps(
+            {
+                "total_samples": 0,
+                "sample_counts": {},
+                "scheduler_overhead_counts": {},
+                "lifecycle": {
+                    "start": 0,
+                    "return": 0,
+                    "yield": 0,
+                    "resume": 0,
+                    "unwind": 0,
+                    "throw": 0,
+                },
+                "member_lifecycle": {},
+                "signatures": {},
+                "spawn_sites": [],
+                "call_edges": [],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _prepare_in_process_bootstrap(

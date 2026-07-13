@@ -1,0 +1,15 @@
+[project]
+name = "residual-async-profile"
+version = "0.1.0"
+description = "Generic residual async optimization profile fixture."
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["setuptools>=69", "wheel>=0.43"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

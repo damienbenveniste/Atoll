@@ -43,6 +43,11 @@ _TRANSFORMATION_VERSIONS: tuple[tuple[SourceTransformationKind, str], ...] = (
     ("quiescent-callable-execution", "quiescent-callable-v1"),
     ("local-state-machine-fusion", "state-machine-v1"),
     ("private-protocol-auto-forwarding", "protocol-forward-v1"),
+    ("run-scoped-guard-amortization", "run-guard-v1"),
+    ("transparent-quiescent-await-chain-collapse", "await-collapse-v1"),
+    ("context-copy-elision", "context-elision-v1"),
+    ("incremental-private-completion-accounting", "completion-accounting-v1"),
+    ("private-result-record-elision", "result-record-elision-v1"),
 )
 _SEMANTIC_BOUNDARIES = (
     "public return values and exception types remain unchanged",
@@ -754,6 +759,73 @@ def _transformation_steps(
                 description="Add a private run-to-completion path for pure protocol forwarding.",
             )
         )
+    if execution_plan.dialect == "anyio-on-asyncio":
+        steps.extend(
+            (
+                TransformationStep(
+                    kind="run-scoped-guard-amortization",
+                    version="run-guard-v1",
+                    source_symbol=execution_plan.owner,
+                    target_symbol=None,
+                    access_sites=access_sites,
+                    semantic_boundary=(
+                        "all runtime guards complete before transformed side effects"
+                    ),
+                    description="Evaluate stable routing guards once for one owned pipeline run.",
+                ),
+                TransformationStep(
+                    kind="transparent-quiescent-await-chain-collapse",
+                    version="await-collapse-v1",
+                    source_symbol=worker,
+                    target_symbol=None,
+                    access_sites=tuple(
+                        site for site in access_sites if site.kind in {"call", "await"}
+                    ),
+                    semantic_boundary=(
+                        "suspension and cancellation retain the original scheduler path"
+                    ),
+                    description="Collapse a proven non-suspending private await chain.",
+                ),
+                TransformationStep(
+                    kind="context-copy-elision",
+                    version="context-elision-v1",
+                    source_symbol=worker,
+                    target_symbol=None,
+                    access_sites=(),
+                    semantic_boundary="context-sensitive work retains copied-context execution",
+                    description="Skip per-item context copies only for context-independent work.",
+                ),
+            )
+        )
+        if reads:
+            steps.extend(
+                (
+                    TransformationStep(
+                        kind="incremental-private-completion-accounting",
+                        version="completion-accounting-v1",
+                        source_symbol=execution_plan.consumer or execution_plan.owner,
+                        target_symbol=None,
+                        access_sites=reads,
+                        semantic_boundary="private completion ownership and ordering",
+                        description=(
+                            "Track owned completions incrementally without repeated scans."
+                        ),
+                    ),
+                    TransformationStep(
+                        kind="private-result-record-elision",
+                        version="result-record-elision-v1",
+                        source_symbol=worker,
+                        target_symbol=execution_plan.consumer,
+                        access_sites=reads,
+                        semantic_boundary=(
+                            "result identity is private and its projection is fixed"
+                        ),
+                        description=(
+                            "Use a private fixed projection instead of the project result wrapper."
+                        ),
+                    ),
+                )
+            )
     return tuple(steps)
 
 

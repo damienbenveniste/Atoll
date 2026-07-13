@@ -14,6 +14,7 @@ import pytest
 import atoll.source_optimization.search as source_search
 from atoll.models import CompileAttempt, CompileConfig, SymbolId
 from atoll.runtime.performance import CommandRunEvidence
+from atoll.runtime.profiling import ProfileResult, unconfigured_profile
 from atoll.source_optimization.application import SourcePatchApplicationResult
 from atoll.source_optimization.lowering import SourceLoweringResult
 from atoll.source_optimization.models import (
@@ -92,6 +93,119 @@ def test_candidate_search_is_stable_and_bounded(
     ]
     assert 1 <= len(first_trials) <= SOURCE_SEARCH_MAX_TRIALS
     assert all(len(trial.transformation_ids) <= SOURCE_SEARCH_MAX_DEPTH for trial in first_trials)
+
+
+def test_profitable_candidate_is_reprofiled_before_later_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate enters the beam only after a fresh optimized payload profile."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    profile_calls: list[tuple[Path, Path, Path, str]] = []
+
+    def profile_candidate(
+        source_root: Path,
+        quality_root: Path,
+        payload_root: Path,
+        candidate_id: str,
+    ) -> ProfileResult:
+        profile_calls.append((source_root, quality_root, payload_root, candidate_id))
+        return replace(
+            unconfigured_profile(),
+            status="profiled",
+            reason="fresh transformed profile",
+            total_samples=123,
+        )
+
+    def fake_run(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: str,
+        **_options: object,
+    ) -> CommandRunEvidence:
+        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.4)
+        return _command_evidence(command, (project_root, payload_root), mode, duration)
+
+    monkeypatch.setattr("atoll.source_optimization.search.run_performance_command", fake_run)
+    result = run_source_optimization_search(
+        (plan,),
+        (assessment,),
+        replace(
+            _search_options(project_root, tmp_path),
+            candidate_profiler=profile_candidate,
+        ),
+    )
+
+    profiled = tuple(trial for trial in result.trials if trial.residual_profile is not None)
+    assert len(profile_calls) == len(profiled) == 1
+    assert profiled[0].residual_profile is not None
+    expected_profile_samples = 123
+    assert profiled[0].residual_profile.total_samples == expected_profile_samples
+    assert profile_calls[0][2] == profile_calls[0][0] / "src"
+
+
+@pytest.mark.parametrize("failure_mode", ["static-fallback", "error"])
+def test_candidate_without_dynamic_profile_cannot_advance_beam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """Later selection requires a real enabled-payload profile, not fallback evidence."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+
+    def profile_candidate(
+        _source_root: Path,
+        _quality_root: Path,
+        _payload_root: Path,
+        _candidate_id: str,
+    ) -> ProfileResult:
+        if failure_mode == "error":
+            raise ValueError("optimized profiling failed")
+        return replace(
+            unconfigured_profile(),
+            status="static-fallback",
+            reason="insufficient optimized samples",
+        )
+
+    def fake_run(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: str,
+        **_options: object,
+    ) -> CommandRunEvidence:
+        duration = 0.05 if command == ("test",) else (0.8 if mode == "baseline" else 0.4)
+        return _command_evidence(command, (project_root, payload_root), mode, duration)
+
+    monkeypatch.setattr("atoll.source_optimization.search.run_performance_command", fake_run)
+    result = run_source_optimization_search(
+        (plan,),
+        (assessment,),
+        replace(
+            _search_options(project_root, tmp_path),
+            candidate_profiler=profile_candidate,
+        ),
+    )
+
+    candidate_trials = tuple(
+        trial for trial in result.trials if trial.candidate_id.startswith("source-candidate-")
+    )
+    assert candidate_trials
+    assert not result.accepted
+    assert all(trial.status == "not-profitable" for trial in candidate_trials)
+    expected_reason = (
+        "candidate residual profiling failed"
+        if failure_mode == "error"
+        else "profiled evidence is required"
+    )
+    assert all(expected_reason in trial.reason for trial in candidate_trials)
 
 
 @pytest.mark.parametrize(
@@ -698,9 +812,9 @@ def test_candidate_that_does_not_improve_current_beam_is_rejected(
         options,
     )
 
-    rejected_trials = [trial for trial in result.trials if trial.status == "rejected"]
+    rejected_trials = [trial for trial in result.trials if trial.status == "not-profitable"]
     assert rejected_trials
-    assert rejected_trials[0].reason == "candidate did not improve the current beam payload"
+    assert rejected_trials[0].reason == "candidate did not meet the 1.05x marginal speedup floor"
     assert rejected_trials[0].current_median_seconds == pytest.approx(0.1)
 
 
