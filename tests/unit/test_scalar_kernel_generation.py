@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
 
@@ -15,6 +16,7 @@ from atoll.generation.scalar_kernel import (
     generate_scalar_kernel,
 )
 from atoll.models import ModuleId, ModuleScan
+from atoll.native_optimization.intervals import NativeInteger
 from atoll.native_optimization.scalar_analysis import analyze_scalar_scan
 
 
@@ -98,3 +100,54 @@ def test_scalar_kernel_rejects_stale_plan_and_non_pyx_destination(tmp_path: Path
 
     with pytest.raises(ValueError, match=r"\.pyx"):
         generate_scalar_kernel(request)
+
+    pyx_request = replace(request, output_path=tmp_path / "generated.pyx")
+    with pytest.raises(ValueError, match="source differs"):
+        generate_scalar_kernel(
+            replace(
+                pyx_request,
+                plan=replace(plan, source_hash="stale"),
+            )
+        )
+
+    with pytest.raises(ValueError, match="absent from staged region"):
+        generate_scalar_kernel(
+            replace(
+                pyx_request,
+                plan=replace(plan, member=replace(plan.member, qualname="missing")),
+            )
+        )
+
+    unsigned = replace(
+        plan.width_proofs[0],
+        native=NativeInteger(width=32, signed=False),
+    )
+    with pytest.raises(ValueError, match="unsigned scalar lowering"):
+        generate_scalar_kernel(replace(pyx_request, width_proof=unsigned))
+
+
+def test_scalar_kernel_expands_zero_power_without_native_pow(tmp_path: Path) -> None:
+    """A literal zero exponent lowers to the exact integer identity constant."""
+    scan = _scan(
+        tmp_path,
+        """
+        def identity_power(value: int) -> int:
+            return value ** 0
+        """,
+    )
+    plan = analyze_scalar_scan(scan).plans[0]
+    region = next(item for item in scan.typed_regions if item.id == plan.region_id)
+
+    generated = generate_scalar_kernel(
+        ScalarKernelGenerationRequest(
+            scan=scan,
+            region=region,
+            plan=plan,
+            width_proof=plan.width_proofs[0],
+            logical_module="_atoll_scalar_zero_power",
+            output_path=tmp_path / "zero_power.pyx",
+        )
+    )
+
+    assert "return 1" in generated.generation.source_text
+    assert "**" not in generated.generation.source_text
