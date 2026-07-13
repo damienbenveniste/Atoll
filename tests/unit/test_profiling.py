@@ -271,6 +271,32 @@ def test_sampling_profiler_attributes_unmapped_leaf_to_project_ancestor(
     assert overhead == {"project_stack::project_call": 1}
 
 
+def test_sampling_profiler_ignores_fully_unmapped_stack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An external stack terminates without inventing project attribution."""
+    config_path, _result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="script",
+            target="unused.py",
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path)
+    profiler = _sampling_profiler(config_path)
+    frame = inspect.currentframe()
+    assert frame is not None
+
+    profiler.sample(frame)
+
+    payload = profiler.payload()
+    assert payload["total_samples"] == 1
+    assert payload["sample_counts"] == {}
+    assert payload["scheduler_overhead_counts"] == {}
+
+
 def test_unsupported_launcher_returns_static_fallback_without_scratch_files(tmp_path: Path) -> None:
     scratch_dir = tmp_path / "scratch"
 
