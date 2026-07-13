@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -293,3 +294,56 @@ def test_validate_cli_returns_failure_for_an_invalid_manifest(
     assert captured.out == ""
     assert "schema_version" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_lock_cli_reports_reviewed_dependency_identity(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Lock inspection hashes the exact repository-local constraints file."""
+    lock = tmp_path / "uv.lock"
+    lock.write_text("package==1.0 --hash=sha256:abc\n", encoding="utf-8")
+    manifest = _write_manifest(tmp_path / "corpus.toml")
+
+    assert (
+        main(
+            (
+                "--manifest",
+                str(manifest),
+                "lock",
+                "--atoll-root",
+                str(tmp_path),
+                "--case",
+                "alpha",
+            )
+        )
+        == 0
+    )
+    payload = capsys.readouterr().out
+    assert hashlib.sha256(lock.read_bytes()).hexdigest() in payload
+    assert '"case":"alpha"' in payload
+
+
+def test_lock_cli_rejects_dependency_lock_symlink(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A reviewed lock identity cannot be redirected through a symlink."""
+    target = tmp_path / "constraints.txt"
+    target.write_text("package==1.0\n", encoding="utf-8")
+    (tmp_path / "uv.lock").symlink_to(target)
+    manifest = _write_manifest(tmp_path / "corpus.toml")
+
+    assert (
+        main(
+            (
+                "--manifest",
+                str(manifest),
+                "lock",
+                "--atoll-root",
+                str(tmp_path),
+            )
+        )
+        == _INVALID_MANIFEST_EXIT_CODE
+    )
+    assert "unsafe dependency lock" in capsys.readouterr().err

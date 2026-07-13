@@ -101,7 +101,11 @@ convention = "google"
 "scripts/run_pydantic_graph_benchmark.py" = ["S603"]
 "scripts/run_cython_batch_benchmark.py" = ["S603"]
 "scripts/run_native_optimizer_benchmark.py" = ["S603"]
+"scripts/benchmark_corpus/process.py" = ["S108", "S603"]
+"scripts/benchmark_corpus/security.py" = ["S603"]
 "tests/**/*.py" = ["D", "S101"]
+"tests/integration/test_benchmark_corpus_lifecycle.py" = ["S603"]
+"tests/unit/test_benchmark_corpus_security.py" = ["S603"]
 "tests/unit/test_source_optimization_transforms.py" = ["S603"]
 
 

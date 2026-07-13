@@ -55,6 +55,7 @@ _CASE_FIELDS = frozenset(
         "dependency_lock",
         "focused_test_command",
         "oracle_adapter",
+        "oracle_arguments",
         "tiers",
         "platforms",
         "workload",
@@ -216,6 +217,9 @@ def _parse_case(index: int, payload: dict[str, object]) -> CorpusCase:
     adapter = _required_string(payload, "oracle_adapter", label)
     if _ADAPTER_PATTERN.fullmatch(adapter) is None:
         raise ManifestError(f"{label}.oracle_adapter must be a dotted lowercase identifier")
+    oracle_arguments = _optional_command(
+        payload.get("oracle_arguments"), f"{label}.oracle_arguments"
+    )
     tiers = cast(
         tuple[CorpusTier, ...],
         _literal_sequence(payload, "tiers", label, _TIERS),
@@ -241,6 +245,7 @@ def _parse_case(index: int, payload: dict[str, object]) -> CorpusCase:
         dependency_lock=dependency_lock,
         focused_test_command=command,
         oracle_adapter=adapter,
+        oracle_arguments=oracle_arguments,
         tiers=tiers,
         platforms=platforms,
         workload=workload,
@@ -325,6 +330,17 @@ def _literal_sequence(
 def _command(value: object, label: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise ManifestError(f"{label} must be a non-empty argv array")
+    items = tuple(cast(list[object], value))
+    if any(not isinstance(item, str) or not item or "\x00" in item for item in items):
+        raise ManifestError(f"{label} must contain non-empty strings without NUL bytes")
+    return tuple(cast(str, item) for item in items)
+
+
+def _optional_command(value: object, label: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ManifestError(f"{label} must be an argv array")
     items = tuple(cast(list[object], value))
     if any(not isinstance(item, str) or not item or "\x00" in item for item in items):
         raise ManifestError(f"{label} must contain non-empty strings without NUL bytes")
