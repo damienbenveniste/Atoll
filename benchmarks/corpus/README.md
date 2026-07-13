@@ -85,6 +85,50 @@ the aggregate command exit nonzero. Case reports label ratios as "Python rewrite
 versus original," "final wheel versus original," and "native layer versus
 source-only wheel."
 
+After reviewing the complete raw evidence, retain a compact immutable snapshot
+and refresh only the generated history block in the benchmark documentation:
+
+```bash
+uv run python -m scripts.benchmark_corpus promote \
+  --tier performance \
+  --platform ubuntu-24.04 \
+  --results-root .atoll/corpus-results \
+  --label 2026-07-13-initial \
+  --reviewed-by REVIEWER
+```
+
+Promotion is intentionally manual and deterministic. Reusing a label with
+different evidence fails, raw samples and wheels remain workflow artifacts,
+and CI never commits snapshots. Performance promotion requires every result's
+adjacent `experiment.json` to carry the same GitHub run ID, run attempt,
+workflow ref, head SHA, and reviewed label. Missing, mixed, or independently
+renamed workflow evidence is rejected. Historical comparison is valid only for
+cases whose retained comparison keys match.
+
+`calibration.toml` separately pins the existing scalar, call-chain, and buffer
+fixtures plus pyperformance's Richards, spectral-norm, and Hexiom workloads.
+Normal validation rehashes the complete repository-owned execution bundle, not
+only the three named wrappers: the hard-suite runner and every non-generated
+file copied from the native fixture are covered. The authoritative native hard
+workflow runs this validation before executing its command template with
+explicit workspace and evidence destinations. The three external pyperformance
+pins are reported as not yet checkout-verified and deliberately have no ambient
+`python -m pyperformance` runner. Authenticate an existing detached
+pyperformance checkout before using those entries:
+
+```bash
+uv run python -m scripts.benchmark_corpus validate \
+  --calibration-checkout /path/to/pinned/pyperformance
+```
+
+That check requires the exact catalogued `HEAD`, a clean tracked tree, and each
+reviewed source digest. Every entry sets
+`included_in_repository_aggregate = false`, so calibration headroom, including
+narrow 22x-style kernels, is never included in either real-repository geometric
+mean. Semantic-corruption, upstream-failure, and compatible-no-op lifecycle
+fixtures serve as negative controls and likewise do not enter repository
+performance aggregates.
+
 The version-1 compatibility matrix contains all 25 planned repositories on both
 Ubuntu 24.04 and macOS 14. Pins use the inspected default-branch revision when it
 passes baseline qualification. SQLGlot uses the newest qualifying Python 3.12

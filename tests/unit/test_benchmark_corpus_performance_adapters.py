@@ -21,6 +21,7 @@ MANIFEST_PATH = Path("benchmarks/corpus/manifest.toml")
 GOLDEN_PATH = WORKLOAD_ROOT / "golden.json"
 DEFAULT_REPETITIONS = 1
 DEFAULT_SEED = 1729
+PERFORMANCE_PROVENANCE_REVISION = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 PERFORMANCE_CASES = {
     "anyio",
     "html5lib",
@@ -76,7 +77,7 @@ def test_performance_adapter_case_set_is_exact() -> None:
 
     assert adapters == PERFORMANCE_CASES
     assert workloads == PERFORMANCE_CASES
-    assert notices == PERFORMANCE_CASES
+    assert notices == PERFORMANCE_CASES | {"pyperformance"}
     assert set(_golden_cases()) == PERFORMANCE_CASES
 
 
@@ -238,6 +239,7 @@ def test_manifest_performance_provenance_matches_reviewed_bytes() -> None:
         notice_path = Path(cast(str, workload["notice"]))
 
         assert workload["source"] == "atoll"
+        assert workload["revision"] == PERFORMANCE_PROVENANCE_REVISION
         assert workload_path == WORKLOAD_ROOT / f"{case_id.replace('-', '_')}.py"
         assert notice_path == NOTICE_ROOT / f"{case_id}.txt"
         assert notice_path.is_file()

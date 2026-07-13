@@ -1,0 +1,251 @@
+name: Multi-Repository Performance Corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: Performance case or the complete 12-case matrix
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - anyio
+          - html5lib
+          - mako
+          - mypy
+          - networkx
+          - pydantic
+          - pydantic-graph
+          - rich
+          - sqlalchemy
+          - sqlglot
+          - sympy
+          - tomli
+      platform:
+        description: Isolated runner platform
+        required: true
+        default: ubuntu-24.04
+        type: choice
+        options:
+          - ubuntu-24.04
+          - macos-14
+      experiment-label:
+        description: Reviewed label retained with workflow evidence
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-performance-${{ inputs.platform }}-${{ inputs.case }}
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    name: Build pinned performance matrix
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      cases: ${{ steps.cases.outputs.json }}
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Sync corpus runner
+        run: uv sync --frozen --all-groups --python 3.12
+
+      - name: Validate experiment label
+        env:
+          EXPERIMENT_LABEL: ${{ inputs['experiment-label'] }}
+        run: |
+          if [[ ! "$EXPERIMENT_LABEL" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+            echo "experiment-label must use 1-64 lowercase letters, digits, dots, dashes, or underscores" >&2
+            exit 2
+          fi
+
+      - name: Resolve selected pinned cases
+        id: cases
+        env:
+          SELECTED_CASE: ${{ inputs.case }}
+          SELECTED_PLATFORM: ${{ inputs.platform }}
+        run: |
+          arguments=(--tier performance --platform "$SELECTED_PLATFORM")
+          if test "$SELECTED_CASE" != "all"; then
+            arguments+=(--case "$SELECTED_CASE")
+          fi
+          matrix=$(uv run --python 3.12 python -m scripts.benchmark_corpus matrix "${arguments[@]}")
+          echo "json=$matrix" >> "$GITHUB_OUTPUT"
+
+  case:
+    name: Performance / ${{ matrix.case }} / ${{ matrix.platform }}
+    needs: matrix
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.matrix.outputs.cases) }}
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Bubblewrap
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes bubblewrap
+
+      - name: Sync corpus runner
+        run: uv sync --frozen --all-groups --python 3.12
+
+      - name: Run isolated measured case
+        id: execute
+        continue-on-error: true
+        env:
+          CASE_ID: ${{ matrix.case }}
+          CASE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          export ATOLL_RUNNER_IMAGE="${ImageOS:-$CASE_PLATFORM}@${ImageVersion:-unknown}"
+          uv run --python 3.12 python -m scripts.benchmark_corpus run "$CASE_ID" \
+            --tier performance \
+            --platform "$CASE_PLATFORM" \
+            --workspace-root "$RUNNER_TEMP/corpus-work" \
+            --evidence-root "$RUNNER_TEMP/corpus-results/$CASE_ID"
+
+      - name: Retain experiment identity
+        if: always()
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/corpus-results/${{ matrix.case }}
+          EXPERIMENT_LABEL: ${{ inputs['experiment-label'] }}
+          EXPERIMENT_REPOSITORY: ${{ github.repository }}
+          EXPERIMENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXPERIMENT_RUN_ID: ${{ github.run_id }}
+          EXPERIMENT_SHA: ${{ github.sha }}
+          EXPERIMENT_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          uv run --python 3.12 python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ["EVIDENCE_DIR"])
+          evidence.mkdir(parents=True, exist_ok=True)
+          payload = {
+              "head_sha": os.environ["EXPERIMENT_SHA"],
+              "label": os.environ["EXPERIMENT_LABEL"],
+              "repository": os.environ["EXPERIMENT_REPOSITORY"],
+              "run_attempt": int(os.environ["EXPERIMENT_RUN_ATTEMPT"]),
+              "run_id": int(os.environ["EXPERIMENT_RUN_ID"]),
+              "schema_version": 1,
+              "workflow_ref": os.environ["EXPERIMENT_WORKFLOW_REF"],
+          }
+          (evidence / "experiment.json").write_text(
+              f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Add case evidence to job summary
+        if: always()
+        run: |
+          result="$RUNNER_TEMP/corpus-results/${{ matrix.case }}/case-result.md"
+          if test -f "$result"; then
+            cat "$result" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload bounded case evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: corpus-performance-${{ matrix.platform }}-${{ matrix.case }}
+          path: ${{ runner.temp }}/corpus-results
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Preserve case outcome
+        if: steps.execute.outcome == 'failure'
+        run: exit 1
+
+  aggregate:
+    name: Aggregate all 12 expected performance cases
+    if: always() && needs.matrix.result == 'success' && inputs.case == 'all'
+    needs: [matrix, case]
+    runs-on: ${{ inputs.platform }}
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Sync corpus aggregator
+        run: uv sync --frozen --all-groups --python 3.12
+
+      - name: Download every case envelope
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          pattern: corpus-performance-${{ inputs.platform }}-*
+          path: ${{ runner.temp }}/corpus-results
+          merge-multiple: true
+
+      - name: Strictly aggregate the complete matrix
+        id: aggregate
+        continue-on-error: true
+        run: >-
+          uv run --python 3.12 python -m scripts.benchmark_corpus aggregate
+          --tier performance
+          --platform "${{ inputs.platform }}"
+          --results-root "$RUNNER_TEMP/corpus-results"
+          --output-root "$RUNNER_TEMP/corpus-aggregate"
+
+      - name: Publish aggregate in workflow summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/corpus-aggregate/aggregate-performance-${{ inputs.platform }}.md"
+          if test -f "$report"; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Corpus aggregation did not produce a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: corpus-performance-${{ inputs.platform }}-aggregate
+          path: ${{ runner.temp }}/corpus-aggregate
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Preserve aggregate outcome
+        if: steps.aggregate.outcome == 'failure'
+        run: exit 1

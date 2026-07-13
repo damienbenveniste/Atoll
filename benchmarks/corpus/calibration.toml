@@ -1,0 +1,88 @@
+schema_version = 1
+
+[[benchmark]]
+id = "native-scalar"
+name = "Atoll fixed-width scalar fixture"
+source = "atoll-fixture"
+execution = "atoll-native-hard-suite"
+execution_paths = ["scripts/run_native_optimizer_benchmark.py", "tests/fixtures/native_optimization_project"]
+execution_sha256 = "aa72f68ec44dbbcb441b568b685a72102af9a7a8829b5b5d542818a6916464a1"
+repository = "https://github.com/damienbenveniste/Atoll.git"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
+source_path = "tests/fixtures/native_optimization_project/benchmarks/run_scalar_hard.py"
+source_sha256 = "9f331e0a7e3f8a361251d9dea398cbd6311065d2e5eb42e336483f73df2d1220"
+runner = ["uv", "run", "--python", "3.12", "python", "scripts/run_native_optimizer_benchmark.py", "--workspace", "{workspace}", "--evidence-root", "{evidence_root}"]
+platforms = ["ubuntu-24.04", "macos-14"]
+notice = "LICENSE"
+included_in_repository_aggregate = false
+
+[[benchmark]]
+id = "native-call-chain"
+name = "Atoll direct call-chain fixture"
+source = "atoll-fixture"
+execution = "atoll-native-hard-suite"
+execution_paths = ["scripts/run_native_optimizer_benchmark.py", "tests/fixtures/native_optimization_project"]
+execution_sha256 = "aa72f68ec44dbbcb441b568b685a72102af9a7a8829b5b5d542818a6916464a1"
+repository = "https://github.com/damienbenveniste/Atoll.git"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
+source_path = "tests/fixtures/native_optimization_project/benchmarks/run_call_chain_hard.py"
+source_sha256 = "cf6f9dda3db19c67a4e5875a9ebaecab08965ee8d3387ef7fc9b654081c5c534"
+runner = ["uv", "run", "--python", "3.12", "python", "scripts/run_native_optimizer_benchmark.py", "--workspace", "{workspace}", "--evidence-root", "{evidence_root}"]
+platforms = ["ubuntu-24.04", "macos-14"]
+notice = "LICENSE"
+included_in_repository_aggregate = false
+
+[[benchmark]]
+id = "native-buffer"
+name = "Atoll zero-copy buffer fixture"
+source = "atoll-fixture"
+execution = "atoll-native-hard-suite"
+execution_paths = ["scripts/run_native_optimizer_benchmark.py", "tests/fixtures/native_optimization_project"]
+execution_sha256 = "aa72f68ec44dbbcb441b568b685a72102af9a7a8829b5b5d542818a6916464a1"
+repository = "https://github.com/damienbenveniste/Atoll.git"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
+source_path = "tests/fixtures/native_optimization_project/benchmarks/run_buffer_hard.py"
+source_sha256 = "8330f62bea3f59ab2b9d8f059b6d41bb2836028cff30756aeb38b4fb135b2f08"
+runner = ["uv", "run", "--python", "3.12", "python", "scripts/run_native_optimizer_benchmark.py", "--workspace", "{workspace}", "--evidence-root", "{evidence_root}"]
+platforms = ["ubuntu-24.04", "macos-14"]
+notice = "LICENSE"
+included_in_repository_aggregate = false
+
+[[benchmark]]
+id = "richards"
+name = "pyperformance Richards"
+source = "pyperformance"
+execution = "external-checkout-required"
+repository = "https://github.com/python/pyperformance.git"
+revision = "216cbeb5f828b8ee5864f9bb52f3563d2d1a4846"
+source_path = "pyperformance/data-files/benchmarks/bm_richards/run_benchmark.py"
+source_sha256 = "a4512668525331960c54043b5150a3fff92badaeaba850a941893ac69a1028d8"
+platforms = ["ubuntu-24.04", "macos-14"]
+notice = "benchmarks/corpus/notices/pyperformance.txt"
+included_in_repository_aggregate = false
+
+[[benchmark]]
+id = "spectral-norm"
+name = "pyperformance spectral_norm"
+source = "pyperformance"
+execution = "external-checkout-required"
+repository = "https://github.com/python/pyperformance.git"
+revision = "216cbeb5f828b8ee5864f9bb52f3563d2d1a4846"
+source_path = "pyperformance/data-files/benchmarks/bm_spectral_norm/run_benchmark.py"
+source_sha256 = "a3390ec6d75606fec30c4b59ad5f77d5292cd8e36f445197232a34560a880b18"
+platforms = ["ubuntu-24.04", "macos-14"]
+notice = "benchmarks/corpus/notices/pyperformance.txt"
+included_in_repository_aggregate = false
+
+[[benchmark]]
+id = "hexiom"
+name = "pyperformance Hexiom"
+source = "pyperformance"
+execution = "external-checkout-required"
+repository = "https://github.com/python/pyperformance.git"
+revision = "216cbeb5f828b8ee5864f9bb52f3563d2d1a4846"
+source_path = "pyperformance/data-files/benchmarks/bm_hexiom/run_benchmark.py"
+source_sha256 = "d7518220380d27449b8951bc9ca2e19593569d9bd9f5cb6d86867f354f22e115"
+platforms = ["ubuntu-24.04", "macos-14"]
+notice = "benchmarks/corpus/notices/pyperformance.txt"
+included_in_repository_aggregate = false

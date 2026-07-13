@@ -208,6 +208,18 @@ def test_aggregation_rejects_missing_expected_matrix_case(tmp_path: Path) -> Non
         aggregate_case_results(manifest, (alpha,), tier="performance", platform="ubuntu-24.04")
 
 
+def test_aggregation_rejects_empty_matrix_slice(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path, ("alpha",))
+
+    with pytest.raises(AggregationError, match="no expected cases"):
+        aggregate_case_results(
+            manifest,
+            (),
+            tier="calibration",
+            platform="ubuntu-24.04",
+        )
+
+
 def test_aggregation_rejects_duplicate_matrix_identity(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path, ("alpha",))
     alpha = _write_result(tmp_path / "alpha.json", _result(manifest, "alpha"))

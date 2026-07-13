@@ -1,0 +1,170 @@
+name: Multi-Repository Compatibility Corpus
+
+on:
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-compatibility-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    name: Build pinned compatibility matrix
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      cases: ${{ steps.cases.outputs.json }}
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Sync corpus runner
+        run: uv sync --frozen --all-groups --python 3.12
+
+      - name: Resolve all 25 pinned cases
+        id: cases
+        run: >-
+          echo "json=$(uv run --python 3.12 python -m scripts.benchmark_corpus matrix
+          --tier compatibility --platform ubuntu-24.04)" >> "$GITHUB_OUTPUT"
+
+  case:
+    name: Compatibility / ${{ matrix.case }}
+    needs: matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.matrix.outputs.cases) }}
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes bubblewrap
+
+      - name: Sync corpus runner
+        run: uv sync --frozen --all-groups --python 3.12
+
+      - name: Run isolated pinned case
+        id: execute
+        continue-on-error: true
+        env:
+          CASE_ID: ${{ matrix.case }}
+        run: |
+          export ATOLL_RUNNER_IMAGE="${ImageOS:-ubuntu-24.04}@${ImageVersion:-unknown}"
+          uv run --python 3.12 python -m scripts.benchmark_corpus run "$CASE_ID" \
+            --tier compatibility \
+            --platform ubuntu-24.04 \
+            --workspace-root "$RUNNER_TEMP/corpus-work" \
+            --evidence-root "$RUNNER_TEMP/corpus-results/$CASE_ID"
+
+      - name: Add case evidence to job summary
+        if: always()
+        run: |
+          result="$RUNNER_TEMP/corpus-results/${{ matrix.case }}/case-result.md"
+          if test -f "$result"; then
+            cat "$result" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload bounded case evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: corpus-compatibility-${{ matrix.case }}
+          path: ${{ runner.temp }}/corpus-results
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Preserve case outcome
+        if: steps.execute.outcome == 'failure'
+        run: exit 1
+
+  aggregate:
+    name: Aggregate all expected compatibility cases
+    if: always() && needs.matrix.result == 'success'
+    needs: [matrix, case]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Sync corpus aggregator
+        run: uv sync --frozen --all-groups --python 3.12
+
+      - name: Download every case envelope
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          pattern: corpus-compatibility-*
+          path: ${{ runner.temp }}/corpus-results
+          merge-multiple: true
+
+      - name: Strictly aggregate the complete matrix
+        id: aggregate
+        continue-on-error: true
+        run: >-
+          uv run --python 3.12 python -m scripts.benchmark_corpus aggregate
+          --tier compatibility
+          --platform ubuntu-24.04
+          --results-root "$RUNNER_TEMP/corpus-results"
+          --output-root "$RUNNER_TEMP/corpus-aggregate"
+
+      - name: Publish aggregate in workflow summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/corpus-aggregate/aggregate-compatibility-ubuntu-24.04.md"
+          if test -f "$report"; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Corpus aggregation did not produce a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: corpus-compatibility-aggregate
+          path: ${{ runner.temp }}/corpus-aggregate
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Preserve aggregate outcome
+        if: steps.aggregate.outcome == 'failure'
+        run: exit 1

@@ -22,7 +22,7 @@ platforms = ["ubuntu-24.04", "macos-14"]
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/anyio.py"
 sha256 = "5c92a14b4f43339d92c17e46c722eb560eeb5dd4d07b49557d44700ec6ff9750"
 notice = "benchmarks/corpus/notices/anyio.txt"
@@ -95,7 +95,7 @@ platforms = ["ubuntu-24.04", "macos-14"]
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/html5lib.py"
 sha256 = "d88252b520bc3e96055edaf62d641e2d2e267309a9ce9125b1dc345b9ed1c579"
 notice = "benchmarks/corpus/notices/html5lib.txt"
@@ -142,7 +142,7 @@ platforms = ["ubuntu-24.04", "macos-14"]
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/mako.py"
 sha256 = "e1843436e48f045b507c4cf66969f680c92bf543c5d2295674814681e44d5c9b"
 notice = "benchmarks/corpus/notices/mako.txt"
@@ -190,7 +190,7 @@ compile_timeout_seconds = 5400
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/mypy.py"
 sha256 = "ca9325d5cedd1658ae96718b0ad2d91ab81a9ab19a4918b44adbdbeb9a98c148"
 notice = "benchmarks/corpus/notices/mypy.txt"
@@ -211,7 +211,7 @@ platforms = ["ubuntu-24.04", "macos-14"]
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/networkx.py"
 sha256 = "83a232c2e3fea14d3f3805ad8746e2133b3e4291002f19cd6775e0c885fcec90"
 notice = "benchmarks/corpus/notices/networkx.txt"
@@ -245,7 +245,7 @@ platforms = ["ubuntu-24.04", "macos-14"]
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/pydantic.py"
 sha256 = "a95e54804e862a5c0111c84c8cfe72ad00a1658d6a3e8878c3691b1861cd1edb"
 notice = "benchmarks/corpus/notices/pydantic.txt"
@@ -267,7 +267,7 @@ compile_timeout_seconds = 5400
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/pydantic_graph.py"
 sha256 = "79d39b20ff9d8db9c634bd3c9db793ddf578573bd979f8277da9f54b3526bd5a"
 notice = "benchmarks/corpus/notices/pydantic-graph.txt"
@@ -288,7 +288,7 @@ platforms = ["ubuntu-24.04", "macos-14"]
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/rich.py"
 sha256 = "7e9af3bb81e430b438325b9d9768d5d624c6ab1a1d5b1c6f4cccdc28a6c11c7f"
 notice = "benchmarks/corpus/notices/rich.txt"
@@ -322,7 +322,7 @@ platforms = ["ubuntu-24.04", "macos-14"]
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/sqlalchemy.py"
 sha256 = "ab74514b500fb9c6f14e58ed062c2025a267e4d7e52168faa32f28f4cbb1393e"
 notice = "benchmarks/corpus/notices/sqlalchemy.txt"
@@ -343,7 +343,7 @@ platforms = ["ubuntu-24.04", "macos-14"]
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/sqlglot.py"
 sha256 = "99fd1a2bcf64993b382e272fac8e8988f3e9f1d6e660a7131b0dd6c5d9647328"
 notice = "benchmarks/corpus/notices/sqlglot.txt"
@@ -365,7 +365,7 @@ compile_timeout_seconds = 5400
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/sympy.py"
 sha256 = "541dc03f4e10b489fdfc93dc4e0b74b86df8bf120311698af593111d0aeefe1f"
 notice = "benchmarks/corpus/notices/sympy.txt"
@@ -386,7 +386,7 @@ platforms = ["ubuntu-24.04", "macos-14"]
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"
-revision = "591b3e914c8d2cb65650b73f178d0ab06e6ad0ad"
+revision = "e9a5c20ab85369d7cc69772975a34fafc251b239"
 path = "benchmarks/corpus/workloads/tomli.py"
 sha256 = "8d350096e8efbd0a22b75974c61e861285e3771cb42466c7ed855e230cabc2c3"
 notice = "benchmarks/corpus/notices/tomli.txt"

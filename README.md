@@ -364,6 +364,13 @@ patch-cache evidence. It requires at least `3.0x` for both transformed source an
 stable source-plan and patch identities, an unchanged checkout, and a warm patch-cache hit. It is
 intentionally separate from normal CI so ordinary correctness checks do not depend on host timing.
 
+The repository-local [multi-repository corpus](benchmarks/corpus/README.md) separately measures
+whole-project compatibility across 25 pinned projects and end-to-end performance across 12 reviewed
+workloads. It retains unsupported and compatible no-op outcomes, reports accepted-only and
+effective-corpus geometric means per platform, and promotes history only through an explicit human
+review. Compiler calibration and semantic negative controls are reported independently and never
+inflate the real-repository aggregate.
+
 Profiling and candidate-trial durations are excluded from the final performance medians. Atoll then
 tests the accepted payload, runs the configured alternating baseline/compiled benchmark pairs, and
 compares median durations. A median below 0.25 seconds is rejected as too noisy. Failed tests,

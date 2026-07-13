@@ -317,6 +317,11 @@ least `3.0x` for both transformed source and the normal wheel. It runs only thro
 workflow dispatch or the repository script; normal CI does not enforce host-dependent wall-clock
 ratios.
 
+The [multi-repository benchmark corpus](benchmarks.md) measures a different boundary: complete
+project compatibility across 25 pinned repositories and end-to-end performance across 12 reviewed
+workloads. It keeps unsupported and no-op outcomes visible, separates Ubuntu from macOS, and never
+mixes calibration kernels or semantic negative controls into real-repository aggregates.
+
 Profiling and candidate trials are excluded from the final benchmark medians. The accepted payload
 must pass the test command before Atoll runs the configured alternating baseline/compiled subprocess
 pairs. Medians below 0.25 seconds are too noisy. Test failure, invalid timing, or speedup below the

@@ -278,6 +278,21 @@ def load_case_result(path: Path) -> CaseResult:
     return _parse_result(payload, str(path))
 
 
+def load_case_results(result_paths: tuple[Path, ...]) -> tuple[CaseResult, ...]:
+    """Load each result path exactly once for a validation transaction.
+
+    Callers that both aggregate and retain case-level evidence must carry these
+    immutable objects across that boundary instead of reopening mutable files.
+
+    Args:
+        result_paths: Case-result JSON files in arbitrary order.
+
+    Returns:
+        tuple[CaseResult, ...]: Parsed evidence in input order.
+    """
+    return tuple(load_case_result(path) for path in result_paths)
+
+
 def aggregate_case_results(
     manifest: CorpusManifest,
     result_paths: tuple[Path, ...],
@@ -303,10 +318,46 @@ def aggregate_case_results(
     Raises:
         AggregationError: If identities, digests, result schemas, or coverage are invalid.
     """
+    return aggregate_loaded_results(
+        manifest,
+        load_case_results(result_paths),
+        tier=tier,
+        platform=platform,
+    )
+
+
+def aggregate_loaded_results(
+    manifest: CorpusManifest,
+    results: tuple[CaseResult, ...],
+    *,
+    tier: CorpusTier,
+    platform: CorpusPlatform,
+) -> CorpusAggregate:
+    """Aggregate one already-loaded result transaction.
+
+    This variant is the promotion boundary: aggregate metrics and retained
+    per-case fields are derived from the same immutable reads.
+
+    Args:
+        manifest: Validated manifest defining the expected matrix identities.
+        results: Parsed case evidence loaded exactly once.
+        tier: Exact tier to aggregate.
+        platform: Exact runner platform to aggregate.
+
+    Returns:
+        CorpusAggregate: Deterministic immutable summary.
+
+    Raises:
+        AggregationError: If the selected matrix is empty or its evidence is
+            incomplete, duplicated, stale, or otherwise invalid.
+    """
     expected_rows = manifest_matrix(manifest, tier=tier, platform=platform)
+    if not expected_rows:
+        raise AggregationError(
+            f"selected matrix slice has no expected cases: tier={tier}, platform={platform}"
+        )
     expected_ids = tuple(row.case_id for row in expected_rows)
     expected = frozenset(expected_ids)
-    results = tuple(load_case_result(path) for path in result_paths)
     by_id = _index_selected_results(results, expected, tier, platform)
     missing = sorted(expected - set(by_id))
     if missing:

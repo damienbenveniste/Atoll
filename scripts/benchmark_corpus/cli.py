@@ -1,7 +1,7 @@
 """Command-line entry point for repository-local corpus tooling.
 
-Validation, lock inspection, matrix projection, and strict aggregation remain
-network-free. Promotion is added by its later delivery milestone.
+Validation, lock inspection, matrix projection, strict aggregation, and manual
+history promotion remain network-free.
 """
 
 from __future__ import annotations
@@ -24,6 +24,16 @@ from scripts.benchmark_corpus.aggregation import (
     render_aggregate_json,
     render_aggregate_markdown,
 )
+from scripts.benchmark_corpus.calibration import (
+    CalibrationError,
+    load_calibration_catalog,
+    verify_external_calibration,
+)
+from scripts.benchmark_corpus.history import (
+    HistoryError,
+    PromotionOptions,
+    promote_results,
+)
 from scripts.benchmark_corpus.lifecycle import (
     LifecycleOptions,
     run_case,
@@ -33,6 +43,9 @@ from scripts.benchmark_corpus.manifest import ManifestError, load_manifest, mani
 from scripts.benchmark_corpus.models import CorpusManifest, CorpusPlatform, CorpusTier
 
 DEFAULT_MANIFEST = Path(__file__).resolve().parents[2] / "benchmarks" / "corpus" / "manifest.toml"
+DEFAULT_CALIBRATION = DEFAULT_MANIFEST.parent / "calibration.toml"
+DEFAULT_HISTORY = DEFAULT_MANIFEST.parent / "history"
+DEFAULT_BENCHMARK_DOCS = DEFAULT_MANIFEST.parents[2] / "docs" / "benchmarks.md"
 LOCK_EXCLUDE_NEWER = "2026-07-13T23:59:59Z"
 _SHA256_HASH = re.compile(r"(?:^|\s)--hash=sha256:([0-9a-f]{64})(?=\s|$)")
 
@@ -52,24 +65,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
     try:
         manifest = load_manifest(args.manifest)
         if args.command == "validate":
-            atoll_root = args.manifest.resolve(strict=True).parents[2]
-            adapter_root = atoll_root / "benchmarks" / "corpus" / "adapters"
-            for case in manifest.cases:
-                if "performance" in case.tiers:
-                    validate_performance_assets(atoll_root, case, adapter_root)
-            print(
-                json.dumps(
-                    {
-                        "backends": list(manifest.backends),
-                        "cases": len(manifest.cases),
-                        "python": manifest.python_version,
-                        "schema_version": manifest.schema_version,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-            return 0
+            return _run_validate(manifest, args)
         if args.command == "matrix":
             rows = manifest_matrix(
                 manifest,
@@ -123,49 +119,127 @@ def main(argv: tuple[str, ...] | None = None) -> int:
                 )
             )
             return 0 if summary.result.status not in _FAILED_STATUSES else 1
-        if args.command == "aggregate":
-            result_paths = _case_result_paths(args.results_root)
-            aggregate = aggregate_case_results(
-                manifest,
-                result_paths,
-                tier=args.tier,
-                platform=args.platform,
-            )
-            output_root = args.output_root or args.results_root
-            json_path, markdown_path = _write_aggregate(
-                aggregate_json=render_aggregate_json(aggregate),
-                aggregate_markdown=render_aggregate_markdown(aggregate),
-                output_root=output_root,
-                tier=args.tier,
-                platform=args.platform,
-            )
-            print(
-                json.dumps(
-                    {
-                        "json": str(json_path),
-                        "markdown": str(markdown_path),
-                        "platform": aggregate.platform,
-                        "tier": aggregate.tier,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-            invalid = (
-                aggregate.infrastructure_invalid_case_ids or aggregate.semantic_invalid_case_ids
-            )
-            return 1 if invalid else 0
+        if args.command in {"aggregate", "promote"}:
+            return _run_result_command(manifest, args)
         parser.error(f"unsupported command: {args.command}")
-    except (AggregationError, ManifestError, OSError, RuntimeError) as error:
+    except (
+        AggregationError,
+        CalibrationError,
+        HistoryError,
+        ManifestError,
+        OSError,
+        RuntimeError,
+    ) as error:
         print(f"benchmark corpus error: {error}", file=sys.stderr)
         return 2
+
+
+def _run_validate(manifest: CorpusManifest, args: argparse.Namespace) -> int:
+    """Validate local corpus assets and optionally authenticate external calibrations."""
+    atoll_root = args.atoll_root.resolve(strict=True)
+    calibration = load_calibration_catalog(args.calibration, atoll_root)
+    external = tuple(
+        benchmark for benchmark in calibration.benchmarks if not benchmark.repository_verified
+    )
+    verified_external = 0
+    if args.calibration_checkout is not None:
+        for benchmark in external:
+            verify_external_calibration(benchmark, args.calibration_checkout)
+            verified_external += 1
+    adapter_root = atoll_root / "benchmarks" / "corpus" / "adapters"
+    for case in manifest.cases:
+        if "performance" in case.tiers:
+            validate_performance_assets(atoll_root, case, adapter_root)
+    print(
+        json.dumps(
+            {
+                "backends": list(manifest.backends),
+                "calibration_catalogued": len(calibration.benchmarks),
+                "calibration_external_pins": len(external),
+                "calibration_external_verified": verified_external,
+                "calibration_local_bundles_verified": sum(
+                    benchmark.repository_verified for benchmark in calibration.benchmarks
+                ),
+                "calibration_local_runnable": sum(
+                    benchmark.runnable for benchmark in calibration.benchmarks
+                ),
+                "cases": len(manifest.cases),
+                "python": manifest.python_version,
+                "schema_version": manifest.schema_version,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
+def _run_result_command(manifest: CorpusManifest, args: argparse.Namespace) -> int:
+    """Aggregate or manually promote one complete result matrix slice."""
+    result_paths = _case_result_paths(args.results_root)
+    if args.command == "aggregate":
+        aggregate = aggregate_case_results(
+            manifest,
+            result_paths,
+            tier=args.tier,
+            platform=args.platform,
+        )
+        output_root = args.output_root or args.results_root
+        json_path, markdown_path = _write_aggregate(
+            aggregate_json=render_aggregate_json(aggregate),
+            aggregate_markdown=render_aggregate_markdown(aggregate),
+            output_root=output_root,
+            tier=args.tier,
+            platform=args.platform,
+        )
+        print(
+            json.dumps(
+                {
+                    "json": str(json_path),
+                    "markdown": str(markdown_path),
+                    "platform": aggregate.platform,
+                    "tier": aggregate.tier,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        invalid = aggregate.infrastructure_invalid_case_ids or aggregate.semantic_invalid_case_ids
+        return 1 if invalid else 0
+    snapshot_path, docs_path = promote_results(
+        manifest,
+        result_paths,
+        PromotionOptions(
+            tier=args.tier,
+            platform=args.platform,
+            label=args.label,
+            reviewed_by=args.reviewed_by,
+            history_root=args.history_root,
+            docs_path=args.docs_path,
+        ),
+    )
+    print(
+        json.dumps(
+            {"docs": str(docs_path), "snapshot": str(snapshot_path)},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m scripts.benchmark_corpus")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("validate", help="validate the corpus manifest")
+    validate = commands.add_parser("validate", help="validate corpus and calibration manifests")
+    validate.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
+    validate.add_argument(
+        "--calibration-checkout",
+        type=Path,
+        help="authenticate external calibration pins against an existing detached checkout",
+    )
+    validate.add_argument("--atoll-root", type=Path, default=DEFAULT_MANIFEST.parents[2])
     matrix = commands.add_parser("matrix", help="emit a deterministic workflow matrix")
     matrix.add_argument("--tier", choices=_tier_choices())
     matrix.add_argument("--platform", choices=_platform_choices())
@@ -195,6 +269,17 @@ def _parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--platform", choices=_platform_choices(), required=True)
     aggregate.add_argument("--results-root", type=Path, required=True)
     aggregate.add_argument("--output-root", type=Path)
+    promote = commands.add_parser(
+        "promote",
+        help="retain one manually reviewed compact snapshot and refresh benchmark docs",
+    )
+    promote.add_argument("--tier", choices=_tier_choices(), required=True)
+    promote.add_argument("--platform", choices=_platform_choices(), required=True)
+    promote.add_argument("--results-root", type=Path, required=True)
+    promote.add_argument("--label", required=True)
+    promote.add_argument("--reviewed-by", required=True)
+    promote.add_argument("--history-root", type=Path, default=DEFAULT_HISTORY)
+    promote.add_argument("--docs-path", type=Path, default=DEFAULT_BENCHMARK_DOCS)
     return parser
 
 
