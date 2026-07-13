@@ -7,7 +7,10 @@ exercise while preserving exact Python semantics at unsafe boundaries.
 
 from __future__ import annotations
 
+import array
+from collections.abc import Buffer
 from dataclasses import dataclass
+from typing import cast
 
 FALLBACK_LIMIT = (1 << 53) - 1
 _MASK = (1 << 61) - 1
@@ -212,6 +215,151 @@ def call_chain_hard_checksum(calls: int, *, depth: int = _DEFAULT_CHAIN_DEPTH) -
         checksum = (checksum ^ result) + index + (result & 17)
         checksum &= _MASK
     return checksum
+
+
+def bytes_checksum(data: bytes) -> int:
+    """Reduce exact `bytes` input without copying the exported buffer.
+
+    Args:
+        data: Immutable byte sequence traversed without copying.
+
+    Returns:
+        Exact sum of every byte.
+    """
+
+    total = 0
+    for value in data:
+        total += value
+    return total
+
+
+def buffer_name_collision(data: bytes) -> int:
+    """Sum bytes while deliberately using Atoll's preferred private view stem.
+
+    Args:
+        data: Immutable byte sequence traversed without copying.
+
+    Returns:
+        Exact sum of every byte.
+    """
+
+    uint8_t = 0
+    for _atoll_view_data in data:
+        uint8_t += _atoll_view_data
+    return uint8_t
+
+
+def bytearray_checksum(data: bytearray) -> int:
+    """Reduce exact `bytearray` input without mutating or copying it.
+
+    Args:
+        data: Mutable byte sequence read directly by index.
+
+    Returns:
+        Bitwise XOR of every byte.
+    """
+
+    total = 0
+    for value in data:
+        total ^= value
+    return total
+
+
+def memoryview_checksum(data: memoryview) -> int:
+    """Reduce a one-dimensional memoryview by direct scalar indexing.
+
+    Args:
+        data: Readable one-dimensional memoryview with scalar integer items.
+
+    Returns:
+        Bitwise XOR of the view's logical items.
+    """
+
+    total = 0
+    for value in data:
+        total ^= value
+    return total
+
+
+def array_checksum(data: array.array[int]) -> int:
+    """Reduce an `array.array` by direct scalar indexing.
+
+    Args:
+        data: Numeric array exporter read without converting to bytes.
+
+    Returns:
+        Exact sum of the array's logical scalar values.
+    """
+
+    total = 0
+    for value in data:
+        total += value
+    return total
+
+
+def buffer_weighted_checksum(data: object, rounds: int = 1, *, seed: int = 11) -> int:
+    """Reduce any buffer exporter by its exact exported bytes.
+
+    Args:
+        data: Object exposing the buffer protocol, such as `bytes`, `bytearray`,
+            `memoryview`, or `array.array`.
+        rounds: Number of repeated checksum passes over the exported bytes.
+        seed: Initial checksum seed.
+
+    Returns:
+        Deterministic checksum over the exact bytes currently exposed by `data`.
+
+    Raises:
+        ValueError: If `rounds` is less than one.
+        TypeError: If `data` does not export a readable buffer.
+    """
+
+    if rounds < 1:
+        raise ValueError("rounds must be positive")
+
+    view = memoryview(cast(Buffer, data))
+    payload = view.tobytes()
+    mask = (1 << 61) - 1
+    total = seed & mask
+    for round_index in range(rounds):
+        salt = (round_index + 1) * 17
+        for index, value in enumerate(payload):
+            total += (value + salt) * (index + 1)
+            total ^= (value << (index & 7)) + round_index
+            total &= mask
+    return total
+
+
+def buffer_mutation_probe(data: object, value: int = 127) -> tuple[str, int, int]:
+    """Attempt one first-item mutation while preserving Python buffer semantics.
+
+    Args:
+        data: Object expected to expose a one-dimensional buffer.
+        value: Replacement value attempted against the first buffer item.
+
+    Returns:
+        Route label, checksum before mutation, and checksum after mutation. The
+        route is `empty` for empty buffers, `readonly` for read-only exporters,
+        `mutated` when direct item assignment succeeds, and `python-fallback`
+        for writable exporters whose format or layout rejects the attempted
+        scalar assignment.
+
+    Raises:
+        TypeError: If `data` does not export a buffer.
+    """
+
+    view = memoryview(cast(Buffer, data))
+    before = buffer_weighted_checksum(view, seed=3)
+    if len(view) == 0:
+        return ("empty", before, before)
+    if view.readonly:
+        return ("readonly", before, before)
+
+    try:
+        view[0] = value
+    except (NotImplementedError, OverflowError, TypeError, ValueError):
+        return ("python-fallback", before, before)
+    return ("mutated", before, buffer_weighted_checksum(view, seed=3))
 
 
 @dataclass(frozen=True, slots=True)

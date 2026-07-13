@@ -308,7 +308,11 @@ class BufferLayoutGuardPayload:
         ndim: Required dimensionality.
         c_contiguous: Whether C-contiguous layout is required.
         f_contiguous: Whether Fortran-contiguous layout is required.
-        readonly: Whether the variant requires a read-only buffer.
+        readonly: Required buffer mutability, or `None` when the read-only kernel accepts
+            either read-only or writable storage.
+        minimum_length: Optional inclusive element-count lower bound.
+        maximum_length: Optional inclusive element-count upper bound proving index and
+            accumulator safety before native entry.
     """
 
     subject: str
@@ -317,7 +321,9 @@ class BufferLayoutGuardPayload:
     ndim: int
     c_contiguous: bool
     f_contiguous: bool = False
-    readonly: bool = False
+    readonly: bool | None = None
+    minimum_length: int | None = None
+    maximum_length: int | None = None
 
     def __post_init__(self) -> None:
         """Reject impossible or underspecified buffer layout requirements.
@@ -334,6 +340,13 @@ class BufferLayoutGuardPayload:
             raise ValueError("buffer-layout ndim must be at least 0")
         if self.ndim == 0 and (self.c_contiguous or self.f_contiguous):
             raise ValueError("buffer-layout scalar buffers cannot require contiguity")
+        if (self.minimum_length is None) != (self.maximum_length is None):
+            raise ValueError("buffer-layout length bounds must be provided together")
+        if self.minimum_length is not None and self.maximum_length is not None:
+            if self.minimum_length < 0:
+                raise ValueError("buffer-layout minimum length must be non-negative")
+            if self.minimum_length > self.maximum_length:
+                raise ValueError("buffer-layout minimum length must not exceed maximum")
 
     @property
     def canonical_serialization(self) -> str:
@@ -352,6 +365,8 @@ class BufferLayoutGuardPayload:
                 str(self.c_contiguous),
                 str(self.f_contiguous),
                 str(self.readonly),
+                "" if self.minimum_length is None else str(self.minimum_length),
+                "" if self.maximum_length is None else str(self.maximum_length),
             )
         )
 

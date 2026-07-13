@@ -56,6 +56,11 @@ from atoll.execution_plans.models import (
     StagedExecutionPlan,
 )
 from atoll.execution_plans.task_preserving import TASK_PRESERVING_BACKEND
+from atoll.generation.buffer_kernel import (
+    BUFFER_KERNEL_GENERATOR_VERSION,
+    BufferKernelGenerationRequest,
+    generate_buffer_kernel,
+)
 from atoll.generation.call_chain import (
     CALL_CHAIN_GENERATOR_VERSION,
     CallChainGenerationRequest,
@@ -106,6 +111,11 @@ from atoll.models import (
     RegionSpecialization,
     SymbolId,
     TypedRegion,
+)
+from atoll.native_optimization.buffer_analysis import (
+    BufferAnalysisResult,
+    BufferKernelPlan,
+    analyze_buffer_scan,
 )
 from atoll.native_optimization.call_chains import (
     CallChainAnalysisResult,
@@ -200,6 +210,7 @@ _WHEEL_TAG_COMPONENT_COUNT = 3
 _SCALAR_INT32_WIDTH = 32
 _SCALAR_INT32_DISPATCH_RANK = 10
 _SCALAR_INT64_DISPATCH_RANK = 20
+_BUFFER_DISPATCH_RANK = 30
 _MAX_PROFILED_CALL_CHAIN_ROOTS = 4
 
 _GENERATED_DIR_NAMES = frozenset(
@@ -288,6 +299,7 @@ class PackageCommandResult:
         typed_regions: Backend-neutral typed regions discovered or reported.
         scalar_analyses: Fixed-width scalar plans and explicit frontend fallbacks.
         call_chain_analyses: Direct native call-chain plans and explicit fallbacks.
+        buffer_analyses: Zero-copy standard-buffer plans and explicit fallbacks.
         compiled_regions: Typed regions successfully compiled into the wheel.
         compiled_bindings: Source bindings successfully provided by compiled regions.
         compiled_variants: Backend and specialization variants successfully compiled.
@@ -327,6 +339,7 @@ class PackageCommandResult:
     typed_regions: tuple[TypedRegion, ...] = ()
     scalar_analyses: tuple[ScalarAnalysisResult, ...] = ()
     call_chain_analyses: tuple[CallChainAnalysisResult, ...] = ()
+    buffer_analyses: tuple[BufferAnalysisResult, ...] = ()
     compiled_regions: tuple[TypedRegion, ...] = ()
     compiled_bindings: tuple[BindingTarget, ...] = ()
     compiled_variants: tuple[CompiledRegionVariant, ...] = ()
@@ -613,6 +626,25 @@ class _CallChainExtensionContext:
 
 
 @dataclass(frozen=True, slots=True)
+class _BufferExtensionContext:
+    """Compile configuration and staged roots for zero-copy buffer variants.
+
+    Attributes:
+        project: Discovered target project and configured backend order.
+        build_root: Disposable root receiving generated buffer units.
+        staged_source_roots: Copied import roots used for source-clean compilation.
+        analyses: Buffer proof plans and rejection evidence for selected scans.
+        progress: Optional callback receiving buffer preparation progress.
+    """
+
+    project: DiscoveredProject
+    build_root: Path
+    staged_source_roots: tuple[Path, ...]
+    analyses: tuple[BufferAnalysisResult, ...]
+    progress: PackageProgress | None
+
+
+@dataclass(frozen=True, slots=True)
 class _TypedRegionPackageContext:
     """Selected analysis evidence carried into source-clean region packaging.
 
@@ -625,6 +657,7 @@ class _TypedRegionPackageContext:
         fusion_plans: Deterministic task-fusion safety evidence for profiled scheduler sites.
         scalar_analyses: Fixed-width scalar proofs and explicit fallbacks for selected scans.
         call_chain_analyses: Direct call-chain plans and explicit fallbacks for selected scans.
+        buffer_analyses: Zero-copy buffer plans and explicit fallbacks for selected scans.
     """
 
     selected: tuple[_SelectedTypedRegion, ...]
@@ -635,6 +668,7 @@ class _TypedRegionPackageContext:
     fusion_plans: tuple[FusionPlan, ...] = ()
     scalar_analyses: tuple[ScalarAnalysisResult, ...] = ()
     call_chain_analyses: tuple[CallChainAnalysisResult, ...] = ()
+    buffer_analyses: tuple[BufferAnalysisResult, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1059,6 +1093,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     typed_regions = tuple(region for scan in scans for region in scan.typed_regions)
     scalar_analyses = _scalar_analyses(scans, options.progress)
     call_chain_analyses = _call_chain_analyses(scans, options.progress)
+    buffer_analyses = _buffer_analyses(scans, options.progress)
     execution_plans = build_execution_plans(scans, None)
     _progress(options.progress, f"scanned {len(scans)} module(s) in {_duration(scan_started)}")
     preflight_selected = _selected_typed_regions(
@@ -1254,6 +1289,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
                 fusion_plans=fusion_plans,
                 scalar_analyses=scalar_analyses,
                 call_chain_analyses=call_chain_analyses,
+                buffer_analyses=buffer_analyses,
             ),
             prepared_baseline=baseline,
             profile=profile,
@@ -1263,6 +1299,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             package_result,
             scalar_analyses=scalar_analyses,
             call_chain_analyses=call_chain_analyses,
+            buffer_analyses=buffer_analyses,
         ),
         source_optimization,
         source_trials,
@@ -1469,6 +1506,7 @@ def _execute_composed_source_arm(
     )
     scalar_analyses = _scalar_analyses(active_scans, options.progress)
     call_chain_analyses = _call_chain_analyses(active_scans, options.progress)
+    buffer_analyses = _buffer_analyses(active_scans, options.progress)
     active_profile = preparation.profile
     if active_profile is not None:
         active_profile = _select_profile_with_call_chains(
@@ -1522,6 +1560,7 @@ def _execute_composed_source_arm(
             ),
             scalar_analyses=scalar_analyses,
             call_chain_analyses=call_chain_analyses,
+            buffer_analyses=buffer_analyses,
         )
 
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
@@ -1547,6 +1586,7 @@ def _execute_composed_source_arm(
                     fusion_plans=active_fusion_plans,
                     scalar_analyses=scalar_analyses,
                     call_chain_analyses=call_chain_analyses,
+                    buffer_analyses=buffer_analyses,
                 ),
                 prepared_baseline=arm.baseline,
                 profile=active_profile,
@@ -1572,6 +1612,7 @@ def _execute_composed_source_arm(
                     test_results=(*search.test_results, *rebased.test_results),
                     scalar_analyses=scalar_analyses,
                     call_chain_analyses=call_chain_analyses,
+                    buffer_analyses=buffer_analyses,
                 ),
                 planning,
                 search.trials,
@@ -1591,6 +1632,7 @@ def _execute_composed_source_arm(
             _source_result_with_composition_fallback(source_result, candidate, project),
             scalar_analyses=scalar_analyses,
             call_chain_analyses=call_chain_analyses,
+            buffer_analyses=buffer_analyses,
         )
 
 
@@ -2059,12 +2101,24 @@ def _execute_typed_region_package(
         prepared=prepared,
         failures=preparation_failures,
     )
+    prepared, preparation_failures, buffer_variant_count = _extend_with_buffer_variants(
+        context=_BufferExtensionContext(
+            project=project,
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            analyses=context.buffer_analyses,
+            progress=options.progress,
+        ),
+        prepared=prepared,
+        failures=preparation_failures,
+    )
     _progress(
         options.progress,
         (
             f"lowered {len(prepared)} native region variant(s), "
             f"including {scalar_variant_count} scalar and "
-            f"{call_chain_variant_count} direct call-chain variant(s); "
+            f"{call_chain_variant_count} direct call-chain and "
+            f"{buffer_variant_count} zero-copy buffer variant(s); "
             f"kept {len(preparation_failures)} as fallback in {_duration(generation_started)}"
         ),
     )
@@ -2295,6 +2349,7 @@ def _execute_typed_region_package(
         typed_regions=context.typed_regions,
         scalar_analyses=context.scalar_analyses,
         call_chain_analyses=context.call_chain_analyses,
+        buffer_analyses=context.buffer_analyses,
         compiled_regions=successful_regions,
         compiled_bindings=successful_bindings,
         compiled_variants=successful_variants,
@@ -2717,6 +2772,226 @@ def _prepare_call_chain_variants(
                     )
                 )
     return tuple(prepared), tuple(failures)
+
+
+def _extend_with_buffer_variants(
+    *,
+    context: _BufferExtensionContext,
+    prepared: list[_PreparedTypedRegion],
+    failures: list[PackageRegionBuildFailure],
+) -> tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure], int]:
+    """Prepend guarded zero-copy buffer variants without changing fallbacks.
+
+    Args:
+        context: Target project, copied roots, buffer analyses, and progress callback.
+        prepared: Existing generic and specialized native variants.
+        failures: Existing preparation failures.
+
+    Returns:
+        tuple[list[_PreparedTypedRegion], list[PackageRegionBuildFailure], int]:
+        Updated variants, failures, and prepared buffer variant count.
+    """
+    if "cython" not in context.project.config.compile.backends:
+        if any(analysis.plans for analysis in context.analyses):
+            _progress(
+                context.progress,
+                "zero-copy buffer variants skipped because Cython is disabled",
+            )
+        return prepared, failures, 0
+    selected_sources = {
+        binding.source
+        for item in prepared
+        for binding in item.generation.bindings
+        if binding.kind != "class"
+    }
+    selected_sources.update(
+        member.id
+        for failure in failures
+        for member in failure.region.members
+        if member.kind in {"function", "method"}
+    )
+    selected_analyses = tuple(
+        replace(
+            analysis,
+            plans=tuple(plan for plan in analysis.plans if plan.member in selected_sources),
+        )
+        for analysis in context.analyses
+    )
+    buffer_prepared, buffer_failures = _prepare_buffer_variants(
+        project=context.project,
+        build_root=context.build_root,
+        staged_source_roots=context.staged_source_roots,
+        analyses=selected_analyses,
+    )
+    return (
+        _merge_specialized_companions(prepared, buffer_prepared),
+        [*failures, *buffer_failures],
+        len(buffer_prepared),
+    )
+
+
+def _prepare_buffer_variants(
+    *,
+    project: DiscoveredProject,
+    build_root: Path,
+    staged_source_roots: tuple[Path, ...],
+    analyses: tuple[BufferAnalysisResult, ...],
+) -> tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+    """Revalidate and lower zero-copy plans inside copied source roots.
+
+    Args:
+        project: Original project discovery used to map staged modules.
+        build_root: Disposable source-clean native build root.
+        staged_source_roots: Copied import roots used during lowering.
+        analyses: Checkout or accepted-source buffer proof evidence.
+
+    Returns:
+        tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+        Prepared buffer variants and explicit lowering failures.
+    """
+    plans = tuple(plan for analysis in analyses for plan in analysis.plans)
+    scans: dict[str, ModuleScan] = {}
+    staged_analyses: dict[str, BufferAnalysisResult] = {}
+    prepared: list[_PreparedTypedRegion] = []
+    failures: list[PackageRegionBuildFailure] = []
+    for plan in plans:
+        module = _find_module(project.modules, plan.member.module)
+        staged_scan = scans.get(plan.member.module)
+        if staged_scan is None:
+            staged_module = _staged_module(module, project, staged_source_roots)
+            staged_scan = enrich_island_analysis(scan_module(staged_module))
+            scans[plan.member.module] = staged_scan
+            staged_analyses[plan.member.module] = analyze_buffer_scan(staged_scan)
+        staged_region = _buffer_region_for_plan(staged_scan, plan)
+        staged_plan = next(
+            (
+                candidate
+                for candidate in staged_analyses[plan.member.module].plans
+                if candidate.id == plan.id and candidate.member == plan.member
+            ),
+            None,
+        )
+        variant_id = _buffer_variant_id(plan)
+        if staged_plan is None:
+            failures.append(
+                PackageRegionBuildFailure(
+                    region=staged_region,
+                    variant_id=variant_id,
+                    backend="cython",
+                    assessment=CYTHON_BACKEND.assess(staged_region),
+                    build=_failed_region_attempt(
+                        "buffer lowering failed: staged proof differs from checkout analysis"
+                    ),
+                )
+            )
+            continue
+        try:
+            prepared.append(
+                _prepare_buffer_variant(
+                    context=_ScalarVariantContext(
+                        project=project,
+                        build_root=build_root,
+                        staged_source_roots=staged_source_roots,
+                        scan=staged_scan,
+                        region=staged_region,
+                    ),
+                    plan=staged_plan,
+                    variant_id=variant_id,
+                )
+            )
+        except (SyntaxError, ValueError) as error:
+            failures.append(
+                PackageRegionBuildFailure(
+                    region=staged_region,
+                    variant_id=variant_id,
+                    backend="cython",
+                    assessment=CYTHON_BACKEND.assess(staged_region),
+                    build=_failed_region_attempt(f"buffer lowering failed: {error}"),
+                )
+            )
+    return tuple(prepared), tuple(failures)
+
+
+def _prepare_buffer_variant(
+    *,
+    context: _ScalarVariantContext,
+    plan: BufferKernelPlan,
+    variant_id: str,
+) -> _PreparedTypedRegion:
+    """Generate one guarded Cython zero-copy buffer variant.
+
+    Args:
+        context: Staged source, scan, region, and filesystem evidence.
+        plan: Revalidated buffer proof plan.
+        variant_id: Stable layout-specific variant identity.
+
+    Returns:
+        _PreparedTypedRegion: Compilable unit and transactional shim contract.
+    """
+    logical_module = _typed_region_module_name(context.region, "cython", variant_id)
+    generated_path = context.build_root / f"{logical_module}.pyx"
+    generated = generate_buffer_kernel(
+        BufferKernelGenerationRequest(
+            scan=context.scan,
+            region=context.region,
+            plan=plan,
+            logical_module=logical_module,
+            output_path=generated_path,
+        )
+    )
+    unit = CYTHON_BACKEND.lower(
+        BackendLoweringRequest(
+            region=context.region,
+            source_path=generated_path,
+            logical_module=logical_module,
+            install_relative_dir=_region_artifact_relative_dir(variant_id),
+            members=(plan.member,),
+            variant_id=variant_id,
+        )
+    )
+    source_module = _find_module(context.project.modules, context.scan.module.name)
+    staged_source_root = _staged_source_root(
+        source_module,
+        context.project,
+        context.staged_source_roots,
+    )
+    return _PreparedTypedRegion(
+        generation=generated.generation,
+        assessment=CYTHON_BACKEND.assess(context.region),
+        unit=unit,
+        shim=RegionShimConfig(
+            source_module=context.scan.module.name,
+            source_path=context.scan.module.path,
+            region_id=context.region.id,
+            variant_id=variant_id,
+            backend="cython",
+            compiled_module=logical_module,
+            artifact_dir=staged_source_root / unit.install_relative_dir,
+            bindings=generated.generation.bindings,
+            dispatch_rank=_BUFFER_DISPATCH_RANK,
+            variant_guards=plan.guards,
+        ),
+        minimum_marginal_speedup=_SPECIALIZED_VARIANT_MINIMUM_SPEEDUP,
+    )
+
+
+def _buffer_region_for_plan(scan: ModuleScan, plan: BufferKernelPlan) -> TypedRegion:
+    region = next(
+        (
+            candidate
+            for candidate in scan.typed_regions
+            if any(member.id == plan.member for member in candidate.members)
+        ),
+        None,
+    )
+    if region is None:
+        raise ValueError(f"staged buffer member is absent: {plan.member.stable_id}")
+    return region
+
+
+def _buffer_variant_id(plan: BufferKernelPlan) -> str:
+    layout = plan.buffers[0].layout
+    return f"{plan.id}@cython-buffer-{layout.format}-{layout.itemsize}"
 
 
 def _prepare_scalar_variant(
@@ -3235,6 +3510,7 @@ def _build_typed_regions(
             ("outlined_region_generator", OUTLINED_REGION_GENERATOR_VERSION),
             ("scalar_kernel_generator", SCALAR_KERNEL_GENERATOR_VERSION),
             ("call_chain_generator", CALL_CHAIN_GENERATOR_VERSION),
+            ("buffer_kernel_generator", BUFFER_KERNEL_GENERATOR_VERSION),
         ),
     )
     for index, item in enumerate(prepared, start=1):
@@ -6332,6 +6608,32 @@ def _call_chain_analyses(
         (
             f"call-chain analysis proved {plan_count} root(s); "
             f"{rejection_count} root(s) retained Python dispatch"
+        ),
+    )
+    return analyses
+
+
+def _buffer_analyses(
+    scans: tuple[ModuleScan, ...],
+    progress: PackageProgress | None,
+) -> tuple[BufferAnalysisResult, ...]:
+    """Derive zero-copy standard-buffer candidates without changing selection.
+
+    Args:
+        scans: Enriched module scans in compile order.
+        progress: Optional CLI progress callback.
+
+    Returns:
+        tuple[BufferAnalysisResult, ...]: Per-module plans and explicit fallbacks.
+    """
+    analyses = tuple(analyze_buffer_scan(scan) for scan in scans)
+    plan_count = sum(len(analysis.plans) for analysis in analyses)
+    rejection_count = sum(len(analysis.rejections) for analysis in analyses)
+    _progress(
+        progress,
+        (
+            f"buffer analysis proved {plan_count} zero-copy kernel(s); "
+            f"{rejection_count} callable(s) retained Python buffer semantics"
         ),
     )
     return analyses

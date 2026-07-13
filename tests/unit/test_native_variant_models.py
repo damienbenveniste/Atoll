@@ -270,6 +270,23 @@ def test_guard_expression_rejects_mismatched_payloads(kind: str, payload: object
             ndim=0,
             c_contiguous=True,
         ),
+        lambda: BufferLayoutGuardPayload(
+            subject="values",
+            format="i",
+            itemsize=4,
+            ndim=1,
+            c_contiguous=True,
+            minimum_length=0,
+        ),
+        lambda: BufferLayoutGuardPayload(
+            subject="values",
+            format="i",
+            itemsize=4,
+            ndim=1,
+            c_contiguous=True,
+            minimum_length=2,
+            maximum_length=1,
+        ),
     ],
 )
 def test_guard_payloads_reject_malformed_combinations(

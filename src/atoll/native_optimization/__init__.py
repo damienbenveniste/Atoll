@@ -1,5 +1,18 @@
 """Native optimization contracts for guarded dispatch and scalar proofs."""
 
+from atoll.native_optimization.buffer_analysis import (
+    AccumulatorEvidence,
+    BufferAccessEvidence,
+    BufferAnalysisResult,
+    BufferKernelPlan,
+    BufferMemberAnalysisOptions,
+    BufferParameterEvidence,
+    BufferRejection,
+    ReturnEvidence,
+    SourceSpan,
+    analyze_buffer_member,
+    analyze_buffer_scan,
+)
 from atoll.native_optimization.models import (
     BindingDispatchPlan,
     BufferLayoutGuardPayload,
@@ -30,8 +43,15 @@ from atoll.native_optimization.scalar_analysis import (
 )
 
 __all__ = (
+    "AccumulatorEvidence",
     "BindingDispatchPlan",
+    "BufferAccessEvidence",
+    "BufferAnalysisResult",
+    "BufferKernelPlan",
     "BufferLayoutGuardPayload",
+    "BufferMemberAnalysisOptions",
+    "BufferParameterEvidence",
+    "BufferRejection",
     "CallableCodeIdentityGuardPayload",
     "CompiledBindingVariant",
     "CompiledVariantKind",
@@ -44,6 +64,7 @@ __all__ = (
     "IntegerBitWidth",
     "IntegerDomainGuardPayload",
     "NativeVariantPlan",
+    "ReturnEvidence",
     "ScalarAnalysisResult",
     "ScalarKernelPlan",
     "ScalarMemberAnalysisOptions",
@@ -51,6 +72,9 @@ __all__ = (
     "ScalarParameterDomain",
     "ScalarRejection",
     "ScalarWidthProof",
+    "SourceSpan",
+    "analyze_buffer_member",
+    "analyze_buffer_scan",
     "analyze_scalar_member",
     "analyze_scalar_scan",
     "stable_native_variant_plan_id",

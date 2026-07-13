@@ -254,8 +254,22 @@ def test_cython_lower_validates_requested_members_and_variant_id(tmp_path: Path)
     )
     assert cython_unit.source_paths == (cython_path,)
 
+    cython_path.write_text(
+        "# atoll buffer proof fixture\n" + source_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    buffer_unit = backend.lower(
+        BackendLoweringRequest(
+            region=region,
+            source_path=cython_path,
+            logical_module="cython_lowering_buffer",
+            members=(scale,),
+        )
+    )
+    assert buffer_unit.source_paths == (cython_path,)
+
     cython_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
-    with pytest.raises(UnsupportedBackendRegionError, match="requires Atoll scalar proof"):
+    with pytest.raises(UnsupportedBackendRegionError, match="requires Atoll proof"):
         backend.lower(
             BackendLoweringRequest(
                 region=region,

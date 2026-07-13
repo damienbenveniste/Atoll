@@ -140,6 +140,14 @@ conflicting call sites, unresolved TypeVars, semantic `Any`, subclass overrides,
 classes are not specialized. Profile-hot boxed callables can still be compiled without pretending
 that their types became concrete.
 
+For exact `bytes`, `bytearray`, `memoryview`, and `array.array` parameters, Atoll can lower a
+conservatively proved read-only sum, XOR, or conditional-count loop through a Cython typed
+memoryview without copying. Dispatch first checks the exact runtime type, one-dimensional
+contiguous format and item size, mutability when required, and a constant-time length bound for
+overflow-sensitive reductions. The initial `memoryview` and `array.array` specialization accepts
+unsigned-byte (`B`) layouts; other formats, strided views, mutation, complex indexing, and mixed
+reductions use the original Python function.
+
 Profile-selected methods and functions are lowered as directed slices rooted at one public
 binding. Ordinary same-module calls, awaited calls, class construction, and `self` or `cls` method
 dispatch remain late-bound Python runtime boundaries unless syntax proves the callee must share the

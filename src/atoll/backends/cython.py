@@ -61,7 +61,10 @@ _DIRECTIVES: dict[str, object] = {
 _MAX_DIAGNOSTIC_LINES = 20
 _SHARED_REGION_ID = "__shared__"
 _SUPPORTED_SOURCE_SUFFIXES = frozenset({".py", ".pyx"})
-_PROOF_GENERATED_PYX_MARKER = "# atoll scalar proof "
+_PROOF_GENERATED_PYX_MARKERS = (
+    "# atoll scalar proof ",
+    "# atoll buffer proof ",
+)
 _PORTABLE_OPTIMIZATION_FLAGS = ("/O2",) if os.name == "nt" else ("-O3",)
 
 
@@ -214,8 +217,7 @@ class CythonBackend:
             request.source_path
         ):
             raise UnsupportedBackendRegionError(
-                f"cython .pyx lowering requires Atoll scalar proof provenance: "
-                f"{request.source_path}"
+                f"cython .pyx lowering requires Atoll proof provenance: {request.source_path}"
             )
         return CompilationUnit(
             region_id=request.variant_id or request.region.id,
@@ -446,7 +448,8 @@ def _is_proof_generated_pyx(path: Path) -> bool:
     Returns:
         bool: Whether the file was emitted by Atoll's scalar proof generator.
     """
-    return _PROOF_GENERATED_PYX_MARKER in path.read_text(encoding="utf-8")
+    source = path.read_text(encoding="utf-8")
+    return any(marker in source for marker in _PROOF_GENERATED_PYX_MARKERS)
 
 
 def _build_units(

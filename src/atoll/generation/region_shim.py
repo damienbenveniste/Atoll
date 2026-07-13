@@ -16,6 +16,7 @@ from pathlib import Path
 
 from atoll.models import Backend, BindingTarget
 from atoll.native_optimization.models import (
+    BufferLayoutGuardPayload,
     CallableCodeIdentityGuardPayload,
     DirectFieldGuardPayload,
     ExactTypeGuardPayload,
@@ -133,11 +134,12 @@ class RegionShimConfig:
             "integer-domain",
             "direct-field",
             "callable-code-identity",
+            "buffer-layout",
         }
         if any(guard.kind not in supported for guard in self.variant_guards):
             raise ValueError(
-                "region shim supports only exact-type, integer-domain, and callable identity "
-                "variant guards"
+                "region shim supports only exact-type, integer-domain, direct-field, "
+                "callable identity, and buffer-layout variant guards"
             )
         if any(
             isinstance(guard.payload, CallableCodeIdentityGuardPayload)
@@ -421,6 +423,35 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "                ):",
             "                    return False",
             "                continue",
+            "            if _atoll_kind == 'buffer-layout':",
+            "                try:",
+            "                    _atoll_view = memoryview(_atoll_value)",
+            "                except (TypeError, ValueError):",
+            "                    return False",
+            "                try:",
+            "                    _atoll_layout_matches = (",
+            "                        _atoll_view.format == _atoll_guard['format']",
+            "                        and _atoll_view.itemsize == _atoll_guard['itemsize']",
+            "                        and _atoll_view.ndim == _atoll_guard['ndim']",
+            "                        and _atoll_view.c_contiguous",
+            "                        == _atoll_guard['c_contiguous']",
+            "                        and _atoll_view.f_contiguous",
+            "                        == _atoll_guard['f_contiguous']",
+            "                        and (",
+            "                            _atoll_guard['readonly'] is None",
+            "                            or _atoll_view.readonly == _atoll_guard['readonly']",
+            "                        )",
+            "                        and (",
+            "                            _atoll_guard['minimum_length'] is None",
+            "                            or _atoll_guard['minimum_length'] <= len(_atoll_view)",
+            "                            <= _atoll_guard['maximum_length']",
+            "                        )",
+            "                    )",
+            "                finally:",
+            "                    _atoll_view.release()",
+            "                if _atoll_layout_matches:",
+            "                    continue",
+            "                return False",
             "            if _atoll_value is None and _atoll_guard['allow_none']:",
             "                continue",
             "            if _atoll_guard['types']:",
@@ -1323,6 +1354,19 @@ def _structured_guard(
             "code_fingerprint": guard.payload.code_fingerprint,
             "receiver_subject": guard.payload.receiver_subject,
             "code_firstlineno": guard.payload.code_firstlineno,
+        }
+    if guard.kind == "buffer-layout" and isinstance(guard.payload, BufferLayoutGuardPayload):
+        return {
+            "kind": "buffer-layout",
+            "parameter_name": guard.payload.subject,
+            "format": guard.payload.format,
+            "itemsize": guard.payload.itemsize,
+            "ndim": guard.payload.ndim,
+            "c_contiguous": guard.payload.c_contiguous,
+            "f_contiguous": guard.payload.f_contiguous,
+            "readonly": guard.payload.readonly,
+            "minimum_length": guard.payload.minimum_length,
+            "maximum_length": guard.payload.maximum_length,
         }
     raise ValueError(f"unsupported structured region guard: {guard.kind}")
 

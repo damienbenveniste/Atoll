@@ -31,8 +31,10 @@ from atoll.models import (
     SymbolId,
 )
 from atoll.native_optimization.models import (
+    BufferLayoutGuardPayload,
     CallableCodeIdentityGuardPayload,
     DirectFieldGuardPayload,
+    ExactTypeGuardPayload,
     GuardExpression,
 )
 
@@ -104,6 +106,14 @@ class _CallableGuardModule(Protocol):
 
     def root(self, value: int) -> tuple[str, int]:
         """Return the selected call-chain route and value."""
+        ...
+
+
+class _BufferGuardModule(Protocol):
+    """Dynamic module surface used by zero-copy buffer dispatcher tests."""
+
+    def checksum(self, data: object) -> tuple[str, int]:
+        """Return the selected buffer route and checksum."""
         ...
 
 
@@ -301,6 +311,71 @@ def test_region_shim_guards_exact_owner_and_direct_integer_field(
     assert worker_type(True).scale(4) == ("python", 4)
     assert worker_type(101).scale(4) == ("python", 404)
     assert child_type(3).scale(4) == ("python", 12)
+
+
+def test_region_shim_guards_exact_buffer_layout_and_safe_length(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buffer variants enter native code only after constant-time layout proof."""
+    binding = BindingTarget(
+        source=SymbolId(module="pkg.worker", qualname="checksum"),
+        compiled_name="compiled_checksum",
+        kind="module",
+        owner_class=None,
+        execution_kind="sync",
+    )
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=tmp_path / "pkg" / "worker.py",
+        region_id="buffer-kernel",
+        backend="cython",
+        compiled_module="_atoll_buffer_kernel",
+        artifact_dir=tmp_path / "pkg" / "artifacts",
+        bindings=(binding,),
+        variant_id="buffer-bytes-B",
+        dispatch_rank=30,
+        variant_guards=(
+            GuardExpression(
+                kind="exact-type",
+                payload=ExactTypeGuardPayload(
+                    subject="data",
+                    type_module="builtins",
+                    type_qualname="bytes",
+                ),
+                message="data must be exact bytes",
+            ),
+            GuardExpression(
+                kind="buffer-layout",
+                payload=BufferLayoutGuardPayload(
+                    subject="data",
+                    format="B",
+                    itemsize=1,
+                    ndim=1,
+                    c_contiguous=True,
+                    f_contiguous=True,
+                    readonly=True,
+                    minimum_length=0,
+                    maximum_length=4,
+                ),
+                message="data must match the proven byte layout and length",
+            ),
+        ),
+    )
+    source = """def checksum(data):
+    return ("python", sum(data))
+"""
+    compiled = """def compiled_checksum(data):
+    return ("compiled", sum(data))
+"""
+    module = cast(
+        _BufferGuardModule,
+        _load_region_module(config, source, compiled, monkeypatch),
+    )
+
+    assert module.checksum(b"abc") == ("compiled", 294)
+    assert module.checksum(b"abcdef") == ("python", 597)
+    assert module.checksum(bytearray(b"abc")) == ("python", 294)
 
 
 def test_region_shim_rejects_helper_rebound_during_module_execution(

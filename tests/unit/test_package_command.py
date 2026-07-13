@@ -41,6 +41,7 @@ from atoll.models import (
     SymbolId,
     TypedRegion,
 )
+from atoll.native_optimization.buffer_analysis import BufferAnalysisResult
 from atoll.native_optimization.call_chains import CallChainAnalysisResult
 from atoll.project import DiscoveredProject, discover_project
 from atoll.report import CompilationReportInput, build_compilation_report
@@ -401,6 +402,21 @@ _extend_with_call_chain_variants = cast(
     Callable[..., tuple[list[_PreparedTypedRegion], list[_TypedRegionFailure], int]],
     _package_attr("_extend_with_call_chain_variants"),
 )
+_buffer_analyses = cast(
+    Callable[
+        [tuple[ModuleScan, ...], Callable[[str], None] | None],
+        tuple[BufferAnalysisResult, ...],
+    ],
+    _package_attr("_buffer_analyses"),
+)
+_BufferExtensionContext = cast(
+    Callable[..., object],
+    _package_attr("_BufferExtensionContext"),
+)
+_extend_with_buffer_variants = cast(
+    Callable[..., tuple[list[_PreparedTypedRegion], list[_TypedRegionFailure], int]],
+    _package_attr("_extend_with_buffer_variants"),
+)
 _runtime_member_closure = cast(
     Callable[[TypedRegion, tuple[SymbolId, ...], frozenset[SymbolId]], tuple[SymbolId, ...]],
     _package_attr("_runtime_member_closure"),
@@ -684,6 +700,115 @@ def test_call_chain_preparation_rejects_staged_source_drift(tmp_path: Path) -> N
     assert prepared == ()
     assert len(failures) == EXPECTED_SINGLE_FAILURE
     assert failures[0].variant_id.endswith("@cython-call-chain")
+
+
+def test_buffer_extension_reports_cython_disabled(tmp_path: Path) -> None:
+    """Configured backend order disables zero-copy buffer variants explicitly."""
+    project_root = tmp_path / "native_project"
+    shutil.copytree(NATIVE_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    project = replace(
+        project,
+        config=replace(
+            project.config,
+            compile=replace(project.config.compile, backends=("mypyc",)),
+        ),
+    )
+    analyses = _buffer_analyses(
+        _selected_scans(project, "native_optimization_fixture.kernels"),
+        None,
+    )
+    messages: list[str] = []
+    context = _BufferExtensionContext(
+        project=project,
+        build_root=tmp_path / "build",
+        staged_source_roots=(),
+        analyses=analyses,
+        progress=messages.append,
+    )
+
+    prepared, failures, count = _extend_with_buffer_variants(
+        context=context,
+        prepared=[],
+        failures=[],
+    )
+
+    assert prepared == []
+    assert failures == []
+    assert count == 0
+    assert messages == ["zero-copy buffer variants skipped because Cython is disabled"]
+
+
+def test_buffer_extension_keeps_candidates_after_generic_preparation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generic backend failure cannot filter out an independent buffer proof."""
+    project_root = tmp_path / "native_project"
+    shutil.copytree(NATIVE_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "native_optimization_fixture.kernels")
+    analyses = _buffer_analyses(scans, None)
+    selected_plan = next(
+        plan
+        for analysis in analyses
+        for plan in analysis.plans
+        if plan.member.qualname == "bytes_checksum"
+    )
+    region = next(
+        item
+        for item in scans[0].typed_regions
+        if any(member.id == selected_plan.member for member in item.members)
+    )
+    generic_failure = package_command.PackageRegionBuildFailure(
+        region=region,
+        variant_id="generic-failure",
+        backend="mypyc",
+        assessment=BackendAssessment(
+            region_id=region.id,
+            backend="mypyc",
+            status="unsupported",
+            supported_members=(),
+            unsupported_members=(selected_plan.member,),
+            capabilities=(),
+            reasons=("fixture generic failure",),
+        ),
+        build=CompileAttempt(
+            success=False,
+            command=(),
+            stdout="",
+            stderr="fixture generic failure",
+            artifact_paths=(),
+            duration_seconds=0.0,
+        ),
+    )
+    captured: list[object] = []
+
+    def capture_plans(**kwargs: object) -> tuple[tuple[object, ...], tuple[object, ...]]:
+        selected = cast(tuple[BufferAnalysisResult, ...], kwargs["analyses"])
+        captured.extend(plan for analysis in selected for plan in analysis.plans)
+        return (), ()
+
+    monkeypatch.setattr(package_command, "_prepare_buffer_variants", capture_plans)
+    context = _BufferExtensionContext(
+        project=project,
+        build_root=tmp_path / "build",
+        staged_source_roots=(),
+        analyses=analyses,
+        progress=None,
+    )
+
+    prepared, failures, count = _extend_with_buffer_variants(
+        context=context,
+        prepared=[],
+        failures=[generic_failure],
+    )
+
+    assert prepared == []
+    assert len(failures) == 1
+    assert failures[0].variant_id == generic_failure.variant_id
+    assert count == 0
+    assert captured == [selected_plan]
 
 
 def test_call_chain_preparation_retains_each_width_lowering_failure(

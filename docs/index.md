@@ -109,6 +109,13 @@ that carry TypeVars, conflicting calls, unresolved TypeVars, semantic `Any`, sub
 and dynamic owner classes are not specialized. Profile-hot boxed callables can still compile
 without claiming their types became concrete.
 
+Exact `bytes`, `bytearray`, `memoryview`, and `array.array` parameters can use a zero-copy Cython
+typed-memoryview kernel when static analysis proves a read-only sum, XOR, or conditional-count
+loop. Runtime dispatch checks exact type, one-dimensional contiguous format and item size,
+mutability when required, and a constant-time safe length before native entry. The initial
+`memoryview` and `array.array` specialization accepts unsigned-byte (`B`) layouts; unsupported
+formats, strided views, mutation, complex indexes, and mixed reductions retain Python behavior.
+
 Profile-selected functions and methods use directed slices rooted at one public binding. Ordinary
 same-module calls, awaited calls, class construction, and receiver method dispatch remain normal
 late-bound runtime boundaries unless syntax proves a shared native unit is required. A blocked or
