@@ -78,6 +78,7 @@ oracle_adapter = "compatibility"
 oracle_arguments = ["--case", "dulwich"]
 tiers = ["compatibility"]
 platforms = ["ubuntu-24.04", "macos-14"]
+compile_timeout_seconds = 5400
 
 [[case]]
 id = "html5lib"
@@ -345,6 +346,7 @@ oracle_adapter = "compatibility"
 oracle_arguments = ["--case", "sqlglot"]
 tiers = ["compatibility", "performance"]
 platforms = ["ubuntu-24.04", "macos-14"]
+compile_timeout_seconds = 5400
 
 [case.workload]
 source = "atoll"

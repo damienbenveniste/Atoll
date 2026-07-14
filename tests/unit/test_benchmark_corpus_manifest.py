@@ -15,6 +15,7 @@ _INVALID_MANIFEST_EXIT_CODE = 2
 _VALID_HASH = "a" * 64
 _TREE_HASH = "b" * 64
 _ARCHIVE_SIZE = 1234
+_LARGE_COMPILE_TIMEOUT_SECONDS = 90 * 60
 _EXPECTED_REPOSITORY_CASES = {
     "anyio",
     "attrs",
@@ -446,6 +447,8 @@ def test_repository_manifest_keeps_httpx_and_dulwich_tests_with_their_projects()
         "ce3f57e64d28229d48b210b348d831126546abe0c8290250f74144e8bffef3f5"
     )
     assert all(case.sdist is None for case in manifest.cases if case.id != "html5lib")
+    assert cases["dulwich"].compile_timeout_seconds == _LARGE_COMPILE_TIMEOUT_SECONDS
+    assert cases["sqlglot"].compile_timeout_seconds == _LARGE_COMPILE_TIMEOUT_SECONDS
 
 
 def test_lock_cli_write_uses_reviewed_input_and_reproducible_uv_policy(

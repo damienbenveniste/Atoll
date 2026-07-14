@@ -71,6 +71,10 @@ wheel digests. Materialized source and wheel payloads are deleted rather than
 uploaded. A warm run uses only the first run's case-local Atoll cache and must
 invoke no native compiler.
 
+Compatibility compiles default to 45 minutes. Large cases identified by an
+observed cold compile may declare the existing 90-minute per-case override;
+the runner still records and classifies any timeout rather than omitting it.
+
 ## Running The Corpus
 
 Validate metadata without cloning or executing external code:
