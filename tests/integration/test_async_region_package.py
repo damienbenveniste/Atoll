@@ -18,16 +18,16 @@ COMPILED_BINDINGS = frozenset(
     {
         f"{MODULE_NAME}::ProtocolRunner.async_exchange",
         f"{MODULE_NAME}::ProtocolRunner.cold_decoy",
+        f"{MODULE_NAME}::ProtocolRunner.compute",
         f"{MODULE_NAME}::ProtocolRunner.exchange",
         f"{MODULE_NAME}::ProtocolRunner.fail_after_suspend",
         f"{MODULE_NAME}::ProtocolRunner.parse",
+        f"{MODULE_NAME}::ProtocolRunner.wait_until_cancelled",
         f"{MODULE_NAME}::ProtocolRunner.with_bias",
     }
 )
 INTERPRETED_BINDINGS = frozenset(
     {
-        f"{MODULE_NAME}::ProtocolRunner.compute",
-        f"{MODULE_NAME}::ProtocolRunner.wait_until_cancelled",
         f"{MODULE_NAME}::GenericRunner.identity",
         f"{MODULE_NAME}::DynamicRunner.calculate",
     }

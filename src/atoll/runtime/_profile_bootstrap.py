@@ -138,22 +138,22 @@ class _SamplingProfiler:
     def start(self) -> None:
         """Enable non-reentrant statistical leaf-frame sampling.
 
-        The real-time timer is one-shot. Each callback rearms it only after frame
-        mapping and counter updates finish, so slow sampling work cannot overlap
-        a later sample.
+        The process-CPU timer is one-shot. Each callback rearms it only after
+        frame mapping and counter updates finish, so slow sampling work cannot
+        overlap a later sample and idle wall-clock time is not sampled.
         """
-        self._previous_handler = signal.getsignal(signal.SIGALRM)
-        signal.signal(signal.SIGALRM, self._sample)
+        self._previous_handler = signal.getsignal(signal.SIGPROF)
+        signal.signal(signal.SIGPROF, self._sample)
         self._enabled = True
         self._arm_timer()
 
     def stop(self) -> None:
         """Disable sampling and monitoring callbacks installed by this pass."""
         self._enabled = False
-        signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
+        signal.setitimer(signal.ITIMER_PROF, 0.0, 0.0)
         if self._previous_handler is not None:
-            signal.signal(signal.SIGALRM, signal.SIG_IGN)
-            signal.signal(signal.SIGALRM, self._previous_handler)
+            signal.signal(signal.SIGPROF, signal.SIG_IGN)
+            signal.signal(signal.SIGPROF, self._previous_handler)
 
     def payload(self) -> JsonObject:
         """Return JSON evidence from the sampling pass.
@@ -196,7 +196,7 @@ class _SamplingProfiler:
 
     def _arm_timer(self) -> None:
         """Schedule one sample without installing a periodic timer."""
-        signal.setitimer(signal.ITIMER_REAL, _SAMPLE_INTERVAL_SECONDS, 0.0)
+        signal.setitimer(signal.ITIMER_PROF, _SAMPLE_INTERVAL_SECONDS, 0.0)
 
 
 class _TypeProfiler:

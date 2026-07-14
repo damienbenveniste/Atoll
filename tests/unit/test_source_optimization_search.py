@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Protocol, cast
 
 import pytest
 
@@ -29,12 +30,19 @@ from atoll.source_optimization.search import (
     SOURCE_SEARCH_MAX_DEPTH,
     SOURCE_SEARCH_MAX_TRIALS,
     SourceOptimizationSearchOptions,
+    SourceOptimizationSearchResult,
     run_source_optimization_search,
 )
 from atoll.source_optimization.transforms import (
     CallableBodyReplacement,
     GeneratedSourcePatch,
     SourceTransformationRequest,
+)
+from atoll.source_optimization.winner_cache import (
+    SourceWinnerIdentity,
+    load_source_winner,
+    store_source_winner,
+    winner_manifest_path,
 )
 from atoll.wheel_overlay import WheelBuildEvidence
 
@@ -45,6 +53,44 @@ WORKER = SymbolId("source_optimization_fixture.workflow", "_immediate_worker")
 LOWERING_VARIANT_COUNT = 2
 SEARCH_BENCHMARK_RUNS_FOR_ONE_CANDIDATE = 12
 WHEEL_SEMANTIC_FAILURE_CODE = 9
+WINNER_IDENTITY_VARIANT_COUNT = 6
+WINNER_CONTENT_IDENTITY_VARIANT_COUNT = 5
+
+
+class _SourceCandidateView(Protocol):
+    """Minimal private candidate surface needed by cache-identity tests."""
+
+    id: str
+
+
+class _CandidateFormationView(Protocol):
+    """Minimal private formation surface needed by cache-identity tests."""
+
+    candidates: tuple[_SourceCandidateView, ...]
+
+
+_form_candidates = cast(
+    Callable[
+        [
+            tuple[SourceOptimizationPlan, ...],
+            tuple[SourceOptimizationAssessment, ...],
+            Path,
+        ],
+        _CandidateFormationView,
+    ],
+    source_search.__dict__["_form_candidates"],
+)
+_winner_identity = cast(
+    Callable[
+        [
+            tuple[SourceOptimizationPlan, ...],
+            tuple[_SourceCandidateView, ...],
+            SourceOptimizationSearchOptions,
+        ],
+        SourceWinnerIdentity,
+    ],
+    source_search.__dict__["_winner_identity"],
+)
 
 
 def test_candidate_search_is_stable_and_bounded(
@@ -1444,6 +1490,424 @@ def test_helper_path_safety_copy_and_progress_edges(tmp_path: Path) -> None:
         source_search_arm("other")
 
 
+def test_accepted_winner_replay_is_stable_despite_opposite_timing_jitter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warm search revalidates only the accepted cold winner despite jitter."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    options = _search_options(project_root, tmp_path)
+    observed_candidate_ids: list[str] = []
+    search_seconds: dict[str, float] = {}
+    warm = False
+    wheel_builds = 0
+
+    def fake_run(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: str,
+        **_options: object,
+    ) -> CommandRunEvidence:
+        candidate_id = _candidate_id_from_path(payload_root)
+        if command == ("test",) and candidate_id:
+            observed_candidate_ids.append(candidate_id)
+        if command == ("test",):
+            duration = 0.05
+        elif mode == "baseline":
+            duration = 8.0
+        elif not candidate_id:
+            duration = 1.0
+        elif warm:
+            duration = 1.2 if candidate_id == cold_winner else 0.5
+        else:
+            duration = search_seconds.setdefault(
+                candidate_id,
+                1.0 if not search_seconds else 0.8,
+            )
+        return _command_evidence(command, (project_root, payload_root), mode, duration)
+
+    def fake_wheel(_winner: object) -> tuple[WheelBuildEvidence, Path, Path]:
+        nonlocal wheel_builds
+        wheel_builds += 1
+        wheel_path = tmp_path / f"candidate-{wheel_builds}-py3-none-any.whl"
+        wheel_path.write_bytes(b"wheel")
+        payload = tmp_path / f"winner-wheel-payload-{wheel_builds}"
+        payload.mkdir()
+        return (
+            WheelBuildEvidence(
+                command=("build",),
+                project_root=project_root,
+                outdir=tmp_path,
+                returncode=0,
+                stdout="",
+                stderr="",
+                duration_seconds=0.2,
+                wheel_paths=(wheel_path,),
+            ),
+            wheel_path,
+            payload,
+        )
+
+    monkeypatch.setattr("atoll.source_optimization.search.run_performance_command", fake_run)
+    monkeypatch.setattr("atoll.source_optimization.search._build_candidate_wheel", fake_wheel)
+
+    cold = run_source_optimization_search((plan,), (assessment,), options)
+    cold_winner = _accepted_candidate_id(cold)
+    assert len(search_seconds) >= LOWERING_VARIANT_COUNT
+
+    observed_candidate_ids.clear()
+    warm = True
+    replayed = run_source_optimization_search((plan,), (assessment,), options)
+
+    assert replayed.accepted
+    assert _accepted_candidate_id(replayed) == cold_winner
+    assert replayed.patch_path == cold.patch_path
+    assert set(observed_candidate_ids) == {cold_winner}
+
+
+def test_winner_identity_invalidates_source_config_and_candidate_universe(
+    tmp_path: Path,
+) -> None:
+    """Every static replay boundary produces a distinct accepted-winner key."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    options = _search_options(project_root, tmp_path)
+    formation = _form_candidates((plan,), (assessment,), project_root)
+    base = _winner_identity(
+        (plan,),
+        formation.candidates,
+        options,
+    )
+    candidate_id = formation.candidates[0].id
+    store_source_winner(options.cache_root, base, candidate_id)
+
+    changed_source_plan = replace(
+        plan,
+        identity=replace(
+            plan.identity,
+            source_hashes=((SOURCE_PATH, "f" * 64),),
+        ),
+    )
+    changed_source = _winner_identity(
+        (changed_source_plan,),
+        formation.candidates,
+        options,
+    )
+    changed_config = _winner_identity(
+        (plan,),
+        formation.candidates,
+        replace(
+            options,
+            compile_config=replace(options.compile_config, benchmark_samples=9),
+        ),
+    )
+    changed_test_command = _winner_identity(
+        (plan,),
+        formation.candidates,
+        replace(
+            options,
+            compile_config=replace(
+                options.compile_config,
+                test_command=("test", "--strict"),
+            ),
+        ),
+    )
+    changed_benchmark_command = _winner_identity(
+        (plan,),
+        formation.candidates,
+        replace(
+            options,
+            compile_config=replace(
+                options.compile_config,
+                benchmark_command=("benchmark", "--large"),
+            ),
+        ),
+    )
+    changed_universe = replace(
+        base,
+        candidate_ids=(*base.candidate_ids, "source-candidate-extra"),
+    )
+    reordered_universe = _winner_identity(
+        (plan,),
+        tuple(reversed(formation.candidates)),
+        options,
+    )
+
+    assert (
+        len(
+            {
+                base.key,
+                changed_source.key,
+                changed_config.key,
+                changed_test_command.key,
+                changed_benchmark_command.key,
+                changed_universe.key,
+            }
+        )
+        == WINNER_IDENTITY_VARIANT_COUNT
+    )
+    assert reordered_universe.key == base.key
+    assert load_source_winner(options.cache_root, base).candidate_id == candidate_id
+    assert load_source_winner(options.cache_root, changed_source).candidate_id is None
+    assert load_source_winner(options.cache_root, changed_config).candidate_id is None
+    assert load_source_winner(options.cache_root, changed_test_command).candidate_id is None
+    assert load_source_winner(options.cache_root, changed_benchmark_command).candidate_id is None
+    assert load_source_winner(options.cache_root, changed_universe).candidate_id is None
+
+
+def test_winner_identity_invalidates_quality_payload_and_environment_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Benchmark, metadata, baseline, and dependency inputs invalidate replay."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    options = _search_options(project_root, tmp_path)
+    formation = _form_candidates((plan,), (assessment,), project_root)
+    benchmark = options.quality_project_root / "benchmark.py"
+    metadata = options.quality_project_root / "pyproject.toml"
+    baseline_module = options.baseline_payload_root / "fixture.py"
+    benchmark.write_text("print('baseline')\n", encoding="utf-8")
+    metadata.write_text("[build-system]\nrequires = ['hatchling']\n", encoding="utf-8")
+    baseline_module.write_text("VALUE = 1\n", encoding="utf-8")
+    base = _winner_identity((plan,), formation.candidates, options)
+
+    benchmark.write_text("print('changed')\n", encoding="utf-8")
+    changed_benchmark = _winner_identity((plan,), formation.candidates, options)
+    benchmark.write_text("print('baseline')\n", encoding="utf-8")
+    metadata.write_text("[build-system]\nrequires = ['setuptools']\n", encoding="utf-8")
+    changed_metadata = _winner_identity((plan,), formation.candidates, options)
+    metadata.write_text("[build-system]\nrequires = ['hatchling']\n", encoding="utf-8")
+    baseline_module.write_text("VALUE = 2\n", encoding="utf-8")
+    changed_baseline = _winner_identity((plan,), formation.candidates, options)
+    baseline_module.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setenv("CFLAGS", "-DATOLL_IDENTITY_TEST=1")
+    changed_environment = _winner_identity((plan,), formation.candidates, options)
+
+    assert (
+        len(
+            {
+                base.key,
+                changed_benchmark.key,
+                changed_metadata.key,
+                changed_baseline.key,
+                changed_environment.key,
+            }
+        )
+        == WINNER_CONTENT_IDENTITY_VARIANT_COUNT
+    )
+
+
+def test_corrupt_winner_entry_is_safe_cache_data(tmp_path: Path) -> None:
+    """Malformed accepted-winner JSON is ignored rather than escaping the search."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    options = _search_options(project_root, tmp_path)
+    formation = _form_candidates((plan,), (assessment,), project_root)
+    identity = _winner_identity(
+        (plan,),
+        formation.candidates,
+        options,
+    )
+    manifest_path = winner_manifest_path(options.cache_root, identity)
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text("{not-json", encoding="utf-8")
+
+    lookup = load_source_winner(options.cache_root, identity)
+
+    assert lookup.candidate_id is None
+    assert lookup.diagnostic.startswith("ignored invalid accepted winner cache:")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"schema_version": "stale", "identity_key": "key", "candidate_id": "source-candidate-x"},
+        {"schema_version": "1", "identity_key": "stale", "candidate_id": "source-candidate-x"},
+        {"schema_version": "1", "identity_key": "key", "candidate_id": "invalid"},
+    ],
+    ids=("non-object", "stale-schema", "stale-identity", "invalid-candidate"),
+)
+def test_winner_cache_rejects_invalid_manifest_shapes(tmp_path: Path, payload: object) -> None:
+    """Every manifest field is validated before a candidate ID can be replayed."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    options = _search_options(project_root, tmp_path)
+    formation = _form_candidates((plan,), (assessment,), project_root)
+    identity = _winner_identity((plan,), formation.candidates, options)
+    manifest_path = winner_manifest_path(options.cache_root, identity)
+    manifest_path.parent.mkdir(parents=True)
+    serialized = json.dumps(payload).replace('"key"', f'"{identity.key}"')
+    manifest_path.write_text(serialized, encoding="utf-8")
+
+    lookup = load_source_winner(options.cache_root, identity)
+
+    assert lookup.candidate_id is None
+    assert lookup.diagnostic.startswith("ignored invalid accepted winner cache:")
+
+
+def test_winner_cache_rejects_candidate_outside_universe(tmp_path: Path) -> None:
+    """Only a formed candidate can become the strict warm-replay winner."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    options = _search_options(project_root, tmp_path)
+    formation = _form_candidates((plan,), (assessment,), project_root)
+    identity = _winner_identity((plan,), formation.candidates, options)
+
+    with pytest.raises(ValueError, match="outside the formed candidate universe"):
+        store_source_winner(options.cache_root, identity, "source-candidate-other")
+
+
+def test_winner_cache_refuses_symlink_manifest(tmp_path: Path) -> None:
+    """Accepted-winner lookup and replacement never follow a manifest symlink."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    options = _search_options(project_root, tmp_path)
+    formation = _form_candidates((plan,), (assessment,), project_root)
+    identity = _winner_identity(
+        (plan,),
+        formation.candidates,
+        options,
+    )
+    manifest_path = winner_manifest_path(options.cache_root, identity)
+    manifest_path.parent.mkdir(parents=True)
+    external = tmp_path / "external.json"
+    external.write_text("external", encoding="utf-8")
+    manifest_path.symlink_to(external)
+
+    lookup = load_source_winner(options.cache_root, identity)
+
+    assert lookup.candidate_id is None
+    assert "symlink" in lookup.diagnostic
+    with pytest.raises(ValueError, match="refusing to replace symlink"):
+        store_source_winner(options.cache_root, identity, formation.candidates[0].id)
+    assert external.read_text(encoding="utf-8") == "external"
+
+
+def test_failed_winner_replay_falls_back_and_replaces_only_after_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed replay triggers full search and stores only its newly gated winner."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    messages: list[str] = []
+    options = replace(_search_options(project_root, tmp_path), progress=messages.append)
+    cold_seconds: dict[str, float] = {}
+    replay_failure_candidate: str | None = None
+    replay_failed = False
+    warm = False
+    wheel_builds = 0
+    semantic_attempts: list[str] = []
+
+    def fake_run(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: str,
+        **_options: object,
+    ) -> CommandRunEvidence:
+        nonlocal replay_failed
+        candidate_id = _candidate_id_from_path(payload_root)
+        returncode = 0
+        if command == ("test",) and candidate_id:
+            semantic_attempts.append(candidate_id)
+        if (
+            warm
+            and command == ("test",)
+            and candidate_id == replay_failure_candidate
+            and not replay_failed
+        ):
+            replay_failed = True
+            returncode = WHEEL_SEMANTIC_FAILURE_CODE
+        if command == ("test",):
+            duration = 0.05
+        elif mode == "baseline":
+            duration = 8.0
+        elif not candidate_id:
+            duration = 1.0
+        elif warm:
+            duration = 2.0 if candidate_id == replay_failure_candidate else 0.8
+        else:
+            duration = cold_seconds.setdefault(
+                candidate_id,
+                1.0 if not cold_seconds else 0.8,
+            )
+        return _command_evidence(
+            command,
+            (project_root, payload_root),
+            mode,
+            duration,
+            result=(returncode, "", ""),
+        )
+
+    def fake_wheel(_winner: object) -> tuple[WheelBuildEvidence, Path, Path]:
+        nonlocal wheel_builds
+        wheel_builds += 1
+        wheel_path = tmp_path / f"fallback-{wheel_builds}-py3-none-any.whl"
+        wheel_path.write_bytes(b"wheel")
+        payload = tmp_path / f"fallback-wheel-payload-{wheel_builds}"
+        payload.mkdir()
+        return (
+            WheelBuildEvidence(
+                command=("build",),
+                project_root=project_root,
+                outdir=tmp_path,
+                returncode=0,
+                stdout="",
+                stderr="",
+                duration_seconds=0.2,
+                wheel_paths=(wheel_path,),
+            ),
+            wheel_path,
+            payload,
+        )
+
+    monkeypatch.setattr("atoll.source_optimization.search.run_performance_command", fake_run)
+    monkeypatch.setattr("atoll.source_optimization.search._build_candidate_wheel", fake_wheel)
+
+    cold = run_source_optimization_search((plan,), (assessment,), options)
+    replay_failure_candidate = _accepted_candidate_id(cold)
+    semantic_attempts.clear()
+    warm = True
+    fallback = run_source_optimization_search((plan,), (assessment,), options)
+    replacement = _accepted_candidate_id(fallback)
+
+    formation = _form_candidates((plan,), (assessment,), project_root)
+    identity = _winner_identity(
+        (plan,),
+        formation.candidates,
+        options,
+    )
+    assert replay_failed
+    assert fallback.accepted
+    assert replacement != replay_failure_candidate
+    assert semantic_attempts.count(replay_failure_candidate) == 1
+    assert (
+        sum(
+            trial.candidate_id == replay_failure_candidate
+            and trial.semantic_exit_code == WHEEL_SEMANTIC_FAILURE_CODE
+            for trial in fallback.trials
+        )
+        == 1
+    )
+    assert load_source_winner(options.cache_root, identity).candidate_id == replacement
+    assert any("restarting full source search" in message for message in messages)
+
+
 def _plan_and_assessment(
     project_root: Path = FIXTURE_ROOT,
 ) -> tuple[SourceOptimizationPlan, SourceOptimizationAssessment]:
@@ -1551,6 +2015,17 @@ def _search_options(project_root: Path, tmp_path: Path) -> SourceOptimizationSea
 
 def _copy_fixture(destination: Path) -> None:
     shutil.copytree(FIXTURE_ROOT, destination)
+
+
+def _accepted_candidate_id(result: SourceOptimizationSearchResult) -> str:
+    accepted = tuple(trial.candidate_id for trial in result.trials if trial.status == "accepted")
+    assert result.accepted
+    assert len(accepted) == 1
+    return accepted[0]
+
+
+def _candidate_id_from_path(path: Path) -> str:
+    return next((part for part in path.parts if part.startswith("source-candidate-")), "")
 
 
 def _command_evidence(

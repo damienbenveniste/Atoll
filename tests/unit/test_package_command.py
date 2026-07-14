@@ -933,6 +933,71 @@ def test_explicit_unbindable_member_remains_an_unsupported_request(
     assert selected == ()
 
 
+def test_iterator_protocol_roots_are_selected_without_other_dunders(tmp_path: Path) -> None:
+    """Package selection binds iterator slots while retaining other class-owned dunders."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    (project_root / "src" / "app" / "iterator.py").write_text(
+        """class Cursor:
+    def value(self) -> int:
+        return 1
+
+    def __iter__(self) -> object:
+        return self
+
+    def __next__(self) -> int:
+        raise StopIteration
+
+    def __get__(self, instance: object, owner: type[object] | None = None) -> object:
+        return self
+
+    def __add__(self, other: object) -> object:
+        return self
+""",
+        encoding="utf-8",
+    )
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "app.iterator")
+    iterator_roots = tuple(
+        SymbolId("app.iterator", f"Cursor.{name}") for name in ("__iter__", "__next__")
+    )
+    ordinary_root = SymbolId("app.iterator", "Cursor.value")
+    blocked_roots = tuple(
+        SymbolId("app.iterator", f"Cursor.{name}") for name in ("__get__", "__add__")
+    )
+
+    selected = _selected_typed_regions(
+        scans,
+        project.config.compile.backends,
+        iterator_roots,
+        hot_members=iterator_roots,
+    )
+    blocked = _selected_typed_regions(
+        scans,
+        project.config.compile.backends,
+        blocked_roots,
+        hot_members=blocked_roots,
+    )
+    ordinary = _selected_typed_regions(
+        scans,
+        project.config.compile.backends,
+        (ordinary_root,),
+        hot_members=(ordinary_root,),
+    )
+
+    assert {selection.slice_root for selection in selected} == set(iterator_roots)
+    assert {
+        binding.source for selection in selected for binding in selection.region.bindings
+    } == set(iterator_roots)
+    assert all(
+        binding.kind == "instance_method"
+        for selection in selected
+        for binding in selection.region.bindings
+    )
+    assert {selection.slice_root for selection in ordinary} == {ordinary_root}
+    assert blocked == ()
+
+
 def test_profitability_selection_rejects_missing_payload_prerequisites(tmp_path: Path) -> None:
     """Internal candidate trials fail before touching incomplete payload state."""
     project_root = tmp_path / "simple_project"
@@ -1649,7 +1714,7 @@ def test_method_selection_keeps_unparseable_normalized_source_interpreted() -> N
 
 
 def test_method_selection_preserves_registered_and_dynamic_owner_classes() -> None:
-    """Method mutation is rejected when an owner may be replaced or intercept writes."""
+    """Method mutation rejects owner-wide hazards, not atomic-class limitations."""
     registered = LoweringDecision(
         target="module::Registered",
         action="fallback",
@@ -1659,6 +1724,22 @@ def test_method_selection_preserves_registered_and_dynamic_owner_classes() -> No
         target="module::Eager",
         action="fallback",
         reason="class remains interpreted because module-time code retains its original identity",
+    )
+    special = LoweringDecision(
+        target="module::Iterable",
+        action="fallback",
+        reason=(
+            "class remains interpreted because special method __iter__ "
+            "requires interpreted class semantics"
+        ),
+    )
+    dynamic_special = LoweringDecision(
+        target="module::Dynamic",
+        action="fallback",
+        reason=(
+            "class remains interpreted because special method __getattr__ "
+            "requires interpreted class semantics"
+        ),
     )
 
     assert _owner_disallows_method_binding(
@@ -1670,6 +1751,16 @@ def test_method_selection_preserves_registered_and_dynamic_owner_classes() -> No
         "Eager",
         "module",
         {eager.target: eager},
+    )
+    assert not _owner_disallows_method_binding(
+        "Iterable",
+        "module",
+        {special.target: special},
+    )
+    assert _owner_disallows_method_binding(
+        "Dynamic",
+        "module",
+        {dynamic_special.target: dynamic_special},
     )
 
 
@@ -3681,6 +3772,15 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
     monkeypatch.setattr(package_command, "run_baseline_profile", insufficient_profile)
     monkeypatch.setattr(package_command, "run_benchmark_gate", rejecting_benchmark)
 
+    def reject_static_bulk_compile(**_kwargs: object) -> object:
+        raise AssertionError("insufficient profile evidence must not compile every static region")
+
+    monkeypatch.setattr(
+        package_command,
+        "_execute_typed_region_package",
+        reject_static_bulk_compile,
+    )
+
     result = package_command.execute_package(
         package_command.PackageOptions(
             root=project_root,
@@ -4006,19 +4106,24 @@ def test_profile_compile_plan_replays_first_selection_and_invalidates_on_source_
         assert ranked.selected_symbols == (selected,)
         return ranked
 
-    selection_scope = _ProfileCompileSelectionScope(
+    full_support = _profile_candidate_support(scans, project.config.compile.backends)
+    cold_scope = _ProfileCompileSelectionScope(
         identity="baseline",
-        support=_profile_candidate_support(scans, project.config.compile.backends),
+        support=full_support,
+    )
+    warm_scope = _ProfileCompileSelectionScope(
+        identity="baseline",
+        support=full_support,
     )
     cold = _stabilize_profile_compile_selection(
-        selection_scope,
+        cold_scope,
         options=options,
         project=project,
         scans=scans,
         profile=profile(rank, rank_samples=140, score_samples=20),
     )
     warm = _stabilize_profile_compile_selection(
-        selection_scope,
+        warm_scope,
         options=options,
         project=project,
         scans=scans,
@@ -4028,11 +4133,35 @@ def test_profile_compile_plan_replays_first_selection_and_invalidates_on_source_
             score_samples=warm_score_samples,
         ),
     )
+    empty_fresh_profile = profile(
+        score,
+        rank_samples=warm_rank_samples,
+        score_samples=warm_score_samples,
+    )
+    empty_warm = _stabilize_profile_compile_selection(
+        warm_scope,
+        options=options,
+        project=project,
+        scans=scans,
+        profile=replace(
+            empty_fresh_profile,
+            candidates=tuple(
+                replace(candidate, selected=False, reason="below-threshold")
+                for candidate in empty_fresh_profile.candidates
+            ),
+            selected_symbols=(),
+            selected_hot_samples=0,
+            selected_hot_coverage=0.0,
+        ),
+    )
 
     assert cold is not None
     assert warm is not None
+    assert empty_warm is not None
     assert cold.selected_symbols == (rank,)
     assert warm.selected_symbols == (rank,)
+    assert empty_warm.selected_symbols == (rank,)
+    assert empty_warm.selected_hot_samples == warm_rank_samples
     assert warm.selected_hot_samples == warm_rank_samples
     assert warm.selected_hot_coverage == pytest.approx(0.125)
     assert "native candidate selection replayed from strict cache" in warm.reason

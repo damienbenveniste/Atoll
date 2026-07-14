@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import ast
+import importlib
+import importlib.util
+import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
+from typing import Protocol, cast
 
 import pytest
 
@@ -17,6 +22,13 @@ from atoll.generation.typed_region import (
     generate_typed_method_region,
 )
 from atoll.models import ModuleId, ModuleScan
+
+
+class _LiveDynamicModule(Protocol):
+    """Runtime surface used by the live dynamic-global generation regression."""
+
+    FACTOR: int
+    Worker: type[object]
 
 
 def _scan(tmp_path: Path) -> ModuleScan:
@@ -176,6 +188,66 @@ def hot(value: int) -> int:
     assert "import runtime_boundary as _atoll_source" in generation.source_text
     assert "return _atoll_source.helper(value)" in generation.source_text
     assert "def hot(value: int) -> int:" in generation.source_text
+
+
+def test_dynamic_global_method_generation_reads_live_source_binding(tmp_path: Path) -> None:
+    """A retained method reads the current source-module global after rebinding."""
+    module_name = "live_dynamic_method"
+    source_path = tmp_path / f"{module_name}.py"
+    source_path.write_text(
+        """def load_factor() -> int:
+    return 2
+
+FACTOR = load_factor()
+
+class Worker:
+    def apply(self, value: int) -> int:
+        return value * FACTOR
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name=module_name, path=source_path)))
+    region = next(
+        item
+        for item in scan.typed_regions
+        if any(member.id.qualname == "Worker.apply" for member in item.members)
+    )
+    method = next(member.id for member in region.members if member.id.qualname == "Worker.apply")
+    generation = generate_typed_method_region(
+        scan,
+        region,
+        (method,),
+        output_path=tmp_path / "generated_live_dynamic_method.py",
+        options=TypedRegionGenerationOptions(backend="cython"),
+    )
+
+    assert region.atomic_class is False
+    assert f"import {module_name} as _atoll_source" in generation.source_text
+    assert "return value * _atoll_source.FACTOR" in generation.source_text
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        source_module = cast("_LiveDynamicModule", importlib.import_module(module_name))
+        generated_spec = importlib.util.spec_from_file_location(
+            "generated_live_dynamic_method",
+            generation.source_path,
+        )
+        assert generated_spec is not None
+        assert generated_spec.loader is not None
+        generated_module = importlib.util.module_from_spec(generated_spec)
+        generated_spec.loader.exec_module(generated_module)
+        generated_apply = cast(
+            "Callable[[object, int], int]",
+            generated_module.Worker__apply,
+        )
+        initial_expected = 6
+        rebound_expected = 15
+        assert generated_apply(source_module.Worker(), 3) == initial_expected
+        source_module.FACTOR = 5
+        assert generated_apply(source_module.Worker(), 3) == rebound_expected
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.path.pop(0)
 
 
 @pytest.mark.parametrize(

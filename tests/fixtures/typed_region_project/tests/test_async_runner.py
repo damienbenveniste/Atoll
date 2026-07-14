@@ -58,15 +58,15 @@ def test_runner_compiled_and_interpreted_routes_are_explicit() -> None:
     compiled = bool(getattr(async_runner, "__atoll_status__", {}).get("compiled", False))
     compiled_members = (
         ProtocolRunner.cold_decoy,
+        ProtocolRunner.compute,
         ProtocolRunner.exchange,
         ProtocolRunner.fail_after_suspend,
         ProtocolRunner.parse,
+        ProtocolRunner.wait_until_cancelled,
         ProtocolRunner.with_bias,
         ProtocolRunner.async_exchange,
     )
     interpreted_members = (
-        ProtocolRunner.compute,
-        ProtocolRunner.wait_until_cancelled,
         GenericRunner.identity,
         DynamicRunner.calculate,
     )

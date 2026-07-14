@@ -33,6 +33,7 @@ GATE_FAILURE_CODE = 7
 PROFILE_BENCHMARK_ITERATIONS = 100_000
 PROFILE_REPORT_SCHEMA_VERSION = COMPILE_REPORT_SCHEMA_VERSION
 MINIMUM_PROFILE_SAMPLES = 100
+MAX_PROFILE_SAMPLING_PASSES = 3
 CLASS_DEPENDENCY_COMPILED_SYMBOLS = 2
 STATEFUL_SECOND_VALUE = 2
 
@@ -436,7 +437,10 @@ for _ in range(ITERATIONS):
     assert profile["total_samples"] >= MINIMUM_PROFILE_SAMPLES
     assert profile["mapped_project_samples"] > 0
     assert profile["selected_hot_coverage"] > 0
-    assert [run["pass_kind"] for run in profile["child_passes"]] == ["sampling", "types"]
+    child_passes = [run["pass_kind"] for run in profile["child_passes"]]
+    assert child_passes[-1] == "types"
+    assert 1 <= len(child_passes[:-1]) <= MAX_PROFILE_SAMPLING_PASSES
+    assert set(child_passes[:-1]) == {"sampling"}
     assert selected
     assert trial_symbols == selected
     assert compiled == accepted_symbols

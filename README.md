@@ -123,7 +123,10 @@ the member while preserving the source contract. A class is replaced atomically 
 method is supported and module loading cannot retain the original class through a decorator,
 reassignment, instance, subclass, annotation, default, registry use, source-defined base,
 asynchronous method, or class-body side effect. Otherwise Atoll preserves the source class and
-compiles eligible methods independently. Cython owns atomic classes because its Python-compatible
+compiles eligible methods independently. An atomic-class rejection caused only by the supported
+iterator protocol does not block ordinary descriptor replacement on the original class; `__iter__`
+and `__next__` are the only special-method slots currently eligible for independent binding. Cython
+owns atomic classes because its Python-compatible
 class objects can preserve method reflection; mypyc remains preferred for callable members, while
 Cython also handles member execution shapes mypyc rejects and deterministic mypyc type failures.
 During automatic whole-project selection, when mypyc reports errors in imported target-project
@@ -182,7 +185,10 @@ binding. Ordinary same-module calls, awaited calls, class construction, and `sel
 dispatch remain late-bound Python runtime boundaries unless syntax proves the callee must share the
 native unit. This keeps blocked or dynamic callees interpreted without poisoning a hot caller.
 Explicitly declared methods on recognized dataclasses may be rebound while preserving the original
-class object and descriptor kind.
+class object and descriptor kind. A single unguarded exact-shape target with no source defaults can
+bind directly when an instance-method target also preserves descriptor binding; callable objects
+without method-descriptor behavior, defaulted, guarded, or multi-variant bindings retain the
+generated dispatcher so source default objects and fallback selection remain authoritative.
 
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
 staging, cache lookup or restore, backend compilation, wheel writing, verification, and cleanup.
@@ -201,10 +207,19 @@ resolution is reproducible, such as an offline wheelhouse, the target project's 
 wheel is cached under `.atoll/cache/baseline-wheel/`; online mutable resolution bypasses this cache.
 This lets safe warm builds avoid rebuilding target-owned extensions. `atoll clean --cache` removes
 all reusable build state.
-For benchmark-guided builds, Atoll still collects a fresh profile on every invocation. It stores the
-first source- and environment-bound native candidate plan under `.atoll/cache/profile-plans/` so
-sampling jitter cannot force new compiler work on an unchanged warm build. A replayed plan still
-runs the configured semantic, marginal-profitability, and final benchmark gates.
+For benchmark-guided builds, Atoll still collects a fresh profile on every invocation. The 2 ms
+sampler measures process-CPU leaf frames, may combine up to three short sampling passes to reach the
+minimum evidence floor, and keeps nested scheduler attribution as orchestration evidence rather
+than native-candidate work. A supported benchmark that still produces insufficient evidence takes
+the measured no-op path instead of triggering an exhaustive native build. Atoll stores the first
+source- and environment-bound native candidate plan under `.atoll/cache/profile-plans/` so sampling
+jitter, including a later empty selection, cannot force new compiler work on an unchanged warm
+build. A replayed plan still runs the configured semantic, marginal-profitability, and final
+benchmark gates. A source candidate that passes every final 3x gate stores only its strict identity
+under `.atoll/cache/accepted-winners/`; a warm run re-evaluates that same candidate with fresh tests,
+profiles, and timings. The identity includes benchmark and test content, project metadata, the
+baseline wheel payload, dependency versions, and build environment. If replay fails semantics, that
+candidate remains rejected for the rest of the invocation while the other candidates are searched.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
 scan and compile reports. A callable from such a module is compiled only when the typed-region
 analysis and backend capability assessment can still preserve its source behavior.

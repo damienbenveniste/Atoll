@@ -41,7 +41,7 @@ from atoll.models import (
     Visibility,
 )
 
-SCANNER_VERSION = "6"
+SCANNER_VERSION = "7"
 
 
 class CacheStats(TypedDict):

@@ -170,6 +170,58 @@ def test_directed_region_slice_rejects_invalid_roots_dependencies_and_bindings(
         build_directed_region_slice(class_region, constructor)
 
 
+def test_iterator_protocol_methods_are_independent_binding_roots(tmp_path: Path) -> None:
+    """Only iterator protocol dunders receive method bindings and directed slices."""
+    scan = _scan_source(
+        tmp_path,
+        "iterator_roots",
+        [
+            "class Cursor:",
+            "    def __init__(self, values: list[int]) -> None:",
+            "        self.values = values",
+            "",
+            "    def __iter__(self) -> object:",
+            "        return self",
+            "",
+            "    def __next__(self) -> int:",
+            "        raise StopIteration",
+            "",
+            "    def __get__(self, instance: object, owner: type[object] | None = None) -> object:",
+            "        return self",
+            "",
+            "    def __add__(self, other: object) -> object:",
+            "        return self",
+            "",
+            "    def __arbitrary__(self) -> int:",
+            "        return 0",
+            "",
+        ],
+    )
+    region = next(
+        item
+        for item in scan.typed_regions
+        if any(member.id.qualname == "Cursor.__iter__" for member in item.members)
+    )
+    bindings = {binding.source.qualname: binding for binding in region.bindings}
+
+    assert set(bindings) == {"Cursor.__iter__", "Cursor.__next__"}
+    assert all(binding.kind == "instance_method" for binding in bindings.values())
+    for qualname in ("Cursor.__iter__", "Cursor.__next__"):
+        root = next(member.id for member in region.members if member.id.qualname == qualname)
+        sliced = build_directed_region_slice(region, root)
+        assert tuple(binding.source for binding in sliced.bindings) == (root,)
+
+    for qualname in (
+        "Cursor.__init__",
+        "Cursor.__get__",
+        "Cursor.__add__",
+        "Cursor.__arbitrary__",
+    ):
+        root = next(member.id for member in region.members if member.id.qualname == qualname)
+        with pytest.raises(ValueError, match="not independently bindable"):
+            build_directed_region_slice(region, root)
+
+
 def test_typed_regions_group_safe_class_methods_atomically(tmp_path: Path) -> None:
     """A safe typed class and its connected methods form one atomic region."""
     module_path = tmp_path / "regions.py"
@@ -568,8 +620,8 @@ def test_deferred_import_after_class_does_not_escape_during_module_load(tmp_path
     )
 
 
-def test_dynamic_method_global_prevents_atomic_class_region(tmp_path: Path) -> None:
-    """Atomic classes cannot depend on state omitted from their generated module."""
+def test_dynamic_method_global_retains_non_atomic_method_region(tmp_path: Path) -> None:
+    """Routable live globals retain methods without enabling atomic class lowering."""
     scan = _scan_source(
         tmp_path,
         "dynamic_class_global",
@@ -588,8 +640,96 @@ def test_dynamic_method_global_prevents_atomic_class_region(tmp_path: Path) -> N
 
     worker = next(symbol for symbol in scan.symbols if symbol.id.qualname == "Worker.apply")
     assert {blocker.code for blocker in worker.blockers} == {"DYNAMIC_GLOBAL_DEP"}
+    method_region = next(
+        region
+        for region in scan.typed_regions
+        if any(member.id.qualname == "Worker.apply" for member in region.members)
+    )
+    assert method_region.atomic_class is False
+    assert tuple(member.id.qualname for member in method_region.members) == ("Worker.apply",)
+    dependency = next(
+        item
+        for item in method_region.dependencies
+        if item.src == worker.id and item.dst == "FACTOR"
+    )
+    assert dependency.kind == "uses_global"
+    assert dependency.role == "runtime"
+    class_decision = next(
+        item for item in method_region.decisions if item.target.endswith("::Worker")
+    )
+    assert class_decision.action == "fallback"
     assert not any(
         region.atomic_class and any(member.id.qualname == "Worker" for member in region.members)
+        for region in scan.typed_regions
+    )
+
+
+def test_dynamic_function_global_retains_non_atomic_region(tmp_path: Path) -> None:
+    """Standalone callables use the same routable dynamic-global exception."""
+    scan = _scan_source(
+        tmp_path,
+        "dynamic_function_global",
+        [
+            "def load_factor() -> int:",
+            "    return 2",
+            "",
+            "FACTOR = load_factor()",
+            "",
+            "def apply(value: int) -> int:",
+            "    return value * FACTOR",
+            "",
+        ],
+    )
+
+    apply = next(symbol for symbol in scan.symbols if symbol.id.qualname == "apply")
+    region = next(
+        item for item in scan.typed_regions if apply.id in {member.id for member in item.members}
+    )
+    assert region.atomic_class is False
+    assert {blocker.code for blocker in apply.blockers} == {"DYNAMIC_GLOBAL_DEP"}
+    assert any(
+        dependency.src == apply.id
+        and dependency.kind == "uses_global"
+        and dependency.dst == "FACTOR"
+        for dependency in region.dependencies
+    )
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "def apply(value: int) -> int:",
+        "class Worker:\n    def apply(self, value: int) -> int:",
+    ],
+)
+def test_unroutable_dynamic_global_remains_excluded(
+    tmp_path: Path,
+    declaration: str,
+) -> None:
+    """Unknown globals without a runtime uses-global edge remain hard exclusions."""
+    body_indent = "        " if declaration.startswith("class ") else "    "
+    scan = _scan_source(
+        tmp_path,
+        "unroutable_dynamic_global",
+        [
+            declaration,
+            f"{body_indent}return value * MISSING_FACTOR",
+            "",
+        ],
+    )
+
+    callable_symbol = next(
+        symbol for symbol in scan.symbols if symbol.kind in {"function", "method"}
+    )
+    assert {blocker.code for blocker in callable_symbol.blockers} == {"DYNAMIC_GLOBAL_DEP"}
+    dependency = next(
+        edge
+        for edge in scan.dependency_edges
+        if edge.src == callable_symbol.id and edge.dst == "MISSING_FACTOR"
+    )
+    assert dependency.kind == "unknown"
+    assert all(
+        callable_symbol.id not in {member.id for member in region.members}
         for region in scan.typed_regions
     )
 

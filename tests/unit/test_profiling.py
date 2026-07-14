@@ -50,7 +50,8 @@ ATTRIBUTED_OWNER_LEAF_SAMPLES = 10
 ATTRIBUTED_OWNER_SCHEDULER_SAMPLES = 70
 ATTRIBUTED_OWNER_SAMPLES = 80
 ATTRIBUTED_OWNER_COVERAGE = 0.4
-SELECTED_ACTIVITY_SAMPLES = 170
+SELECTED_LEAF_SAMPLES = 90
+SELECTED_LEAF_COVERAGE = 0.9
 BOOTSTRAP_EXIT_CODE = 7
 BOOTSTRAP_USAGE_ERROR_CODE = 2
 BOOTSTRAP_STRING_EXIT_CODE = 1
@@ -327,6 +328,7 @@ def test_sampling_profiler_rearms_one_shot_timer_after_non_reentrant_callback(
     frame = inspect.currentframe()
     assert frame is not None
     timer_calls: list[tuple[int, float, float]] = []
+    signal_calls: list[int] = []
     callback_state: list[int] = []
 
     def setitimer(which: int, seconds: float, interval: float = 0.0) -> tuple[float, float]:
@@ -339,10 +341,12 @@ def test_sampling_profiler_rearms_one_shot_timer_after_non_reentrant_callback(
         callback_state.append(len(timer_calls))
         return "workload::hot"
 
-    def getsignal(_signal_number: int) -> signal.Handlers:
+    def getsignal(signal_number: int) -> signal.Handlers:
+        signal_calls.append(signal_number)
         return signal.SIG_DFL
 
-    def install_signal(_signal_number: int, _handler: object) -> signal.Handlers:
+    def install_signal(signal_number: int, _handler: object) -> signal.Handlers:
+        signal_calls.append(signal_number)
         return signal.SIG_DFL
 
     mapper = _attribute(profiler.wrapped, "_mapper")
@@ -360,10 +364,78 @@ def test_sampling_profiler_rearms_one_shot_timer_after_non_reentrant_callback(
     assert payload["sample_counts"] == {"workload::hot": 1}
     assert callback_state == [1, 1]
     assert timer_calls == [
-        (signal.ITIMER_REAL, 0.002, 0.0),
-        (signal.ITIMER_REAL, 0.002, 0.0),
-        (signal.ITIMER_REAL, 0.0, 0.0),
+        (signal.ITIMER_PROF, 0.002, 0.0),
+        (signal.ITIMER_PROF, 0.002, 0.0),
+        (signal.ITIMER_PROF, 0.0, 0.0),
     ]
+    assert signal_calls == [signal.SIGPROF] * 4
+
+
+def test_baseline_profile_merges_sampling_attempts_and_observes_types_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Short sampling runs aggregate deterministically before one targeted pass."""
+    expected_total_samples = 105
+    expected_scheduler_overhead_samples = 15
+    stages: list[str] = []
+    sampling_payloads = (
+        (40, {"workload::beta": 10, "workload::alpha": 20}),
+        (35, {"workload::alpha": 15, "workload::beta": 10}),
+        (30, {"workload::beta": 5, "workload::alpha": 15}),
+    )
+
+    def fake_run(invocation: SubprocessInvocationView) -> subprocess.CompletedProcess[str]:
+        config = cast(
+            dict[str, object],
+            json.loads(Path(invocation.command[-1]).read_text(encoding="utf-8")),
+        )
+        stage = cast(str, config["profile_stage"])
+        stages.append(stage)
+        result_path = Path(cast(str, config["result_path"]))
+        if stage == "sampling":
+            total_samples, sample_counts = sampling_payloads[stages.count("sampling") - 1]
+            payload: dict[str, object] = {
+                "total_samples": total_samples,
+                "sample_counts": sample_counts,
+                "scheduler_overhead_counts": {"workload::owner": 5},
+            }
+        else:
+            assert cast(list[str], config["targets"]) == [
+                "workload::alpha",
+                "workload::beta",
+                "workload::owner",
+            ]
+            payload = {
+                "lifecycle": {},
+                "member_lifecycle": {},
+                "signatures": {},
+                "spawn_sites": [],
+                "call_edges": [],
+            }
+        result_path.write_text(json.dumps(payload), encoding="utf-8")
+        return subprocess.CompletedProcess(invocation.command, 0, "private", "private")
+
+    monkeypatch.setattr(profiling, "_run_subprocess", fake_run)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("workload", "workload.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    assert stages == ["sampling", "sampling", "sampling", "types"]
+    assert result.total_samples == expected_total_samples
+    assert [(member.qualname, member.samples) for member in result.members] == [
+        ("alpha", 50),
+        ("beta", 25),
+        ("owner", 0),
+    ]
+    assert result.scheduler_overhead_samples == expected_scheduler_overhead_samples
+    assert [run.pass_kind for run in result.runs] == stages
+    assert all(run.stdout == run.stderr == "" for run in result.runs)
 
 
 def test_frame_mapper_uses_constant_time_path_index_for_large_module_map(
@@ -479,7 +551,12 @@ def test_script_launch_collects_lifecycle_types_and_cleans_scratch(tmp_path: Pat
 
     assert result.status == "profiled"
     assert result.launch_kind == "script"
-    assert [run.pass_kind for run in result.runs] == ["sampling", "types"]
+    assert [run.pass_kind for run in result.runs] == [
+        "sampling",
+        "sampling",
+        "sampling",
+        "types",
+    ]
     assert result.runs[0].stdout == ""
     assert result.runs[1].stdout == ""
     assert result.lifecycle.start > 0
@@ -731,8 +808,8 @@ def test_select_profile_candidates_applies_threshold_coverage_and_limit_policy()
     ]
 
 
-def test_candidate_selection_includes_attributed_scheduler_activity() -> None:
-    """Nested scheduler samples can identify a hot owner with a cold leaf frame."""
+def test_candidate_selection_uses_exclusive_leaf_work() -> None:
+    """Nested scheduler samples remain evidence but do not select a thin native wrapper."""
     profile = _profile_with_members(
         total_samples=200,
         members=(
@@ -765,14 +842,11 @@ def test_candidate_selection_includes_attributed_scheduler_activity() -> None:
         tuple(_symbol(module, qualname) for module, qualname, _samples in _member_specs(profile)),
     )
 
-    assert [symbol.qualname for symbol in selected.selected_symbols] == [
-        "owner",
-        "leaf",
-        "helper",
-    ]
-    assert selected.selected_hot_samples == SELECTED_ACTIVITY_SAMPLES
-    assert selected.selected_hot_coverage == 1.0
+    assert [symbol.qualname for symbol in selected.selected_symbols] == ["leaf", "helper"]
+    assert selected.selected_hot_samples == SELECTED_LEAF_SAMPLES
+    assert selected.selected_hot_coverage == SELECTED_LEAF_COVERAGE
     owner = _candidate(selected, "owner")
+    assert owner.reason == "below-threshold"
     assert owner.samples == ATTRIBUTED_OWNER_LEAF_SAMPLES
     assert owner.scheduler_overhead_samples == ATTRIBUTED_OWNER_SCHEDULER_SAMPLES
     assert owner.attributed_samples == ATTRIBUTED_OWNER_SAMPLES
@@ -945,8 +1019,8 @@ def test_baseline_profile_disables_atoll_by_default(
         scratch_dir=tmp_path / "scratch",
     )
 
-    assert [request["enable_atoll"] for request in requests] == [False, False]
-    assert [environment["ATOLL_DISABLE"] for environment in environments] == ["1", "1"]
+    assert [request["enable_atoll"] for request in requests] == [False] * 4
+    assert [environment["ATOLL_DISABLE"] for environment in environments] == ["1"] * 4
     assert all("ATOLL_STRICT" not in environment for environment in environments)
     assert all("ATOLL_REQUIRE_COMPILED" not in environment for environment in environments)
     assert all("ATOLL_REQUIRE_OPTIMIZED" not in environment for environment in environments)
@@ -985,7 +1059,7 @@ def test_baseline_profile_can_enable_atoll_payload(
         enable_atoll=True,
     )
 
-    assert [request["enable_atoll"] for request in requests] == [True, True]
+    assert [request["enable_atoll"] for request in requests] == [True] * 4
     assert all("ATOLL_DISABLE" not in environment for environment in environments)
     assert all("ATOLL_STRICT" not in environment for environment in environments)
     assert all("ATOLL_REQUIRE_COMPILED" not in environment for environment in environments)

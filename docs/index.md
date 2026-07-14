@@ -93,7 +93,10 @@ the member while preserving the source contract. Atomic class replacement requir
 be supported and no module-time decorator, reassignment, instance, subclass, annotation, default,
 registry use, source-defined base, asynchronous method, or class-body side effect. If that proof
 fails, Atoll preserves the source class and routes eligible methods independently. Cython owns
-atomic classes so their method reflection remains Python-compatible. Mypyc remains preferred for
+atomic classes so their method reflection remains Python-compatible. An atomic-class rejection
+caused only by the supported iterator protocol does not block ordinary descriptor replacement on
+the original class; `__iter__` and `__next__` are the only special-method slots currently eligible
+for independent binding. Mypyc remains preferred for
 callable members, while Cython also handles unsupported member execution shapes or deterministic
 mypyc type failures. During automatic whole-project selection, a mypyc error originating in
 imported target-project source opens a cached project-scoped circuit for that import package: later
@@ -143,7 +146,9 @@ same-module calls, awaited calls, class construction, and receiver method dispat
 late-bound runtime boundaries unless syntax proves a shared native unit is required. A blocked or
 dynamic callee therefore does not automatically reject its hot caller. Explicitly declared methods
 on recognized dataclasses may be rebound while the original class object and descriptor kind stay
-intact.
+intact. A single unguarded exact-shape target with no source defaults can bind directly; defaulted,
+guarded, multi-variant, or instance-method targets without compatible descriptor behavior retain the
+generated dispatcher so source default objects and fallback selection remain authoritative.
 
 During source-clean compile, Atoll prints timed progress lines to stderr for discovery, scanning,
 staging, cache lookup or restore, backend compilation, wheel writing, verification, and cleanup.
@@ -162,10 +167,19 @@ resolution, such as an offline wheelhouse, a digest-verified copy of the target'
 under `.atoll/cache/baseline-wheel/`; mutable online resolution bypasses reuse. Safe warm builds can
 therefore avoid recompiling target-owned extensions. `atoll clean --cache` removes all reusable
 build state.
-Benchmark-guided builds continue to collect a fresh profile on every invocation. The first strict
-native candidate plan is stored under `.atoll/cache/profile-plans/`, preventing statistical sample
-jitter from creating a cold artifact variant on an unchanged warm build. Replay never skips the
-configured semantic, marginal-profitability, or final benchmark gates.
+Benchmark-guided builds continue to collect a fresh profile on every invocation. The 2 ms sampler
+measures process-CPU leaf frames, may combine up to three short sampling passes to reach the minimum
+evidence floor, and retains nested scheduler attribution as orchestration evidence rather than
+native-candidate work. A supported benchmark that still has insufficient evidence follows the
+measured no-op path instead of starting an exhaustive native build. The first strict native
+candidate plan is stored under `.atoll/cache/profile-plans/`, preventing statistical sample jitter,
+including a later empty selection, from creating a cold artifact variant on an unchanged warm
+build. Replay never skips the configured semantic, marginal-profitability, or final benchmark
+gates. After a source candidate passes every final 3x gate, Atoll stores only its strict identity
+under `.atoll/cache/accepted-winners/`; warm replay reruns tests, profiles, timings, and both final
+gates. The identity covers benchmark and test content, project metadata, the baseline wheel payload,
+dependency versions, and the build environment. A candidate that fails replay semantics is not
+retried during that invocation; the full search continues with the remaining candidates.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
 scan and compile reports. A callable from such a module is compiled only when the typed-region
 analysis and backend capability assessment can still preserve its source behavior. Boxed executable

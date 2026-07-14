@@ -8,7 +8,7 @@ import importlib.machinery
 import importlib.util
 import inspect
 import sys
-from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
+from collections.abc import AsyncGenerator, Callable, Coroutine, Generator, Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
@@ -118,6 +118,30 @@ class _ManagedCallableProtocol(Protocol):
     def __call__(self, value: int) -> int:
         """Return the managed helper result."""
         ...
+
+
+class _NamedCallableProtocol(Protocol):
+    """Generated callable metadata inspected after descriptor installation."""
+
+    __name__: str
+
+
+class _CompiledDispatcherProtocol(Protocol):
+    """Dispatcher metadata exposed for a guarded compiled binding."""
+
+    __atoll_compiled_target__: object
+
+
+class _IteratorWorkerProtocol(Protocol):
+    """Iterator and retained special-method surface used by slot tests."""
+
+    def __iter__(self) -> Iterator[int]: ...
+
+    def __next__(self) -> int: ...
+
+    def __get__(self, instance: object, owner: type[object] | None = None) -> str: ...
+
+    def __add__(self, other: object) -> str: ...
 
 
 class _BufferGuardModule(Protocol):
@@ -560,6 +584,8 @@ def choose(value, /, scale=2, *, token=DEFAULT):
     with pytest.raises(TypeError):
         module.choose(value=3)
     variants = module.choose.__atoll_binding_variants__
+    assert module.choose is not variants[0]["target"]
+    assert module.choose is not variants[1]["target"]
     assert tuple(item["variant_id"] for item in variants) == (
         "safe-int32",
         "generic-cython",
@@ -873,6 +899,7 @@ async def Worker__stream(self, token=object()):
     assert worker.scale.__name__ == "scale"
     assert worker.scale.__doc__ == "source scale doc"
     assert inspect.signature(worker.scale).parameters["token"].default is module.DEFAULT
+
     assert worker.scale()[1] is module.DEFAULT
     assert worker_type.parse() == "compiled-parse:source"
     assert worker_type.create() is module.DEFAULT
@@ -899,6 +926,61 @@ async def Worker__stream(self, token=object()):
     assert second == ("compiled-stream-sent", "async-sent")
     assert handled == "handled"
     assert events == [("asend", "async-sent"), ("athrow", "boom"), ("aclose", None)]
+
+
+def test_region_shim_binds_iterator_slots_on_original_class_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Iterator bindings update their slots without replacing the class or other dunders."""
+    source_path = tmp_path / "pkg" / "worker.py"
+    config = replace(
+        _config(tmp_path),
+        source_path=source_path,
+        artifact_dir=source_path.parent / "artifacts",
+        bindings=(
+            _binding("__iter__", "instance_method"),
+            _binding("__next__", "instance_method"),
+        ),
+    )
+    source = """class Worker:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise StopIteration
+
+    def __get__(self, instance, owner=None):
+        return "source-get"
+
+    def __add__(self, other):
+        return "source-add"
+
+ORIGINAL_WORKER = Worker
+"""
+    compiled = """def Worker____iter__(self):
+    self._atoll_remaining = 2
+    return self
+
+def Worker____next__(self):
+    if self._atoll_remaining == 0:
+        raise StopIteration
+    self._atoll_remaining -= 1
+    return self._atoll_remaining
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+    worker_type = cast(type[_IteratorWorkerProtocol], module.Worker)
+    worker = worker_type()
+
+    assert worker_type is module.ORIGINAL_WORKER
+    assert list(worker) == [1, 0]
+    assert worker.__get__(None, worker_type) == "source-get"
+    assert worker + object() == "source-add"
+    iterator = cast(_NamedCallableProtocol, vars(worker_type)["__iter__"])
+    next_item = cast(_NamedCallableProtocol, vars(worker_type)["__next__"])
+    assert iterator.__name__ == "__iter__"
+    assert next_item.__name__ == "__next__"
 
 
 def test_region_shim_binds_outlined_coroutine_shell(
@@ -1135,6 +1217,9 @@ def test_region_shim_uses_direct_call_path_without_source_defaults(
     module = _load_region_module(config, source, compiled, monkeypatch)
     worker_type = cast(type[_TextScaleWorkerProtocol], module.Worker)
     worker = worker_type()
+    compiled_target = sys.modules[config.compiled_module].Worker__scale
+
+    assert vars(worker_type)["scale"] is compiled_target
 
     def fail_bind(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("Signature.bind should not run without source defaults")
@@ -1142,6 +1227,234 @@ def test_region_shim_uses_direct_call_path_without_source_defaults(
     monkeypatch.setattr(inspect.Signature, "bind", fail_bind)
 
     assert worker.scale(7) == "compiled:7"
+
+
+def test_region_shim_callable_object_method_target_uses_dispatcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A callable without descriptor binding cannot replace an instance method directly."""
+    config = replace(
+        _config(tmp_path),
+        source_path=tmp_path / "pkg" / "worker.py",
+        artifact_dir=tmp_path / "pkg" / "artifacts",
+        bindings=(_binding("scale", "instance_method"),),
+    )
+    source = """class Worker:
+    def scale(self, value: int) -> str:
+        return "source-scale"
+"""
+    compiled = """class MutableCallable:
+    def __call__(callable_self, self, value):
+        return f"compiled:{value}"
+
+Worker__scale = MutableCallable()
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+    worker_type = cast(type[_TextScaleWorkerProtocol], module.Worker)
+    compiled_target = sys.modules[config.compiled_module].Worker__scale
+    descriptor = vars(worker_type)["scale"]
+
+    assert descriptor is not compiled_target
+    assert descriptor.__atoll_compiled_target__ is compiled_target
+    assert worker_type().scale(7) == "compiled:7"
+
+
+def test_region_shim_defaulted_binding_uses_dispatcher_to_preserve_call_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defaulted callables retain the adapter that binds source default objects."""
+    binding = BindingTarget(
+        source=SymbolId(module="pkg.worker", qualname="choose"),
+        compiled_name="compiled_choose",
+        kind="module",
+        owner_class=None,
+        execution_kind="sync",
+    )
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=tmp_path / "pkg" / "worker.py",
+        region_id="direct-metadata",
+        backend="cython",
+        compiled_module="_atoll_direct_metadata",
+        artifact_dir=tmp_path / "pkg" / "artifacts",
+        bindings=(binding,),
+    )
+    source = '''DEFAULT = object()
+
+def choose(value: int = 1, *, token: object = DEFAULT) -> tuple[int, object]:
+    """Return the interpreted choice."""
+    return value, token
+'''
+    compiled = """def compiled_choose(value="wrong", *, token=None):
+    return value, token
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+    compiled_target = sys.modules[config.compiled_module].compiled_choose
+
+    assert module.choose is not compiled_target
+    assert module.choose() == (1, module.DEFAULT)
+    assert module.choose.__name__ == "choose"
+    assert module.choose.__qualname__ == "choose"
+    assert module.choose.__module__ == module.__name__
+    assert module.choose.__doc__ == "Return the interpreted choice."
+    assert module.choose.__annotations__ == {
+        "value": int,
+        "token": object,
+        "return": tuple[int, object],
+    }
+    assert module.choose.__defaults__ is module.choose.__atoll_python_fallback__.__defaults__
+    assert module.choose.__kwdefaults__ is module.choose.__atoll_python_fallback__.__kwdefaults__
+    assert inspect.signature(module.choose).parameters["token"].default is module.DEFAULT
+    assert module.choose.__atoll_compiled_target__ is compiled_target
+    assert module.choose.__atoll_compiled_targets__ == (compiled_target,)
+    assert module.choose.__atoll_runtime_guards__ == ()
+    assert module.choose.__atoll_variant_guards__ == ((),)
+    assert module.choose.__atoll_binding_variants__[0]["target"] is compiled_target
+
+
+def test_region_shim_guarded_single_variant_uses_dispatcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guard keeps selection and fallback behavior in the generated dispatcher."""
+    guarded_binding = replace(
+        _binding("scale", "instance_method"),
+        guards=(
+            RuntimeTypeGuard(
+                parameter_name="value",
+                positional_index=1,
+                annotation="int",
+                nominal_type_paths=("int",),
+                allow_none=False,
+            ),
+        ),
+    )
+    config = replace(
+        _config(tmp_path),
+        bindings=(guarded_binding,),
+        artifact_dir=tmp_path / "pkg" / "artifacts",
+    )
+    source = """class Worker:
+    def scale(self, value):
+        return "source"
+"""
+    compiled = """def Worker__scale(self, value):
+    return "compiled"
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+    descriptor = cast(
+        _CompiledDispatcherProtocol,
+        vars(cast(type[object], module.Worker))["scale"],
+    )
+    compiled_target = sys.modules[config.compiled_module].Worker__scale
+
+    assert descriptor is not compiled_target
+    assert descriptor.__atoll_compiled_target__ is compiled_target
+    assert module.Worker().scale(1) == "compiled"
+    assert module.Worker().scale("text") == "source"
+
+
+@pytest.mark.parametrize(
+    ("compiled", "target_name"),
+    [
+        (
+            """class ImmutableCallable:
+    __slots__ = ()
+
+    def __call__(self, value):
+        return f"immutable:{value}"
+
+compiled_choose = ImmutableCallable()
+""",
+            "compiled_choose",
+        ),
+        (
+            """def compiled_choose(left, right):
+    return f"shape:{left}:{right}"
+""",
+            "compiled_choose",
+        ),
+    ],
+    ids=("immutable-metadata", "shape-mismatch"),
+)
+def test_region_shim_direct_binding_proof_failure_uses_dispatcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compiled: str,
+    target_name: str,
+) -> None:
+    """Immutable metadata or a different call shape retains the wrapper path."""
+    binding = BindingTarget(
+        source=SymbolId(module="pkg.worker", qualname="choose"),
+        compiled_name=target_name,
+        kind="module",
+        owner_class=None,
+        execution_kind="sync",
+    )
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=tmp_path / "pkg" / "worker.py",
+        region_id=f"fallback-{target_name}",
+        backend="cython",
+        compiled_module=f"_atoll_fallback_{tmp_path.name}",
+        artifact_dir=tmp_path / "pkg" / "artifacts",
+        bindings=(binding,),
+    )
+    source = """def choose(value):
+    return f"source:{value}"
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+    compiled_target = getattr(sys.modules[config.compiled_module], target_name)
+
+    assert module.choose is not compiled_target
+    assert module.choose.__atoll_compiled_target__ is compiled_target
+
+
+def test_region_shim_declared_execution_kind_uses_dispatcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared kind cannot make a differently shaped target bind directly."""
+    binding = BindingTarget(
+        source=SymbolId(module="pkg.worker", qualname="choose"),
+        compiled_name="compiled_choose",
+        kind="module",
+        owner_class=None,
+        execution_kind="coroutine",
+    )
+    config = RegionShimConfig(
+        source_module="pkg.worker",
+        source_path=tmp_path / "pkg" / "worker.py",
+        region_id="declared-coroutine",
+        backend="cython",
+        compiled_module="_atoll_declared_coroutine",
+        artifact_dir=tmp_path / "pkg" / "artifacts",
+        bindings=(binding,),
+    )
+    source = """async def choose(value):
+    return f"source:{value}"
+"""
+    compiled = """async def _compiled_result(value):
+    return f"compiled:{value}"
+
+def compiled_choose(value):
+    return _compiled_result(value)
+
+__atoll_execution_kinds__ = {"compiled_choose": "coroutine"}
+"""
+
+    module = _load_region_module(config, source, compiled, monkeypatch)
+    compiled_target = sys.modules[config.compiled_module].compiled_choose
+
+    assert module.choose is not compiled_target
+    assert inspect.iscoroutinefunction(module.choose)
+    assert asyncio.run(module.choose(3)) == "compiled:3"
 
 
 def test_region_shim_rolls_back_when_apply_fails(
@@ -1183,6 +1496,11 @@ def Worker__parse(text):
 
     assert module.Worker().scale(1) == "source-scale"
     assert module.Worker.parse("value") == "source-parse"
+    compiled_module = sys.modules[config.compiled_module]
+    assert compiled_module.Worker__scale.__name__ == "Worker__scale"
+    assert compiled_module.Worker__parse.__name__ == "Worker__parse"
+    assert not hasattr(compiled_module.Worker__scale, "__atoll_binding_variants__")
+    assert not hasattr(compiled_module.Worker__parse, "__atoll_binding_variants__")
     region_status = module.__atoll_status__["regions"][config.region_id]
     assert region_status["active"] is False
     assert region_status["compiled"] is False

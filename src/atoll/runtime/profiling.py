@@ -39,6 +39,7 @@ CandidateDecisionReason = Literal[
 ]
 
 _MIN_TOTAL_SAMPLES = 100
+_MAX_SAMPLING_ATTEMPTS = 3
 _MIN_CANDIDATE_SAMPLES = 20
 _MIN_CANDIDATE_SHARE = 0.02
 _TARGET_MAPPED_COVERAGE = 0.80
@@ -405,8 +406,8 @@ class ProfileResult:
         scheduler_overhead_samples: Nested non-project samples attributed to active project
             callers.
         scheduler_overhead_coverage: Fraction of total samples represented by that overhead.
-        selected_hot_samples: Leaf and attributed scheduler samples covered by candidates.
-        selected_hot_coverage: Fraction of mapped project activity covered by candidates.
+        selected_hot_samples: Exclusive project leaf samples covered by native candidates.
+        selected_hot_coverage: Fraction of mapped project leaf work covered by candidates.
         runs: Child-process evidence for each profiling pass.
         lifecycle: Python lifecycle event counts from the targeted observation pass.
         members: Profiled project members with sample and type evidence.
@@ -473,7 +474,7 @@ def run_baseline_profile(
     module_paths: tuple[tuple[str, str], ...],
     **options: Unpack[_BaselineProfileOptions],
 ) -> ProfileResult:
-    """Run the two-pass baseline profiler for a supported Python benchmark command.
+    """Run baseline sampling and targeted observation for a Python benchmark.
 
     Args:
         command: Benchmark argv. Only Python script and `python -m module` forms are supported.
@@ -505,29 +506,37 @@ def run_baseline_profile(
     resolved_scratch_dir = options["scratch_dir"].resolve()
     enable_atoll = options.get("enable_atoll", False)
     resolved_scratch_dir.mkdir(parents=True, exist_ok=True)
-    sampling_payload, sampling_run = _run_bootstrap_pass(
-        _BootstrapRequest(
-            profile_stage="sampling",
-            launch_plan=launch_plan,
-            project_root=resolved_project_root,
-            payload_root=resolved_payload_root,
-            module_paths=module_paths,
-            scratch_dir=resolved_scratch_dir,
-            enable_atoll=enable_atoll,
-            targets=(),
-            spawn_targets=(),
-            call_edge_targets=(),
-        )
+    sampling_payloads: list[JsonObject] = []
+    sampling_runs: list[SubprocessPassEvidence] = []
+    sampling_payload = _empty_payload()
+    sampling_request = _BootstrapRequest(
+        profile_stage="sampling",
+        launch_plan=launch_plan,
+        project_root=resolved_project_root,
+        payload_root=resolved_payload_root,
+        module_paths=module_paths,
+        scratch_dir=resolved_scratch_dir,
+        enable_atoll=enable_atoll,
+        targets=(),
+        spawn_targets=(),
+        call_edge_targets=(),
     )
-    runs: tuple[SubprocessPassEvidence, ...] = (sampling_run,)
-    if sampling_run.returncode != 0:
-        return _profile_from_payload(
-            sampling_payload,
-            status="invalid",
-            reason=f"sampling profile exited with status {sampling_run.returncode}",
-            launch_kind=launch_plan.launch_kind,
-            runs=runs,
-        )
+    for _attempt in range(_MAX_SAMPLING_ATTEMPTS):
+        attempt_payload, attempt_run = _run_bootstrap_pass(sampling_request)
+        sampling_payloads.append(attempt_payload)
+        sampling_runs.append(attempt_run)
+        sampling_payload = _merge_sampling_payloads(sampling_payloads)
+        runs = tuple(sampling_runs)
+        if attempt_run.returncode != 0:
+            return _profile_from_payload(
+                sampling_payload,
+                status="invalid",
+                reason=f"sampling profile exited with status {attempt_run.returncode}",
+                launch_kind=launch_plan.launch_kind,
+                runs=runs,
+            )
+        if _int_field(sampling_payload, "total_samples") >= _MIN_TOTAL_SAMPLES:
+            break
 
     hot_targets = tuple(member_key for member_key, _ in _hot_member_keys(sampling_payload))
     explicit_targets = tuple(
@@ -552,7 +561,7 @@ def run_baseline_profile(
             call_edge_targets=options.get("call_edge_targets", ()),
         )
     )
-    runs = (sampling_run, type_run)
+    runs = (*sampling_runs, type_run)
     combined = _merge_payloads(sampling_payload, type_payload)
     if type_run.returncode != 0:
         return _profile_from_payload(
@@ -631,9 +640,7 @@ def select_profile_candidates(
             symbol=symbol,
             context=_CandidatePolicyContext(
                 total_samples=profile.total_samples,
-                mapped_activity_samples=(
-                    profile.mapped_project_samples + profile.scheduler_overhead_samples
-                ),
+                mapped_activity_samples=profile.mapped_project_samples,
                 selected_samples=selected_samples,
                 selected_count=len(selected_symbols),
             ),
@@ -641,7 +648,7 @@ def select_profile_candidates(
         selected = reason == "selected"
         if selected:
             selected_symbols.append(member.symbol)
-            selected_samples += member.attributed_samples
+            selected_samples += member.samples
         decisions.append(
             MappedCandidateDecision(
                 symbol=symbol,
@@ -664,7 +671,7 @@ def select_profile_candidates(
         selected_hot_samples=selected_samples,
         selected_hot_coverage=_coverage(
             selected_samples,
-            profile.mapped_project_samples + profile.scheduler_overhead_samples,
+            profile.mapped_project_samples,
         ),
         candidates=tuple(decisions),
         selected_symbols=tuple(selected_symbols),
@@ -989,8 +996,8 @@ def _candidate_reason(
         return "unmapped"
     if (
         context.total_samples < _MIN_TOTAL_SAMPLES
-        or member.attributed_samples < _MIN_CANDIDATE_SAMPLES
-        or _coverage(member.attributed_samples, context.total_samples) < _MIN_CANDIDATE_SHARE
+        or member.samples < _MIN_CANDIDATE_SAMPLES
+        or _coverage(member.samples, context.total_samples) < _MIN_CANDIDATE_SHARE
     ):
         return "below-threshold"
     if context.selected_count >= _MAX_SELECTED_CANDIDATES:
@@ -1030,6 +1037,35 @@ def _merge_payloads(sampling_payload: JsonObject, type_payload: JsonObject) -> J
     merged["member_lifecycle"] = type_payload.get("member_lifecycle", {})
     merged["spawn_sites"] = type_payload.get("spawn_sites", [])
     merged["call_edges"] = type_payload.get("call_edges", [])
+    return merged
+
+
+def _merge_sampling_payloads(payloads: list[JsonObject]) -> JsonObject:
+    """Combine repeated sampling attempts into deterministic counter evidence.
+
+    Args:
+        payloads: Sampling payloads in execution order.
+
+    Returns:
+        JsonObject: Summed sample totals and lexically ordered member counters.
+    """
+    sample_counts: dict[str, int] = {}
+    scheduler_overhead_counts: dict[str, int] = {}
+    total_samples = 0
+    for payload in payloads:
+        total_samples += _int_field(payload, "total_samples")
+        for key, value in _object_field(payload, "sample_counts").items():
+            member_key = _string_key(key)
+            sample_counts[member_key] = sample_counts.get(member_key, 0) + _int_value(value)
+        for key, value in _object_field(payload, "scheduler_overhead_counts").items():
+            member_key = _string_key(key)
+            scheduler_overhead_counts[member_key] = scheduler_overhead_counts.get(
+                member_key, 0
+            ) + _int_value(value)
+    merged = _empty_payload()
+    merged["total_samples"] = total_samples
+    merged["sample_counts"] = dict(sorted(sample_counts.items()))
+    merged["scheduler_overhead_counts"] = dict(sorted(scheduler_overhead_counts.items()))
     return merged
 
 

@@ -33,7 +33,10 @@ from atoll.analysis.task_fusion import (
     build_fusion_plans,
     fusion_observation_targets,
 )
-from atoll.analysis.typed_regions import build_directed_region_slice
+from atoll.analysis.typed_regions import (
+    build_directed_region_slice,
+    is_independently_bindable_method_name,
+)
 from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
 from atoll.backends.mypyc import MYPYC_BACKEND
@@ -236,7 +239,7 @@ _MAX_PROFILED_CALL_CHAIN_ROOTS = 4
 _MINIMUM_CYTHON_BATCH_SIZE = 2
 _MINIMUM_INTERACTION_VARIANTS = 2
 _PROFILE_PLAN_CACHE_FORMAT_VERSION = "1"
-_PROFILE_PLAN_LOWERING_VERSION = "profile-native-selection-v2"
+_PROFILE_PLAN_LOWERING_VERSION = "profile-native-selection-v3"
 _BACKEND_POLICY_BYPASS_PREFIX = "BACKEND_POLICY_BYPASS:"
 
 _GENERATED_DIR_NAMES = frozenset(
@@ -540,12 +543,13 @@ class _ProfileCandidateSupport:
 
 @dataclass(frozen=True, slots=True)
 class _ProfileCompileSelectionScope:
-    """Reusable support evidence and identity for strict selection caching.
+    """Current support evidence and stable identity for selection caching.
 
     Attributes:
         identity: Stable baseline or transformed-source scope identity.
-        support: Capability results already used for profile ranking. Reusing
-            them prevents whole-project directed-slice analysis from running twice.
+        support: Capability results already used for profile ranking. The
+            statistically observed subset is deliberately excluded from the
+            cache identity, which instead uses all callable source members.
     """
 
     identity: str
@@ -1552,6 +1556,15 @@ def _execute_profile_selected_package(
             if profile_members
             else ()
         )
+    elif (
+        context.automatic_benchmark
+        and profile is not None
+        and profile.launch_kind in {"script", "module"}
+    ):
+        # A supported benchmark with insufficient sampling evidence must not
+        # turn into an exhaustive whole-project native build. The measured
+        # no-op path still runs semantics and the final performance gate.
+        selected = ()
     else:
         selected = context.preflight_selected
     _progress_compile_selection(
@@ -8425,14 +8438,18 @@ def _stabilize_profile_compile_selection(
             selection on a cache hit, otherwise the current selection.
     """
     benchmark = project.config.compile.benchmark_command
-    if (
-        profile is None
-        or profile.status != "profiled"
-        or not profile.selected_symbols
-        or benchmark is None
-    ):
+    if profile is None or profile.status != "profiled" or benchmark is None:
         return profile
-    available = frozenset(selection_scope.support.supported)
+    # Profile observations are intentionally absent from this universe. A
+    # cold and warm run over unchanged sources must address the same cache key
+    # even when statistical ranking observes different callable subsets.
+    available = frozenset(
+        member.id
+        for scan in scans
+        for region in scan.typed_regions
+        for member in region.members
+        if member.kind in {"function", "method"}
+    )
     try:
         identity = ProfilePlanIdentity(
             scope_identity=selection_scope.identity,
@@ -8529,7 +8546,7 @@ def _profile_with_replayed_compile_selection(
             )
         )
     selected_samples = sum(
-        member.attributed_samples for member in profile.members if member.symbol in selected
+        member.samples for member in profile.members if member.symbol in selected
     )
     return replace(
         profile,
@@ -8540,7 +8557,7 @@ def _profile_with_replayed_compile_selection(
         selected_hot_samples=selected_samples,
         selected_hot_coverage=_sample_coverage(
             selected_samples,
-            profile.mapped_project_samples + profile.scheduler_overhead_samples,
+            profile.mapped_project_samples,
         ),
         candidates=tuple(candidates),
         selected_symbols=decision.selection,
@@ -9028,15 +9045,15 @@ def _eligible_typed_callables(
     *,
     hot: frozenset[SymbolId],
 ) -> tuple[SymbolId, ...]:
-    return tuple(
-        member.id
-        for member in region.members
+    eligible: list[SymbolId] = []
+    for member in region.members:
+        method_name = member.id.qualname.rsplit(".", 1)[-1]
         if (
             (member.kind == "function" and member.binding_kind == "module")
             or (
                 member.kind == "method"
                 and member.binding_kind in {"instance_method", "staticmethod", "classmethod"}
-                and not member.id.qualname.rsplit(".", 1)[-1].startswith("__")
+                and is_independently_bindable_method_name(method_name)
                 and not _owner_disallows_method_binding(
                     member.owner_class,
                     region.source_module.name,
@@ -9044,12 +9061,12 @@ def _eligible_typed_callables(
                 )
                 and not _member_requires_source_class(member.source_text)
             )
-        )
-        and (
+        ) and (
             decisions[member.id.stable_id].action == "preserve"
             or (member.id in hot and decisions[member.id.stable_id].action in {"box", "fallback"})
-        )
-    )
+        ):
+            eligible.append(member.id)
+    return tuple(eligible)
 
 
 def _runtime_member_closure(
@@ -9118,20 +9135,42 @@ def _owner_disallows_method_binding(
     module_name: str,
     decisions: dict[str, LoweringDecision],
 ) -> bool:
+    """Reject descriptor mutation only for owner-wide runtime hazards.
+
+    Atomic-class rejection is a stricter decision than method binding. A source
+    class may remain interpreted because it defines supported iterator slots
+    while ordinary descriptors and those iterator slots can still be replaced on
+    the original class object. Other special methods, registration, dynamic
+    attribute behavior, and an ambiguous module binding remain owner-wide blockers.
+
+    Args:
+        owner_class: Source owner name, or ``None`` for a malformed method.
+        module_name: Logical source module containing the owner.
+        decisions: Region loss-ledger decisions keyed by stable target identity.
+
+    Returns:
+        bool: Whether mutating any descriptor on the owner is unsafe.
+    """
     if owner_class is None:
         return True
     decision = decisions.get(f"{module_name}::{owner_class}")
     if decision is None:
         return False
-    return any(
+    owner_wide_hazard = any(
         reason in decision.reason
         for reason in (
             "decorators may register or replace",
             "dynamic behavior is blocked",
             "module binding is reassigned",
-            "special method",
         )
     )
+    if owner_wide_hazard:
+        return True
+    special_marker = "special method "
+    if special_marker not in decision.reason:
+        return False
+    method_name = decision.reason.partition(special_marker)[2].split(maxsplit=1)[0]
+    return not is_independently_bindable_method_name(method_name)
 
 
 def _member_requires_source_class(source_text: str) -> bool:

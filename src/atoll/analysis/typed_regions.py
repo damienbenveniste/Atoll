@@ -17,6 +17,7 @@ from textwrap import dedent
 
 from atoll.models import (
     BindingTarget,
+    Blocker,
     DependencyEdge,
     LoweringDecision,
     ModuleScan,
@@ -33,10 +34,27 @@ from atoll.models import (
     TypeParameterRecord,
 )
 
-TYPED_REGION_SCHEMA_VERSION = "atoll-typed-region-v3"
+TYPED_REGION_SCHEMA_VERSION = "atoll-typed-region-v4"
 _UNSAFE_SOFT_BLOCKERS = frozenset({"UNTYPED_DECORATOR"})
 _DEFAULT_ANY_PATHS = frozenset({"Any", "typing.Any", "typing_extensions.Any"})
 _GETATTR_REQUIRED_ARGS = 2
+_INDEPENDENTLY_BINDABLE_SPECIAL_METHODS = frozenset({"__iter__", "__next__"})
+
+
+def is_independently_bindable_method_name(name: str) -> bool:
+    """Return whether a method can replace one descriptor on its source class.
+
+    Iterator protocol roots are the only special methods whose slot updates are
+    supported by independent runtime binding. Constructors, descriptors,
+    operators, and all other double-underscore names remain class-owned.
+
+    Args:
+        name: Unqualified source method name.
+
+    Returns:
+        bool: Whether typed-region machinery may bind the method independently.
+    """
+    return not name.startswith("__") or name in _INDEPENDENTLY_BINDABLE_SPECIAL_METHODS
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,7 +283,7 @@ def build_directed_region_slice(region: TypedRegion, root: SymbolId) -> TypedReg
     root_member = member_by_id[root]
     if not bindings and root_member.kind == "method":
         method_name = root.qualname.rsplit(".", maxsplit=1)[-1]
-        if method_name.startswith("__"):
+        if not is_independently_bindable_method_name(method_name):
             raise ValueError(f"directed slice root is not independently bindable: {root.stable_id}")
         bindings = (
             BindingTarget(
@@ -299,30 +317,70 @@ def _eligible(
     edges: tuple[DependencyEdge, ...],
 ) -> bool:
     hard_blockers = tuple(blocker for blocker in symbol.blockers if blocker.severity == "hard")
-    if any(blocker.code != "LOCAL_BLOCKED_DEP" for blocker in hard_blockers):
-        return False
-    if any(
-        edge.src == symbol.id
-        and edge.kind == "calls"
-        and isinstance(edge.dst, SymbolId)
-        and edge.dst in blocked
-        and edge.requires_same_unit
-        for edge in edges
-    ):
-        return False
-    if hard_blockers and not any(
-        edge.src == symbol.id
-        and edge.kind == "calls"
-        and isinstance(edge.dst, SymbolId)
-        and edge.dst in blocked
-        for edge in edges
-    ):
-        return False
+    if not _has_routable_dynamic_globals(symbol, hard_blockers, edges):
+        if any(blocker.code != "LOCAL_BLOCKED_DEP" for blocker in hard_blockers):
+            return False
+        if any(
+            edge.src == symbol.id
+            and edge.kind == "calls"
+            and isinstance(edge.dst, SymbolId)
+            and edge.dst in blocked
+            and edge.requires_same_unit
+            for edge in edges
+        ):
+            return False
+        if hard_blockers and not any(
+            edge.src == symbol.id
+            and edge.kind == "calls"
+            and isinstance(edge.dst, SymbolId)
+            and edge.dst in blocked
+            for edge in edges
+        ):
+            return False
     if any(blocker.code in _UNSAFE_SOFT_BLOCKERS for blocker in symbol.blockers):
         return False
     if symbol.kind == "class":
         return True
     return True
+
+
+def _has_routable_dynamic_globals(
+    symbol: SymbolRecord,
+    hard_blockers: tuple[Blocker, ...],
+    edges: tuple[DependencyEdge, ...],
+) -> bool:
+    """Accept callable globals that generated lowering can read from the source module.
+
+    Dynamic-global blockers remain attached to the symbol as conservative scan
+    and report evidence. The typed frontend relaxes them only for callables and
+    only when every blocker names a runtime ``uses_global`` edge that callable
+    lowering can rewrite through ``_atoll_source``.
+
+    Args:
+        symbol: Scanned declaration being considered for a typed region.
+        hard_blockers: Hard blocker evidence already attached to the declaration.
+        edges: Dependency edges available to generated callable lowering.
+
+    Returns:
+        bool: Whether all hard blockers are routable dynamic-global boundaries.
+    """
+    if symbol.kind not in {"function", "method"} or not hard_blockers:
+        return False
+    if any(blocker.code != "DYNAMIC_GLOBAL_DEP" for blocker in hard_blockers):
+        return False
+    routable_names = {
+        edge.dst
+        for edge in edges
+        if edge.src == symbol.id
+        and edge.kind == "uses_global"
+        and isinstance(edge.dst, str)
+        and edge.dst.isidentifier()
+        and not edge.requires_same_unit
+    }
+    return all(
+        any(blocker.message.startswith(f"global {name!r} is ") for name in routable_names)
+        for blocker in hard_blockers
+    )
 
 
 def _signature_is_complete(symbol: SymbolRecord) -> bool:
@@ -386,7 +444,7 @@ def _connect_atomic_classes(
             )
             continue
         if any(
-            method.id not in eligible or _method_requires_boxed_lowering(method)
+            method.id not in eligible or _method_requires_non_atomic_lowering(method)
             for method in methods
         ):
             eligible.pop(class_symbol.id, None)
@@ -404,8 +462,12 @@ def _connect_atomic_classes(
     return downgraded
 
 
-def _method_requires_boxed_lowering(method: SymbolRecord) -> bool:
-    return not _signature_is_complete(method) or method.has_any_annotation
+def _method_requires_non_atomic_lowering(method: SymbolRecord) -> bool:
+    return (
+        not _signature_is_complete(method)
+        or method.has_any_annotation
+        or any(blocker.code == "DYNAMIC_GLOBAL_DEP" for blocker in method.blockers)
+    )
 
 
 def _connect_interpreted_owner_methods(
@@ -993,8 +1055,8 @@ def _binding_targets(
     for symbol in symbols:
         if atomic_class and symbol.kind == "method":
             continue
-        if symbol.kind == "method" and symbol.id.qualname.rsplit(".", maxsplit=1)[-1].startswith(
-            "__"
+        if symbol.kind == "method" and not is_independently_bindable_method_name(
+            symbol.id.qualname.rsplit(".", maxsplit=1)[-1]
         ):
             continue
         targets.append(
@@ -1128,7 +1190,7 @@ def _subclass_specializations(
                     ):
                         continue
                     if (
-                        method_name.startswith("__")
+                        not is_independently_bindable_method_name(method_name)
                         or method_name in claimed_method_names
                         or method_name in base_target.shadowed_method_names
                     ):

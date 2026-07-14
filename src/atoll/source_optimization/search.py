@@ -12,11 +12,17 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
+import os
+import platform
 import shutil
+import sys
+import sysconfig
 import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from statistics import median
 from typing import Literal
@@ -61,6 +67,11 @@ from atoll.source_optimization.transforms import (
     SourceTransformationRequest,
     materialize_transformed_files,
 )
+from atoll.source_optimization.winner_cache import (
+    SourceWinnerIdentity,
+    load_source_winner,
+    store_source_winner,
+)
 from atoll.source_snapshot import copy_source_snapshot
 from atoll.wheel_overlay import (
     WheelBuildEvidence,
@@ -79,6 +90,8 @@ SOURCE_SEARCH_MAX_TRIALS = 8
 SOURCE_SEARCH_WARMUPS = 1
 SOURCE_SEARCH_SAMPLES = 3
 SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP = DEFAULT_MINIMUM_MARGINAL_SPEEDUP
+SOURCE_SEARCH_VERSION = "source-search-v2"
+SOURCE_SEARCH_LOWERING_VERSION = "source-search-lowering-v1"
 _RESIDUAL_TRANSFORMATIONS: tuple[SourceTransformationKind, ...] = (
     "run-scoped-guard-amortization",
     "transparent-quiescent-await-chain-collapse",
@@ -310,69 +323,329 @@ def run_source_optimization_search(
             build=options.baseline_build,
         )
 
-    return _run_formed_search(formation, options)
+    winner_identity = _winner_identity(plans, formation.candidates, options)
+    return _run_formed_search(formation, options, winner_identity)
 
 
 def _run_formed_search(
     formation: _CandidateFormation,
     options: SourceOptimizationSearchOptions,
+    winner_identity: SourceWinnerIdentity,
 ) -> SourceOptimizationSearchResult:
     """Evaluate formed candidates while owning disposable scratch cleanup.
 
     Args:
         formation: Deterministic candidates and lowering rejection evidence.
         options: Prepared source-search paths and command policy.
+        winner_identity: Exact static compatibility identity for accepted replay.
 
     Returns:
         SourceOptimizationSearchResult: Bounded beam and final-gate outcome.
     """
     _reset_dir(options.scratch_root)
-    timings: list[CompilePhaseTiming] = []
-    evaluations: list[_CandidateEvaluation] = []
-    trials = list(formation.trials)
     try:
-        for depth, candidates in itertools.groupby(
-            formation.candidates,
-            key=lambda candidate: candidate.depth,
-        ):
-            current = _fastest_evaluation(evaluations)
-            depth_evaluations: list[_CandidateEvaluation] = []
-            for candidate in candidates:
-                if len(evaluations) + len(depth_evaluations) >= SOURCE_SEARCH_MAX_TRIALS:
-                    break
-                evaluation, trial, candidate_timings = _evaluate_candidate(
-                    candidate,
-                    options=options,
-                    current=current,
-                )
-                timings.extend(candidate_timings)
-                trials.append(trial)
-                if evaluation is not None:
-                    depth_evaluations.append(evaluation)
-            evaluations = sorted(
-                (*evaluations, *depth_evaluations),
-                key=lambda item: (
-                    item.benchmark.candidate_median_seconds or float("inf"),
-                    item.candidate.id,
-                ),
-            )[:SOURCE_SEARCH_BEAM_WIDTH]
+        lookup = load_source_winner(options.cache_root, winner_identity)
+        _progress(options.progress, lookup.diagnostic)
+        replay = next(
+            (
+                candidate
+                for candidate in formation.candidates
+                if candidate.id == lookup.candidate_id
+            ),
+            None,
+        )
+        if replay is not None:
+            replay_result, replay_timings = _replay_cached_winner(
+                replay,
+                formation=formation,
+                options=options,
+            )
+            if replay_result.accepted:
+                _store_accepted_winner(replay_result, options, winner_identity)
+                return replay_result
             _progress(
                 options.progress,
-                f"source search depth {depth} retained {len(evaluations)} beam candidate(s)",
+                f"accepted winner replay failed for {replay.id}; restarting full source search",
             )
-
-        winner = _fastest_evaluation(evaluations)
-        if winner is None:
-            return _search_rejected(options, trials, timings)
-        return _finalize_candidate(
-            winner,
-            options=options,
-            trials=tuple(trials),
-            timings=tuple(timings),
-        )
+            _reset_dir(options.scratch_root)
+            result = _run_full_search(
+                formation,
+                options,
+                excluded_candidate_ids=frozenset((replay.id,)),
+                initial_trials=replay_result.trials,
+                initial_timings=replay_timings,
+            )
+        else:
+            result = _run_full_search(formation, options)
+        if result.accepted:
+            _store_accepted_winner(result, options, winner_identity)
+        return result
     finally:
         if options.scratch_root.exists():
             shutil.rmtree(options.scratch_root)
+
+
+def _replay_cached_winner(
+    candidate: _SourceCandidate,
+    *,
+    formation: _CandidateFormation,
+    options: SourceOptimizationSearchOptions,
+) -> tuple[SourceOptimizationSearchResult, tuple[CompilePhaseTiming, ...]]:
+    """Re-evaluate only a cached candidate and reproduce every acceptance gate.
+
+    Args:
+        candidate: Previously accepted candidate still present in the exact universe.
+        formation: Current deterministic formation and lowering evidence.
+        options: Current invocation paths, commands, profiler, and gate policy.
+
+    Returns:
+        tuple[SourceOptimizationSearchResult, tuple[CompilePhaseTiming, ...]]:
+            Fresh replay result and its current-invocation phase timings.
+    """
+    evaluation, trial, timings = _evaluate_candidate(candidate, options=options, current=None)
+    trials = (*formation.trials, trial)
+    if evaluation is None:
+        return _search_rejected(options, list(trials), list(timings)), timings
+    return (
+        _finalize_candidate(
+            evaluation,
+            options=options,
+            trials=trials,
+            timings=timings,
+        ),
+        timings,
+    )
+
+
+def _run_full_search(
+    formation: _CandidateFormation,
+    options: SourceOptimizationSearchOptions,
+    *,
+    excluded_candidate_ids: frozenset[str] = frozenset(),
+    initial_trials: tuple[SourceOptimizationTrial, ...] | None = None,
+    initial_timings: tuple[CompilePhaseTiming, ...] = (),
+) -> SourceOptimizationSearchResult:
+    """Run the ordinary bounded beam search over the complete formed universe.
+
+    Args:
+        formation: Complete deterministic candidates and lowering rejections.
+        options: Prepared source-search paths and command policy.
+        excluded_candidate_ids: Candidates that failed a semantic gate earlier
+            in this invocation and must not be retried.
+        initial_trials: Earlier current-invocation evidence to retain.
+        initial_timings: Earlier current-invocation phase timings to retain.
+
+    Returns:
+        SourceOptimizationSearchResult: Fresh bounded-search and final-gate result.
+    """
+    timings = list(initial_timings)
+    evaluations: list[_CandidateEvaluation] = []
+    trials = list(formation.trials if initial_trials is None else initial_trials)
+    evaluated_count = 0
+    for depth, candidates in itertools.groupby(
+        formation.candidates,
+        key=lambda candidate: candidate.depth,
+    ):
+        current = _fastest_evaluation(evaluations)
+        depth_evaluations: list[_CandidateEvaluation] = []
+        for candidate in candidates:
+            if candidate.id in excluded_candidate_ids:
+                continue
+            if evaluated_count >= SOURCE_SEARCH_MAX_TRIALS:
+                break
+            evaluation, trial, candidate_timings = _evaluate_candidate(
+                candidate,
+                options=options,
+                current=current,
+            )
+            evaluated_count += 1
+            timings.extend(candidate_timings)
+            trials.append(trial)
+            if evaluation is not None:
+                depth_evaluations.append(evaluation)
+        evaluations = sorted(
+            (*evaluations, *depth_evaluations),
+            key=lambda item: (
+                item.benchmark.candidate_median_seconds or float("inf"),
+                item.candidate.id,
+            ),
+        )[:SOURCE_SEARCH_BEAM_WIDTH]
+        _progress(
+            options.progress,
+            f"source search depth {depth} retained {len(evaluations)} beam candidate(s)",
+        )
+        if evaluated_count >= SOURCE_SEARCH_MAX_TRIALS:
+            break
+
+    winner = _fastest_evaluation(evaluations)
+    if winner is None:
+        return _search_rejected(options, trials, timings)
+    return _finalize_candidate(
+        winner,
+        options=options,
+        trials=tuple(trials),
+        timings=tuple(timings),
+    )
+
+
+def _store_accepted_winner(
+    result: SourceOptimizationSearchResult,
+    options: SourceOptimizationSearchOptions,
+    identity: SourceWinnerIdentity,
+) -> None:
+    """Persist an accepted candidate without making cache I/O promotion-critical.
+
+    Args:
+        result: Fresh search result whose accepted trial identifies the winner.
+        options: Search paths and progress sink for the active invocation.
+        identity: Strict static compatibility boundary for later replay.
+    """
+    candidate_id = next(
+        (trial.candidate_id for trial in result.trials if trial.status == "accepted"),
+        None,
+    )
+    if candidate_id is None:
+        return
+    try:
+        store_source_winner(options.cache_root, identity, candidate_id)
+    except (OSError, ValueError) as error:
+        _progress(options.progress, f"could not store accepted winner cache: {error}")
+
+
+def _winner_identity(
+    plans: tuple[SourceOptimizationPlan, ...],
+    candidates: tuple[_SourceCandidate, ...],
+    options: SourceOptimizationSearchOptions,
+) -> SourceWinnerIdentity:
+    """Build the strict static identity that permits accepted-winner replay.
+
+    Args:
+        plans: Source plans whose hashes define candidate inputs.
+        candidates: Complete formed candidate universe, independent of ranking.
+        options: Commands, performance policy, quality tree, baseline payload,
+            and environment for the current invocation.
+
+    Returns:
+        SourceWinnerIdentity: Content-derived replay compatibility boundary.
+    """
+    config = options.compile_config
+    candidate_plan_ids = {plan_id for candidate in candidates for plan_id in candidate.plan_ids}
+    plan_sources = tuple(
+        sorted(
+            (
+                plan.id,
+                tuple(
+                    sorted(
+                        (path.as_posix(), source_hash)
+                        for path, source_hash in plan.identity.source_hashes
+                    )
+                ),
+            )
+            for plan in plans
+            if plan.id in candidate_plan_ids
+        )
+    )
+    configuration = (
+        ("backends", "\0".join(config.backends)),
+        ("benchmark_warmups", str(config.benchmark_warmups)),
+        ("benchmark_samples", str(config.benchmark_samples)),
+        ("minimum_speedup", config.minimum_speedup.hex()),
+        ("beam_width", str(SOURCE_SEARCH_BEAM_WIDTH)),
+        ("max_depth", str(SOURCE_SEARCH_MAX_DEPTH)),
+        ("max_trials", str(SOURCE_SEARCH_MAX_TRIALS)),
+        ("search_warmups", str(SOURCE_SEARCH_WARMUPS)),
+        ("search_samples", str(SOURCE_SEARCH_SAMPLES)),
+        ("marginal_speedup", SOURCE_SEARCH_MINIMUM_MARGINAL_SPEEDUP.hex()),
+        ("hard_speedup", HARD_MINIMUM_SOURCE_SPEEDUP.hex()),
+    )
+    return SourceWinnerIdentity(
+        plan_sources=plan_sources,
+        # Candidate hot-share ordering is profile evidence and may jitter.
+        # Membership, not runtime ranking, defines replay compatibility.
+        candidate_ids=tuple(sorted(candidate.id for candidate in candidates)),
+        test_command=config.test_command or (),
+        benchmark_command=config.benchmark_command or (),
+        quality_project_digest=_content_tree_digest(
+            options.quality_project_root,
+            ignored_names=_IGNORED_PROJECT_NAMES,
+        ),
+        baseline_payload_digest=_content_tree_digest(
+            options.baseline_payload_root,
+            ignored_names=frozenset(("__pycache__",)),
+        ),
+        environment_digest=_runtime_environment_digest(),
+        configuration=configuration,
+        python_abi=sys.implementation.cache_tag or sys.implementation.name,
+        platform=sysconfig.get_platform(),
+        versions=(
+            ("search", SOURCE_SEARCH_VERSION),
+            ("lowering", SOURCE_SEARCH_LOWERING_VERSION),
+        ),
+    )
+
+
+def _content_tree_digest(root: Path, *, ignored_names: frozenset[str]) -> str:
+    """Hash stable paths, entry kinds, symlink text, and regular-file content.
+
+    Args:
+        root: Existing tree whose content participates in winner compatibility.
+        ignored_names: Path components that are disposable runtime output.
+
+    Returns:
+        str: Deterministic SHA-256 digest independent of mtimes and inode metadata.
+
+    Raises:
+        ValueError: If ``root`` is not an existing directory.
+        OSError: If a selected entry cannot be inspected or read.
+    """
+    if not root.is_dir():
+        raise ValueError(f"winner identity root is not a directory: {root}")
+    digest = hashlib.sha256(b"atoll-source-winner-tree-v1\0")
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root)
+        if any(part in ignored_names for part in relative.parts):
+            continue
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(b"symlink\0")
+            digest.update(path.readlink().as_posix().encode("utf-8"))
+        elif path.is_file():
+            digest.update(b"file\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+        elif path.is_dir():
+            digest.update(b"directory\0")
+        else:
+            digest.update(b"other\0")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _runtime_environment_digest() -> str:
+    """Hash dependency versions and process inputs that can affect winner choice.
+
+    The manifest stores only this digest. Environment values and distribution
+    metadata are never persisted in source-optimization cache files.
+
+    Returns:
+        str: Deterministic SHA-256 digest for the active runtime/build environment.
+    """
+    distributions = {
+        (name.casefold(), distribution.version)
+        for distribution in importlib_metadata.distributions()
+        if isinstance((name := distribution.metadata.get("Name")), str) and name
+    }
+    payload = {
+        "distributions": sorted(distributions),
+        "environment": sorted(os.environ.items()),
+        "python": {
+            "executable": sys.executable,
+            "implementation": sys.implementation.name,
+            "version": platform.python_version(),
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _not_attempted(options: SourceOptimizationSearchOptions) -> SourceOptimizationSearchResult:
@@ -419,7 +692,7 @@ def _form_candidates(
                 -candidate.hot_share,
                 candidate.id,
             ),
-        )[:SOURCE_SEARCH_MAX_TRIALS]
+        )
     )
     return _CandidateFormation(candidates=ordered, trials=tuple(unavailable))
 

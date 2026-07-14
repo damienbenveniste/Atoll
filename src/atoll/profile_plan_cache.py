@@ -162,7 +162,10 @@ def select_profile_plan(
     A non-empty, unique, available current selection is the authoritative value
     written on a miss or after any invalid entry. Existing entries are data only:
     JSON parsing and explicit shape checks are the sole interpretation performed.
-    Empty current selections bypass both persistence and replay.
+    An empty current selection may replay a valid existing entry, but it never
+    creates or replaces cache state. This lets an unchanged warm compile survive
+    statistical sampling jitter without allowing an empty profile to establish a
+    new native-compilation promise.
 
     Args:
         cache_root: Caller-owned root beneath which the content-addressed entry lives.
@@ -182,33 +185,46 @@ def select_profile_plan(
     identity_payload = _identity_payload(identity)
     identity_digest = _sha256(_canonical_bytes(identity_payload))
     cache_path = cache_root.expanduser() / "profile-plans" / f"{identity_digest}.json"
-    if not current:
-        return ProfilePlanDecision(
-            status="disabled",
-            selection=(),
-            diagnostic="empty-current-selection",
-            cache_path=cache_path,
-            identity_digest=identity_digest,
-        )
-    _validate_current(current, available)
-    if not cache_path.exists():
+    if current:
+        _validate_current(current, available)
+    if not cache_path.exists() and not cache_path.is_symlink():
+        if not current:
+            return ProfilePlanDecision(
+                status="disabled",
+                selection=(),
+                diagnostic="empty-current-selection:no-entry",
+                cache_path=cache_path,
+                identity_digest=identity_digest,
+            )
         _write_entry_atomic(cache_path, identity_payload, current)
         return _decision("miss", current, "absent", cache_path, identity_digest)
     invalid_reason: str | None = None
-    try:
-        stored = _read_selection(cache_path, identity_payload, identity)
-        invalid_reason = _stored_selection_invalid_reason(stored, available)
-    except json.JSONDecodeError:
-        invalid_reason = "malformed-json"
-        stored = ()
-    except OSError:
-        invalid_reason = "io-error"
-        stored = ()
-    except (TypeError, ValueError) as error:
-        invalid_reason = str(error)
-        stored = ()
+    stored: tuple[SymbolId, ...] = ()
+    if cache_path.is_symlink():
+        invalid_reason = "symlink"
+    else:
+        try:
+            stored = _read_selection(cache_path, identity_payload, identity)
+            invalid_reason = _stored_selection_invalid_reason(stored, available)
+        except json.JSONDecodeError:
+            invalid_reason = "malformed-json"
+            stored = ()
+        except OSError:
+            invalid_reason = "io-error"
+            stored = ()
+        except (TypeError, ValueError) as error:
+            invalid_reason = str(error)
+            stored = ()
     if invalid_reason is None:
         return _decision("hit", stored, "strict-hit", cache_path, identity_digest)
+    if not current:
+        return _decision(
+            "disabled",
+            (),
+            f"empty-current-selection:{invalid_reason}",
+            cache_path,
+            identity_digest,
+        )
     _write_entry_atomic(cache_path, identity_payload, current)
     return _decision(
         "miss",

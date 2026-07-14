@@ -202,19 +202,33 @@ def test_read_failure_has_deterministic_diagnostic(
     assert result.cache_path == first.cache_path
 
 
-def test_empty_current_selection_never_reads_or_writes(tmp_path: Path) -> None:
+def test_empty_current_selection_replays_valid_entry_without_writing(tmp_path: Path) -> None:
     identity = _identity()
     symbol = _symbol("run")
     stored = select_profile_plan(tmp_path, identity, (symbol,), frozenset((symbol,)))
     before = stored.cache_path.read_bytes()
 
-    disabled = select_profile_plan(tmp_path, identity, (), frozenset())
+    replayed = select_profile_plan(tmp_path, identity, (), frozenset((symbol,)))
+
+    assert replayed.status == "hit"
+    assert replayed.selection == (symbol,)
+    assert replayed.diagnostic == "strict-hit"
+    assert replayed.cache_path == stored.cache_path
+    assert stored.cache_path.read_bytes() == before
+
+
+def test_empty_current_selection_does_not_replace_invalid_entry(tmp_path: Path) -> None:
+    identity = _identity()
+    symbol = _symbol("run")
+    stored = select_profile_plan(tmp_path, identity, (symbol,), frozenset((symbol,)))
+    stored.cache_path.write_text("broken", encoding="utf-8")
+
+    disabled = select_profile_plan(tmp_path, identity, (), frozenset((symbol,)))
 
     assert disabled.status == "disabled"
     assert disabled.selection == ()
-    assert disabled.diagnostic == "empty-current-selection"
-    assert disabled.cache_path == stored.cache_path
-    assert stored.cache_path.read_bytes() == before
+    assert disabled.diagnostic == "empty-current-selection:malformed-json"
+    assert stored.cache_path.read_text(encoding="utf-8") == "broken"
 
 
 def test_empty_current_selection_does_not_create_cache_root(tmp_path: Path) -> None:
@@ -223,7 +237,33 @@ def test_empty_current_selection_does_not_create_cache_root(tmp_path: Path) -> N
     result = select_profile_plan(cache_root, _identity(), (), frozenset())
 
     assert result.status == "disabled"
+    assert result.diagnostic == "empty-current-selection:no-entry"
     assert not cache_root.exists()
+
+
+@pytest.mark.parametrize("target_exists", [True, False], ids=("valid", "dangling"))
+def test_empty_current_selection_never_reads_symlink_entry(
+    tmp_path: Path,
+    target_exists: bool,
+) -> None:
+    """Warm replay treats valid and dangling manifest symlinks as disabled data."""
+    identity = _identity()
+    symbol = _symbol("run")
+    stored = select_profile_plan(tmp_path, identity, (symbol,), frozenset((symbol,)))
+    payload = stored.cache_path.read_bytes()
+    target = tmp_path / "external.json"
+    stored.cache_path.unlink()
+    if target_exists:
+        target.write_bytes(payload)
+    stored.cache_path.symlink_to(target)
+
+    replayed = select_profile_plan(tmp_path, identity, (), frozenset((symbol,)))
+
+    assert replayed.status == "disabled"
+    assert replayed.selection == ()
+    assert replayed.diagnostic == "empty-current-selection:symlink"
+    if target_exists:
+        assert target.read_bytes() == payload
 
 
 def test_invalid_current_selection_is_rejected_before_persistence(tmp_path: Path) -> None:
