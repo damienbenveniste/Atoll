@@ -32,7 +32,7 @@ import zipfile
 
 stage = sys.argv[1]
 target = pathlib.Path(sys.argv[2]).resolve()
-plan = json.loads(sys.argv[3])
+plan = json.load(sys.stdin)
 temporary = None
 if stage == "wheel":
     temporary = tempfile.TemporaryDirectory(prefix="atoll-wheel-verify-")
@@ -240,6 +240,9 @@ def verify_package_subprocess(
 ) -> PackageVerificationResult:
     """Verify compiled routing from an unpacked payload or extracted final wheel.
 
+    The structured plan is streamed over standard input so verification remains
+    independent of operating-system command-line limits for large projects.
+
     Args:
         stage: Verification stage that determines the target and failure context.
         target: Wheel or payload path verified in an isolated child process.
@@ -275,7 +278,7 @@ def verify_package_subprocess(
         sort_keys=True,
         separators=(",", ":"),
     )
-    command = (sys.executable, "-I", "-c", _VERIFY_SCRIPT, stage, str(target.resolve()), payload)
+    command = (sys.executable, "-I", "-c", _VERIFY_SCRIPT, stage, str(target.resolve()))
     started = time.perf_counter()
     completed = subprocess.run(
         command,
@@ -284,6 +287,7 @@ def verify_package_subprocess(
         shell=False,
         capture_output=True,
         text=True,
+        input=payload,
     )
     return PackageVerificationResult(
         stage=stage,

@@ -15,6 +15,9 @@ from atoll.runtime.package_verify import (
     verify_package_subprocess,
 )
 
+_VERIFY_COMMAND_ARGUMENT_COUNT = 6
+_MAX_VERIFY_COMMAND_ARGUMENT_LENGTH = 10_000
+
 
 def test_verify_payload_imports_promised_region_and_checks_artifact(tmp_path: Path) -> None:
     """A fresh interpreter accepts matching status and native bytes."""
@@ -41,6 +44,43 @@ def test_verify_payload_imports_promised_region_and_checks_artifact(tmp_path: Pa
     assert result.exit_code == 0
     assert result.stderr == ""
     assert result.command[:3] == (result.command[0], "-I", "-c")
+    assert len(result.command) == _VERIFY_COMMAND_ARGUMENT_COUNT
+    assert "region-1" not in result.command
+
+
+def test_verify_payload_transports_large_plan_over_stdin(tmp_path: Path) -> None:
+    """Large verification plans do not exceed operating-system argv limits."""
+    payload = tmp_path / "payload"
+    package = payload / "pkg"
+    artifact = payload / ".atoll" / "artifacts" / "region" / "native.so"
+    package.mkdir(parents=True)
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"native")
+    region_ids = tuple(f"region-{index:05d}" for index in range(20_000))
+    (package / "__init__.py").write_text(
+        "__atoll_region_status__ = {\n"
+        "    f'region-{index:05d}': {'compiled': True}\n"
+        "    for index in range(20_000)\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    plan = PackageVerificationPlan(
+        modules=("pkg",),
+        regions=(("pkg", region_ids),),
+        artifacts=(_artifact(artifact),),
+    )
+
+    result = verify_package_subprocess(
+        stage="payload",
+        target=payload,
+        plan=plan,
+        project_root=tmp_path,
+        variant_allowlist=frozenset(region_ids),
+    )
+
+    assert result.success is True
+    assert len(result.command) == _VERIFY_COMMAND_ARGUMENT_COUNT
+    assert max(map(len, result.command)) < _MAX_VERIFY_COMMAND_ARGUMENT_LENGTH
 
 
 def test_verify_wheel_extracts_before_importing(tmp_path: Path) -> None:
