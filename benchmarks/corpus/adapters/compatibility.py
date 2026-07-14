@@ -6,6 +6,7 @@ import argparse
 import importlib
 import io
 import json
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -30,6 +31,17 @@ def _module_path(module: ModuleType) -> str:
 
 def _module_paths(modules: tuple[ModuleType, ...]) -> list[str]:
     return [_module_path(module) for module in modules]
+
+
+def _run_probe(probe: Probe) -> ProbeResult:
+    """Run a project probe without allowing sibling adapters to shadow it."""
+    adapter_root = Path(__file__).resolve().parent
+    original_path = sys.path[:]
+    try:
+        sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != adapter_root]
+        return probe()
+    finally:
+        sys.path[:] = original_path
 
 
 def _probe_anyio() -> ProbeResult:
@@ -367,7 +379,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if not arguments.project_root.resolve(strict=True).is_dir():
         parser.error("--project-root must identify a directory")
-    canonical, modules = PROBES[arguments.case]()
+    canonical, modules = _run_probe(PROBES[arguments.case])
     payload = {"canonical": canonical, "imports": _module_paths(modules)}
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     return 0

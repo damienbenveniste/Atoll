@@ -1207,6 +1207,9 @@ def _run_oracle(
     case = context.case
     paths = context.paths
     state = context.state
+    failure_status: CaseStatus = (
+        "upstream-broken" if label == "baseline-oracle" else "compatibility-regression"
+    )
     adapter = _reviewed_adapter_path(context, case.oracle_adapter)
     oracle_cwd = paths.workspace / "oracle-cwd"
     oracle_cwd.mkdir(exist_ok=True)
@@ -1227,22 +1230,22 @@ def _run_oracle(
             timeout_seconds=case.test_timeout_seconds or 300,
         ),
     )
-    _require_success(result, "compatibility-regression", f"{label} execution")
+    _require_success(result, failure_status, f"{label} execution")
     payload = _read_json_object(paths.evidence / state.phases[-1].log_path)
     canonical = payload.get("canonical")
     imports = payload.get("imports")
     if not isinstance(imports, list) or not imports:
         raise LifecycleError(
-            "compatibility-regression",
+            failure_status,
             f"{label} did not report imported project payload paths",
         )
     for raw_path in cast(list[object], imports):
         if not isinstance(raw_path, str):
-            raise LifecycleError("compatibility-regression", f"{label} import path is not text")
+            raise LifecycleError(failure_status, f"{label} import path is not text")
         imported = Path(raw_path).resolve(strict=True)
         if not imported.is_relative_to(arm.import_root.resolve(strict=True)):
             raise LifecycleError(
-                "compatibility-regression",
+                failure_status,
                 f"{label} imported project code outside installed payload: {imported}",
             )
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()

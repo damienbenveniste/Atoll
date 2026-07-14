@@ -122,6 +122,18 @@ def test_baseline_build_failure_is_attributed_upstream(tmp_path: Path) -> None:
     assert summary.result.cold_report_path is None
 
 
+def test_baseline_oracle_failure_is_attributed_upstream(tmp_path: Path) -> None:
+    """A pristine wheel that fails its oracle never becomes an Atoll regression."""
+    _remote, revision = _local_remote(tmp_path)
+    manifest = load_manifest(_write_manifest(tmp_path, revision, oracle_arguments=("--fail",)))
+
+    summary = run_case(manifest, "simple-project", _options(tmp_path))
+
+    assert summary.result.status == "upstream-broken"
+    assert "baseline-oracle execution" in summary.result.diagnostics[0]
+    assert summary.result.cold_report_path is None
+
+
 def test_compiled_wheel_oracle_corruption_is_a_regression(tmp_path: Path) -> None:
     """A final wheel with changed canonical behavior fails compatibility."""
     _remote, revision = _local_remote(tmp_path)

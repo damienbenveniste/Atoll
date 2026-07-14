@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import tomllib
 from pathlib import Path
 from types import ModuleType
@@ -78,6 +79,35 @@ def test_main_prints_one_stable_json_object(
     assert captured.err == ""
     assert captured.out == json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
     assert json.loads(captured.out) == expected
+
+
+def test_probe_ignores_same_named_sibling_adapter(
+    tmp_path: Path,
+) -> None:
+    """The script directory cannot shadow the installed project package."""
+    adapter = _load_adapter()
+    package_root = tmp_path / "sqlglot"
+    package_root.mkdir()
+    package_file = package_root / "__init__.py"
+    package_file.write_text("ORIGIN = 'installed-payload'\n", encoding="utf-8")
+    original_path = sys.path[:]
+    sys.path[:0] = [str(ADAPTER_PATH.parent.resolve()), str(tmp_path)]
+    previous = sys.modules.pop("sqlglot", None)
+
+    def probe() -> tuple[dict[str, object], tuple[ModuleType, ...]]:
+        package = __import__("sqlglot")
+        return {"origin": vars(package)["ORIGIN"]}, (package,)
+
+    try:
+        canonical, modules = adapter._run_probe(probe)
+    finally:
+        sys.path[:] = original_path
+        sys.modules.pop("sqlglot", None)
+        if previous is not None:
+            sys.modules["sqlglot"] = previous
+
+    assert canonical == {"origin": "installed-payload"}
+    assert modules[0].__file__ == str(package_file)
 
 
 def test_module_path_returns_non_empty_absolute_existing_path(tmp_path: Path) -> None:

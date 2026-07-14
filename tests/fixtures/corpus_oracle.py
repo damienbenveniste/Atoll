@@ -30,7 +30,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--corrupt-compiled", action="store_true")
+    parser.add_argument("--fail", action="store_true")
     args = parser.parse_args()
+    if args.fail:
+        raise RuntimeError("fixture baseline oracle failure")
     app = importlib.import_module("app")
     ranking = importlib.import_module("app.ranking")
     types = importlib.import_module("app.types")
