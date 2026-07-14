@@ -759,6 +759,11 @@ class Worker:
     def scale(self: "Worker", value: typing.SupportsInt) -> int:
         return double(int(value))
 
+    def local_scale(self, value: int) -> int:
+        from .helpers import twice
+
+        return twice(value)
+
     def copy(self: typing.Self) -> typing.Self:
         return self
 
@@ -794,6 +799,10 @@ class Worker:
     assert create_receiver is not None
     assert copy_return is not None
     assert "from pkg.helpers import twice as double" in generation.source_text
+    local_scale = functions["Worker__local_scale"]
+    local_import = next(node for node in ast.walk(local_scale) if isinstance(node, ast.ImportFrom))
+    assert local_import.level == 0
+    assert local_import.module == "pkg.helpers"
     assert ast.unparse(scale_receiver) == "_AtollWorker"
     assert ast.unparse(copy_receiver) == "_AtollWorker"
     assert ast.unparse(create_receiver) == "type[_AtollWorker]"

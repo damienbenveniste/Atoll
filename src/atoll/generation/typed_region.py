@@ -26,7 +26,7 @@ from atoll.models import (
     TypedRegion,
 )
 
-TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-region-v5"
+TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-region-v6"
 _SUPPORTED_BINDINGS = frozenset({"instance_method", "staticmethod", "classmethod"})
 _SUPPORTED_EXECUTION_KINDS = frozenset({"sync", "generator", "coroutine"})
 
@@ -230,7 +230,6 @@ def _generated_source(
     options: TypedRegionGenerationOptions,
 ) -> str:
     backend = options.backend
-    specialization = options.specialization
     owner_names: set[str] = set()
     for binding in bindings:
         owner = binding.target_owner_class or binding.owner_class
@@ -247,7 +246,7 @@ def _generated_source(
         runtime_boundary=bool(boundary_roots),
     )
     if atomic_class:
-        sections.extend(("", _lowered_atomic_class(members[0], backend)))
+        sections.extend(("", _lowered_atomic_class(scan, members[0], backend)))
     else:
         binding_by_source = {binding.source: binding for binding in bindings}
         for member in members:
@@ -255,10 +254,10 @@ def _generated_source(
                 (
                     "",
                     _lowered_callable(
+                        scan,
                         member,
                         binding_by_source[member.id],
-                        backend,
-                        specialization,
+                        options,
                         boundary_roots,
                     ),
                 )
@@ -331,10 +330,15 @@ def _generated_sections(
     return sections
 
 
-def _lowered_atomic_class(member: RegionMember, backend: Backend) -> str:
+def _lowered_atomic_class(
+    scan: ModuleScan,
+    member: RegionMember,
+    backend: Backend,
+) -> str:
     """Preserve one class declaration and add semantics-preserving backend flags.
 
     Args:
+        scan: Module scan retaining the source package context.
         member: Typed-region member being assessed or generated.
         backend: Compiler backend selected for this operation.
 
@@ -342,6 +346,7 @@ def _lowered_atomic_class(member: RegionMember, backend: Backend) -> str:
         str: Generated atomic class source and promised bindings.
     """
     node = _class_node(member)
+    _rewrite_relative_imports(scan, node)
     if backend == "mypyc":
         node.decorator_list.insert(
             0,
@@ -372,27 +377,90 @@ def _preserved_import(scan: ModuleScan, record: ImportRecord) -> str:
         str: Import source required to preserve generated annotations.
 
     Raises:
+        TypeError: If an import record does not contain an ``ImportFrom`` node.
         ValueError: If a relative import ascends beyond the source package.
     """
     if record.level == 0:
         return record.source_text
+    statement = ast.parse(record.source_text).body[0]
+    if not isinstance(statement, ast.ImportFrom):
+        raise TypeError(f"cannot preserve relative import: {record.source_text}")
+    _resolve_relative_import(scan, statement, source_text=record.source_text)
+    return ast.unparse(statement)
+
+
+def _rewrite_relative_imports(scan: ModuleScan, node: ast.AST) -> None:
+    """Resolve function-local relative imports against the source package.
+
+    Generated extensions use private top-level module names, so leaving a
+    relative import inside a copied callable would resolve against the helper
+    module instead of the original package. Rewriting only ``ImportFrom``
+    nodes preserves conditional and function-local import timing.
+
+    Args:
+        scan: Module scan retaining the original package name and path.
+        node: Generated declaration whose executable imports are rewritten.
+    """
+    _RelativeImportRewriter(scan).visit(node)
+
+
+class _RelativeImportRewriter(ast.NodeTransformer):
+    """Rewrite relative imports without moving them across execution scopes."""
+
+    def __init__(self, scan: ModuleScan) -> None:
+        self.scan = scan
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+        """Return an equivalent absolute import for generated code.
+
+        Args:
+            node: Relative or absolute import encountered in a declaration.
+
+        Returns:
+            ast.ImportFrom: The original absolute import or a resolved clone.
+        """
+        if node.level == 0:
+            return node
+        resolved = ast.ImportFrom(
+            module=node.module,
+            names=node.names,
+            level=node.level,
+        )
+        _resolve_relative_import(self.scan, resolved, source_text=ast.unparse(node))
+        return ast.copy_location(resolved, node)
+
+
+def _resolve_relative_import(
+    scan: ModuleScan,
+    statement: ast.ImportFrom,
+    *,
+    source_text: str,
+) -> None:
+    """Resolve one relative import against its original module package.
+
+    Args:
+        scan: Module scan retaining the original package name and path.
+        statement: Relative import node to mutate into an absolute import.
+        source_text: Source spelling used in conservative failure diagnostics.
+
+    Raises:
+        ValueError: The source import ascends beyond its importable package.
+    """
+    if statement.level == 0:
+        return
     package_parts = scan.module.name.split(".")
     if scan.module.path.name != "__init__.py":
         package_parts = package_parts[:-1]
-    ascend = record.level - 1
-    if ascend > len(package_parts):
-        raise ValueError(
-            f"relative import escapes package in {scan.module.name}: {record.source_text}"
-        )
+    ascend = statement.level - 1
+    if not package_parts or ascend >= len(package_parts):
+        raise ValueError(f"relative import escapes package in {scan.module.name}: {source_text}")
     prefix = package_parts[: len(package_parts) - ascend]
-    module_parts = record.module.split(".") if record.module else []
+    module_parts = statement.module.split(".") if statement.module else []
     absolute_module = ".".join((*prefix, *module_parts))
-    statement = ast.parse(record.source_text).body[0]
-    if not isinstance(statement, ast.ImportFrom) or not absolute_module:
-        raise ValueError(f"cannot preserve relative import: {record.source_text}")
+    if not absolute_module:
+        raise ValueError(f"cannot preserve relative import: {source_text}")
     statement.level = 0
     statement.module = absolute_module
-    return ast.unparse(statement)
 
 
 def _owner_facade(
@@ -486,13 +554,16 @@ def _owner_facade(
 
 
 def _lowered_callable(
+    scan: ModuleScan,
     member: RegionMember,
     binding: BindingTarget,
-    backend: Backend,
-    specialization: RegionSpecialization | None,
+    options: TypedRegionGenerationOptions,
     boundary_roots: frozenset[str],
 ) -> str:
+    backend = options.backend
+    specialization = options.specialization
     node = _callable_node(member)
+    _rewrite_relative_imports(scan, node)
     node.name = binding.compiled_name
     node.decorator_list = []
     if backend == "cython" and specialization is None:

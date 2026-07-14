@@ -94,7 +94,9 @@ fails, Atoll preserves the source class and routes eligible methods independentl
 atomic classes so their method reflection remains Python-compatible. Mypyc remains preferred for
 callable members, while Cython also handles unsupported member execution shapes or deterministic
 mypyc type failures. Cython annotation typing and C-type inference are disabled to preserve Python
-integer and container semantics. A profile-hot callable with explicit `Any`, incomplete
+integer and container semantics. Relative imports inside copied callables keep their original
+execution scope and resolve against the source package rather than the private extension module. A
+profile-hot callable with explicit `Any`, incomplete
 annotations, or unresolved TypeVars may use boxed Cython semantics; without a configured benchmark
 those boxed candidates remain interpreted. PEP 695 function type-parameter syntax is removed only
 from private generated Cython input, while the public wrapper retains source annotations and type

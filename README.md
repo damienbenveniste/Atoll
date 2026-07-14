@@ -125,7 +125,9 @@ compiles eligible methods independently. Cython owns atomic classes because its 
 class objects can preserve method reflection; mypyc remains preferred for callable members, while
 Cython also handles member execution shapes mypyc rejects and deterministic mypyc type failures.
 Cython annotation typing and C-type inference are disabled so Python integer and container
-semantics are not silently narrowed. When profiling identifies a hot callable, Cython may compile
+semantics are not silently narrowed. Relative imports inside copied callables remain in their
+original execution scope and resolve against the source package rather than the private extension
+module. When profiling identifies a hot callable, Cython may compile
 explicit `Any`, incomplete annotations, or unresolved TypeVars with boxed Python semantics. PEP
 695 function type-parameter syntax is removed only from the private generated Cython input; the
 public wrapper retains the source function's annotations and type-parameter metadata. Without a

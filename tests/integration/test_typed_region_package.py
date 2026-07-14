@@ -122,6 +122,17 @@ def test_compile_builds_and_routes_typed_methods_without_source_edits(
     """A staged wheel binds methods while dynamic owners remain interpreted."""
     project_root = tmp_path / "typed_region_project"
     shutil.copytree(FIXTURE_ROOT, project_root)
+    worker_source = project_root / "src" / "typed_region_project" / "worker.py"
+    worker_source.write_text(
+        worker_source.read_text(encoding="utf-8").replace(
+            "        return int(value)\n",
+            (
+                "        from .helpers import twice as local_twice\n\n"
+                "        return local_twice(int(value)) // 2\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
     original_hashes = _source_contents(project_root)
 
     first_exit = main(
@@ -197,7 +208,6 @@ def test_compile_builds_and_routes_typed_methods_without_source_edits(
     assert "maybe_pair" not in vars(disabled_module.PayloadPairer)
     assert not hasattr(disabled_module.Pairer.pair, "__atoll_compiled_target__")
 
-    worker_source = project_root / "src" / "typed_region_project" / "worker.py"
     invalidated_source = worker_source.read_text(encoding="utf-8").replace(
         "        total = 0\n",
         "        total = 1\n",
@@ -586,8 +596,10 @@ def _assert_installed_wheel_routes(wheel_path: Path, tmp_path: Path) -> None:
                 (
                     "import typed_region_project.worker as worker",
                     "assert worker.Worker(3).scale(5) == 23",
+                    "assert worker.Worker.parse('7') == 7",
                     "assert worker.__atoll_status__['compiled'] is True",
                     "assert hasattr(worker.Worker.scale, '__atoll_compiled_target__')",
+                    "assert hasattr(worker.Worker.parse, '__atoll_compiled_target__')",
                     "assert hasattr(worker.Worker.exchange, '__atoll_compiled_target__')",
                 )
             ),
