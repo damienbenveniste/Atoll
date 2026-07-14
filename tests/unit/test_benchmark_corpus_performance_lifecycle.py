@@ -11,6 +11,7 @@ import pytest
 from scripts.benchmark_corpus.lifecycle import (
     LifecycleError,
     build_performance_compile_policy,
+    calibrated_benchmark_repetitions,
     classify_compile_process,
     performance_asset_digest,
     ratio_evidence_from_report,
@@ -49,10 +50,39 @@ def test_performance_policy_uses_reviewed_adapters_and_isolated_python(tmp_path:
         str(performance_adapter),
         "--project-root",
         str(project_root),
+        "--repetitions",
+        "1",
     )
     assert policy.benchmark_warmups == 1
     assert policy.benchmark_samples == _EXPECTED_SAMPLE_COUNT
     assert policy.minimum_speedup == pytest.approx(1.10)
+
+
+@pytest.mark.parametrize(
+    ("current", "duration_seconds", "expected"),
+    [
+        (1, 0.50, 1),
+        (1, 0.24, 3),
+        (2, 0.40, 4),
+        (1, 0.001, 128),
+        (128, 0.10, 128),
+    ],
+)
+def test_benchmark_calibration_scales_above_the_noise_floor(
+    current: int,
+    duration_seconds: float,
+    expected: int,
+) -> None:
+    assert calibrated_benchmark_repetitions(current, duration_seconds) == expected
+
+
+@pytest.mark.parametrize(("current", "duration_seconds"), [(0, 0.5), (1, 0.0), (1, float("inf"))])
+def test_benchmark_calibration_rejects_invalid_measurements(
+    current: int,
+    duration_seconds: float,
+) -> None:
+    with pytest.raises(ValueError, match=r"positive|finite"):
+        calibrated_benchmark_repetitions(current, duration_seconds)
 
 
 def test_performance_assets_are_hash_checked_at_runtime(tmp_path: Path) -> None:

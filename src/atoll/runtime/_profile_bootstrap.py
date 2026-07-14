@@ -54,14 +54,6 @@ class _Config:
 
 
 @dataclass(frozen=True, slots=True)
-class _ModulePath:
-    module: str
-    suffix: str
-    project_path: Path
-    payload_path: Path
-
-
-@dataclass(frozen=True, slots=True)
 class _SpawnTarget:
     id: str
     owner: str
@@ -140,15 +132,24 @@ class _SamplingProfiler:
         self._scheduler_overhead_counts: Counter[str] = Counter()
         self._total_samples = 0
         self._previous_handler: _SignalHandler = None
+        self._enabled = False
+        self._in_sample = False
 
     def start(self) -> None:
-        """Enable statistical leaf-frame sampling without tracing distortion."""
+        """Enable non-reentrant statistical leaf-frame sampling.
+
+        The real-time timer is one-shot. Each callback rearms it only after frame
+        mapping and counter updates finish, so slow sampling work cannot overlap
+        a later sample.
+        """
         self._previous_handler = signal.getsignal(signal.SIGALRM)
         signal.signal(signal.SIGALRM, self._sample)
-        signal.setitimer(signal.ITIMER_REAL, _SAMPLE_INTERVAL_SECONDS, _SAMPLE_INTERVAL_SECONDS)
+        self._enabled = True
+        self._arm_timer()
 
     def stop(self) -> None:
         """Disable sampling and monitoring callbacks installed by this pass."""
+        self._enabled = False
         signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
         if self._previous_handler is not None:
             signal.signal(signal.SIGALRM, signal.SIG_IGN)
@@ -172,18 +173,30 @@ class _SamplingProfiler:
         }
 
     def _sample(self, _signum: int, frame: FrameType | None) -> None:
-        self._total_samples += 1
-        key = self._mapper.member_key(frame) if frame is not None else None
-        if key is not None:
-            self._sample_counts[key] += 1
+        if self._in_sample:
             return
-        ancestor = frame.f_back if frame is not None else None
-        while ancestor is not None:
-            key = self._mapper.member_key(ancestor)
+        self._in_sample = True
+        try:
+            self._total_samples += 1
+            key = self._mapper.member_key(frame) if frame is not None else None
             if key is not None:
-                self._scheduler_overhead_counts[key] += 1
+                self._sample_counts[key] += 1
                 return
-            ancestor = ancestor.f_back
+            ancestor = frame.f_back if frame is not None else None
+            while ancestor is not None:
+                key = self._mapper.member_key(ancestor)
+                if key is not None:
+                    self._scheduler_overhead_counts[key] += 1
+                    return
+                ancestor = ancestor.f_back
+        finally:
+            self._in_sample = False
+            if self._enabled:
+                self._arm_timer()
+
+    def _arm_timer(self) -> None:
+        """Schedule one sample without installing a periodic timer."""
+        signal.setitimer(signal.ITIMER_REAL, _SAMPLE_INTERVAL_SECONDS, 0.0)
 
 
 class _TypeProfiler:
@@ -480,15 +493,10 @@ class _TypeProfiler:
 
 class _FrameMapper:
     def __init__(self, config: _Config) -> None:
-        self._paths = tuple(
-            _ModulePath(
-                module=module,
-                suffix=suffix,
-                project_path=(config.project_root / suffix).resolve(),
-                payload_path=(config.payload_root / suffix).resolve(),
-            )
-            for module, suffix in sorted(config.module_paths, key=lambda item: (item[1], item[0]))
-        )
+        self._modules_by_path: dict[Path, str] = {}
+        for module, suffix in sorted(config.module_paths, key=lambda item: (item[1], item[0])):
+            self._modules_by_path.setdefault((config.project_root / suffix).resolve(), module)
+            self._modules_by_path.setdefault((config.payload_root / suffix).resolve(), module)
         self._code_keys: dict[CodeType, str | None] = {}
 
     def member_key(self, frame: FrameType | None) -> str | None:
@@ -518,14 +526,14 @@ class _FrameMapper:
         filename = code.co_filename
         qualname = code.co_qualname
         path = Path(filename).resolve()
-        for module_path in self._paths:
-            if path in {module_path.project_path, module_path.payload_path}:
-                if "<locals>" in qualname or qualname == "<module>":
-                    self._code_keys[code] = None
-                    return None
-                key = f"{module_path.module}::{qualname}"
-                self._code_keys[code] = key
-                return key
+        module = self._modules_by_path.get(path)
+        if module is not None:
+            if "<locals>" in qualname or qualname == "<module>":
+                self._code_keys[code] = None
+                return None
+            key = f"{module}::{qualname}"
+            self._code_keys[code] = key
+            return key
         self._code_keys[code] = None
         return None
 

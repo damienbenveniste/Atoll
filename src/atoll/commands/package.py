@@ -177,6 +177,7 @@ from atoll.runtime.performance import (
     run_performance_command,
 )
 from atoll.runtime.profiling import (
+    CandidateDecisionReason,
     MappedCandidateDecision,
     ProfileCallEdgeTarget,
     ProfileResult,
@@ -198,6 +199,7 @@ from atoll.source_optimization.search import (
     SourceOptimizationSearchResult,
     run_source_optimization_search,
 )
+from atoll.source_snapshot import copy_source_snapshot, symlink_target_bytes
 from atoll.wheel_overlay import (
     WheelBuildEvidence,
     WheelOverlayError,
@@ -234,7 +236,7 @@ _MAX_PROFILED_CALL_CHAIN_ROOTS = 4
 _MINIMUM_CYTHON_BATCH_SIZE = 2
 _MINIMUM_INTERACTION_VARIANTS = 2
 _PROFILE_PLAN_CACHE_FORMAT_VERSION = "1"
-_PROFILE_PLAN_LOWERING_VERSION = "profile-native-selection-v1"
+_PROFILE_PLAN_LOWERING_VERSION = "profile-native-selection-v2"
 _BACKEND_POLICY_BYPASS_PREFIX = "BACKEND_POLICY_BYPASS:"
 
 _GENERATED_DIR_NAMES = frozenset(
@@ -507,6 +509,50 @@ class _RequestedCallableVariant:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProfileCandidateRejection:
+    """One statically known callable excluded from automatic profile selection.
+
+    Attributes:
+        symbol: Source callable that runtime profiling may observe.
+        reason: Stable capability reason retained in profile and compile reports.
+    """
+
+    symbol: SymbolId
+    reason: CandidateDecisionReason
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileCandidateSupport:
+    """Backend-supported roots and explicit rejections for profile ranking.
+
+    Automatic profiling may only consume ``supported`` roots. Rejections stay
+    attached to their real static symbols so unsupported hot code remains
+    visible without consuming candidate limits or aborting compilation.
+
+    Attributes:
+        supported: Callable roots with a complete backend-supported directed slice.
+        rejected: Callable roots that cannot be independently bound or lowered.
+    """
+
+    supported: tuple[SymbolId, ...]
+    rejected: tuple[_ProfileCandidateRejection, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileCompileSelectionScope:
+    """Reusable support evidence and identity for strict selection caching.
+
+    Attributes:
+        identity: Stable baseline or transformed-source scope identity.
+        support: Capability results already used for profile ranking. Reusing
+            them prevents whole-project directed-slice analysis from running twice.
+    """
+
+    identity: str
+    support: _ProfileCandidateSupport
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedTypedRegion:
     """Generated unit plus its staged runtime binding contract.
 
@@ -770,6 +816,43 @@ class _TypedRegionPackageContext:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProfileSelectedPackageContext:
+    """Inputs required to route one automatic or explicit native selection.
+
+    Attributes:
+        options: Source-clean command and output policy.
+        project: Active target project and compile configuration.
+        scans: Selected source scans used for directed region selection.
+        baseline: Prepared interpreted wheel payload, when profiling was configured.
+        preparation: Baseline, profile, and planning evidence for failure reporting.
+        typed_regions: Backend-neutral regions retained in the compile report.
+        preflight_selected: Static selections prepared before profiling.
+        profile: Current profile and supported candidate decisions.
+        execution_plans: Scheduler plans and rejections retained for reporting.
+        fusion_plans: Task-fusion research plans retained for reporting.
+        scalar_analyses: Fixed-width scalar proof results.
+        call_chain_analyses: Direct call-chain proof results.
+        buffer_analyses: Zero-copy buffer proof results.
+        automatic_benchmark: Whether selection came from configured automatic profiling.
+    """
+
+    options: PackageOptions
+    project: DiscoveredProject
+    scans: tuple[ModuleScan, ...]
+    baseline: _BaselineWheelPayload | None
+    preparation: _ProfilePreparation
+    typed_regions: tuple[TypedRegion, ...]
+    preflight_selected: tuple[_SelectedTypedRegion, ...]
+    profile: ProfileResult | None
+    execution_plans: tuple[ExecutionPlan | PlanRejection, ...]
+    fusion_plans: tuple[FusionPlan, ...]
+    scalar_analyses: tuple[ScalarAnalysisResult, ...]
+    call_chain_analyses: tuple[CallChainAnalysisResult, ...]
+    buffer_analyses: tuple[BufferAnalysisResult, ...]
+    automatic_benchmark: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparationFailureContext:
     """Inputs used to report a source-clean native preparation failure.
 
@@ -1010,6 +1093,8 @@ class _ProfitabilitySelectionContext:
         project: Discovered target project configuration and modules.
         baseline: Baseline wheel and source-stripped quality-project evidence.
         payload_root: Superset staged payload controlled by the internal allowlist.
+        staged_source_roots: Copied source roots containing the generated candidate
+            shims and native artifacts.
         progress: Optional progress callback for long-running trials.
     """
 
@@ -1019,6 +1104,7 @@ class _ProfitabilitySelectionContext:
     project: DiscoveredProject
     baseline: _BaselineWheelPayload
     payload_root: Path
+    staged_source_roots: tuple[Path, ...]
     progress: PackageProgress | None
 
 
@@ -1264,11 +1350,6 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         hot_members=options.selected_members,
     )
     preflight_missing = _missing_requested_members(options.selected_members, preflight_selected)
-    profile_candidates = (
-        _profile_candidate_members(scans, project.config.compile.backends)
-        if project.config.compile.benchmark_command is not None and not options.selected_members
-        else ()
-    )
     plan_profile_targets = execution_plan_profile_targets(scans)
     preflight_error = _region_selection_error(
         profile=None,
@@ -1277,7 +1358,10 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         selected=preflight_selected,
         missing=preflight_missing,
     )
-    if preflight_error is not None and not profile_candidates and not plan_profile_targets:
+    automatic_benchmark = (
+        project.config.compile.benchmark_command is not None and not options.selected_members
+    )
+    if preflight_error is not None and not plan_profile_targets and not automatic_benchmark:
         _remove_failed_wheels(
             project,
             _resolve_output_dir(project.config.root, options.output_dir),
@@ -1299,11 +1383,24 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         return preparation.failure
     baseline = preparation.baseline
     profile = preparation.profile
+    profile_support = _ProfileCandidateSupport(supported=(), rejected=())
     if profile is not None:
+        support_roots = (
+            _profile_support_roots(profile, call_chain_analyses)
+            if profile.status == "profiled"
+            else None
+        )
+        profile_support = _profile_candidate_support(
+            scans,
+            project.config.compile.backends,
+            roots=support_roots,
+        )
         profile = _select_profile_with_call_chains(
             profile,
             scans,
             call_chain_analyses,
+            project.config.compile.backends,
+            support=profile_support,
         )
         _progress(
             options.progress,
@@ -1380,90 +1477,32 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     if source_terminal is not None:
         return source_terminal
     profile = _stabilize_profile_compile_selection(
+        _ProfileCompileSelectionScope(identity="baseline", support=profile_support),
         options=options,
         project=project,
         scans=scans,
         profile=profile,
-        scope_identity="baseline",
     )
     preparation = replace(preparation, profile=profile)
     source_trials = source_search.trials if source_search is not None else ()
-    profile_members = (
-        profile.selected_symbols if profile is not None and profile.status == "profiled" else ()
-    )
-    profile_members = tuple(
-        dict.fromkeys(
-            (
-                *profile_members,
-                *_profiled_call_chain_roots(call_chain_analyses, profile),
-            )
-        )
-    )
-    selection_members = options.selected_members or profile_members
-    selected_typed_regions = (
-        _selected_typed_regions(
-            scans,
-            project.config.compile.backends,
-            selection_members,
-            hot_members=profile_members,
-        )
-        if profile_members and not options.selected_members
-        else preflight_selected
-    )
-    _progress_compile_selection(
-        options.progress,
-        selected_typed_regions,
-        requested_members=selection_members,
-    )
-    missing_members = _missing_requested_members(
-        options.selected_members,
-        selected_typed_regions,
-    )
-    selection_error = _region_selection_error(
-        profile=profile,
-        selection_members=selection_members,
-        profile_members=profile_members,
-        selected=selected_typed_regions,
-        missing=missing_members,
-    )
-    plan_only_allowed = bool(selected_execution_plans) and not options.selected_members
-    if selection_error is not None and not plan_only_allowed:
-        package_result = _failed_region_selection(
+    package_result = _execute_profile_selected_package(
+        _ProfileSelectedPackageContext(
             options=options,
             project=project,
+            scans=scans,
+            baseline=baseline,
             preparation=preparation,
-            error=selection_error,
             typed_regions=typed_regions,
-        )
-    elif plan_only_allowed and (not profile_members or not selected_typed_regions):
-        package_result = _execute_execution_plan_only_package(
-            _ExecutionPlanOnlyContext(
-                options=options,
-                project=project,
-                typed_regions=typed_regions,
-                execution_plans=execution_plans,
-                prepared_baseline=baseline,
-                profile=profile,
-            )
-        )
-    else:
-        package_result = _execute_typed_region_package(
-            options=options,
-            project=project,
-            context=_TypedRegionPackageContext(
-                selected=selected_typed_regions,
-                typed_regions=typed_regions,
-                preflight_skipped=(),
-                native_readiness=(),
-                execution_plans=execution_plans,
-                fusion_plans=fusion_plans,
-                scalar_analyses=scalar_analyses,
-                call_chain_analyses=call_chain_analyses,
-                buffer_analyses=buffer_analyses,
-            ),
-            prepared_baseline=baseline,
+            preflight_selected=preflight_selected,
             profile=profile,
+            execution_plans=execution_plans,
+            fusion_plans=fusion_plans,
+            scalar_analyses=scalar_analyses,
+            call_chain_analyses=call_chain_analyses,
+            buffer_analyses=buffer_analyses,
+            automatic_benchmark=automatic_benchmark,
         )
+    )
     return _with_source_optimization(
         replace(
             package_result,
@@ -1473,6 +1512,96 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
         ),
         source_optimization,
         source_trials,
+    )
+
+
+def _execute_profile_selected_package(
+    context: _ProfileSelectedPackageContext,
+) -> PackageCommandResult:
+    """Route supported native selections or a measured automatic no-op.
+
+    Explicit selections remain hard contracts: unsupported requested members
+    fail before compilation. Automatic benchmark selection instead runs the
+    complete semantic and performance gate when no backend-supported hot root
+    remains, producing honest ``not-profitable`` evidence without a wheel.
+
+    Args:
+        context: Static, profile, baseline, and optimizer evidence for routing.
+
+    Returns:
+        PackageCommandResult: Native package result, explicit selection failure,
+            or measured unoptimized result.
+    """
+    profile = context.profile
+    options = context.options
+    project = context.project
+    profile_members = (
+        profile.selected_symbols if profile is not None and profile.status == "profiled" else ()
+    )
+    selection_members = options.selected_members or profile_members
+    if options.selected_members:
+        selected = context.preflight_selected
+    elif profile is not None and profile.status == "profiled":
+        selected = (
+            _selected_typed_regions(
+                context.scans,
+                project.config.compile.backends,
+                selection_members,
+                hot_members=profile_members,
+            )
+            if profile_members
+            else ()
+        )
+    else:
+        selected = context.preflight_selected
+    _progress_compile_selection(
+        options.progress,
+        selected,
+        requested_members=selection_members,
+    )
+    missing = _missing_requested_members(options.selected_members, selected)
+    selection_error = _region_selection_error(
+        profile=profile,
+        selection_members=selection_members,
+        profile_members=profile_members,
+        selected=selected,
+        missing=missing,
+    )
+    if context.automatic_benchmark and not selected:
+        return _execute_execution_plan_only_package(
+            _ExecutionPlanOnlyContext(
+                options=options,
+                project=project,
+                typed_regions=context.typed_regions,
+                execution_plans=context.execution_plans,
+                prepared_baseline=context.baseline,
+                profile=profile,
+            )
+        )
+    if selection_error is not None:
+        return _failed_region_selection(
+            options=options,
+            project=project,
+            preparation=context.preparation,
+            error=selection_error,
+            typed_regions=context.typed_regions,
+        )
+    return _execute_typed_region_package(
+        options=options,
+        project=project,
+        context=_TypedRegionPackageContext(
+            selected=selected,
+            typed_regions=context.typed_regions,
+            preflight_skipped=(),
+            native_readiness=(),
+            execution_plans=context.execution_plans,
+            fusion_plans=context.fusion_plans,
+            scalar_analyses=context.scalar_analyses,
+            call_chain_analyses=context.call_chain_analyses,
+            buffer_analyses=context.buffer_analyses,
+        ),
+        prepared_baseline=context.baseline,
+        profile=profile,
     )
 
 
@@ -1575,7 +1704,14 @@ def _profile_source_candidate(
         call_edge_targets=_call_chain_profile_targets(call_chains),
         enable_atoll=True,
     )
-    selected = _select_profile_with_call_chains(profile, scans, call_chains)
+    support = _profile_candidate_support(scans, active_project.config.compile.backends)
+    selected = _select_profile_with_call_chains(
+        profile,
+        scans,
+        call_chains,
+        active_project.config.compile.backends,
+        support=support,
+    )
     _profile_progress(options.progress, selected)
     return selected
 
@@ -1728,38 +1864,49 @@ def _execute_composed_source_arm(
     buffer_analyses = _buffer_analyses(active_scans, options.progress)
     active_profile = _accepted_source_profile(search) or preparation.profile
     if active_profile is not None:
+        support_roots = (
+            _profile_support_roots(active_profile, call_chain_analyses)
+            if active_profile.status == "profiled"
+            else None
+        )
+        active_support = _profile_candidate_support(
+            active_scans,
+            arm.active_project.config.compile.backends,
+            roots=support_roots,
+        )
         active_profile = _select_profile_with_call_chains(
             active_profile,
             active_scans,
             call_chain_analyses,
+            arm.active_project.config.compile.backends,
+            support=active_support,
         )
+    else:
+        active_support = _ProfileCandidateSupport(supported=(), rejected=())
     active_execution_plans = build_execution_plans(active_scans, active_profile)
     active_fusion_plans = (
         build_fusion_plans(active_scans, active_profile) if active_profile is not None else ()
     )
     active_profile = _stabilize_profile_compile_selection(
+        _ProfileCompileSelectionScope(
+            identity=(
+                "accepted-source:"
+                + hashlib.sha256(
+                    search.materialization_patch.patch_text.encode("utf-8")
+                ).hexdigest()
+            ),
+            support=active_support,
+        ),
         options=options,
         project=arm.active_project,
         scans=active_scans,
         profile=active_profile,
-        scope_identity=(
-            "accepted-source:"
-            + hashlib.sha256(search.materialization_patch.patch_text.encode("utf-8")).hexdigest()
-        ),
     )
     typed_regions = tuple(region for scan in active_scans for region in scan.typed_regions)
     profile_members = (
         active_profile.selected_symbols
         if active_profile is not None and active_profile.status == "profiled"
         else ()
-    )
-    profile_members = tuple(
-        dict.fromkeys(
-            (
-                *profile_members,
-                *_profiled_call_chain_roots(call_chain_analyses, active_profile),
-            )
-        )
     )
     selection_members = options.selected_members or profile_members
     run_guard_plans = search.native_plans
@@ -5753,6 +5900,10 @@ def _append_phase_timings(
 def _promote_source_clean_payload(
     context: _SourceCleanPromotionContext,
 ) -> _SourceCleanPromotionResult:
+    _clear_payload_bytecode_with_progress(
+        (context.install_root,),
+        context.options.progress,
+    )
     payload_verification = _verify_package_stage(
         stage="payload",
         target=context.install_root,
@@ -5987,6 +6138,7 @@ def _finalize_typed_payload(
                 project=context.project,
                 baseline=context.baseline,
                 payload_root=context.install_root,
+                staged_source_roots=context.staged_source_roots,
                 progress=context.options.progress,
             )
         )
@@ -7270,6 +7422,128 @@ def _profile_profitability_enabled(
     )
 
 
+def _materialize_candidate_payload(
+    context: _ProfitabilitySelectionContext,
+    selected: tuple[_PreparedTypedRegion, ...],
+    destination: Path,
+) -> None:
+    """Create the exact payload represented by one candidate allowlist.
+
+    Candidate benchmarks must measure the same shim and artifact layout that a
+    promoted wheel receives. Merely disabling superset variants at runtime
+    leaves their generated shim declarations on the import path and can make a
+    profitable candidate appear slower than its final materialized payload.
+
+    Args:
+        context: Baseline wheel and staged superset inputs.
+        selected: Native variants that should exist in the disposable payload.
+        destination: New temporary payload root to materialize.
+
+    Raises:
+        OSError: If baseline files, generated shims, or artifacts cannot be copied.
+        ValueError: If a selected source or artifact is outside the staged roots,
+            or the baseline wheel omitted a selected source module.
+    """
+    baseline_root = context.baseline.baseline_install_root
+    if baseline_root is None:
+        raise ValueError("candidate payload requires an unpacked baseline wheel")
+    copy_source_snapshot(baseline_root, destination)
+
+    configs_by_path: dict[Path, list[RegionShimConfig]] = {}
+    for item in selected:
+        configs_by_path.setdefault(item.shim.source_path, []).append(item.shim)
+    for source_path, configs in configs_by_path.items():
+        relative = _source_relative_path(source_path, context.staged_source_roots)
+        target = destination / relative
+        if not target.is_file():
+            raise ValueError(
+                f"target PEP 517 wheel omitted a compiled source module: {relative.as_posix()}"
+            )
+        source_text = source_path.read_text(encoding="utf-8")
+        target.write_text(
+            insert_or_replace_region_shim(source_text, tuple(configs)).new_text,
+            encoding="utf-8",
+        )
+
+    artifact_dirs = tuple(dict.fromkeys(item.shim.artifact_dir for item in selected))
+    for artifact_dir in artifact_dirs:
+        relative = _source_relative_path(artifact_dir, context.staged_source_roots)
+        copy_source_snapshot(artifact_dir, destination / relative)
+    _clear_payload_bytecode((destination,))
+
+
+def _run_exact_candidate_trial(
+    context: _ProfitabilitySelectionContext,
+    accepted: tuple[_PreparedTypedRegion, ...],
+    candidate: _PreparedTypedRegion,
+    minimum_speedup: float,
+) -> tuple[CommandRunEvidence, BenchmarkGateResult | None]:
+    """Test one candidate against exact accepted and proposed payloads.
+
+    Native artifacts are reused from the superset build, but each arm receives
+    only its selected shim declarations and artifact directories. This keeps
+    marginal timing equivalent to final-wheel routing without another compiler
+    invocation.
+
+    Args:
+        context: Profile-guided selection boundaries and staged build state.
+        accepted: Variants retained before this trial.
+        candidate: Proposed additional variant.
+        minimum_speedup: Marginal speedup required for acceptance.
+
+    Returns:
+        tuple[CommandRunEvidence, BenchmarkGateResult | None]: Semantic evidence
+        and paired timing evidence when semantics pass.
+
+    Raises:
+        ValueError: If required commands or payload roots are unavailable.
+    """
+    test_command = context.project.config.compile.test_command
+    benchmark_command = context.project.config.compile.benchmark_command
+    quality_root = context.baseline.quality_project_root
+    if test_command is None or benchmark_command is None or quality_root is None:
+        raise ValueError("candidate selection prerequisites are unavailable")
+
+    selected = (*accepted, candidate)
+    accepted_ids = frozenset(item.unit.region_id for item in accepted)
+    variant_id = candidate.unit.region_id
+    with tempfile.TemporaryDirectory(
+        prefix="atoll-candidate-payloads-",
+        dir=context.payload_root.parent,
+    ) as workspace_text:
+        workspace = Path(workspace_text)
+        accepted_payload = workspace / "accepted"
+        candidate_payload = workspace / "candidate"
+        _materialize_candidate_payload(context, accepted, accepted_payload)
+        _materialize_candidate_payload(context, selected, candidate_payload)
+        semantic = run_performance_command(
+            test_command,
+            project_root=quality_root,
+            payload_root=candidate_payload,
+            mode="compiled",
+        )
+        if not semantic.succeeded:
+            return semantic, None
+        _progress(
+            context.progress,
+            (f"candidate benchmarking {variant_id} against {len(accepted)} accepted variant(s)"),
+        )
+        benchmark = run_benchmark_gate(
+            BenchmarkGateConfig(
+                command=benchmark_command,
+                warmups=_CANDIDATE_BENCHMARK_WARMUPS,
+                samples=_CANDIDATE_BENCHMARK_SAMPLES,
+                minimum_speedup=minimum_speedup,
+            ),
+            project_root=quality_root,
+            baseline_payload_root=accepted_payload,
+            compiled_payload_root=candidate_payload,
+            baseline_variant_allowlist=(accepted_ids if accepted else None),
+            progress=partial(_candidate_benchmark_progress, context.progress, variant_id),
+        )
+        return semantic, benchmark
+
+
 def _select_profitable_candidates(
     context: _ProfitabilitySelectionContext,
 ) -> _ProfitabilitySelectionOutcome:
@@ -7286,6 +7560,9 @@ def _select_profitable_candidates(
 
     Returns:
         _ProfitabilitySelectionOutcome: Accepted variants, decisions, and command timings.
+
+    Raises:
+        AssertionError: If a successful semantic trial omits benchmark evidence.
     """
     candidates = _profiled_profitability_candidates(
         context.successful,
@@ -7323,12 +7600,11 @@ def _select_profitable_candidates(
             context.progress,
             f"candidate {index}/{candidate_count} testing {variant_id} semantics",
         )
-        semantic = run_performance_command(
-            test_command,
-            project_root=quality_root,
-            payload_root=context.payload_root,
-            mode="compiled",
-            variant_allowlist=frozenset(trial_ids),
+        semantic, benchmark = _run_exact_candidate_trial(
+            context,
+            tuple(accepted),
+            prepared,
+            minimum_speedup,
         )
         timings.append(
             CompilePhaseTiming(
@@ -7343,28 +7619,8 @@ def _select_profitable_candidates(
             benchmark_status = "not-run"
             marginal_speedup = None
         else:
-            _progress(
-                context.progress,
-                (
-                    f"candidate {index}/{candidate_count} benchmarking {variant_id} "
-                    f"against {len(baseline_ids)} accepted variant(s)"
-                ),
-            )
-
-            benchmark = run_benchmark_gate(
-                BenchmarkGateConfig(
-                    command=benchmark_command,
-                    warmups=_CANDIDATE_BENCHMARK_WARMUPS,
-                    samples=_CANDIDATE_BENCHMARK_SAMPLES,
-                    minimum_speedup=minimum_speedup,
-                ),
-                project_root=quality_root,
-                baseline_payload_root=context.payload_root,
-                compiled_payload_root=context.payload_root,
-                baseline_variant_allowlist=frozenset(baseline_ids),
-                compiled_variant_allowlist=frozenset(trial_ids),
-                progress=partial(_candidate_benchmark_progress, context.progress, variant_id),
-            )
+            if benchmark is None:
+                raise AssertionError("successful candidate semantics omitted benchmark evidence")
             timings.extend(_candidate_benchmark_timings(variant_id, benchmark))
             benchmark_status = benchmark.status
             marginal_speedup = benchmark.speedup
@@ -7663,6 +7919,10 @@ def _run_configured_quality_gate(
     progress: PackageProgress | None,
 ) -> _QualityGateOutcome:
     config = project.config.compile
+    payload_roots: tuple[Path, ...] = (compiled_payload_root,)
+    if baseline.baseline_install_root is not None:
+        payload_roots = (baseline.baseline_install_root, *payload_roots)
+    _clear_payload_bytecode_with_progress(payload_roots, progress)
     commands_configured = config.test_command is not None or config.benchmark_command is not None
     if commands_configured and baseline.quality_project_root is None:
         return _invalid_quality_gate(config.minimum_speedup, "quality-gate project is missing")
@@ -8055,10 +8315,42 @@ def _profiled_call_chain_roots(
     return tuple(ranked[:_MAX_PROFILED_CALL_CHAIN_ROOTS])
 
 
+def _profile_support_roots(
+    profile: ProfileResult,
+    analyses: tuple[CallChainAnalysisResult, ...],
+) -> tuple[SymbolId, ...]:
+    """Return only observed roots that can influence profile selection.
+
+    Whole-project support assessment is expensive because each callable needs
+    a directed dependency slice and backend capability check. A successful
+    profile can select only members it observed or roots promoted by observed
+    direct call edges, so unrelated cold callables cannot affect backfilling.
+
+    Args:
+        profile: Current successful baseline profile.
+        analyses: Static call-chain evidence used for root promotion.
+
+    Returns:
+        tuple[SymbolId, ...]: Deduplicated observed members and hot call-chain
+        roots in deterministic profile order.
+    """
+    return tuple(
+        dict.fromkeys(
+            (
+                *(member.symbol for member in profile.members),
+                *_profiled_call_chain_roots(analyses, profile),
+            )
+        )
+    )
+
+
 def _select_profile_with_call_chains(
     profile: ProfileResult,
     scans: tuple[ModuleScan, ...],
     analyses: tuple[CallChainAnalysisResult, ...],
+    backends: tuple[Backend, ...],
+    *,
+    support: _ProfileCandidateSupport | None = None,
 ) -> ProfileResult:
     """Add exact-edge hot callers to ordinary leaf-sample profile selection.
 
@@ -8066,32 +8358,52 @@ def _select_profile_with_call_chains(
         profile: Current-invocation baseline profile.
         scans: Current static symbols used for ordinary candidate mapping.
         analyses: Current call-chain plans used for edge-root promotion.
+        backends: Configured compiler backends in preference order.
+        support: Reusable capability assessment for the current scans.
 
     Returns:
         ProfileResult: Candidate selection including hot public call-chain roots.
     """
-    call_chain_roots = _profiled_call_chain_roots(analyses, profile)
+    support = support or _profile_candidate_support(scans, backends)
+    supported = frozenset(support.supported)
+    rejected = {item.symbol: item.reason for item in support.rejected}
+    call_chain_roots = tuple(
+        root for root in _profiled_call_chain_roots(analyses, profile) if root in supported
+    )
     selected = select_profile_candidates(
         profile,
-        tuple(symbol for scan in scans for symbol in scan.symbols),
+        tuple(symbol for scan in scans for symbol in scan.symbols if symbol.id in supported),
+    )
+    decisions = tuple(
+        replace(
+            decision,
+            symbol=observed,
+            reason=rejected[observed],
+            selected=False,
+        )
+        if decision.symbol is None
+        and (observed := SymbolId(decision.module, decision.qualname)) in rejected
+        else decision
+        for decision in selected.candidates
     )
     if not call_chain_roots:
-        return selected
+        return replace(selected, candidates=decisions)
     return replace(
         selected,
         status="profiled",
         reason="baseline profile collected with hot direct call-edge roots",
+        candidates=decisions,
         selected_symbols=tuple(dict.fromkeys((*selected.selected_symbols, *call_chain_roots))),
     )
 
 
 def _stabilize_profile_compile_selection(
+    selection_scope: _ProfileCompileSelectionScope,
     *,
     options: PackageOptions,
     project: DiscoveredProject,
     scans: tuple[ModuleScan, ...],
     profile: ProfileResult | None,
-    scope_identity: str,
 ) -> ProfileResult | None:
     """Replay the first strict native candidate plan for an unchanged scope.
 
@@ -8102,11 +8414,11 @@ def _stabilize_profile_compile_selection(
     profitability gates still evaluate the replayed selection from scratch.
 
     Args:
+        selection_scope: Stable arm identity and previously computed backend support.
         options: Current package options, including an optional cache override.
         project: Active original or transformed project configuration.
         scans: Active source scans whose content and symbols bound replay.
         profile: Fresh current-invocation profile and candidate selection.
-        scope_identity: Stable baseline or accepted-source arm identity.
 
     Returns:
         ProfileResult | None: Fresh profile evidence with a strictly replayed native
@@ -8120,10 +8432,10 @@ def _stabilize_profile_compile_selection(
         or benchmark is None
     ):
         return profile
-    available = frozenset(symbol.id for scan in scans for symbol in scan.symbols)
+    available = frozenset(selection_scope.support.supported)
     try:
         identity = ProfilePlanIdentity(
-            scope_identity=scope_identity,
+            scope_identity=selection_scope.identity,
             candidate_identity=tuple(sorted(symbol.stable_id for symbol in available)),
             module_source_hashes=tuple(
                 sorted(
@@ -8235,37 +8547,64 @@ def _profile_with_replayed_compile_selection(
     )
 
 
-def _profile_candidate_members(
+def _profile_candidate_support(
     scans: tuple[ModuleScan, ...],
     backends: tuple[Backend, ...],
-) -> tuple[SymbolId, ...]:
-    """Return callable roots a dynamic profile may select for some backend.
+    *,
+    roots: tuple[SymbolId, ...] | None = None,
+) -> _ProfileCandidateSupport:
+    """Assess callable roots that can participate in dynamic hotness ranking.
 
-    This preflight does not select or compile a member. It prevents Atoll from
-    rejecting a benchmark-configured project merely because all credible hot
-    members require boxed Cython lowering.
+    The profile should rank only roots Atoll can independently bind through a
+    complete directed closure. Unsupported roots remain explicit report
+    evidence instead of appearing unmapped or causing a later selection crash.
 
     Args:
-        scans: Selected module scans in deterministic order.
+        scans: Selected module scans in deterministic source order.
         backends: Backends considered in configured preference order.
+        roots: Profile-observed roots to assess. ``None`` retains exhaustive
+            static behavior for unsupported profiling launchers.
 
     Returns:
-        tuple[SymbolId, ...]: Potential profile roots in scan/source order.
+        _ProfileCandidateSupport: Supported roots and stable capability rejections.
     """
-    candidates: list[SymbolId] = []
+    supported: list[SymbolId] = []
+    rejected: list[_ProfileCandidateRejection] = []
+    requested = None if roots is None else frozenset(roots)
     for scan in scans:
         for region in scan.typed_regions:
             decisions = {decision.target: decision for decision in region.decisions}
             all_members = frozenset(member.id for member in region.members)
             eligible = _eligible_typed_callables(region, decisions, hot=all_members)
-            for root in eligible:
-                sliced = build_directed_region_slice(region, root)
-                if any(
-                    root in _compiler_backend(backend).assess(sliced).supported_members
-                    for backend in backends
-                ):
-                    candidates.append(root)
-    return tuple(candidates)
+            specialization_roots = frozenset(
+                specialization.source_member for specialization in region.specializations
+            )
+            for member in region.members:
+                if member.kind not in {"function", "method"}:
+                    continue
+                root = member.id
+                if requested is not None and root not in requested:
+                    continue
+                variants = _selected_requested_root_variants(
+                    scan=scan,
+                    source_region=region,
+                    root=root,
+                    hot=all_members,
+                    backends=backends,
+                )
+                if variants:
+                    supported.append(root)
+                    continue
+                reason: CandidateDecisionReason = (
+                    "backend-unsupported"
+                    if root in eligible or root in specialization_roots
+                    else "not-independently-bindable"
+                )
+                rejected.append(_ProfileCandidateRejection(symbol=root, reason=reason))
+    return _ProfileCandidateSupport(
+        supported=tuple(dict.fromkeys(supported)),
+        rejected=tuple(rejected),
+    )
 
 
 def _selected_typed_regions(
@@ -8411,10 +8750,51 @@ def _selected_requested_region_slices(
     variants: list[_SelectedTypedRegion] = []
     roots = tuple(member.id for member in source_region.members if member.id in requested)
     for root in roots:
+        variants.extend(
+            _selected_requested_root_variants(
+                scan=scan,
+                source_region=source_region,
+                root=root,
+                hot=hot,
+                backends=backends,
+            )
+        )
+    return tuple(variants)
+
+
+def _selected_requested_root_variants(
+    *,
+    scan: ModuleScan,
+    source_region: TypedRegion,
+    root: SymbolId,
+    hot: frozenset[SymbolId],
+    backends: tuple[Backend, ...],
+) -> tuple[_SelectedTypedRegion, ...]:
+    """Select a callable slice or concrete specialization for one public root.
+
+    Eligibility is checked against the connected source region before directed
+    slicing. This keeps low-level slice invariants strict while turning ordinary
+    capability exclusions, such as dunder methods, into reportable selection
+    rejections rather than exceptions.
+
+    Args:
+        scan: Module scan retaining source facts for generated code.
+        source_region: Connected source region that owns ``root``.
+        root: Explicit or profile-derived public binding.
+        hot: Profile-selected roots allowed to use boxed lowering.
+        backends: Backends considered in configured preference order.
+
+    Returns:
+        tuple[_SelectedTypedRegion, ...]: At most one ordinary backend variant,
+            followed by any supported concrete specialization when needed.
+    """
+    decisions = {decision.target: decision for decision in source_region.decisions}
+    eligible = _eligible_typed_callables(source_region, decisions, hot=hot)
+    if root in eligible:
         sliced = build_directed_region_slice(source_region, root)
-        decisions = {decision.target: decision for decision in sliced.decisions}
-        eligible = _eligible_typed_callables(sliced, decisions, hot=hot)
-        closure = _runtime_member_closure(sliced, eligible, frozenset({root}))
+        sliced_decisions = {decision.target: decision for decision in sliced.decisions}
+        sliced_eligible = _eligible_typed_callables(sliced, sliced_decisions, hot=hot)
+        closure = _runtime_member_closure(sliced, sliced_eligible, frozenset({root}))
         callable_variants = _selected_requested_callable_variant(
             _RequestedCallableVariant(
                 scan=scan,
@@ -8426,19 +8806,17 @@ def _selected_requested_region_slices(
                 slice_root=root,
             )
         )
-        variants.extend(callable_variants)
         if callable_variants:
-            continue
-        variants.extend(
-            variant
-            for specialization in source_region.specializations
-            if specialization.source_member == root
-            for variant in (
-                _selected_specialization_variant(scan, source_region, specialization, backends),
-            )
-            if variant is not None
+            return callable_variants
+    return tuple(
+        variant
+        for specialization in source_region.specializations
+        if specialization.source_member == root
+        for variant in (
+            _selected_specialization_variant(scan, source_region, specialization, backends),
         )
-    return tuple(variants)
+        if variant is not None
+    )
 
 
 def _selected_requested_callable_variant(
@@ -8841,8 +9219,6 @@ def _source_roots_digest(
         digest.update(f"root:{index}".encode("ascii"))
         digest.update(b"\0")
         for path in sorted(source_root.rglob("*")):
-            if not path.is_file():
-                continue
             relative = path.relative_to(source_root).as_posix()
             relative_parts = PurePosixPath(relative).parts
             if (
@@ -8855,9 +9231,19 @@ def _source_roots_digest(
                 }
             ):
                 continue
+            if path.is_symlink():
+                kind = b"symlink"
+                content_digest = symlink_target_bytes(path)
+            elif path.is_file():
+                kind = b"file"
+                content_digest = hashlib.sha256(path.read_bytes()).digest()
+            else:
+                continue
             digest.update(relative.encode("utf-8"))
             digest.update(b"\0")
-            digest.update(hashlib.sha256(path.read_bytes()).digest())
+            digest.update(kind)
+            digest.update(b"\0")
+            digest.update(content_digest)
     return digest.hexdigest()
 
 
@@ -8871,7 +9257,7 @@ def _copy_source_roots(
         if destination.resolve() == build_root.resolve():
             _copytree_contents(source_root, destination)
         else:
-            shutil.copytree(source_root, destination, ignore=_copy_ignore)
+            copy_source_snapshot(source_root, destination, ignore=_copy_ignore)
         staged_roots.append(destination)
     return tuple(staged_roots)
 
@@ -8880,6 +9266,63 @@ def _copy_if_different(source: Path, destination: Path) -> None:
     if source.resolve() == destination.resolve():
         return
     shutil.copy2(source, destination)
+
+
+def _clear_payload_bytecode(roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    """Remove interpreter caches that would bias payload timing or wheel contents.
+
+    Verification subprocesses and third-party build hooks may import staged
+    modules before the performance gate. Baseline and compiled measurements
+    must not differ merely because one tree already contains bytecode caches.
+    Symlink entries are unlinked without following their targets.
+
+    Args:
+        roots: Owned unpacked wheel or disposable candidate payload roots.
+
+    Returns:
+        tuple[Path, ...]: Removed cache directories and standalone bytecode files.
+    """
+    removed: list[Path] = []
+    for root in dict.fromkeys(path.resolve() for path in roots):
+        if not root.is_dir():
+            continue
+        cache_dirs = sorted(
+            root.rglob("__pycache__"),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        )
+        for cache_dir in cache_dirs:
+            if cache_dir.is_symlink():
+                cache_dir.unlink(missing_ok=True)
+            elif cache_dir.is_dir():
+                shutil.rmtree(cache_dir)
+            else:
+                continue
+            removed.append(cache_dir)
+        for pattern in ("*.pyc", "*.pyo"):
+            for bytecode in root.rglob(pattern):
+                if bytecode.is_file() or bytecode.is_symlink():
+                    bytecode.unlink(missing_ok=True)
+                    removed.append(bytecode)
+    return tuple(removed)
+
+
+def _clear_payload_bytecode_with_progress(
+    roots: tuple[Path, ...],
+    progress: PackageProgress | None,
+) -> None:
+    """Clear timing-affecting caches and report only when stale paths existed.
+
+    Args:
+        roots: Owned payload roots scrubbed before verification or timing.
+        progress: Optional compile progress callback.
+    """
+    removed = _clear_payload_bytecode(roots)
+    if removed:
+        _progress(
+            progress,
+            f"removed {len(removed)} pre-existing bytecode cache path(s)",
+        )
 
 
 def _overlay_staged_sources(
@@ -9080,8 +9523,10 @@ def _copytree_contents(source: Path, destination: Path) -> None:
         if item.name in ignored_names:
             continue
         target = destination / item.name
-        if item.is_dir():
-            shutil.copytree(item, target, ignore=_copy_ignore)
+        if item.is_symlink():
+            shutil.copy2(item, target, follow_symlinks=False)
+        elif item.is_dir():
+            copy_source_snapshot(item, target, ignore=_copy_ignore)
         else:
             shutil.copy2(item, target)
 
@@ -9121,7 +9566,7 @@ def _copy_pep517_project(
                 ignored.add(name)
         return ignored
 
-    shutil.copytree(source_root, destination, ignore=ignore)
+    copy_source_snapshot(source_root, destination, ignore=ignore)
     _write_gitdir_pointer(source_root, destination)
     shutil.copystat(source_root, destination)
 

@@ -29,6 +29,8 @@ ProfilePassKind = Literal["sampling", "types"]
 CandidateDecisionReason = Literal[
     "selected",
     "unmapped",
+    "not-independently-bindable",
+    "backend-unsupported",
     "below-threshold",
     "coverage-reached",
     "limit",
@@ -114,14 +116,14 @@ class _ProfileMemberPayloadContext:
 
 @dataclass(frozen=True, slots=True)
 class SubprocessPassEvidence:
-    """Captured evidence from one profiling child process.
+    """Sanitized evidence from one profiling child process.
 
     Attributes:
         pass_kind: Profiling pass represented by this child process.
         command: Exact argv tuple used for the profiling bootstrap child.
         returncode: Child process exit status.
-        stdout: Captured benchmark standard output from the child.
-        stderr: Captured benchmark standard error from the child.
+        stdout: Compatibility field kept empty so benchmark output is not retained.
+        stderr: Compatibility field kept empty so benchmark output is not retained.
         duration_seconds: Parent-observed elapsed duration for evidence only.
     """
 
@@ -702,8 +704,8 @@ def _run_bootstrap_pass(request: _BootstrapRequest) -> tuple[JsonObject, Subproc
             pass_kind=request.profile_stage,
             command=command,
             returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout="",
+            stderr="",
             duration_seconds=duration,
         )
     finally:

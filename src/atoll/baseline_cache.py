@@ -31,6 +31,8 @@ from urllib.parse import unquote, urlparse
 from packaging import tags
 from packaging.requirements import InvalidRequirement, Requirement
 
+from atoll.source_snapshot import symlink_target_bytes
+
 BASELINE_WHEEL_CACHE_VERSION = 1
 BASELINE_WHEEL_CACHE_CONTEXT_ENV = "ATOLL_BASELINE_CACHE_CONTEXT"
 _MANIFEST_NAME = "manifest.json"
@@ -340,12 +342,20 @@ def _project_tree_digest(project_root: Path) -> str:
         relative = path.relative_to(project_root)
         if relative.parts and relative.parts[0] == ".git":
             continue
-        if not path.is_file() and not path.is_dir():
+        if path.is_symlink():
+            metadata = path.lstat()
+            kind = b"symlink"
+        elif path.is_file():
+            metadata = path.stat()
+            kind = b"file"
+        elif path.is_dir():
+            metadata = path.stat()
+            kind = b"directory"
+        else:
             continue
-        metadata = path.stat()
         digest.update(relative.as_posix().encode("utf-8"))
         digest.update(b"\0")
-        digest.update(b"file" if path.is_file() else b"directory")
+        digest.update(kind)
         digest.update(b"\0")
         digest.update(str(metadata.st_mode).encode("ascii"))
         digest.update(b"\0")
@@ -353,7 +363,9 @@ def _project_tree_digest(project_root: Path) -> str:
         digest.update(b"\0")
         digest.update(str(metadata.st_size).encode("ascii"))
         digest.update(b"\0")
-        if path.is_file():
+        if kind == b"symlink":
+            digest.update(symlink_target_bytes(path))
+        elif kind == b"file":
             digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 
@@ -506,11 +518,21 @@ def _path_digest(root: Path) -> str:
     digest = hashlib.sha256()
     paths = (root,) if root.is_file() else (root, *sorted(root.rglob("*")))
     for path in paths:
-        if not path.is_file() and not path.is_dir():
+        if path.is_symlink():
+            metadata = path.lstat()
+            kind = b"symlink"
+        elif path.is_file():
+            metadata = path.stat()
+            kind = b"file"
+        elif path.is_dir():
+            metadata = path.stat()
+            kind = b"directory"
+        else:
             continue
         relative = path.name if root.is_file() else path.relative_to(root).as_posix()
-        metadata = path.stat()
         digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(kind)
         digest.update(b"\0")
         digest.update(str(metadata.st_mode).encode("ascii"))
         digest.update(b"\0")
@@ -518,7 +540,9 @@ def _path_digest(root: Path) -> str:
         digest.update(b"\0")
         digest.update(str(metadata.st_size).encode("ascii"))
         digest.update(b"\0")
-        if path.is_file():
+        if kind == b"symlink":
+            digest.update(symlink_target_bytes(path))
+        elif kind == b"file":
             digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 

@@ -46,6 +46,7 @@ def test_verify_payload_imports_promised_region_and_checks_artifact(tmp_path: Pa
     assert result.command[:3] == (result.command[0], "-I", "-c")
     assert len(result.command) == _VERIFY_COMMAND_ARGUMENT_COUNT
     assert "region-1" not in result.command
+    assert not (package / "__pycache__").exists()
 
 
 def test_verify_payload_transports_large_plan_over_stdin(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ status. It does not install dependencies or mutate the target checkout.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -30,6 +31,7 @@ import sys
 import tempfile
 import zipfile
 
+sys.dont_write_bytecode = True
 stage = sys.argv[1]
 target = pathlib.Path(sys.argv[2]).resolve()
 plan = json.load(sys.stdin)
@@ -279,10 +281,13 @@ def verify_package_subprocess(
         separators=(",", ":"),
     )
     command = (sys.executable, "-I", "-c", _VERIFY_SCRIPT, stage, str(target.resolve()))
+    child_environment = dict(os.environ)
+    child_environment["PYTHONDONTWRITEBYTECODE"] = "1"
     started = time.perf_counter()
     completed = subprocess.run(
         command,
         cwd=project_root.resolve(),
+        env=child_environment,
         check=False,
         shell=False,
         capture_output=True,

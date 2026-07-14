@@ -19,7 +19,7 @@ import stat
 import sys
 import sysconfig
 import zipfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
@@ -70,6 +70,9 @@ _COMPILER_WRAPPER_NAME = "compiler-probe.py"
 _BOOTSTRAP_ATTEMPTS = 2
 _BENCHMARK_WARMUPS = 1
 _BENCHMARK_SAMPLES = 7
+_BENCHMARK_CALIBRATION_TARGET_SECONDS = 0.50
+_BENCHMARK_CALIBRATION_ATTEMPTS = 3
+_BENCHMARK_MAX_REPETITIONS = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +191,7 @@ class _State:
     comparison_key: str | None = None
     ratios: RatioEvidence = field(default_factory=RatioEvidence)
     sdist_source: bool = False
+    benchmark_repetitions: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,6 +351,11 @@ def _execute_case(context: _RunContext) -> None:
             "disposable checkout did not return to its pinned source identity",
         )
     _validate_workload_assets(context)
+    state.benchmark_repetitions = _calibrate_benchmark_repetitions(
+        context,
+        tools_python,
+        baseline_arm,
+    )
     state.policy = append_compile_policy(
         paths.project / "pyproject.toml",
         _compile_policy(context, tools_python),
@@ -397,13 +406,139 @@ def _compile_policy(context: _RunContext, tools_python: Path) -> CompilePolicy:
         context,
         context.case.id.replace("-", "_"),
     )
-    return build_performance_compile_policy(
+    policy = build_performance_compile_policy(
         backends=context.manifest.backends,
         tools_python=tools_python,
         adapters=(semantic_adapter, performance_adapter),
         project_root=context.paths.project,
         oracle_arguments=context.case.oracle_arguments,
     )
+    benchmark_command = policy.benchmark_command
+    if benchmark_command is None:
+        raise AssertionError("performance compile policy omitted its benchmark command")
+    if benchmark_command[-2:] != ("--repetitions", "1"):
+        raise AssertionError("performance compile policy has an invalid repetition suffix")
+    return replace(
+        policy,
+        benchmark_command=(*benchmark_command[:-1], str(context.state.benchmark_repetitions)),
+    )
+
+
+def _calibrate_benchmark_repetitions(
+    context: _RunContext,
+    tools_python: Path,
+    baseline_arm: _Arm,
+) -> int:
+    """Choose a deterministic workload multiplier above the timing noise floor.
+
+    Calibration runs only the installed baseline payload and is never included
+    in Atoll's performance medians. The exact chosen multiplier is embedded in
+    the disposable compile policy, whose digest is part of the historical
+    comparison key.
+
+    Args:
+        context: Selected case and bounded subprocess infrastructure.
+        tools_python: Interpreter later used by the configured benchmark command.
+        baseline_arm: Installed pristine wheel used to calibrate import and timing behavior.
+
+    Returns:
+        int: Positive repetition count whose calibration duration reached the
+        half-second stability target, or one for non-performance cases.
+
+    Raises:
+        LifecycleError: If the workload fails, routes outside the baseline wheel,
+            emits malformed evidence, or remains too short at the maximum scale.
+    """
+    if context.options.tier != "performance":
+        return 1
+    adapter = _reviewed_adapter_path(context, context.case.id.replace("-", "_"))
+    environment = dict(baseline_arm.environment)
+    inherited_pythonpath = tuple(
+        entry for entry in environment.get("PYTHONPATH", "").split(os.pathsep) if entry
+    )
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(baseline_arm.import_root), *inherited_pythonpath)
+    )
+    calibration_cwd = context.paths.workspace / "benchmark-calibration-cwd"
+    calibration_cwd.mkdir(exist_ok=True)
+    repetitions = 1
+    last_repetitions = repetitions
+    last_duration = 0.0
+    for attempt in range(1, _BENCHMARK_CALIBRATION_ATTEMPTS + 1):
+        last_repetitions = repetitions
+        result = _phase(
+            context,
+            _PhaseRequest(
+                name=f"benchmark-calibration-{attempt}",
+                argv=(
+                    str(tools_python),
+                    str(adapter),
+                    "--project-root",
+                    str(context.paths.project),
+                    "--repetitions",
+                    str(repetitions),
+                ),
+                cwd=calibration_cwd,
+                environment=environment,
+                timeout_seconds=context.case.test_timeout_seconds or 300,
+            ),
+        )
+        _require_success(result, "upstream-broken", "performance workload calibration")
+        if result.log_truncated:
+            raise LifecycleError(
+                "infrastructure-error",
+                "performance workload calibration output exceeded the log limit",
+            )
+        payload = _read_json_object(context.paths.evidence / context.state.phases[-1].log_path)
+        if not isinstance(payload.get("canonical"), dict):
+            raise LifecycleError(
+                "upstream-broken",
+                "performance workload calibration omitted canonical output",
+            )
+        _validate_performance_imports(
+            payload.get("imports"),
+            baseline_arm.import_root,
+            attempt,
+        )
+        last_duration = result.duration_seconds
+        if last_duration >= _BENCHMARK_CALIBRATION_TARGET_SECONDS:
+            return repetitions
+        repetitions = calibrated_benchmark_repetitions(repetitions, last_duration)
+    raise LifecycleError(
+        "unstable",
+        (
+            "performance workload remained below the 0.50s calibration target "
+            f"after {_BENCHMARK_CALIBRATION_ATTEMPTS} attempt(s); "
+            f"last duration {last_duration:.3f}s at {last_repetitions} repetition(s)"
+        ),
+    )
+
+
+def calibrated_benchmark_repetitions(current: int, duration_seconds: float) -> int:
+    """Scale a workload toward the corpus stability target with safety margin.
+
+    Args:
+        current: Repetition count used for the observed duration.
+        duration_seconds: Positive elapsed subprocess duration.
+
+    Returns:
+        int: Monotonically larger count capped by the corpus safety maximum, or
+        ``current`` when the target has already been reached.
+
+    Raises:
+        ValueError: If the inputs cannot describe a valid calibration sample.
+    """
+    if current <= 0:
+        raise ValueError("current repetitions must be positive")
+    if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        raise ValueError("calibration duration must be positive and finite")
+    if duration_seconds >= _BENCHMARK_CALIBRATION_TARGET_SECONDS:
+        return current
+    multiplier = max(
+        2,
+        math.ceil((_BENCHMARK_CALIBRATION_TARGET_SECONDS / duration_seconds) * 1.25),
+    )
+    return min(_BENCHMARK_MAX_REPETITIONS, current * multiplier)
 
 
 def build_performance_compile_policy(
@@ -441,6 +576,8 @@ def build_performance_compile_policy(
             str(performance_adapter),
             "--project-root",
             str(project_root),
+            "--repetitions",
+            "1",
         ),
         benchmark_warmups=_BENCHMARK_WARMUPS,
         benchmark_samples=_BENCHMARK_SAMPLES,

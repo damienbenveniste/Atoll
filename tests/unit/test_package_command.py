@@ -46,6 +46,7 @@ from atoll.models import (
 from atoll.native_optimization.buffer_analysis import BufferAnalysisResult
 from atoll.native_optimization.call_chains import CallChainAnalysisResult
 from atoll.native_optimization.run_guard import CompletionIndexNativePlan, RunGuardNativePlan
+from atoll.profile_plan_cache import ProfilePlanDecision
 from atoll.project import DiscoveredProject, discover_project
 from atoll.report import CompilationReportInput, build_compilation_report
 from atoll.runtime.fusion_performance import (
@@ -68,6 +69,7 @@ from atoll.runtime.performance import (
 )
 from atoll.runtime.profiling import (
     LifecycleCounts,
+    MappedCandidateDecision,
     ProfileCallEdgeTarget,
     ProfiledCallEdge,
     ProfiledMember,
@@ -85,6 +87,7 @@ from atoll.source_optimization.transforms import (
     GeneratedSourcePatch,
     TransformedSourceFile,
 )
+from atoll.wheel_overlay import WheelOverlayError
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 TYPED_FIXTURE_ROOT = Path("tests/fixtures/typed_region_project")
@@ -99,6 +102,8 @@ EXPECTED_CALL_CHAIN_WIDTH_COUNT = 2
 EXPECTED_SINGLE_FAILURE = 1
 EXPECTED_SAFETY_VERIFICATION_STEPS = 2
 OWNER_PROFILE_SAMPLES = 40
+SECOND_CANDIDATE_REGION_COUNT = 2
+PROFILE_REPLAY_RANK_SAMPLES = 120
 
 
 @pytest.fixture(autouse=True)
@@ -240,6 +245,20 @@ class _ProfitabilityCandidate(Protocol):
     prepared: _PreparedTypedRegion
     symbols: tuple[str, ...]
     profile_samples: int
+
+
+class _ProfitabilitySelectionOutcomeView(Protocol):
+    accepted: tuple[_PreparedTypedRegion, ...]
+    trials: tuple[object, ...]
+
+
+class _ProfileCandidateRejectionView(Protocol):
+    symbol: SymbolId
+
+
+class _ProfileCandidateSupportView(Protocol):
+    supported: tuple[SymbolId, ...]
+    rejected: tuple[_ProfileCandidateRejectionView, ...]
 
 
 class _TypedRegionOutcome(Protocol):
@@ -428,6 +447,10 @@ _relative_source_root = cast(
     _package_attr("_relative_source_root"),
 )
 _reset_dir = cast(Callable[[Path], None], _package_attr("_reset_dir"))
+_resolve_output_dir = cast(
+    Callable[[Path, Path | None], Path],
+    _package_attr("_resolve_output_dir"),
+)
 _sequence = cast(
     Callable[[object], tuple[object, ...]],
     _package_attr("_sequence"),
@@ -482,19 +505,47 @@ _materialize_profitable_payload = cast(
     Callable[..., str | None],
     _package_attr("_materialize_profitable_payload"),
 )
+_materialize_candidate_payload = cast(
+    Callable[..., None],
+    _package_attr("_materialize_candidate_payload"),
+)
+_run_exact_candidate_trial = cast(
+    Callable[..., tuple[CommandRunEvidence, BenchmarkGateResult | None]],
+    _package_attr("_run_exact_candidate_trial"),
+)
+_select_profitable_candidates = cast(
+    Callable[..., object],
+    _package_attr("_select_profitable_candidates"),
+)
+_clear_payload_bytecode = cast(
+    Callable[[tuple[Path, ...]], tuple[Path, ...]],
+    _package_attr("_clear_payload_bytecode"),
+)
+_clear_payload_bytecode_with_progress = cast(
+    Callable[[tuple[Path, ...], Callable[[str], None] | None], None],
+    _package_attr("_clear_payload_bytecode_with_progress"),
+)
 _SelectedTypedRegion = cast(Callable[..., _TypedSelection], _package_attr("_SelectedTypedRegion"))
 _RequestedCallableVariant = cast(Callable[..., object], _package_attr("_RequestedCallableVariant"))
 _staged_typed_selection = cast(
     Callable[[ModuleScan, _TypedSelection], _TypedSelection],
     _package_attr("_staged_typed_selection"),
 )
-_profile_candidate_members = cast(
-    Callable[[tuple[ModuleScan, ...], tuple[Backend, ...]], tuple[SymbolId, ...]],
-    _package_attr("_profile_candidate_members"),
+_ProfileCompileSelectionScope = cast(
+    Callable[..., object],
+    _package_attr("_ProfileCompileSelectionScope"),
+)
+_profile_candidate_support = cast(
+    Callable[..., object],
+    _package_attr("_profile_candidate_support"),
 )
 _stabilize_profile_compile_selection = cast(
     Callable[..., ProfileResult | None],
     _package_attr("_stabilize_profile_compile_selection"),
+)
+_profile_with_replayed_compile_selection = cast(
+    Callable[[ProfileResult, ProfilePlanDecision], ProfileResult],
+    _package_attr("_profile_with_replayed_compile_selection"),
 )
 _call_chain_analyses = cast(
     Callable[
@@ -519,7 +570,12 @@ _profiled_call_chain_roots = cast(
 )
 _select_profile_with_call_chains = cast(
     Callable[
-        [ProfileResult, tuple[ModuleScan, ...], tuple[CallChainAnalysisResult, ...]],
+        [
+            ProfileResult,
+            tuple[ModuleScan, ...],
+            tuple[CallChainAnalysisResult, ...],
+            tuple[Backend, ...],
+        ],
         ProfileResult,
     ],
     _package_attr("_select_profile_with_call_chains"),
@@ -600,6 +656,10 @@ _owner_disallows_method_binding = cast(
 _BaselineWheelPayload = cast(
     _BaselinePayloadFactory,
     _package_attr("_BaselineWheelPayload"),
+)
+_ProfitabilitySelectionContext = cast(
+    Callable[..., object],
+    _package_attr("_ProfitabilitySelectionContext"),
 )
 _ProfilePreparation = cast(Callable[..., object], _package_attr("_ProfilePreparation"))
 _OptimizationArm = cast(Callable[..., object], _package_attr("OptimizationArm"))
@@ -779,13 +839,243 @@ def test_profiled_call_edges_promote_hot_call_chain_root(tmp_path: Path) -> None
     )
 
     roots = _profiled_call_chain_roots(analyses, profile)
-    selected = _select_profile_with_call_chains(profile, scans, analyses)
+    selected = _select_profile_with_call_chains(
+        profile,
+        scans,
+        analyses,
+        project.config.compile.backends,
+    )
 
     assert roots[0] == SymbolId(
         "native_optimization_fixture.kernels",
         "direct_chain_root",
     )
     assert roots[0] in selected.selected_symbols
+
+
+def test_profile_selection_skips_unbindable_dunder_and_backfills_supported_member(
+    tmp_path: Path,
+) -> None:
+    """An unsupported hottest root cannot consume automatic candidate capacity."""
+    project_root = tmp_path / "typed_region_project"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "typed_region_project.worker")
+    lifecycle = LifecycleCounts(
+        start=0,
+        return_=0,
+        yield_=0,
+        resume=0,
+        unwind=0,
+        throw=0,
+    )
+    unsupported = ProfiledMember(
+        module="typed_region_project.worker",
+        qualname="Worker.__init__",
+        samples=100,
+        coverage=0.5,
+        call_count=0,
+        lifecycle=lifecycle,
+        signatures=(),
+        polymorphic_overflow=False,
+    )
+    supported = ProfiledMember(
+        module="typed_region_project.worker",
+        qualname="Worker.score",
+        samples=80,
+        coverage=0.4,
+        call_count=0,
+        lifecycle=lifecycle,
+        signatures=(),
+        polymorphic_overflow=False,
+    )
+    profile = replace(
+        unconfigured_profile(),
+        status="profiled",
+        reason="test profile",
+        total_samples=200,
+        mapped_project_samples=180,
+        mapped_coverage=0.9,
+        members=(unsupported, supported),
+    )
+
+    selected = _select_profile_with_call_chains(
+        profile,
+        scans,
+        (),
+        project.config.compile.backends,
+    )
+
+    assert selected.selected_symbols == (supported.symbol,)
+    assert [(item.symbol, item.reason) for item in selected.candidates] == [
+        (unsupported.symbol, "not-independently-bindable"),
+        (supported.symbol, "selected"),
+    ]
+
+
+def test_explicit_unbindable_member_remains_an_unsupported_request(
+    tmp_path: Path,
+) -> None:
+    """Explicit roots return no variant without weakening directed-slice invariants."""
+    project_root = tmp_path / "typed_region_project"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scans = _selected_scans(project, "typed_region_project.worker")
+    constructor = SymbolId("typed_region_project.worker", "Worker.__init__")
+
+    selected = _selected_typed_regions(
+        scans,
+        project.config.compile.backends,
+        (constructor,),
+        hot_members=(constructor,),
+    )
+
+    assert selected == ()
+
+
+def test_profitability_selection_rejects_missing_payload_prerequisites(tmp_path: Path) -> None:
+    """Internal candidate trials fail before touching incomplete payload state."""
+    project_root = tmp_path / "simple_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    baseline = _BaselineWheelPayload(
+        wheel_path=None,
+        build=_successful_attempt(),
+    )
+    context = _ProfitabilitySelectionContext(
+        successful=(),
+        skipped=(),
+        profile=unconfigured_profile(),
+        project=project,
+        baseline=baseline,
+        payload_root=tmp_path / "payload",
+        staged_source_roots=(),
+        progress=None,
+    )
+
+    with pytest.raises(ValueError, match="unpacked baseline wheel"):
+        _materialize_candidate_payload(context, (), tmp_path / "candidate")
+    with pytest.raises(ValueError, match="selection prerequisites"):
+        _run_exact_candidate_trial(context, (), object(), _CANDIDATE_SPEEDUP)
+
+    outcome = cast(_ProfitabilitySelectionOutcomeView, _select_profitable_candidates(context))
+    assert outcome.accepted == ()
+    assert outcome.trials == ()
+
+
+def test_profiled_zero_variant_package_runs_unoptimized_full_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Automatic capability rejection produces measured no-op evidence, not an error."""
+    project_root = tmp_path / "typed_region_project"
+    output_dir = tmp_path / "out"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8")
+        + """
+
+[tool.atoll.compile]
+test_command = ["python", "-c", "pass"]
+benchmark_command = ["python", "bench.py"]
+benchmark_warmups = 0
+benchmark_samples = 1
+minimum_speedup = 1.10
+""",
+        encoding="utf-8",
+    )
+    test_modes: list[RuntimeMode] = []
+
+    def pass_semantics(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: RuntimeMode,
+        **_options: object,
+    ) -> CommandRunEvidence:
+        test_modes.append(mode)
+        return CommandRunEvidence(
+            command=command,
+            project_root=project_root,
+            payload_root=payload_root,
+            mode=mode,
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.1,
+        )
+
+    def unsupported_profile(*_args: object, **_kwargs: object) -> ProfileResult:
+        lifecycle = LifecycleCounts(
+            start=10,
+            return_=10,
+            yield_=0,
+            resume=0,
+            unwind=0,
+            throw=0,
+        )
+        return replace(
+            unconfigured_profile(),
+            status="profiled",
+            reason="fixture profile",
+            launch_kind="script",
+            total_samples=200,
+            mapped_project_samples=180,
+            mapped_coverage=0.9,
+            lifecycle=lifecycle,
+            members=(
+                ProfiledMember(
+                    module="typed_region_project.worker",
+                    qualname="Worker.__init__",
+                    samples=180,
+                    coverage=0.9,
+                    call_count=10,
+                    lifecycle=lifecycle,
+                    signatures=(),
+                    polymorphic_overflow=False,
+                ),
+            ),
+        )
+
+    def no_speedup(*_args: object, **_kwargs: object) -> BenchmarkGateResult:
+        return BenchmarkGateResult(
+            status="not-profitable",
+            reason="fixture measured no speedup",
+            minimum_speedup=1.1,
+            baseline_median_seconds=1.0,
+            compiled_median_seconds=1.0,
+            speedup=1.0,
+            warmups=(),
+            samples=(),
+        )
+
+    def reject_native_execution(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("automatic unsupported roots must not enter native compilation")
+
+    monkeypatch.setattr(package_command, "run_performance_command", pass_semantics)
+    monkeypatch.setattr(package_command, "run_baseline_profile", unsupported_profile)
+    monkeypatch.setattr(package_command, "run_benchmark_gate", no_speedup)
+    monkeypatch.setattr(package_command, "_execute_typed_region_package", reject_native_execution)
+
+    result = package_command.execute_package(
+        package_command.PackageOptions(
+            root=project_root,
+            module_name="typed_region_project.worker",
+            output_dir=output_dir,
+        )
+    )
+
+    assert result.success is False
+    assert result.error == "fixture measured no speedup"
+    assert result.performance is not None
+    assert result.performance.status == "not-profitable"
+    assert result.profile is not None
+    assert result.profile.selected_symbols == ()
+    assert result.profile.candidates[0].reason == "not-independently-bindable"
+    assert test_modes == ["baseline", "compiled"]
+    assert not tuple(output_dir.glob("*.whl"))
 
 
 def test_call_chain_extension_reports_cython_disabled(tmp_path: Path) -> None:
@@ -1068,7 +1358,19 @@ def test_profile_and_directed_closure_helpers_cover_backend_boundaries(tmp_path:
     shutil.copytree(FIXTURE_ROOT, project_root)
     project = discover_project(project_root)
     scans = _selected_scans(project, "app.ranking")
-    assert _profile_candidate_members(scans, ()) == ()
+    observed_root = next(
+        symbol.id for symbol in scans[0].symbols if symbol.id.qualname == "rank_candidates"
+    )
+    support = cast(
+        _ProfileCandidateSupportView,
+        _profile_candidate_support(
+            scans,
+            project.config.compile.backends,
+            roots=(observed_root,),
+        ),
+    )
+    assessed = (*support.supported, *(item.symbol for item in support.rejected))
+    assert assessed == (observed_root,)
 
     region = next(
         region
@@ -3143,6 +3445,10 @@ def test_plan_only_promotion_preserves_the_baseline_pure_wheel_tag(tmp_path: Pat
     assert _promotion_wheel_tag(context, tmp_path / "fixture-0.1-py3-none-any.whl") == (
         "py3-none-any"
     )
+    with pytest.raises(WheelOverlayError, match="invalid filename"):
+        _promotion_wheel_tag(context, tmp_path / "fixture.txt")
+    with pytest.raises(WheelOverlayError, match="tag is unavailable"):
+        _promotion_wheel_tag(context, tmp_path / "fixture.whl")
 
 
 def test_plan_only_baseline_failure_cleans_scratch_and_returns_evidence(
@@ -3700,14 +4006,19 @@ def test_profile_compile_plan_replays_first_selection_and_invalidates_on_source_
         assert ranked.selected_symbols == (selected,)
         return ranked
 
+    selection_scope = _ProfileCompileSelectionScope(
+        identity="baseline",
+        support=_profile_candidate_support(scans, project.config.compile.backends),
+    )
     cold = _stabilize_profile_compile_selection(
+        selection_scope,
         options=options,
         project=project,
         scans=scans,
         profile=profile(rank, rank_samples=140, score_samples=20),
-        scope_identity="baseline",
     )
     warm = _stabilize_profile_compile_selection(
+        selection_scope,
         options=options,
         project=project,
         scans=scans,
@@ -3716,7 +4027,6 @@ def test_profile_compile_plan_replays_first_selection_and_invalidates_on_source_
             rank_samples=warm_rank_samples,
             score_samples=warm_score_samples,
         ),
-        scope_identity="baseline",
     )
 
     assert cold is not None
@@ -3738,6 +4048,13 @@ def test_profile_compile_plan_replays_first_selection_and_invalidates_on_source_
     changed_project = discover_project(project.config.root)
     changed_scans = _selected_scans(changed_project, "app.ranking")
     changed = _stabilize_profile_compile_selection(
+        _ProfileCompileSelectionScope(
+            identity="baseline",
+            support=_profile_candidate_support(
+                changed_scans,
+                changed_project.config.compile.backends,
+            ),
+        ),
         options=options,
         project=changed_project,
         scans=changed_scans,
@@ -3746,7 +4063,6 @@ def test_profile_compile_plan_replays_first_selection_and_invalidates_on_source_
             rank_samples=warm_rank_samples,
             score_samples=warm_score_samples,
         ),
-        scope_identity="baseline",
     )
 
     assert changed is not None
@@ -3755,6 +4071,74 @@ def test_profile_compile_plan_replays_first_selection_and_invalidates_on_source_
         sum("profile compile plan cache miss" in message for message in progress)
         == expected_cache_misses
     )
+
+
+def test_profile_compile_replay_restores_candidates_missing_from_fresh_ranking(
+    tmp_path: Path,
+) -> None:
+    """A strict cache hit reconstructs observed and zero-sample cached members."""
+    rank = SymbolId("app.ranking", "rank_candidates")
+    score = SymbolId("app.ranking", "score_user")
+    missing = SymbolId("app.ranking", "cached_but_unobserved")
+    lifecycle = LifecycleCounts(
+        start=10,
+        return_=10,
+        yield_=0,
+        resume=0,
+        unwind=0,
+        throw=0,
+    )
+    profile = replace(
+        unconfigured_profile(),
+        status="profiled",
+        reason="fresh fixture profile",
+        total_samples=200,
+        mapped_project_samples=120,
+        members=(
+            ProfiledMember(
+                module=rank.module,
+                qualname=rank.qualname,
+                samples=PROFILE_REPLAY_RANK_SAMPLES,
+                coverage=0.6,
+                call_count=10,
+                lifecycle=lifecycle,
+                signatures=(),
+                polymorphic_overflow=False,
+            ),
+        ),
+        candidates=(
+            MappedCandidateDecision(
+                symbol=score,
+                module=score.module,
+                qualname=score.qualname,
+                samples=80,
+                coverage=0.4,
+                scheduler_overhead_samples=0,
+                attributed_samples=80,
+                attributed_coverage=0.4,
+                selected=True,
+                reason="selected",
+            ),
+        ),
+        selected_symbols=(score,),
+    )
+    decision = ProfilePlanDecision(
+        status="hit",
+        selection=(rank, missing),
+        diagnostic="fixture replay",
+        cache_path=tmp_path / "plan.json",
+        identity_digest="a" * 64,
+    )
+
+    replayed = _profile_with_replayed_compile_selection(profile, decision)
+
+    assert replayed.selected_symbols == (rank, missing)
+    assert replayed.selected_hot_samples == PROFILE_REPLAY_RANK_SAMPLES
+    assert [(item.symbol, item.samples, item.reason) for item in replayed.candidates] == [
+        (score, 80, "cache-replay-excluded"),
+        (rank, PROFILE_REPLAY_RANK_SAMPLES, "cache-replayed"),
+        (missing, 0, "cache-replayed"),
+    ]
 
 
 def test_conditional_task_fusion_trials_disposable_payload_after_safe_miss(
@@ -4080,11 +4464,19 @@ def test_fusion_trial_timings_preserve_arm_and_phase() -> None:
     ]
 
 
+@pytest.mark.parametrize("second_candidate_semantics_pass", [True, False])
 def test_package_greedily_keeps_only_profitable_profile_candidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    second_candidate_semantics_pass: bool,
 ) -> None:
-    """Profile order drives marginal trials and rejected artifacts never reach the wheel."""
+    """Profile order retains only candidates passing semantics and marginal timing.
+
+    Args:
+        tmp_path: Isolated source-clean target and wheel output.
+        monkeypatch: Deterministic semantic, profile, and benchmark boundaries.
+        second_candidate_semantics_pass: Whether the second candidate reaches timing.
+    """
     project_root = tmp_path / "simple_project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -4124,14 +4516,20 @@ minimum_speedup = 1.10
         variant_allowlist = cast(frozenset[str] | None, options.get("variant_allowlist"))
         region_allowlist = cast(frozenset[str] | None, options.get("region_allowlist"))
         observed_allowlists.append(variant_allowlist or region_allowlist)
+        compiled_count = _compiled_region_marker_count(payload_root)
+        failed = (
+            mode == "compiled"
+            and compiled_count == SECOND_CANDIDATE_REGION_COUNT
+            and not second_candidate_semantics_pass
+        )
         return CommandRunEvidence(
             command=command,
             project_root=project_root,
             payload_root=payload_root,
             mode=mode,
-            returncode=0,
+            returncode=9 if failed else 0,
             stdout="",
-            stderr="",
+            stderr="second candidate failed semantics" if failed else "",
             duration_seconds=0.5,
         )
 
@@ -4180,9 +4578,19 @@ minimum_speedup = 1.10
             candidate_index = benchmark_thresholds.count(_CANDIDATE_SPEEDUP)
             speedup = 1.02 if candidate_index == 1 else 1.005
             status: BenchmarkStatus = "passed" if candidate_index == 1 else "not-profitable"
-            assert kwargs["baseline_payload_root"] == kwargs["compiled_payload_root"]
+            baseline_payload_root = cast(Path, kwargs["baseline_payload_root"])
+            compiled_payload_root = cast(Path, kwargs["compiled_payload_root"])
+            assert baseline_payload_root != compiled_payload_root
+            baseline_source = (baseline_payload_root / "app" / "ranking.py").read_text(
+                encoding="utf-8"
+            )
+            compiled_source = (compiled_payload_root / "app" / "ranking.py").read_text(
+                encoding="utf-8"
+            )
+            assert baseline_source.count("'compiled_module':") == candidate_index - 1
+            assert compiled_source.count("'compiled_module':") == candidate_index
             assert "baseline_variant_allowlist" in kwargs
-            assert "compiled_variant_allowlist" in kwargs
+            assert "compiled_variant_allowlist" not in kwargs
         else:
             speedup = 1.12
             status = "passed"
@@ -4212,7 +4620,10 @@ minimum_speedup = 1.10
 
     assert result.success is True
     assert result.wheel_path is not None
-    assert [trial.status for trial in result.candidate_trials] == ["accepted", "rejected"]
+    assert [trial.status for trial in result.candidate_trials] == [
+        "accepted",
+        "rejected" if second_candidate_semantics_pass else "failed-semantics",
+    ]
     assert result.candidate_trials[0].symbols == ("app.ranking::rank_candidates",)
     assert result.candidate_trials[1].symbols == ("app.ranking::normalize_features",)
     assert result.candidate_trials[0].accepted_hot_coverage == pytest.approx(2 / 3)
@@ -4221,13 +4632,14 @@ minimum_speedup = 1.10
     assert result.performance is not None
     assert result.performance.speedup == pytest.approx(1.12)
     assert {binding.source.qualname for binding in result.compiled_bindings} == {"rank_candidates"}
-    assert benchmark_thresholds == [_CANDIDATE_SPEEDUP, _CANDIDATE_SPEEDUP, 1.1]
-    assert observed_allowlists[0] is None
-    assert observed_allowlists[1] == frozenset({result.candidate_trials[0].variant_id})
-    assert observed_allowlists[2] == frozenset(
-        trial.variant_id for trial in result.candidate_trials
+    expected_thresholds = (
+        [_CANDIDATE_SPEEDUP, _CANDIDATE_SPEEDUP, 1.1]
+        if second_candidate_semantics_pass
+        else [_CANDIDATE_SPEEDUP, 1.1]
     )
-    assert observed_allowlists[3] is None
+    assert benchmark_thresholds == expected_thresholds
+    assert observed_allowlists[0] is None
+    assert observed_allowlists[1:] == [None, None, None]
     assert len(result.test_results) == EXPECTED_FINAL_TEST_RESULTS
     with zipfile.ZipFile(result.wheel_path) as wheel:
         native_entries = {
@@ -4236,6 +4648,43 @@ minimum_speedup = 1.10
             if any(name.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES)
         }
     assert native_entries == {record.install_relative_path for record in result.artifact_records}
+
+
+def test_payload_bytecode_cleanup_removes_caches_without_following_symlinks(
+    tmp_path: Path,
+) -> None:
+    """Pre-gate cleanup removes timing bias without escaping the owned payload."""
+    payload = tmp_path / "payload"
+    cache = payload / "pkg" / "__pycache__"
+    cache.mkdir(parents=True)
+    (cache / "module.cpython-312.pyc").write_bytes(b"cached")
+    standalone = payload / "legacy.pyo"
+    standalone.write_bytes(b"legacy")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_marker = outside / "keep.pyc"
+    outside_marker.write_bytes(b"keep")
+    linked_cache = payload / "linked" / "__pycache__"
+    linked_cache.parent.mkdir()
+    linked_cache.symlink_to(outside, target_is_directory=True)
+
+    removed = _clear_payload_bytecode((payload,))
+
+    assert cache in removed
+    assert standalone in removed
+    assert linked_cache in removed
+    assert not cache.exists()
+    assert not standalone.exists()
+    assert not linked_cache.exists()
+    assert outside_marker.read_bytes() == b"keep"
+
+    progress_cache = payload / "pkg" / "__pycache__"
+    progress_cache.mkdir(parents=True)
+    messages: list[str] = []
+    _clear_payload_bytecode_with_progress((tmp_path / "missing", payload), messages.append)
+
+    assert messages == ["removed 1 pre-existing bytecode cache path(s)"]
+    assert not progress_cache.exists()
 
 
 def test_package_stops_before_profiling_when_baseline_semantics_fail(
@@ -4468,6 +4917,8 @@ def test_transformed_source_candidate_is_profiled_with_optimized_routing(
         profile: ProfileResult,
         _scans: tuple[ModuleScan, ...],
         _chains: tuple[CallChainAnalysisResult, ...],
+        _backends: tuple[Backend, ...],
+        **_options: object,
     ) -> ProfileResult:
         return profile
 
@@ -5425,6 +5876,7 @@ def test_package_helpers_handle_flat_source_roots(tmp_path: Path) -> None:
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "pkg" / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "current.py").symlink_to("pkg/mod.py")
     project = discover_project(tmp_path)
     build_root = tmp_path / "build"
     build_root.mkdir()
@@ -5433,6 +5885,8 @@ def test_package_helpers_handle_flat_source_roots(tmp_path: Path) -> None:
 
     assert staged_roots == (build_root,)
     assert (build_root / "pkg" / "mod.py").exists()
+    assert (build_root / "current.py").is_symlink()
+    assert (build_root / "current.py").readlink() == Path("pkg/mod.py")
 
 
 def test_source_roots_digest_invalidates_on_imported_source_change(tmp_path: Path) -> None:
@@ -5510,6 +5964,44 @@ def test_pep517_project_copy_preserves_reproducible_root_metadata(
     assert baseline_wheel_cache_key(first) == baseline_wheel_cache_key(second)
 
 
+def test_pep517_project_copy_resolves_worktree_git_pointer(tmp_path: Path) -> None:
+    """A linked-worktree checkout exposes its real Git directory to the build copy."""
+    source = tmp_path / "project"
+    package = source / "src" / "demo"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    git_dir = tmp_path / "worktree-git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (source / ".git").write_text("gitdir: ../worktree-git\n", encoding="utf-8")
+    destination = tmp_path / "copy"
+
+    _copy_pep517_project(
+        source,
+        destination,
+        excluded_output=source / ".atoll" / "dist",
+    )
+
+    assert (destination / ".git").read_text(encoding="utf-8") == f"gitdir: {git_dir.resolve()}\n"
+
+
+def test_pep517_project_copy_ignores_invalid_git_pointer(tmp_path: Path) -> None:
+    """Malformed copied-worktree metadata is not propagated into a build tree."""
+    source = tmp_path / "project"
+    source.mkdir()
+    (source / "pyproject.toml").write_text("[build-system]\n", encoding="utf-8")
+    (source / ".git").write_text("not a git pointer\n", encoding="utf-8")
+    destination = tmp_path / "copy"
+
+    _copy_pep517_project(
+        source,
+        destination,
+        excluded_output=source / ".atoll" / "dist",
+    )
+
+    assert not (destination / ".git").exists()
+
+
 def test_atoll_artifact_helpers_copy_artifacts_and_skip_same_file(tmp_path: Path) -> None:
     """Source-clean artifact copies tolerate missing roots and an identical target."""
     source_root = tmp_path / "source"
@@ -5567,8 +6059,15 @@ def test_package_small_helpers_cover_fallbacks(tmp_path: Path) -> None:
     outside_root = tmp_path.parent / "not-under-root"
     assert _relative_source_root(tmp_path, outside_root) != outside_root
     assert _mapping(None) == {}
+    assert _mapping({1: "value"}) == {"1": "value"}
     assert _sequence(None) == ()
+    assert _sequence([1, "two"]) == (1, "two")
     assert _string(1) is None
+    assert _string("value") == "value"
+    assert _resolve_output_dir(tmp_path, None) == tmp_path / ".atoll" / "dist"
+    assert (
+        _resolve_output_dir(tmp_path, Path("custom-dist")) == (tmp_path / "custom-dist").resolve()
+    )
 
 
 def test_package_helpers_report_missing_modules(tmp_path: Path) -> None:
@@ -5646,6 +6145,21 @@ def _successful_attempt() -> CompileAttempt:
         artifact_paths=(),
         duration_seconds=0.0,
     )
+
+
+def _compiled_region_marker_count(payload_root: Path) -> int:
+    """Count generated native binding declarations in a candidate payload.
+
+    Args:
+        payload_root: Exact unpacked wheel payload measured by a candidate trial.
+
+    Returns:
+        int: Number of compiled-module declarations in the fixture source shim.
+    """
+    source_path = payload_root / "app" / "ranking.py"
+    if not source_path.is_file():
+        return 0
+    return source_path.read_text(encoding="utf-8").count("'compiled_module':")
 
 
 def _benchmark_result(status: BenchmarkStatus) -> BenchmarkGateResult:

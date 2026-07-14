@@ -42,11 +42,11 @@ events, source manifests, the accepted patch, and an acceptance summary. The run
 - checkout Python source hashes remain unchanged;
 - the warm run invokes no native compiler and contains no native compiler phase.
 
-The July 12, 2026 Apple Silicon acceptance run measured `4.753x` for transformed source and
-`7.914x` for the final composed wheel. The native residual improved the accepted source-only arm by
-`1.717x`; the warm compile restored every native artifact with zero compiler probes or native
-compiler phases. These ratios are paired same-machine evidence for the pinned workload, not a
-universal Python or Pydantic claim.
+The July 12, 2026 Apple Silicon ratios are withdrawn. Payload verification imported the compiled
+tree before timing and left `__pycache__` files that were repacked into the candidate wheel, while
+the baseline tree had no equivalent bytecode caches. Those measurements therefore mixed native
+and source optimization with import-cache effects. A corrected bytecode-neutral hard-benchmark run
+must pass every gate above before replacement ratios are documented.
 `baseline.json` retains the older native-compiler reference only as historical regression data.
 Task-fusion and execution-plan fields remain compatibility and research evidence; schema-v6 policy,
 stage-median, final-composition, and source-trial evidence control this benchmark's promotion.

@@ -136,12 +136,13 @@ No reviewed corpus snapshots have been promoted.
 
 ## Existing Experiment Evidence
 
-The July 12, 2026 Apple Silicon Pydantic Graph acceptance run is retained in
-the repository's hard-benchmark documentation. For its pinned workload it
-measured **4.753x Python rewrite versus original**, **7.914x final wheel versus
-original**, and **1.717x native layer versus source-only wheel**. This is a
-promoted same-machine hard-benchmark result, not a corpus aggregate or a
-universal Pydantic claim.
+The July 12, 2026 Apple Silicon Pydantic Graph ratios have been withdrawn.
+Payload verification imported the compiled tree before timing and left
+`__pycache__` files that were then repacked into the candidate wheel. The
+baseline tree did not receive equivalent bytecode caches, so the reported
+final-wheel and native-layer ratios did not isolate Atoll's optimizations. A
+replacement result must come from the corrected bytecode-neutral pipeline and
+pass the existing hard benchmark before it is promoted here.
 
 The older Pydantic Graph compiler baseline records 192.702 seconds in cold
 `mypycify` work at Atoll revision `77d95c0`. It is compile-time regression

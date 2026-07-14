@@ -81,6 +81,24 @@ def test_baseline_wheel_cache_invalidates_source_and_build_environment(
     assert changed_environment != changed_source
 
 
+def test_baseline_wheel_cache_fingerprints_symlink_target_text(tmp_path: Path) -> None:
+    """Equivalent and dangling link spellings remain distinct build inputs."""
+    project_root = _project(tmp_path)
+    link = project_root / "src" / "current.py"
+    link.symlink_to("demo.py")
+    original = baseline_wheel_cache_key(project_root)
+
+    link.unlink()
+    link.symlink_to("./demo.py")
+    equivalent_referent = baseline_wheel_cache_key(project_root)
+    link.unlink()
+    link.symlink_to("missing.py")
+    dangling = baseline_wheel_cache_key(project_root)
+
+    assert equivalent_referent != original
+    assert dangling != equivalent_referent
+
+
 def test_baseline_wheel_cache_invalidates_arbitrary_environment_and_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -135,6 +153,7 @@ def test_baseline_wheel_cache_keys_complete_offline_wheelhouse(
     wheelhouse.mkdir()
     backend = wheelhouse / "setuptools-1-py3-none-any.whl"
     backend.write_bytes(b"backend-v1")
+    (wheelhouse / "current.whl").symlink_to(backend.name)
     monkeypatch.setenv("PIP_NO_INDEX", "1")
     monkeypatch.setenv("PIP_FIND_LINKS", str(wheelhouse))
     project_root = _project(tmp_path)
@@ -147,9 +166,13 @@ def test_baseline_wheel_cache_keys_complete_offline_wheelhouse(
     )
     backend.write_bytes(b"backend-v2")
     changed = baseline_wheel_cache_key(project_root)
+    (wheelhouse / "current.whl").unlink()
+    (wheelhouse / "current.whl").symlink_to(f"./{backend.name}")
+    changed_link_text = baseline_wheel_cache_key(project_root)
 
     assert first_probe.status == "miss"
     assert changed != original
+    assert changed_link_text != changed
 
 
 @pytest.mark.parametrize(

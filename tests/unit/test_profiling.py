@@ -7,6 +7,7 @@ import importlib
 import inspect
 import json
 import os
+import signal
 import subprocess
 import sys
 from collections.abc import Callable
@@ -112,6 +113,12 @@ class _TypeProfilerHarness:
 @dataclass(frozen=True, slots=True)
 class _SamplingProfilerHarness:
     wrapped: object
+
+    def start(self) -> None:
+        _callable_attribute(self.wrapped, "start")()
+
+    def stop(self) -> None:
+        _callable_attribute(self.wrapped, "stop")()
 
     def sample(self, frame: FrameType | None) -> None:
         _callable_attribute(self.wrapped, "_sample")(0, frame)
@@ -302,6 +309,110 @@ def test_sampling_profiler_ignores_fully_unmapped_stack(
     assert payload["scheduler_overhead_counts"] == {}
 
 
+def test_sampling_profiler_rearms_one_shot_timer_after_non_reentrant_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A callback cannot overlap itself and rearms only after mapping completes."""
+    config_path, _result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="script",
+            target="unused.py",
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path)
+    profiler = _sampling_profiler(config_path)
+    frame = inspect.currentframe()
+    assert frame is not None
+    timer_calls: list[tuple[int, float, float]] = []
+    callback_state: list[int] = []
+
+    def setitimer(which: int, seconds: float, interval: float = 0.0) -> tuple[float, float]:
+        timer_calls.append((which, seconds, interval))
+        return 0.0, 0.0
+
+    def member_key(_frame: FrameType | None) -> str | None:
+        callback_state.append(len(timer_calls))
+        profiler.sample(frame)
+        callback_state.append(len(timer_calls))
+        return "workload::hot"
+
+    def getsignal(_signal_number: int) -> signal.Handlers:
+        return signal.SIG_DFL
+
+    def install_signal(_signal_number: int, _handler: object) -> signal.Handlers:
+        return signal.SIG_DFL
+
+    mapper = _attribute(profiler.wrapped, "_mapper")
+    monkeypatch.setattr(mapper, "member_key", member_key)
+    monkeypatch.setattr(signal, "getsignal", getsignal)
+    monkeypatch.setattr(signal, "signal", install_signal)
+    monkeypatch.setattr(signal, "setitimer", setitimer)
+
+    profiler.start()
+    profiler.sample(frame)
+    profiler.stop()
+
+    payload = profiler.payload()
+    assert payload["total_samples"] == 1
+    assert payload["sample_counts"] == {"workload::hot": 1}
+    assert callback_state == [1, 1]
+    assert timer_calls == [
+        (signal.ITIMER_REAL, 0.002, 0.0),
+        (signal.ITIMER_REAL, 0.002, 0.0),
+        (signal.ITIMER_REAL, 0.0, 0.0),
+    ]
+
+
+def test_frame_mapper_uses_constant_time_path_index_for_large_module_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mapping one uncached code object performs one lookup regardless of map size."""
+    module_count = 10_000
+    target_suffix = f"pkg/module_{module_count - 1}.py"
+    config_path, _result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="script",
+            target="unused.py",
+            module_paths=tuple(
+                (f"pkg.module_{index}", f"pkg/module_{index}.py") for index in range(module_count)
+            ),
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path)
+    profiler = _sampling_profiler(config_path)
+    mapper = _attribute(profiler.wrapped, "_mapper")
+    path_index = cast(dict[Path, str], _attribute(mapper, "_modules_by_path"))
+    lookup_count = 0
+
+    class CountingPathIndex:
+        def __init__(self, paths: dict[Path, str]) -> None:
+            self._paths = paths
+
+        def get(self, key: Path, default: str | None = None) -> str | None:
+            nonlocal lookup_count
+            lookup_count += 1
+            return self._paths.get(key, default)
+
+    monkeypatch.setattr(mapper, "_modules_by_path", CountingPathIndex(path_index))
+    code = (lambda: None).__code__.replace(
+        co_filename=str(tmp_path / target_suffix),
+        co_name="hot",
+        co_qualname="hot",
+    )
+    hot = FunctionType(code, {})
+
+    key = _callable_attribute(mapper, "code_key")(hot.__code__)
+
+    assert key == f"pkg.module_{module_count - 1}::hot"
+    assert lookup_count == 1
+
+
 def test_unsupported_launcher_returns_static_fallback_without_scratch_files(tmp_path: Path) -> None:
     scratch_dir = tmp_path / "scratch"
 
@@ -319,6 +430,42 @@ def test_unsupported_launcher_returns_static_fallback_without_scratch_files(tmp_
     assert not list(scratch_dir.glob("*.json")) if scratch_dir.exists() else True
 
 
+def test_failed_profile_retains_structured_evidence_without_benchmark_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure metadata remains useful without retaining target output payloads."""
+    output_marker = "benchmark-private-output"
+
+    def fake_run(invocation: SubprocessInvocationView) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            invocation.command,
+            BOOTSTRAP_EXIT_CODE,
+            f"stdout:{output_marker}",
+            f"stderr:{output_marker}",
+        )
+
+    monkeypatch.setattr(profiling, "_run_subprocess", fake_run)
+
+    result = run_baseline_profile(
+        (sys.executable, "bench.py"),
+        project_root=tmp_path,
+        payload_root=tmp_path,
+        module_paths=(("workload", "workload.py"),),
+        scratch_dir=tmp_path / "scratch",
+    )
+
+    assert result.status == "invalid"
+    assert result.reason == f"sampling profile exited with status {BOOTSTRAP_EXIT_CODE}"
+    assert len(result.runs) == 1
+    run = result.runs[0]
+    assert run.returncode == BOOTSTRAP_EXIT_CODE
+    assert run.command[0] == sys.executable
+    assert run.stdout == ""
+    assert run.stderr == ""
+    assert output_marker not in repr(result)
+
+
 def test_script_launch_collects_lifecycle_types_and_cleans_scratch(tmp_path: Path) -> None:
     _write_workload_project(tmp_path)
 
@@ -333,8 +480,8 @@ def test_script_launch_collects_lifecycle_types_and_cleans_scratch(tmp_path: Pat
     assert result.status == "profiled"
     assert result.launch_kind == "script"
     assert [run.pass_kind for run in result.runs] == ["sampling", "types"]
-    assert result.runs[0].stdout == "script-done\n"
-    assert result.runs[1].stdout == "script-done\n"
+    assert result.runs[0].stdout == ""
+    assert result.runs[1].stdout == ""
     assert result.lifecycle.start > 0
     assert result.lifecycle.return_ > 0
     assert any(
@@ -361,7 +508,7 @@ def test_module_launch_collects_project_samples(tmp_path: Path) -> None:
 
     assert result.status == "profiled"
     assert result.launch_kind == "module"
-    assert result.runs[0].stdout == "module-done\n"
+    assert result.runs[0].stdout == ""
     assert result.mapped_project_samples >= 0
 
 
@@ -1124,6 +1271,17 @@ def test_type_profiler_callbacks_are_bounded_and_ignore_non_targets(
             target="unused.py",
             module_paths=(("callback_case", "callback_case.py"),),
             targets=("callback_case::hot",),
+            call_edge_targets=(
+                ProfileCallEdgeTarget(
+                    id="hot-self-edge",
+                    owner=SymbolId("callback_case", "hot"),
+                    callee=SymbolId("callback_case", "hot"),
+                    lineno=2,
+                    col_offset=0,
+                    end_lineno=None,
+                    end_col_offset=None,
+                ),
+            ),
         ),
     )
     _prepare_in_process_bootstrap(
@@ -1155,6 +1313,14 @@ def test_type_profiler_callbacks_are_bounded_and_ignore_non_targets(
             callback_case.hot(value, 1, flag=True, extra=None)
         for value in range(MAX_TYPE_OBSERVATIONS_PER_MEMBER - len(distinct_values)):
             callback_case.hot(value)
+        assert profiler.observer(callback_case.hot.__code__, 0) is None
+        profiler.lifecycle_callback("yield")(callback_case.hot.__code__, 0)
+        profiler.lifecycle_callback("return")(callback_case.hot.__code__, 0)
+        mapper = _attribute(profiler.wrapped, "_mapper")
+        assert _callable_attribute(mapper, "member_key")(None) is None
+        active_calls = cast(dict[str, int], _attribute(profiler.wrapped, "_active_calls"))
+        active_calls["callback_case::hot"] = 0
+        profiler.lifecycle_callback("return")(callback_case.hot.__code__, 0)
         profiler.lifecycle_callback("throw")(callback_case.hot.__code__, 0)
         profiler.lifecycle_callback("throw")((lambda: None).__code__, 0)
     finally:
@@ -1170,7 +1336,8 @@ def test_type_profiler_callbacks_are_bounded_and_ignore_non_targets(
     signatures = cast(dict[str, dict[str, object]], payload["signatures"])
     hot_payload = signatures["callback_case::hot"]
     assert hot_payload["call_count"] == MAX_TYPE_OBSERVATIONS_PER_MEMBER
-    assert hot_payload["completed_calls"] == 0
+    assert hot_payload["completed_calls"] == 1
+    assert hot_payload["pre_completion_suspensions"] == 1
     assert cast(int, hot_payload["max_active_calls"]) >= MAX_TYPE_OBSERVATIONS_PER_MEMBER
     assert hot_payload["observation_capped"] is True
     assert hot_payload["polymorphic_overflow"] is True

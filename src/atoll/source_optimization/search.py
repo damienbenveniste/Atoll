@@ -61,6 +61,7 @@ from atoll.source_optimization.transforms import (
     SourceTransformationRequest,
     materialize_transformed_files,
 )
+from atoll.source_snapshot import copy_source_snapshot
 from atoll.wheel_overlay import (
     WheelBuildEvidence,
     WheelOverlayError,
@@ -763,7 +764,7 @@ def _candidate_workspace(
     quality_copy = root / "quality"
     _copy_project(options.project_root, project_copy, excluded_output=options.output_dir)
     materialize_transformed_files(options.project_root, project_copy, patch)
-    shutil.copytree(project_copy, quality_copy, ignore=_quality_copy_ignore)
+    copy_source_snapshot(project_copy, quality_copy, ignore=_quality_copy_ignore)
     for module_path in options.module_paths:
         _safe_relative_path(quality_copy, module_path).unlink(missing_ok=True)
     source_payload = _source_payload_root(
@@ -1473,7 +1474,7 @@ def _copy_project(source: Path, destination: Path, *, excluded_output: Path) -> 
                 ignored.add(name)
         return ignored
 
-    shutil.copytree(source_root, destination, ignore=ignore)
+    copy_source_snapshot(source_root, destination, ignore=ignore)
     _write_git_pointer(source_root, destination)
 
 
@@ -1513,8 +1514,10 @@ def _source_payload_root(
             destination = merge_root / item.name
             if destination.exists():
                 raise ValueError(f"source roots overlap at {item.name}")
-            if item.is_dir():
-                shutil.copytree(item, destination)
+            if item.is_symlink():
+                shutil.copy2(item, destination, follow_symlinks=False)
+            elif item.is_dir():
+                copy_source_snapshot(item, destination)
             else:
                 shutil.copy2(item, destination)
     return merge_root
