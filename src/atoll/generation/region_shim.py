@@ -846,7 +846,7 @@ def render_region_shim(configs: tuple[RegionShimConfig, ...]) -> str:
             "                _atoll_target.__atoll_binding_variants__ = (_atoll_candidate,)",
             "                if _atoll_inspect.signature(_atoll_target) != _atoll_signature:",
             "                    raise TypeError('Atoll direct target changed source signature')",
-            "                if _atoll_target.__annotations__ is not (",
+            "                if _atoll_target.__annotations__ != (",
             "                    _atoll_source.__annotations__",
             "                ):",
             "                    raise TypeError('Atoll direct target changed source annotations')",
