@@ -73,6 +73,7 @@ _BENCHMARK_SAMPLES = 7
 _BENCHMARK_CALIBRATION_TARGET_SECONDS = 0.50
 _BENCHMARK_CALIBRATION_ATTEMPTS = 3
 _BENCHMARK_MAX_REPETITIONS = 128
+_PROFILED_NOOP_REASON = "no profile-guided optimization candidate was retained"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2169,16 +2170,61 @@ def _string_list(value: object) -> tuple[str, ...]:
 
 
 def _is_clean_noop_report(report: dict[str, object]) -> bool:
-    """Recognize only Atoll's structured no-candidate result as compatible."""
+    """Recognize only Atoll's structured no-candidate result as compatible.
+
+    Static scans use the legacy empty-build marker. Profile-guided compiles can
+    build and profile the normal project wheel before proving that no source,
+    native, or execution-plan variant is worth retaining. That second shape is
+    a compatible no-op only when the baseline build and semantic evidence are
+    clean and the final composition is empty.
+    """
     if report.get("version") != _COMPILE_REPORT_SCHEMA_VERSION:
         return False
     build = _mapping_field(report, "build")
-    return (
+    legacy_noop = (
         report.get("success") is False
         and build.get("stderr") == "scan found no backend-supported typed regions"
         and build.get("command") == []
         and build.get("artifacts") == []
         and build.get("support_artifacts") == []
+    )
+    if legacy_noop:
+        return True
+    summary_value = report.get("summary")
+    performance_value = report.get("performance")
+    composition_value = report.get("final_composition")
+    if not all(
+        isinstance(value, dict) for value in (summary_value, performance_value, composition_value)
+    ):
+        return False
+    summary = cast(dict[str, object], summary_value)
+    performance = cast(dict[str, object], performance_value)
+    composition = cast(dict[str, object], composition_value)
+    empty_composition = all(
+        composition.get(field) == []
+        for field in (
+            "source_plan_ids",
+            "transformation_ids",
+            "native_variant_ids",
+            "execution_plan_ids",
+            "artifacts",
+        )
+    )
+    return (
+        report.get("success") is False
+        and report.get("wheel_path") is None
+        and build.get("success") is True
+        and build.get("artifacts") == []
+        and build.get("support_artifacts") == []
+        and performance.get("status") == "unbenchmarked"
+        and performance.get("reason") == _PROFILED_NOOP_REASON
+        and summary.get("compiled_regions") == 0
+        and summary.get("artifacts") == 0
+        and summary.get("support_artifacts") == 0
+        and summary.get("execution_applied_plans") == 0
+        and summary.get("semantic_test_failures") == 0
+        and summary.get("subprocess_verification_failures") == 0
+        and empty_composition
     )
 
 

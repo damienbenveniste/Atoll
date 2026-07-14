@@ -736,7 +736,7 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
     assert report["optimization_policy"] == {
         "version": 1,
         "stability_floor_seconds": 0.25,
-        "profile_guided_minimum_marginal_speedup": 1.01,
+        "profile_guided_minimum_marginal_speedup": 1.05,
         "specialized_minimum_marginal_speedup": 1.05,
         "final_minimum_speedup": 1.1,
         "hard_benchmark_minimum_speedup": 3.0,

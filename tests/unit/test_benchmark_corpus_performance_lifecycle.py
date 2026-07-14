@@ -141,6 +141,93 @@ def test_performance_compile_status_preserves_report_backed_outcomes(
     assert observed == expected
 
 
+def test_profiled_empty_composition_is_a_supported_noop(tmp_path: Path) -> None:
+    """A clean profile rejection cannot become a compiler error through timing noise."""
+    report: dict[str, object] = {
+        "version": 6,
+        "success": False,
+        "wheel_path": None,
+        "build": {
+            "success": True,
+            "artifacts": [],
+            "support_artifacts": [],
+        },
+        "performance": {
+            "status": "unbenchmarked",
+            "reason": "no profile-guided optimization candidate was retained",
+        },
+        "summary": {
+            "compiled_regions": 0,
+            "artifacts": 0,
+            "support_artifacts": 0,
+            "execution_applied_plans": 0,
+            "semantic_test_failures": 0,
+            "subprocess_verification_failures": 0,
+        },
+        "final_composition": {
+            "source_plan_ids": [],
+            "transformation_ids": [],
+            "native_variant_ids": [],
+            "execution_plan_ids": [],
+            "artifacts": [],
+        },
+    }
+
+    observed = classify_compile_process(
+        _process(1),
+        report,
+        "performance",
+        "cold",
+        tmp_path,
+    )
+
+    assert observed == "supported-no-op"
+
+
+def test_unrelated_unbenchmarked_failure_is_not_a_supported_noop(tmp_path: Path) -> None:
+    """Only Atoll's explicit empty profile result receives no-op classification."""
+    report: dict[str, object] = {
+        "version": 6,
+        "success": False,
+        "wheel_path": None,
+        "build": {
+            "success": True,
+            "artifacts": [],
+            "support_artifacts": [],
+        },
+        "performance": {
+            "status": "unbenchmarked",
+            "reason": "unrelated compiler failure",
+        },
+        "summary": {
+            "compiled_regions": 0,
+            "artifacts": 0,
+            "support_artifacts": 0,
+            "execution_applied_plans": 0,
+            "semantic_test_failures": 0,
+            "subprocess_verification_failures": 0,
+        },
+        "final_composition": {
+            "source_plan_ids": [],
+            "transformation_ids": [],
+            "native_variant_ids": [],
+            "execution_plan_ids": [],
+            "artifacts": [],
+        },
+    }
+
+    with pytest.raises(LifecycleError, match="cold Atoll compile") as error:
+        classify_compile_process(
+            _process(1),
+            report,
+            "performance",
+            "cold",
+            tmp_path,
+        )
+
+    assert error.value.status == "compile-error"
+
+
 def test_compiled_semantic_failure_is_a_compatibility_regression() -> None:
     report: dict[str, object] = {
         "version": 6,

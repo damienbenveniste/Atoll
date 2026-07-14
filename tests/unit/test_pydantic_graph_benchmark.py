@@ -298,7 +298,7 @@ def _report(
         "optimization_policy": {
             "version": 1,
             "stability_floor_seconds": 0.25,
-            "profile_guided_minimum_marginal_speedup": 1.01,
+            "profile_guided_minimum_marginal_speedup": 1.05,
             "specialized_minimum_marginal_speedup": MINIMUM_COMPOSED_MARGINAL_SPEEDUP,
             "final_minimum_speedup": MINIMUM_FINAL_SPEEDUP,
             "hard_benchmark_minimum_speedup": MINIMUM_FINAL_SPEEDUP,

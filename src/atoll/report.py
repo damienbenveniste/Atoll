@@ -2052,7 +2052,7 @@ class CompilationOptimizationPolicyReport(TypedDict):
     Attributes:
         version: Policy schema version independent of report schema versions.
         stability_floor_seconds: Minimum credible median for each compared arm.
-        profile_guided_minimum_marginal_speedup: Legacy hot-region incremental gate.
+        profile_guided_minimum_marginal_speedup: Hot-region incremental gate.
         specialized_minimum_marginal_speedup: Scalar, call-chain, buffer, and plan gate.
         final_minimum_speedup: Configured final wheel promotion threshold.
         hard_benchmark_minimum_speedup: Representative family and source-patch floor.

@@ -265,10 +265,9 @@ benchmark_samples = 7
 minimum_speedup = 1.10
 ```
 
-`minimum_speedup` must be greater than `1.0`. Specialized variants and execution plans require a
-`1.05x` marginal improvement; profile-guided generic region trials retain `1.01x`. Both measured
-medians must exceed 0.25 seconds, while source patches and representative optimizer-family workflows
-use the separate `3.0x` hard floor.
+`minimum_speedup` must be greater than `1.0`. Every native variant and execution plan requires a
+`1.05x` marginal improvement. Both measured medians must exceed 0.25 seconds, while source patches
+and representative optimizer-family workflows use the separate `3.0x` hard floor.
 
 Atoll runs these arrays with `shell=False`. For `python script.py` and `python -m module` benchmark
 commands, it builds and tests the baseline wheel before region selection, then runs unmeasured
@@ -286,11 +285,11 @@ back to static selection while retaining the final performance gate.
 For a supported profile, Atoll compiles the candidate superset once and tests candidates in hotness
 order through an internal region allowlist. Each candidate combination runs the semantic command
 once, then one warmup and three alternating benchmark pairs compare it with the accepted set. Atoll
-retains only candidates with at least `1.01x` marginal median speedup, rebuilds the payload from the
+retains only candidates with at least `1.05x` marginal median speedup, rebuilds the payload from the
 baseline, and removes rejected shims and artifacts. Reports distinguish mapped coverage, selected
 hot coverage, accepted hot coverage, lowering mode, fallback reason, and marginal speedup.
-When every profiled candidate is rejected, Atoll records the final full-gate evidence but does not
-publish a wheel containing no native regions.
+When every profiled candidate is rejected, Atoll records a structured no-op without timing or
+publishing an unchanged wheel.
 
 Profile-selected async execution plans are trialed only when both `test_command` and
 `benchmark_command` are configured. Discovery is automatic for the built-in `asyncio` and

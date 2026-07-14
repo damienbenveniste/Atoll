@@ -96,7 +96,7 @@ EXPECTED_ATOMIC_SELECTION_COUNT = 2
 TEST_FAILURE_RETURN_CODE = 9
 RANKING_BINDING_COUNT = 3
 OUTLINED_COMPILE_CALL_COUNT = 2
-_CANDIDATE_SPEEDUP = 1.01
+_CANDIDATE_SPEEDUP = 1.05
 EXPECTED_FINAL_TEST_RESULTS = 2
 EXPECTED_CALL_CHAIN_WIDTH_COUNT = 2
 EXPECTED_SINGLE_FAILURE = 1
@@ -104,6 +104,12 @@ EXPECTED_SAFETY_VERIFICATION_STEPS = 2
 OWNER_PROFILE_SAMPLES = 40
 SECOND_CANDIDATE_REGION_COUNT = 2
 PROFILE_REPLAY_RANK_SAMPLES = 120
+
+
+def _assert_candidate_baseline_allowlist(options: dict[str, object], accepted_count: int) -> None:
+    assert "baseline_variant_allowlist" in options
+    allowlist = cast(frozenset[str], options["baseline_variant_allowlist"])
+    assert bool(allowlist) is (accepted_count > 0)
 
 
 @pytest.fixture(autouse=True)
@@ -1028,11 +1034,11 @@ def test_profitability_selection_rejects_missing_payload_prerequisites(tmp_path:
     assert outcome.trials == ()
 
 
-def test_profiled_zero_variant_package_runs_unoptimized_full_gate(
+def test_profiled_zero_variant_package_returns_structured_noop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Automatic capability rejection produces measured no-op evidence, not an error."""
+    """Automatic capability rejection does not time an unchanged payload."""
     project_root = tmp_path / "typed_region_project"
     output_dir = tmp_path / "out"
     shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
@@ -1046,7 +1052,7 @@ test_command = ["python", "-c", "pass"]
 benchmark_command = ["python", "bench.py"]
 benchmark_warmups = 0
 benchmark_samples = 1
-minimum_speedup = 1.10
+minimum_speedup = 1.23
 """,
         encoding="utf-8",
     )
@@ -1105,16 +1111,7 @@ minimum_speedup = 1.10
         )
 
     def no_speedup(*_args: object, **_kwargs: object) -> BenchmarkGateResult:
-        return BenchmarkGateResult(
-            status="not-profitable",
-            reason="fixture measured no speedup",
-            minimum_speedup=1.1,
-            baseline_median_seconds=1.0,
-            compiled_median_seconds=1.0,
-            speedup=1.0,
-            warmups=(),
-            samples=(),
-        )
+        raise AssertionError("an empty candidate set must not run the performance gate")
 
     def reject_native_execution(*_args: object, **_kwargs: object) -> object:
         pytest.fail("automatic unsupported roots must not enter native compilation")
@@ -1133,13 +1130,15 @@ minimum_speedup = 1.10
     )
 
     assert result.success is False
-    assert result.error == "fixture measured no speedup"
+    assert result.error == "no profile-guided optimization candidate was retained"
     assert result.performance is not None
-    assert result.performance.status == "not-profitable"
+    assert result.performance.status == "unbenchmarked"
+    assert result.performance.reason == result.error
+    assert result.performance.minimum_speedup == pytest.approx(1.23)
     assert result.profile is not None
     assert result.profile.selected_symbols == ()
     assert result.profile.candidates[0].reason == "not-independently-bindable"
-    assert test_modes == ["baseline", "compiled"]
+    assert test_modes == ["baseline"]
     assert not tuple(output_dir.glob("*.whl"))
 
 
@@ -3656,11 +3655,11 @@ def test_plan_only_success_forwards_trial_and_promotion_evidence(
     assert result.execution_plan_trials == (trial,)
 
 
-def test_package_rejects_not_profitable_wheel_after_semantic_tests(
+def test_package_skips_unchanged_full_gate_after_insufficient_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A configured benchmark below threshold removes the candidate wheel."""
+    """Insufficient profile evidence stops after baseline semantics."""
     project_root = tmp_path / "simple_project"
     output_dir = tmp_path / "out"
     shutil.copytree(FIXTURE_ROOT, project_root)
@@ -3720,28 +3719,8 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
             duration_seconds=0.5,
         )
 
-    def rejecting_benchmark(
-        config: BenchmarkGateConfig,
-        *,
-        project_root: Path,
-        baseline_payload_root: Path,
-        compiled_payload_root: Path,
-        progress: Callable[[BenchmarkProgress], None] | None = None,
-    ) -> BenchmarkGateResult:
-        assert config.command == ("python", "bench.py")
-        assert project_root == project_root.resolve()
-        assert baseline_payload_root != compiled_payload_root
-        assert progress is not None
-        return BenchmarkGateResult(
-            status="not-profitable",
-            reason="compiled median speedup 1.020 is below threshold 1.100",
-            minimum_speedup=1.1,
-            baseline_median_seconds=1.02,
-            compiled_median_seconds=1.0,
-            speedup=1.02,
-            warmups=(),
-            samples=(),
-        )
+    def rejecting_benchmark(*_args: object, **_kwargs: object) -> BenchmarkGateResult:
+        raise AssertionError("an empty profile must not benchmark an unchanged payload")
 
     def insufficient_profile(
         command: tuple[str, ...],
@@ -3792,21 +3771,23 @@ def test_package_rejects_not_profitable_wheel_after_semantic_tests(
     assert result.success is False
     assert result.wheel_path is None
     assert result.performance is not None
-    assert result.performance.status == "not-profitable"
-    assert result.error == result.performance.reason
-    assert test_modes == ["baseline", "compiled"]
+    assert result.performance.status == "unbenchmarked"
+    assert result.performance.reason == result.error
+    assert result.performance.minimum_speedup == pytest.approx(1.10)
+    assert result.error == "no profile-guided optimization candidate was retained"
+    assert test_modes == ["baseline"]
     assert not tuple(output_dir.glob("*.whl"))
     assert not (output_dir / "install").exists()
     assert not (output_dir / "build").exists()
     assert result.cleanup_removed == (output_dir / "build", output_dir / "install")
-    assert not result.verification_steps[-1].target.exists()
+    assert result.verification_steps == ()
 
 
-def test_profiled_promotion_rejects_a_wheel_without_profitable_regions(
+def test_profiled_promotion_retains_a_defensive_empty_composition_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The full gate still runs, but an all-rejected profile cannot publish a no-op wheel."""
+    """The late promotion boundary still rejects an inconsistent empty composition."""
     project = _quality_gate_project(tmp_path, ())
     output_dir = tmp_path / "out"
     build_root = output_dir / "build"
@@ -4593,10 +4574,86 @@ def test_fusion_trial_timings_preserve_arm_and_phase() -> None:
     ]
 
 
-@pytest.mark.parametrize("second_candidate_semantics_pass", [True, False])
+def _assert_profile_candidate_trials(
+    result: package_command.PackageCommandResult,
+    first_candidate_speedup: float,
+    second_candidate_semantics_pass: bool,
+) -> bool:
+    """Assert common marginal-trial evidence and return whether one was retained."""
+    first_candidate_profitable = first_candidate_speedup >= _CANDIDATE_SPEEDUP
+    assert result.success is first_candidate_profitable
+    assert (result.wheel_path is not None) is first_candidate_profitable
+    expected_first_status = "accepted" if first_candidate_profitable else "rejected"
+    assert [trial.status for trial in result.candidate_trials] == [
+        expected_first_status,
+        "rejected" if second_candidate_semantics_pass else "failed-semantics",
+    ]
+    assert result.candidate_trials[0].symbols == ("app.ranking::rank_candidates",)
+    assert result.candidate_trials[1].symbols == ("app.ranking::normalize_features",)
+    expected_coverage = 2 / 3 if first_candidate_profitable else 0.0
+    assert result.candidate_trials[0].accepted_hot_coverage == pytest.approx(expected_coverage)
+    assert result.candidate_trials[1].accepted_hot_coverage == pytest.approx(expected_coverage)
+    assert result.candidate_trials[0].marginal_speedup == pytest.approx(first_candidate_speedup)
+    assert result.performance is not None
+    return first_candidate_profitable
+
+
+def _assert_profitable_profile_candidate_result(
+    result: package_command.PackageCommandResult,
+    second_candidate_semantics_pass: bool,
+    observed_allowlists: list[frozenset[str] | None],
+    benchmark_thresholds: list[float],
+) -> None:
+    """Assert final promotion evidence after the first native candidate wins."""
+    expected_thresholds = (
+        [_CANDIDATE_SPEEDUP, _CANDIDATE_SPEEDUP, 1.1]
+        if second_candidate_semantics_pass
+        else [_CANDIDATE_SPEEDUP, 1.1]
+    )
+    assert benchmark_thresholds == expected_thresholds
+    assert observed_allowlists == [None, None, None, None]
+    assert result.performance is not None
+    assert result.performance.speedup == pytest.approx(1.12)
+    assert {binding.source.qualname for binding in result.compiled_bindings} == {"rank_candidates"}
+    assert len(result.test_results) == EXPECTED_FINAL_TEST_RESULTS
+    assert result.wheel_path is not None
+    with zipfile.ZipFile(result.wheel_path) as wheel:
+        native_entries = {
+            name
+            for name in wheel.namelist()
+            if any(name.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES)
+        }
+    assert native_entries == {record.install_relative_path for record in result.artifact_records}
+
+
+def _assert_unretained_profile_candidate_result(
+    result: package_command.PackageCommandResult,
+    observed_allowlists: list[frozenset[str] | None],
+    benchmark_thresholds: list[float],
+    output_dir: Path,
+) -> None:
+    """Assert that an all-rejected candidate set skips unchanged promotion."""
+    assert benchmark_thresholds == [_CANDIDATE_SPEEDUP, _CANDIDATE_SPEEDUP]
+    assert observed_allowlists == [None, None, None]
+    assert result.performance is not None
+    assert result.performance.status == "unbenchmarked"
+    assert result.performance.reason == "no profile-guided optimization candidate was retained"
+    assert result.performance.speedup is None
+    assert result.error == result.performance.reason
+    assert result.compiled_bindings == ()
+    assert result.artifact_records == ()
+    assert len(result.test_results) == 1
+    assert not tuple(output_dir.glob("*.whl"))
+
+
+@pytest.mark.parametrize(
+    ("first_candidate_speedup", "second_candidate_semantics_pass"),
+    [(1.06, True), (1.06, False), (1.04, True)],
+)
 def test_package_greedily_keeps_only_profitable_profile_candidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    first_candidate_speedup: float,
     second_candidate_semantics_pass: bool,
 ) -> None:
     """Profile order retains only candidates passing semantics and marginal timing.
@@ -4604,6 +4661,7 @@ def test_package_greedily_keeps_only_profitable_profile_candidates(
     Args:
         tmp_path: Isolated source-clean target and wheel output.
         monkeypatch: Deterministic semantic, profile, and benchmark boundaries.
+        first_candidate_speedup: Marginal result for the hottest native candidate.
         second_candidate_semantics_pass: Whether the second candidate reaches timing.
     """
     project_root = tmp_path / "simple_project"
@@ -4705,8 +4763,10 @@ minimum_speedup = 1.10
         benchmark_thresholds.append(config.minimum_speedup)
         if config.minimum_speedup == _CANDIDATE_SPEEDUP:
             candidate_index = benchmark_thresholds.count(_CANDIDATE_SPEEDUP)
-            speedup = 1.02 if candidate_index == 1 else 1.005
-            status: BenchmarkStatus = "passed" if candidate_index == 1 else "not-profitable"
+            speedup = first_candidate_speedup if candidate_index == 1 else 1.005
+            status: BenchmarkStatus = (
+                "passed" if speedup >= _CANDIDATE_SPEEDUP else "not-profitable"
+            )
             baseline_payload_root = cast(Path, kwargs["baseline_payload_root"])
             compiled_payload_root = cast(Path, kwargs["compiled_payload_root"])
             assert baseline_payload_root != compiled_payload_root
@@ -4716,9 +4776,12 @@ minimum_speedup = 1.10
             compiled_source = (compiled_payload_root / "app" / "ranking.py").read_text(
                 encoding="utf-8"
             )
-            assert baseline_source.count("'compiled_module':") == candidate_index - 1
-            assert compiled_source.count("'compiled_module':") == candidate_index
-            assert "baseline_variant_allowlist" in kwargs
+            accepted_count = int(
+                candidate_index > 1 and first_candidate_speedup >= _CANDIDATE_SPEEDUP
+            )
+            assert baseline_source.count("'compiled_module':") == accepted_count
+            assert compiled_source.count("'compiled_module':") == accepted_count + 1
+            _assert_candidate_baseline_allowlist(kwargs, accepted_count)
             assert "compiled_variant_allowlist" not in kwargs
         else:
             speedup = 1.12
@@ -4747,36 +4810,25 @@ minimum_speedup = 1.10
         )
     )
 
-    assert result.success is True
-    assert result.wheel_path is not None
-    assert [trial.status for trial in result.candidate_trials] == [
-        "accepted",
-        "rejected" if second_candidate_semantics_pass else "failed-semantics",
-    ]
-    assert result.candidate_trials[0].symbols == ("app.ranking::rank_candidates",)
-    assert result.candidate_trials[1].symbols == ("app.ranking::normalize_features",)
-    assert result.candidate_trials[0].accepted_hot_coverage == pytest.approx(2 / 3)
-    assert result.candidate_trials[1].accepted_hot_coverage == pytest.approx(2 / 3)
-    assert result.candidate_trials[0].marginal_speedup == pytest.approx(1.02)
-    assert result.performance is not None
-    assert result.performance.speedup == pytest.approx(1.12)
-    assert {binding.source.qualname for binding in result.compiled_bindings} == {"rank_candidates"}
-    expected_thresholds = (
-        [_CANDIDATE_SPEEDUP, _CANDIDATE_SPEEDUP, 1.1]
-        if second_candidate_semantics_pass
-        else [_CANDIDATE_SPEEDUP, 1.1]
+    first_candidate_profitable = _assert_profile_candidate_trials(
+        result,
+        first_candidate_speedup,
+        second_candidate_semantics_pass,
     )
-    assert benchmark_thresholds == expected_thresholds
-    assert observed_allowlists[0] is None
-    assert observed_allowlists[1:] == [None, None, None]
-    assert len(result.test_results) == EXPECTED_FINAL_TEST_RESULTS
-    with zipfile.ZipFile(result.wheel_path) as wheel:
-        native_entries = {
-            name
-            for name in wheel.namelist()
-            if any(name.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES)
-        }
-    assert native_entries == {record.install_relative_path for record in result.artifact_records}
+    if first_candidate_profitable:
+        _assert_profitable_profile_candidate_result(
+            result,
+            second_candidate_semantics_pass,
+            observed_allowlists,
+            benchmark_thresholds,
+        )
+    else:
+        _assert_unretained_profile_candidate_result(
+            result,
+            observed_allowlists,
+            benchmark_thresholds,
+            output_dir,
+        )
 
 
 def test_payload_bytecode_cleanup_removes_caches_without_following_symlinks(
@@ -5353,6 +5405,13 @@ def test_composed_source_arm_keeps_successful_native_overlay(
     monkeypatch.setattr(package_command, "_materialize_source_optimization_arm", materialize)
     monkeypatch.setattr(package_command, "_selected_scans", selected_scans)
     monkeypatch.setattr(package_command, "_selected_typed_regions", selected_regions)
+
+    def stabilize(_scope: object, **kwargs: object) -> object:
+        active_options = cast(package_command.PackageOptions, kwargs["options"])
+        assert active_options.cache_dir == project.config.cache_dir
+        return kwargs["profile"]
+
+    monkeypatch.setattr(package_command, "_stabilize_profile_compile_selection", stabilize)
 
     def execute_native(**kwargs: object) -> package_command.PackageCommandResult:
         assert kwargs["prepared_baseline"] is baseline

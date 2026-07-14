@@ -238,6 +238,7 @@ _RUN_GUARD_DISPATCH_RANK = 25
 _MAX_PROFILED_CALL_CHAIN_ROOTS = 4
 _MINIMUM_CYTHON_BATCH_SIZE = 2
 _MINIMUM_INTERACTION_VARIANTS = 2
+_NO_PROFILE_OPTIMIZATION_REASON = "no profile-guided optimization candidate was retained"
 _PROFILE_PLAN_CACHE_FORMAT_VERSION = "1"
 _PROFILE_PLAN_LOWERING_VERSION = "profile-native-selection-v3"
 _BACKEND_POLICY_BYPASS_PREFIX = "BACKEND_POLICY_BYPASS:"
@@ -1900,6 +1901,10 @@ def _execute_composed_source_arm(
     active_fusion_plans = (
         build_fusion_plans(active_scans, active_profile) if active_profile is not None else ()
     )
+    composed_cache_options = replace(
+        options,
+        cache_dir=options.cache_dir or project.config.cache_dir,
+    )
     active_profile = _stabilize_profile_compile_selection(
         _ProfileCompileSelectionScope(
             identity=(
@@ -1910,7 +1915,7 @@ def _execute_composed_source_arm(
             ),
             support=active_support,
         ),
-        options=options,
+        options=composed_cache_options,
         project=arm.active_project,
         scans=active_scans,
         profile=active_profile,
@@ -1966,9 +1971,8 @@ def _execute_composed_source_arm(
 
     output_dir = _resolve_output_dir(project.config.root, options.output_dir)
     composed_options = replace(
-        options,
+        composed_cache_options,
         output_dir=output_dir,
-        cache_dir=options.cache_dir or project.config.cache_dir,
         apply_source=False,
     )
     with tempfile.TemporaryDirectory(prefix="atoll-source-arm-") as backup_dir_text:
@@ -2324,8 +2328,8 @@ def _execute_execution_plan_only_package(
     The normal PEP 517 wheel remains the base payload. Selected scheduler plans
     stage only against its temporary unpacked copy, then pass the same isolated
     payload/wheel verification and final semantic/performance gate as native
-    variants. A profile-selected plan that fails every backend trial cannot
-    publish an unchanged baseline wheel.
+    variants. When no plan survives its marginal gate, the command returns a
+    structured no-op without benchmarking or publishing an unchanged wheel.
 
     Args:
         context: Baseline, profile, project, and selected plan state.
@@ -2369,6 +2373,29 @@ def _execute_execution_plan_only_package(
             accepted_region_ids=frozenset(),
         )
     )
+    build = _append_phase_timings(baseline.build, plan_application.timings)
+    if not plan_application.applied_plan_ids:
+        _remove_failed_wheels(project, output_dir)
+        cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
+        semantic_test = baseline.semantic_test_result
+        return PackageCommandResult(
+            success=False,
+            project_root=project.config.root,
+            output_dir=output_dir,
+            install_root=install_root,
+            wheel_path=None,
+            islands=(),
+            build=build,
+            cleanup_removed=cleanup_removed,
+            cleanup_kept=(),
+            error=_NO_PROFILE_OPTIMIZATION_REASON,
+            typed_regions=context.typed_regions,
+            test_results=((semantic_test,) if semantic_test is not None else ()),
+            performance=_unretained_profile_performance(project),
+            profile=context.profile,
+            execution_plans=context.execution_plans,
+            execution_plan_trials=plan_application.trials,
+        )
     promotion = _promote_source_clean_payload(
         _SourceCleanPromotionContext(
             options=options,
@@ -2382,7 +2409,7 @@ def _execute_execution_plan_only_package(
                 regions=(),
                 artifacts=(),
             ),
-            build=_append_phase_timings(baseline.build, plan_application.timings),
+            build=build,
             requires_profitable_optimization=True,
             profitable_optimization_applied=bool(plan_application.applied_plan_ids),
         )
@@ -2732,7 +2759,18 @@ def _execute_typed_region_package(
             accepted_artifacts or plan_application.applied_plan_ids
         ),
     )
-    if finalized.overlay_error is None:
+    if (
+        finalized.overlay_error is None
+        and finalized.profitability_applied
+        and not accepted_artifacts
+        and not plan_application.applied_plan_ids
+    ):
+        _progress(
+            options.progress,
+            "all profile-guided candidates were rejected; skipping unchanged final gate",
+        )
+        promotion = _unretained_profile_promotion(promotion_context)
+    elif finalized.overlay_error is None:
         _progress(options.progress, f"prepared install payload in {_duration(payload_started)}")
         promotion = _promote_source_clean_payload(promotion_context)
     else:
@@ -6124,6 +6162,59 @@ def _failed_promotion(
     )
 
 
+def _unretained_profile_performance(project: DiscoveredProject) -> BenchmarkGateResult:
+    """Describe a clean profile-guided no-op without manufacturing timing data.
+
+    Args:
+        project: Project whose configured final threshold belongs in the report.
+
+    Returns:
+        BenchmarkGateResult: Explicit unbenchmarked evidence for an empty composition.
+    """
+    return BenchmarkGateResult(
+        status="unbenchmarked",
+        reason=_NO_PROFILE_OPTIMIZATION_REASON,
+        minimum_speedup=project.config.compile.minimum_speedup,
+        baseline_median_seconds=None,
+        compiled_median_seconds=None,
+        speedup=None,
+        warmups=(),
+        samples=(),
+    )
+
+
+def _unretained_profile_promotion(
+    context: _SourceCleanPromotionContext,
+) -> _SourceCleanPromotionResult:
+    """Discard an unchanged staged payload after every profiled variant loses.
+
+    This path deliberately skips payload verification, repacking, and the final
+    baseline-versus-baseline benchmark. Baseline semantic evidence remains in
+    the report so corpus classification can distinguish a compatible no-op
+    from a build or correctness failure.
+
+    Args:
+        context: Staged payload and baseline evidence to clean and report.
+
+    Returns:
+        _SourceCleanPromotionResult: Structured no-op with no promoted wheel.
+    """
+    _remove_failed_wheels(context.project, context.output_dir)
+    cleanup_removed = _remove_source_clean_scratch(context.build_root, context.install_root)
+    semantic_test = context.baseline.semantic_test_result
+    return _SourceCleanPromotionResult(
+        success=False,
+        wheel_path=None,
+        build=replace(context.build, artifact_paths=()),
+        verification_steps=(),
+        test_results=((semantic_test,) if semantic_test is not None else ()),
+        performance=_unretained_profile_performance(context.project),
+        cleanup_removed=cleanup_removed,
+        cleanup_kept=(),
+        error=_NO_PROFILE_OPTIMIZATION_REASON,
+    )
+
+
 def _finalize_typed_payload(
     context: _TypedPayloadFinalizationContext,
 ) -> _TypedPayloadFinalizationResult:
@@ -7551,7 +7642,11 @@ def _run_exact_candidate_trial(
             project_root=quality_root,
             baseline_payload_root=accepted_payload,
             compiled_payload_root=candidate_payload,
-            baseline_variant_allowlist=(accepted_ids if accepted else None),
+            # An explicit empty allowlist keeps an accepted source optimization
+            # active while proving that the first native variant adds value.
+            # ``None`` would set ATOLL_DISABLE=1 and compare the candidate with
+            # the original Python fallback instead of the current source arm.
+            baseline_variant_allowlist=accepted_ids,
             progress=partial(_candidate_benchmark_progress, context.progress, variant_id),
         )
         return semantic, benchmark

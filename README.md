@@ -308,10 +308,9 @@ benchmark_samples = 7
 minimum_speedup = 1.10
 ```
 
-`minimum_speedup` must be greater than `1.0`. Specialized native and execution-plan candidates
-must improve the current accepted arm by at least `1.05x`; profile-guided generic regions retain
-their `1.01x` exploratory gate. Both compared medians must be at least 0.25 seconds. Source patches
-and representative family promotion use the separate `3.0x` hard floor.
+`minimum_speedup` must be greater than `1.0`. Every native and execution-plan candidate must
+improve the current accepted arm by at least `1.05x`. Both compared medians must be at least 0.25
+seconds. Source patches and representative family promotion use the separate `3.0x` hard floor.
 
 Commands run directly with `shell=False`. For `python script.py` and `python -m module` benchmark
 commands, Atoll first builds and tests the baseline wheel, then runs unmeasured profile passes before
@@ -330,11 +329,11 @@ the final benchmark gate.
 For a supported profile, Atoll compiles the selected candidates once and evaluates them in hotness
 order. Each candidate combination runs the semantic command once, then one warmup and three
 alternating benchmark pairs compare it with the previously accepted set. A candidate is retained
-only when its marginal median speedup is at least `1.01x`. Rejected shims and native artifacts are
+only when its marginal median speedup is at least `1.05x`. Rejected shims and native artifacts are
 removed before final packaging. The report records candidate coverage, lowering mode, fallback
 reason, marginal speedup, and the hot-path coverage retained by the accepted set.
-If every profiled candidate is rejected, Atoll still records the final full-gate evidence but does
-not publish a wheel with zero native regions.
+If every profiled candidate is rejected, Atoll records a structured no-op without timing or
+publishing an unchanged wheel.
 
 Profile-selected async execution plans are trialed only when both `test_command` and
 `benchmark_command` are configured. Discovery is automatic for the built-in `asyncio` and
