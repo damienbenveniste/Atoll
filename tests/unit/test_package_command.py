@@ -94,6 +94,7 @@ _CANDIDATE_SPEEDUP = 1.01
 EXPECTED_FINAL_TEST_RESULTS = 2
 EXPECTED_CALL_CHAIN_WIDTH_COUNT = 2
 EXPECTED_SINGLE_FAILURE = 1
+EXPECTED_SAFETY_VERIFICATION_STEPS = 2
 OWNER_PROFILE_SAMPLES = 40
 
 
@@ -167,6 +168,13 @@ class _PromotionContextView(Protocol):
     profitable_optimization_applied: bool
 
 
+class _RuntimeSafetySelectionView(Protocol):
+    successful: tuple[_PreparedTypedRegion, ...]
+    failures: tuple[_TypedRegionFailure, ...]
+    verification_steps: tuple[PackageVerificationResult, ...]
+    overlay_error: str | None
+
+
 class _FusionResearchOutcomeView(Protocol):
     trials: tuple[FusionTrial, ...]
     timings: tuple[CompilePhaseTiming, ...]
@@ -229,6 +237,7 @@ class _TypedRegionOutcome(Protocol):
 
 class _TypedRegionFailure(Protocol):
     variant_id: str
+    build: CompileAttempt
 
 
 class _FakeCompileBackend:
@@ -373,6 +382,10 @@ _artifact_records_for_prepared = cast(
     ],
     _package_attr("_artifact_records_for_prepared"),
 )
+_partition_wheel_owned_variants = cast(
+    Callable[..., tuple[tuple[_PreparedTypedRegion, ...], tuple[_TypedRegionFailure, ...]]],
+    _package_attr("_partition_wheel_owned_variants"),
+)
 _materialize_profitable_payload = cast(
     Callable[..., str | None],
     _package_attr("_materialize_profitable_payload"),
@@ -459,6 +472,26 @@ _build_typed_regions = cast(
 )
 _TypedRegionBuildContext = cast(Callable[..., object], _package_attr("_TypedRegionBuildContext"))
 _TypedRegionBuildOutcome = cast(Callable[..., object], _package_attr("_TypedRegionBuildOutcome"))
+_TypedPayloadFinalizationContext = cast(
+    Callable[..., object],
+    _package_attr("_TypedPayloadFinalizationContext"),
+)
+_TypedPayloadFinalizationResult = cast(
+    Callable[..., object],
+    _package_attr("_TypedPayloadFinalizationResult"),
+)
+_select_runtime_safe_variants = cast(
+    Callable[[object, object], object],
+    _package_attr("_select_runtime_safe_variants"),
+)
+_bisect_runtime_safe_variants = cast(
+    Callable[..., tuple[_PreparedTypedRegion, ...]],
+    _package_attr("_bisect_runtime_safe_variants"),
+)
+_resolve_runtime_variant_interactions = cast(
+    Callable[..., tuple[_PreparedTypedRegion, ...]],
+    _package_attr("_resolve_runtime_variant_interactions"),
+)
 _compiler_backends = cast(dict[Backend, object], _package_attr("_COMPILER_BACKENDS"))
 _member_requires_source_class = cast(
     Callable[[str], bool],
@@ -1343,7 +1376,12 @@ def test_package_cleans_payload_after_subprocess_verification_failure(
     )
 
     assert result.success is False
-    assert result.error == "routing failed"
+    if failed_stage == "payload":
+        assert result.error == (
+            "isolated payload verification failed without any native variants: routing failed"
+        )
+    else:
+        assert result.error == "routing failed"
     assert result.cleanup_removed == (output_dir / "build", output_dir / "install")
     assert result.cleanup_kept == ()
     assert not (output_dir / "build").exists()
@@ -1407,6 +1445,151 @@ def test_prepare_typed_region_appends_outlined_cython_fallback(tmp_path: Path) -
     assert outlined.lowering_mode == "outlined-block"
     assert outlined.native_helpers
     assert outlined.unit.region_id.endswith("@cython-outline")
+
+
+def test_wheel_owned_variant_partition_rejects_backend_omissions(tmp_path: Path) -> None:
+    """Only source modules already shipped by the baseline wheel reach a compiler."""
+    prepared, _build_root, staged_source_roots = _prepare_outlined_coroutine_fixture(tmp_path)
+    install_root = tmp_path / "install"
+    relative = prepared.shim.source_path.relative_to(staged_source_roots[0])
+    destination = install_root / relative
+    destination.parent.mkdir(parents=True)
+    destination.write_text("baseline\n", encoding="utf-8")
+
+    retained, omitted = _partition_wheel_owned_variants(
+        (prepared,),
+        staged_source_roots=staged_source_roots,
+        install_root=install_root,
+    )
+
+    assert retained == (prepared,)
+    assert omitted == ()
+
+    destination.unlink()
+    retained, omitted = _partition_wheel_owned_variants(
+        (prepared,),
+        staged_source_roots=staged_source_roots,
+        install_root=install_root,
+    )
+
+    assert retained == ()
+    assert len(omitted) == 1
+    assert omitted[0].variant_id == prepared.unit.region_id
+    assert "target PEP 517 wheel omitted" in omitted[0].build.stderr
+
+
+def test_runtime_safety_selection_drops_variant_that_fails_in_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashing compiled variant is removed while the baseline payload survives."""
+    prepared, _build_root, staged_source_roots = _prepare_outlined_coroutine_fixture(tmp_path)
+    project_root = tmp_path / "project"
+    project = discover_project(project_root)
+    baseline_root = tmp_path / "baseline"
+    install_root = tmp_path / "install"
+    shutil.copytree(staged_source_roots[0], baseline_root)
+    shutil.copytree(baseline_root, install_root)
+    outcome = _TypedRegionBuildOutcome(
+        successful=(prepared,),
+        build=_successful_attempt(),
+        artifacts=(),
+        skipped=(),
+    )
+    baseline = _BaselineWheelPayload(
+        wheel_path=tmp_path / "baseline.whl",
+        build=_successful_attempt(),
+        baseline_install_root=baseline_root,
+    )
+
+    def verify(**kwargs: object) -> PackageVerificationResult:
+        allowlist = cast(frozenset[str] | None, kwargs["variant_allowlist"])
+        success = allowlist == frozenset()
+        return PackageVerificationResult(
+            stage=cast(VerificationStage, kwargs["stage"]),
+            target=cast(Path, kwargs["target"]),
+            command=("python", "verify"),
+            success=success,
+            exit_code=0 if success else -11,
+            stdout="",
+            stderr="",
+            duration_seconds=0.01,
+        )
+
+    monkeypatch.setattr(package_command, "verify_package_subprocess", verify)
+    context = _TypedPayloadFinalizationContext(
+        options=package_command.PackageOptions(root=project_root),
+        project=project,
+        profile=None,
+        baseline=baseline,
+        install_root=install_root,
+        staged_source_roots=staged_source_roots,
+        outcome=outcome,
+        overlay_error=None,
+    )
+    finalized = _TypedPayloadFinalizationResult(
+        successful=(prepared,),
+        artifacts=(),
+        build=_successful_attempt(),
+        trials=(),
+        overlay_error=None,
+        profitability_applied=False,
+    )
+
+    result = cast(
+        _RuntimeSafetySelectionView,
+        _select_runtime_safe_variants(context, finalized),
+    )
+
+    assert result.successful == ()
+    assert len(result.failures) == 1
+    assert result.failures[0].variant_id == prepared.unit.region_id
+    assert len(result.verification_steps) == EXPECTED_SAFETY_VERIFICATION_STEPS
+    assert result.overlay_error is None
+
+
+def test_runtime_safety_selection_resolves_interaction_only_failure(tmp_path: Path) -> None:
+    """Individually safe variants are combined only while the aggregate still imports."""
+    first, _build_root, _staged_source_roots = _prepare_outlined_coroutine_fixture(tmp_path)
+    second = _PreparedTypedRegionState(
+        generation=first.generation,
+        assessment=first.assessment,
+        unit=replace(first.unit, region_id=f"{first.unit.region_id}-second"),
+        shim=first.shim,
+        lowering_mode=first.lowering_mode,
+        native_helpers=first.native_helpers,
+    )
+    failed = PackageVerificationResult(
+        stage="payload",
+        target=tmp_path,
+        command=("python", "verify"),
+        success=False,
+        exit_code=-11,
+        stdout="",
+        stderr="combined activation failed",
+        duration_seconds=0.01,
+    )
+    passed = replace(failed, success=True, exit_code=0, stderr="")
+
+    def verify(candidates: tuple[_PreparedTypedRegion, ...]) -> PackageVerificationResult:
+        return passed if len(candidates) <= 1 else failed
+
+    rejected: dict[str, PackageVerificationResult] = {}
+    individually_safe = _bisect_runtime_safe_variants(
+        (first, second),
+        verify=verify,
+        failed_result=failed,
+        rejected_results=rejected,
+    )
+    retained = _resolve_runtime_variant_interactions(
+        individually_safe,
+        verify=verify,
+        rejected_results=rejected,
+    )
+
+    assert individually_safe == (first, second)
+    assert retained == (first,)
+    assert rejected == {second.unit.region_id: failed}
 
 
 def test_private_native_helper_uses_public_owner_for_profile_profitability(

@@ -464,6 +464,39 @@ def test_compile_reports_backend_wheel_omission_without_traceback(
     assert not (project_root / ".atoll" / "dist" / "install").exists()
 
 
+def test_compile_skips_automatic_modules_omitted_by_backend_wheel(tmp_path: Path) -> None:
+    """Whole-project compile follows the PEP 517 wheel's distributable module boundary."""
+    project_root = tmp_path / "mixed_flat_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    shutil.move(project_root / "src" / "app", project_root / "app")
+    (project_root / "src").rmdir()
+    tools = project_root / "tools"
+    tools.mkdir()
+    (tools / "__init__.py").write_text("", encoding="utf-8")
+    (tools / "helper.py").write_text(
+        "def increment(value: int) -> int:\n    return value + 1\n",
+        encoding="utf-8",
+    )
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'where = ["src"]',
+            'where = ["."]\ninclude = ["app*"]',
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["compile", "--root", str(project_root)])
+
+    wheels = tuple((project_root / ".atoll" / "dist").glob("*.whl"))
+    assert exit_code == 0
+    assert len(wheels) == 1
+    with zipfile.ZipFile(wheels[0]) as archive:
+        names = set(archive.namelist())
+    assert "app/ranking.py" in names
+    assert "tools/helper.py" not in names
+
+
 def test_compile_rejects_invalid_compile_config_without_traceback(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

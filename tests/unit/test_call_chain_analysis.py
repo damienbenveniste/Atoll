@@ -127,6 +127,32 @@ def test_call_chain_analysis_supports_direct_staticmethod_helpers(tmp_path: Path
     assert payload.callable_qualname == "Arithmetic.step"
 
 
+def test_call_chain_analysis_preserves_method_lexical_indentation(tmp_path: Path) -> None:
+    """Unindented text inside a method docstring cannot break declaration parsing."""
+    scan = _scan(
+        tmp_path,
+        '''
+        class Arithmetic:
+            @staticmethod
+            def step(value: int) -> int:
+                """Return the next value.
+
+Example text intentionally starts in column zero.
+                """
+                return value + 1
+
+            @staticmethod
+            def run(value: int) -> int:
+                return Arithmetic.step(value) * 2
+        ''',
+    )
+
+    result = analyze_call_chain_scan(scan)
+
+    assert any(plan.root.qualname == "Arithmetic.run" for plan in result.plans)
+    assert not any(rejection.code == "unparseable-source" for rejection in result.rejections)
+
+
 def test_call_chain_analysis_preserves_same_line_call_site_identity(tmp_path: Path) -> None:
     """Two direct calls on one line retain distinct source spans and profile IDs."""
     scan = _scan(

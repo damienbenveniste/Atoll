@@ -224,6 +224,7 @@ _BUFFER_DISPATCH_RANK = 30
 _RUN_GUARD_DISPATCH_RANK = 25
 _MAX_PROFILED_CALL_CHAIN_ROOTS = 4
 _MINIMUM_CYTHON_BATCH_SIZE = 2
+_MINIMUM_INTERACTION_VARIANTS = 2
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -711,6 +712,27 @@ class _TypedRegionPackageContext:
 
 
 @dataclass(frozen=True, slots=True)
+class _PreparationFailureContext:
+    """Inputs used to report a source-clean native preparation failure.
+
+    Attributes:
+        options: Command options that determine output and cleanup locations.
+        project: Discovered target project and source-clean configuration.
+        package: Static region-selection evidence retained in the report.
+        profile: Optional unmeasured profile attached to the failed attempt.
+        failures: Backend lowering failures retained as interpreted fallbacks.
+        wheel_omissions: Variants excluded because their modules are absent from the wheel.
+    """
+
+    options: PackageOptions
+    project: DiscoveredProject
+    package: _TypedRegionPackageContext
+    profile: ProfileResult | None
+    failures: tuple[PackageRegionBuildFailure, ...]
+    wheel_omissions: tuple[PackageRegionBuildFailure, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _BaselineWheelPayload:
     """Normal target wheel unpacked as the immutable source-clean base layer.
 
@@ -965,6 +987,27 @@ class _TypedPayloadFinalizationResult:
     trials: tuple[CandidateTrial, ...]
     overlay_error: str | None
     profitability_applied: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeSafetySelectionResult:
+    """Compiled subset that survives isolated import and routing verification.
+
+    Attributes:
+        successful: Variants retained after deterministic failure isolation.
+        artifacts: Native artifacts reachable from the retained variants.
+        build: Build evidence extended with safety-verification timings.
+        failures: Variants downgraded to interpreted fallback after verification.
+        verification_steps: Child-process attempts used to isolate unsafe variants.
+        overlay_error: Failure rebuilding the verified payload, when present.
+    """
+
+    successful: tuple[_PreparedTypedRegion, ...]
+    artifacts: tuple[ArtifactRecord, ...]
+    build: CompileAttempt
+    failures: tuple[PackageRegionBuildFailure, ...] = ()
+    verification_steps: tuple[PackageVerificationResult, ...] = ()
+    overlay_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1933,9 +1976,10 @@ def _source_optimization_package_result(
     Returns:
         PackageCommandResult: Successful pure or project-native normal wheel result.
     """
-    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
-    build_root = output_dir / "build"
-    install_root = output_dir / "install"
+    output_dir, build_root, install_root = _source_clean_output_paths(
+        project.config.root,
+        options.output_dir,
+    )
     cleanup_removed: list[Path] = []
     cleanup_kept: tuple[Path, ...] = ()
     if options.keep_install_tree and search.wheel_path is not None:
@@ -2156,9 +2200,10 @@ def _execute_typed_region_package(
     Returns:
         PackageCommandResult: Complete source-clean package result for selected regions.
     """
-    output_dir = _resolve_output_dir(project.config.root, options.output_dir)
-    build_root = output_dir / "build"
-    install_root = output_dir / "install"
+    output_dir, build_root, install_root = _source_clean_output_paths(
+        project.config.root,
+        options.output_dir,
+    )
     baseline = _package_baseline(options, project, prepared_baseline)
     if baseline.wheel_path is None:
         _remove_failed_wheels(project, output_dir)
@@ -2239,10 +2284,24 @@ def _execute_typed_region_package(
         prepared=prepared,
         failures=preparation_failures,
     )
+    wheel_owned_prepared, wheel_omissions = _partition_wheel_owned_variants(
+        tuple(prepared),
+        staged_source_roots=staged_source_roots,
+        install_root=install_root,
+    )
+    preparation_failures.extend(wheel_omissions)
+    if wheel_omissions:
+        _progress(
+            options.progress,
+            (
+                f"skipped {len(wheel_omissions)} native variant(s) whose source modules "
+                "are not shipped by the target PEP 517 wheel"
+            ),
+        )
     _progress(
         options.progress,
         (
-            f"lowered {len(prepared)} native region variant(s), "
+            f"lowered {len(wheel_owned_prepared)} native region variant(s), "
             f"including {scalar_variant_count} scalar and "
             f"{call_chain_variant_count} direct call-chain and "
             f"{buffer_variant_count} zero-copy buffer variant(s); "
@@ -2250,34 +2309,21 @@ def _execute_typed_region_package(
             f"kept {len(preparation_failures)} as fallback in {_duration(generation_started)}"
         ),
     )
-    if not prepared:
-        result_error = "No selected typed regions could be lowered for a compiler backend."
-        _remove_failed_wheels(project, output_dir)
-        cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
-        return PackageCommandResult(
-            success=False,
-            project_root=project.config.root,
-            output_dir=output_dir,
-            install_root=install_root,
-            wheel_path=None,
-            islands=(),
-            build=_failed_region_attempt(result_error),
-            cleanup_removed=cleanup_removed,
-            cleanup_kept=(),
-            error=result_error,
-            preflight_skipped=context.preflight_skipped,
-            native_readiness=context.native_readiness,
-            typed_regions=context.typed_regions,
-            backend_assessments=tuple(selection.assessment for selection in context.selected),
-            region_skipped=tuple(preparation_failures),
-            profile=profile,
-            execution_plans=context.execution_plans,
-            fusion_plans=context.fusion_plans,
+    if not wheel_owned_prepared:
+        return _failed_preparation_result(
+            _PreparationFailureContext(
+                options=options,
+                project=project,
+                package=context,
+                profile=profile,
+                failures=tuple(preparation_failures),
+                wheel_omissions=wheel_omissions,
+            )
         )
 
-    prepared_assessments = _prepared_backend_assessments(tuple(prepared))
+    prepared_assessments = _prepared_backend_assessments(wheel_owned_prepared)
     outcome = _build_typed_regions(
-        prepared=tuple(prepared),
+        prepared=wheel_owned_prepared,
         context=_TypedRegionBuildContext(
             build_root=build_root,
             staged_source_roots=staged_source_roots,
@@ -2361,7 +2407,7 @@ def _execute_typed_region_package(
     _progress(options.progress, "binding compiled classes and callables in staged modules")
     overlay_error = _stage_compiled_superset(
         outcome,
-        tuple(prepared),
+        wheel_owned_prepared,
         staged_source_roots,
         install_root,
     )
@@ -2376,6 +2422,20 @@ def _execute_typed_region_package(
             outcome=outcome,
             overlay_error=overlay_error,
         )
+    )
+    finalized, outcome, safety = _apply_runtime_safety_selection(
+        context=_TypedPayloadFinalizationContext(
+            options=options,
+            project=project,
+            profile=profile,
+            baseline=baseline,
+            install_root=install_root,
+            staged_source_roots=staged_source_roots,
+            outcome=outcome,
+            overlay_error=finalized.overlay_error,
+        ),
+        finalized=finalized,
+        selected_members=options.selected_members,
     )
     accepted_successful, plan_application = (
         finalized.successful,
@@ -2429,6 +2489,10 @@ def _execute_typed_region_package(
                 error=finalized.overlay_error,
             ),
         )
+    promotion = replace(
+        promotion,
+        verification_steps=(*safety.verification_steps, *promotion.verification_steps),
+    )
     promotion, fusion_research = _attach_conditional_task_fusion_research(
         promotion,
         _FusionResearchContext(
@@ -2494,6 +2558,51 @@ def _execute_typed_region_package(
         execution_plan_trials=plan_application.trials,
         fusion_plans=context.fusion_plans,
         fusion_trials=fusion_research.trials,
+    )
+
+
+def _failed_preparation_result(
+    context: _PreparationFailureContext,
+) -> PackageCommandResult:
+    """Report that every selected native variant remained interpreted.
+
+    Args:
+        context: Lowering failures and source-clean package boundaries.
+
+    Returns:
+        PackageCommandResult: Failed result with scratch output removed and
+        every rejected variant retained as report evidence.
+    """
+    output_dir, build_root, install_root = _source_clean_output_paths(
+        context.project.config.root,
+        context.options.output_dir,
+    )
+    error = (
+        context.wheel_omissions[0].build.stderr
+        if context.wheel_omissions
+        else "No selected typed regions could be lowered for a compiler backend."
+    )
+    _remove_failed_wheels(context.project, output_dir)
+    cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
+    return PackageCommandResult(
+        success=False,
+        project_root=context.project.config.root,
+        output_dir=output_dir,
+        install_root=install_root,
+        wheel_path=None,
+        islands=(),
+        build=_failed_region_attempt(error),
+        cleanup_removed=cleanup_removed,
+        cleanup_kept=(),
+        error=error,
+        preflight_skipped=context.package.preflight_skipped,
+        native_readiness=context.package.native_readiness,
+        typed_regions=context.package.typed_regions,
+        backend_assessments=tuple(selection.assessment for selection in context.package.selected),
+        region_skipped=context.failures,
+        profile=context.profile,
+        execution_plans=context.package.execution_plans,
+        fusion_plans=context.package.fusion_plans,
     )
 
 
@@ -4181,6 +4290,50 @@ def _failed_region_attempt(error: str) -> CompileAttempt:
     )
 
 
+def _partition_wheel_owned_variants(
+    prepared: tuple[_PreparedTypedRegion, ...],
+    *,
+    staged_source_roots: tuple[Path, ...],
+    install_root: Path,
+) -> tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+    """Keep only variants whose source module is owned by the baseline wheel.
+
+    Flat-layout repositories often contain documentation plugins, release
+    scripts, examples, and other importable-looking Python files beside their
+    distributable package. The PEP 517 wheel is the authoritative package
+    boundary: automatic compilation may replace a shipped source module, but it
+    must not introduce a module that the backend intentionally omitted.
+
+    Args:
+        prepared: Lowered native variants awaiting compiler invocation.
+        staged_source_roots: Copied import roots used to derive install paths.
+        install_root: Unpacked baseline wheel payload.
+
+    Returns:
+        tuple[tuple[_PreparedTypedRegion, ...], tuple[PackageRegionBuildFailure, ...]]:
+        Wheel-owned variants and deterministic interpreted-fallback evidence for
+        every omitted source module.
+    """
+    retained: list[_PreparedTypedRegion] = []
+    omitted: list[PackageRegionBuildFailure] = []
+    for item in prepared:
+        relative = _source_relative_path(item.shim.source_path, staged_source_roots)
+        if (install_root / relative).is_file():
+            retained.append(item)
+            continue
+        error = f"target PEP 517 wheel omitted a compiled source module: {relative.as_posix()}"
+        omitted.append(
+            PackageRegionBuildFailure(
+                region=item.generation.region,
+                variant_id=item.unit.region_id,
+                backend=item.generation.backend,
+                assessment=item.assessment,
+                build=_failed_region_attempt(error),
+            )
+        )
+    return tuple(retained), tuple(omitted)
+
+
 def _stage_compiled_superset(
     outcome: _TypedRegionBuildOutcome,
     prepared: tuple[_PreparedTypedRegion, ...],
@@ -4948,19 +5101,16 @@ def _prepare_baseline_wheel_payload(
         duration_seconds=time.perf_counter() - unpack_started,
         detail=wheel_path.name,
     )
-    baseline_install_root: Path | None = None
-    baseline_copy_timing: tuple[CompilePhaseTiming, ...] = ()
-    if run_quality_gates and project.config.compile.benchmark_command is not None:
-        baseline_started = time.perf_counter()
-        baseline_install_root = build_root / "baseline-install"
-        shutil.copytree(install_root, baseline_install_root)
-        baseline_copy_timing = (
-            CompilePhaseTiming(
-                name="baseline_payload_copy",
-                duration_seconds=time.perf_counter() - baseline_started,
-                detail="benchmark baseline",
-            ),
-        )
+    baseline_started = time.perf_counter()
+    baseline_install_root = build_root / "baseline-install"
+    shutil.copytree(install_root, baseline_install_root)
+    baseline_copy_timing = (
+        CompilePhaseTiming(
+            name="baseline_payload_copy",
+            duration_seconds=time.perf_counter() - baseline_started,
+            detail="immutable interpreted baseline",
+        ),
+    )
     quality_project_root: Path | None = None
     if run_quality_gates and (
         project.config.compile.test_command is not None
@@ -5111,9 +5261,25 @@ def _verify_package_stage(
         plan=plan,
         project_root=project_root,
     )
-    status = "passed" if result.success else f"failed with exit {result.exit_code}"
-    _progress(progress, f"{stage} verification {status} in {result.duration_seconds:.2f}s")
+    _verification_progress(result, progress)
     return result
+
+
+def _verification_progress(
+    result: PackageVerificationResult,
+    progress: PackageProgress | None,
+) -> None:
+    """Emit one bounded child-verification status line.
+
+    Args:
+        result: Completed child-process verification attempt.
+        progress: Optional callback receiving the normalized status line.
+    """
+    status = "passed" if result.success else f"failed with exit {result.exit_code}"
+    _progress(
+        progress,
+        f"{result.stage} verification {status} in {result.duration_seconds:.2f}s",
+    )
 
 
 def _append_verification_timing(
@@ -5436,6 +5602,312 @@ def _finalize_typed_payload(
         overlay_error=overlay_error,
         profitability_applied=profitability_applied,
     )
+
+
+def _apply_runtime_safety_selection(
+    *,
+    context: _TypedPayloadFinalizationContext,
+    finalized: _TypedPayloadFinalizationResult,
+    selected_members: tuple[SymbolId, ...],
+) -> tuple[
+    _TypedPayloadFinalizationResult,
+    _TypedRegionBuildOutcome,
+    _RuntimeSafetySelectionResult,
+]:
+    """Apply isolated safety selection and enforce explicit member promises.
+
+    Args:
+        context: Finalization boundaries and complete native build outcome.
+        finalized: Candidate subset accepted by static and profitability gates.
+        selected_members: Explicitly requested bindings that may not fall back silently.
+
+    Returns:
+        tuple[_TypedPayloadFinalizationResult, _TypedRegionBuildOutcome,
+        _RuntimeSafetySelectionResult]: Verified finalization state, augmented
+        build outcome, and isolated verification evidence.
+    """
+    safety = _select_runtime_safe_variants(context, finalized)
+    finalized = replace(
+        finalized,
+        successful=safety.successful,
+        artifacts=safety.artifacts,
+        build=safety.build,
+        overlay_error=safety.overlay_error,
+    )
+    outcome = replace(
+        context.outcome,
+        skipped=(*context.outcome.skipped, *safety.failures),
+    )
+    verified_bindings = _deduplicated_public_bindings(finalized.successful)
+    verified_sources = frozenset(binding.source for binding in verified_bindings)
+    missing = tuple(member for member in selected_members if member not in verified_sources)
+    if missing:
+        missing_text = ", ".join(member.stable_id for member in missing)
+        finalized = replace(
+            finalized,
+            overlay_error=(
+                f"requested member(s) failed isolated payload verification: {missing_text}"
+            ),
+        )
+    return finalized, outcome, safety
+
+
+def _select_runtime_safe_variants(
+    context: _TypedPayloadFinalizationContext,
+    finalized: _TypedPayloadFinalizationResult,
+) -> _RuntimeSafetySelectionResult:
+    """Isolate import or binding failures and retain the maximal verified subset.
+
+    Native toolchains can successfully emit an extension that later crashes or
+    raises while its source module is imported. Verification therefore starts
+    with the complete accepted set and bisects failures in fresh interpreters.
+    Variants that cannot verify alone remain interpreted; verified variants are
+    rematerialized from the immutable baseline before wheel promotion.
+
+    Args:
+        context: Baseline payload, staged source roots, and build boundaries.
+        finalized: Variants accepted by static or profitability selection.
+
+    Returns:
+        _RuntimeSafetySelectionResult: Verified variants, rejected evidence,
+        subprocess attempts, and payload rematerialization status.
+    """
+    candidates = finalized.successful
+    if finalized.overlay_error is not None or not candidates:
+        return _RuntimeSafetySelectionResult(
+            successful=candidates,
+            artifacts=finalized.artifacts,
+            build=finalized.build,
+            overlay_error=finalized.overlay_error,
+        )
+
+    attempts: list[PackageVerificationResult] = []
+    rejected_results: dict[str, PackageVerificationResult] = {}
+
+    def verify(candidates_to_verify: tuple[_PreparedTypedRegion, ...]) -> PackageVerificationResult:
+        artifacts = _artifact_records_for_prepared(
+            candidates_to_verify,
+            context.outcome.artifacts,
+        )
+        plan = _typed_verification_plan(
+            tuple(item.shim for item in candidates_to_verify),
+            artifacts,
+        )
+        allowlist = frozenset(item.unit.region_id for item in candidates_to_verify)
+        result = verify_package_subprocess(
+            stage="payload",
+            target=context.install_root,
+            plan=plan,
+            project_root=context.project.config.root,
+            variant_allowlist=allowlist,
+        )
+        _verification_progress(result, context.options.progress)
+        attempts.append(result)
+        return result
+
+    complete_result = verify(candidates)
+    if complete_result.success:
+        return _RuntimeSafetySelectionResult(
+            successful=candidates,
+            artifacts=finalized.artifacts,
+            build=_append_verification_timings(finalized.build, tuple(attempts)),
+            verification_steps=tuple(attempts),
+        )
+
+    harness_result = verify(())
+    if not harness_result.success:
+        return _RuntimeSafetySelectionResult(
+            successful=candidates,
+            artifacts=finalized.artifacts,
+            build=_append_verification_timings(finalized.build, tuple(attempts)),
+            verification_steps=tuple(attempts),
+            overlay_error=(
+                "isolated payload verification failed without any native variants: "
+                f"{_verification_failure_summary(harness_result)}"
+            ),
+        )
+
+    retained = _bisect_runtime_safe_variants(
+        candidates,
+        verify=verify,
+        failed_result=complete_result,
+        rejected_results=rejected_results,
+    )
+    retained = _resolve_runtime_variant_interactions(
+        retained,
+        verify=verify,
+        rejected_results=rejected_results,
+    )
+
+    retained_ids = frozenset(candidate.unit.region_id for candidate in retained)
+    rejected = tuple(
+        candidate for candidate in candidates if candidate.unit.region_id not in retained_ids
+    )
+    failures = tuple(
+        _runtime_verification_failure(
+            candidate,
+            rejected_results.get(candidate.unit.region_id, complete_result),
+        )
+        for candidate in rejected
+    )
+    overlay_error = _materialize_profitable_payload(
+        baseline=context.baseline,
+        staged_source_roots=context.staged_source_roots,
+        install_root=context.install_root,
+        superset=candidates,
+        accepted=retained,
+    )
+    artifacts = _artifact_records_for_prepared(retained, context.outcome.artifacts)
+    _progress(
+        context.options.progress,
+        (f"runtime verification retained {len(retained)} of {len(candidates)} compiled variant(s)"),
+    )
+    return _RuntimeSafetySelectionResult(
+        successful=retained,
+        artifacts=artifacts,
+        build=_append_verification_timings(finalized.build, tuple(attempts)),
+        failures=failures,
+        verification_steps=tuple(attempts),
+        overlay_error=overlay_error,
+    )
+
+
+def _bisect_runtime_safe_variants(
+    candidates: tuple[_PreparedTypedRegion, ...],
+    *,
+    verify: Callable[
+        [tuple[_PreparedTypedRegion, ...]],
+        PackageVerificationResult,
+    ],
+    failed_result: PackageVerificationResult,
+    rejected_results: dict[str, PackageVerificationResult],
+) -> tuple[_PreparedTypedRegion, ...]:
+    """Recursively isolate variants whose activation fails in a fresh child.
+
+    Args:
+        candidates: Ordered native variants represented by ``failed_result``.
+        verify: Fresh-process verifier for an arbitrary candidate subset.
+        failed_result: Verification evidence for the complete candidate tuple.
+        rejected_results: Mutable diagnostic sink keyed by rejected variant ID.
+
+    Returns:
+        tuple[_PreparedTypedRegion, ...]: Variants that verify alone or within
+        their recursively isolated subset.
+    """
+    if failed_result.success:
+        return candidates
+    if len(candidates) == 1:
+        rejected_results[candidates[0].unit.region_id] = failed_result
+        return ()
+    midpoint = len(candidates) // 2
+    left = candidates[:midpoint]
+    right = candidates[midpoint:]
+    return (
+        *_bisect_runtime_safe_variants(
+            left,
+            verify=verify,
+            failed_result=verify(left),
+            rejected_results=rejected_results,
+        ),
+        *_bisect_runtime_safe_variants(
+            right,
+            verify=verify,
+            failed_result=verify(right),
+            rejected_results=rejected_results,
+        ),
+    )
+
+
+def _resolve_runtime_variant_interactions(
+    candidates: tuple[_PreparedTypedRegion, ...],
+    *,
+    verify: Callable[
+        [tuple[_PreparedTypedRegion, ...]],
+        PackageVerificationResult,
+    ],
+    rejected_results: dict[str, PackageVerificationResult],
+) -> tuple[_PreparedTypedRegion, ...]:
+    """Greedily remove variants that fail only when combined with safe peers.
+
+    Args:
+        candidates: Individually verified variants that may interact unsafely.
+        verify: Fresh-process verifier for an arbitrary candidate subset.
+        rejected_results: Mutable diagnostic sink keyed by rejected variant ID.
+
+    Returns:
+        tuple[_PreparedTypedRegion, ...]: Deterministic maximal prefix-compatible
+        subset retained for wheel promotion.
+    """
+    if len(candidates) < _MINIMUM_INTERACTION_VARIANTS or verify(candidates).success:
+        return candidates
+    compatible: list[_PreparedTypedRegion] = []
+    for candidate in candidates:
+        trial = (*compatible, candidate)
+        result = verify(tuple(trial))
+        if result.success:
+            compatible.append(candidate)
+        else:
+            rejected_results[candidate.unit.region_id] = result
+    return tuple(compatible)
+
+
+def _runtime_verification_failure(
+    candidate: _PreparedTypedRegion,
+    result: PackageVerificationResult,
+) -> PackageRegionBuildFailure:
+    """Normalize one unsafe runtime variant into interpreted-fallback evidence.
+
+    Args:
+        candidate: Native variant rejected by isolated activation.
+        result: Child-process evidence that explains the rejection.
+
+    Returns:
+        PackageRegionBuildFailure: Report evidence preserving the Python fallback.
+    """
+    return PackageRegionBuildFailure(
+        region=candidate.generation.region,
+        variant_id=candidate.unit.region_id,
+        backend=candidate.generation.backend,
+        assessment=candidate.assessment,
+        build=_failed_region_attempt(
+            "isolated payload verification rejected native variant: "
+            f"{_verification_failure_summary(result)}"
+        ),
+    )
+
+
+def _verification_failure_summary(result: PackageVerificationResult) -> str:
+    """Return bounded deterministic diagnostics for a failed child verifier.
+
+    Args:
+        result: Failed child-process verification result.
+
+    Returns:
+        str: Last non-empty diagnostic line, or an exit-code fallback, capped
+        for stable progress and report output.
+    """
+    lines = tuple(line.strip() for line in result.stderr.splitlines() if line.strip())
+    if not lines:
+        return f"child exited {result.exit_code} without diagnostics"
+    return lines[-1][:500]
+
+
+def _append_verification_timings(
+    attempt: CompileAttempt,
+    results: tuple[PackageVerificationResult, ...],
+) -> CompileAttempt:
+    """Append every failure-isolation subprocess duration to build evidence.
+
+    Args:
+        attempt: Native compilation evidence receiving verification timings.
+        results: Ordered child-process attempts from safety selection.
+
+    Returns:
+        CompileAttempt: Build evidence with every verification phase appended.
+    """
+    for result in results:
+        attempt = _append_verification_timing(attempt, result)
+    return attempt
 
 
 def _execution_plan_application_for_finalized_payload(
@@ -7938,6 +8410,23 @@ def _resolve_output_dir(root: Path, output_dir: Path | None) -> Path:
     if output_dir.is_absolute():
         return output_dir.resolve()
     return (root / output_dir).resolve()
+
+
+def _source_clean_output_paths(
+    root: Path,
+    output_dir: Path | None,
+) -> tuple[Path, Path, Path]:
+    """Resolve the persistent output and disposable source-clean roots.
+
+    Args:
+        root: Target project root used for the default Atoll directory.
+        output_dir: Optional absolute or project-relative wheel destination.
+
+    Returns:
+        tuple[Path, Path, Path]: Output directory, build root, and install root.
+    """
+    resolved = _resolve_output_dir(root, output_dir)
+    return resolved, resolved / "build", resolved / "install"
 
 
 def _reset_dir(path: Path) -> None:

@@ -6,6 +6,8 @@ import hashlib
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from atoll.runtime.package_verify import (
     PackageVerificationPlan,
     VerificationArtifact,
@@ -200,14 +202,91 @@ __atoll_region_status__ = {'region-1': {'compiled': True}}
     assert result.success is True
 
 
+def test_verify_payload_activates_only_allowlisted_native_variant(tmp_path: Path) -> None:
+    """Verification can exclude a staged variant that would fail during import."""
+    payload, artifact = _variant_payload(tmp_path)
+    plan = PackageVerificationPlan(
+        modules=("pkg",),
+        regions=(("pkg", ("selected-a", "selected-b")),),
+        artifacts=(_artifact(artifact),),
+    )
+
+    result = verify_package_subprocess(
+        stage="payload",
+        target=payload,
+        plan=plan,
+        project_root=tmp_path,
+        variant_allowlist=frozenset(("selected-b", "selected-a")),
+    )
+
+    assert result.success is True
+    assert result.stderr == ""
+
+
+def test_verify_payload_default_activates_all_native_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default verification ignores an inherited allowlist and activates every variant."""
+    payload, artifact = _variant_payload(tmp_path)
+    monkeypatch.setenv("ATOLL_VARIANT_ALLOWLIST", "selected-a")
+    plan = PackageVerificationPlan(
+        modules=("pkg",),
+        regions=(("pkg", ("selected-a", "selected-b", "unselected")),),
+        artifacts=(_artifact(artifact),),
+    )
+
+    result = verify_package_subprocess(
+        stage="payload",
+        target=payload,
+        plan=plan,
+        project_root=tmp_path,
+    )
+
+    assert result.success is False
+    assert "unselected variant activated" in result.stderr
+
+
+def _variant_payload(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a staged package whose second native variant fails on activation."""
+    payload = tmp_path / "payload"
+    package = payload / "pkg"
+    artifact = payload / ".atoll" / "artifacts" / "region" / "native.so"
+    package.mkdir(parents=True)
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"native")
+    (package / "__init__.py").write_text(
+        """import os
+
+allowlist_text = os.getenv("ATOLL_VARIANT_ALLOWLIST")
+allowlist = None if allowlist_text is None else frozenset(allowlist_text.splitlines())
+if allowlist is not None and allowlist_text != "selected-a\\nselected-b":
+    raise RuntimeError(f"variant allowlist is not deterministic: {allowlist_text!r}")
+variants = ("selected-a", "selected-b", "unselected")
+__atoll_region_status__ = {}
+for variant in variants:
+    if allowlist is not None and variant not in allowlist:
+        continue
+    if variant == "unselected":
+        raise RuntimeError("unselected variant activated")
+    __atoll_region_status__[variant] = {"compiled": True}
+""",
+        encoding="utf-8",
+    )
+    return payload, artifact
+
+
+def _artifact(artifact: Path) -> VerificationArtifact:
+    """Return verification metadata for the shared staged native artifact."""
+    return VerificationArtifact(
+        path=".atoll/artifacts/region/native.so",
+        digest=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+    )
+
+
 def _plan(artifact: Path) -> PackageVerificationPlan:
     return PackageVerificationPlan(
         modules=("pkg",),
         regions=(("pkg", ("region-1",)),),
-        artifacts=(
-            VerificationArtifact(
-                path=".atoll/artifacts/region/native.so",
-                digest=hashlib.sha256(artifact.read_bytes()).hexdigest(),
-            ),
-        ),
+        artifacts=(_artifact(artifact),),
     )

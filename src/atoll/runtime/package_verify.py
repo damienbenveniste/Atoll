@@ -43,6 +43,10 @@ else:
     root = target
 sys.path.insert(0, str(root))
 os.environ.pop("ATOLL_DISABLE", None)
+os.environ.pop("ATOLL_VARIANT_ALLOWLIST", None)
+variant_allowlist = plan["variant_allowlist"]
+if variant_allowlist is not None:
+    os.environ["ATOLL_VARIANT_ALLOWLIST"] = "\n".join(variant_allowlist)
 os.environ["ATOLL_REQUIRE_COMPILED"] = "1"
 for artifact in plan["artifacts"]:
     path = root / artifact["path"]
@@ -232,6 +236,7 @@ def verify_package_subprocess(
     target: Path,
     plan: PackageVerificationPlan,
     project_root: Path,
+    variant_allowlist: frozenset[str] | None = None,
 ) -> PackageVerificationResult:
     """Verify compiled routing from an unpacked payload or extracted final wheel.
 
@@ -240,6 +245,8 @@ def verify_package_subprocess(
         target: Wheel or payload path verified in an isolated child process.
         plan: Expected modules, regions, and artifacts for package verification.
         project_root: Root directory of the target Python project.
+        variant_allowlist: Native variant IDs permitted to activate in the child. When
+            omitted, verification activates every staged variant.
 
     Returns:
         PackageVerificationResult: Captured isolated verification evidence for the requested stage.
@@ -261,6 +268,9 @@ def verify_package_subprocess(
                 }
                 for binding in plan.bindings
             ],
+            "variant_allowlist": (
+                sorted(variant_allowlist) if variant_allowlist is not None else None
+            ),
         },
         sort_keys=True,
         separators=(",", ":"),

@@ -47,6 +47,7 @@ CallChainRejectionCode = Literal[
     "ambiguous-call",
     "opaque-call",
     "unproven-root",
+    "unparseable-source",
 ]
 
 CALL_CHAIN_ANALYSIS_VERSION = "call-chain-analysis-v1"
@@ -358,7 +359,22 @@ def analyze_call_chain_scan(scan: ModuleScan) -> CallChainAnalysisResult:
             for member in region.members
             if member.kind in {"function", "method"} and member.execution_kind == "sync"
         }
-        nodes = {member_id: _callable_node(member) for member_id, member in members.items()}
+        nodes: dict[SymbolId, ast.FunctionDef] = {}
+        for member_id, member in members.items():
+            try:
+                nodes[member_id] = _callable_node(member)
+            except _ChainError as error:
+                rejections.append(
+                    CallChainRejection(
+                        root=member.id,
+                        code=error.code,
+                        message=error.message,
+                        lineno=error.lineno,
+                    )
+                )
+        members = {member_id: member for member_id, member in members.items() if member_id in nodes}
+        if not members:
+            continue
         context = _ChainContext(
             scan=scan,
             region=region,
@@ -554,8 +570,20 @@ def _validate_helper_parameter_reads(member: RegionMember, expression: ast.expr)
 
 
 def _callable_node(member: RegionMember) -> ast.FunctionDef:
-    parsed = ast.parse(textwrap.dedent(member.source_text))
-    declarations = tuple(node for node in parsed.body if isinstance(node, ast.FunctionDef))
+    wrapped_source = "if True:\n" + textwrap.indent(member.source_text, "    ")
+    try:
+        parsed = ast.parse(wrapped_source)
+    except SyntaxError as error:
+        source_line = max(1, (error.lineno or 2) - 1)
+        raise _ChainError(
+            "unparseable-source",
+            f"{member.id.stable_id} source cannot be parsed in its lexical context",
+            source_line,
+        ) from error
+    container = parsed.body[0]
+    if not isinstance(container, ast.If):
+        raise TypeError("call-chain source wrapper produced an invalid syntax tree")
+    declarations = tuple(node for node in container.body if isinstance(node, ast.FunctionDef))
     if len(declarations) != 1:
         raise _ChainError(
             "unsupported-helper",
