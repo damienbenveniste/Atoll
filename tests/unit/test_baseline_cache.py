@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -226,7 +227,7 @@ def test_baseline_wheel_cache_rejects_corrupt_artifact(tmp_path: Path) -> None:
 
 
 def test_baseline_wheel_cache_tracks_worktree_git_metadata(tmp_path: Path) -> None:
-    """A copied worktree pointer includes HEAD, index, and common ref changes."""
+    """A copied worktree pointer includes HEAD, staged entries, and common refs."""
     project_root = _project(tmp_path)
     git_dir = tmp_path / "worktree-git"
     common_dir = tmp_path / "common-git"
@@ -245,6 +246,43 @@ def test_baseline_wheel_cache_tracks_worktree_git_metadata(tmp_path: Path) -> No
     second = baseline_wheel_cache_key(project_root)
 
     assert first != second
+
+
+def test_baseline_wheel_cache_normalizes_git_index_stat_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Index housekeeping is stable while staged-entry changes invalidate the key."""
+    project_root = _project(tmp_path)
+    git_dir = tmp_path / "git"
+    git_dir.mkdir()
+    index = git_dir / "index"
+    index.write_bytes(b"raw-index-stat-cache-v1")
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (project_root / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+    semantic_index = tmp_path / "semantic-index"
+    semantic_index.write_bytes(b"100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0\tsrc/demo.py\0")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"sys.stdout.buffer.write(Path({str(semantic_index)!r}).read_bytes())\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    first = baseline_wheel_cache_key(project_root)
+    index.write_bytes(b"raw-index-stat-cache-v2")
+    housekeeping_only = baseline_wheel_cache_key(project_root)
+    semantic_index.write_bytes(b"100644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 0\tsrc/demo.py\0")
+    staged_change = baseline_wheel_cache_key(project_root)
+
+    assert housekeeping_only == first
+    assert staged_change != housekeeping_only
 
 
 @pytest.mark.parametrize(

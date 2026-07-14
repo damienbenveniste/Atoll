@@ -17,6 +17,7 @@ import platform
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import sysconfig
 import tempfile
@@ -372,7 +373,7 @@ def _git_repository_digest(project_root: Path) -> str | None:
                 if common_value.is_absolute()
                 else (git_dir / common_value).resolve()
             )
-        candidates = [git_dir / "HEAD", git_dir / "index", common_dir / "packed-refs"]
+        candidates = [git_dir / "HEAD", common_dir / "packed-refs"]
         candidates.extend(sorted((common_dir / "refs").rglob("*")))
         digest = hashlib.sha256()
         hashed = False
@@ -384,9 +385,51 @@ def _git_repository_digest(project_root: Path) -> str | None:
             digest.update(b"\0")
             digest.update(hashlib.sha256(path.read_bytes()).digest())
             hashed = True
+        index_digest = _git_index_digest(git_dir)
+        if index_digest is not None:
+            digest.update(b"index\0")
+            digest.update(index_digest)
+            hashed = True
     except OSError:
         return None
     return digest.hexdigest() if hashed else None
+
+
+def _git_index_digest(git_dir: Path) -> bytes | None:
+    """Hash staged entries without including Git's mutable stat cache.
+
+    Git may rewrite raw index bytes after a read-only status operation because
+    the index also stores filesystem metadata. ``ls-files --stage`` exposes the
+    semantic mode, object ID, stage, and path entries while ignoring that
+    housekeeping. Falling back to raw bytes remains conservative when Git
+    cannot provide the normalized view.
+
+    Args:
+        git_dir: Repository or linked-worktree Git directory containing the index.
+
+    Returns:
+        bytes | None: Binary SHA-256 digest, or ``None`` when no index exists.
+    """
+    index_path = git_dir / "index"
+    if not index_path.is_file():
+        return None
+    git_command = shutil.which("git")
+    result = None
+    if git_command is not None:
+        try:
+            result = subprocess.run(
+                (git_command, f"--git-dir={git_dir}", "ls-files", "--stage", "-z"),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+    if result is not None and result.returncode == 0:
+        return hashlib.sha256(result.stdout).digest()
+    return hashlib.sha256(index_path.read_bytes()).digest()
 
 
 def _git_directory(marker: Path, project_root: Path) -> Path | None:
