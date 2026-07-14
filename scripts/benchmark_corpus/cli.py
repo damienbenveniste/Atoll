@@ -259,7 +259,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--atoll-root", type=Path, default=DEFAULT_MANIFEST.parents[2])
     run.add_argument("--workspace-root", type=Path, required=True)
     run.add_argument("--evidence-root", type=Path, required=True)
-    run.add_argument("--allow-unsandboxed", action="store_true")
+    run.add_argument(
+        "--allow-unsandboxed",
+        action="store_true",
+        help="use the disposable host itself as the external-code boundary",
+    )
     run.add_argument("--keep-workspace", action="store_true")
     aggregate = commands.add_parser(
         "aggregate",

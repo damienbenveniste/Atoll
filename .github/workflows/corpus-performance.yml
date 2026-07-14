@@ -111,12 +111,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Bubblewrap
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes bubblewrap
-
       - name: Sync corpus runner
         run: uv sync --frozen --all-groups --python 3.12
 
@@ -132,7 +126,8 @@ jobs:
             --tier performance \
             --platform "$CASE_PLATFORM" \
             --workspace-root "$RUNNER_TEMP/corpus-work" \
-            --evidence-root "$RUNNER_TEMP/corpus-results/$CASE_ID"
+            --evidence-root "$RUNNER_TEMP/corpus-results/$CASE_ID" \
+            --allow-unsandboxed
 
       - name: Retain experiment identity
         if: always()

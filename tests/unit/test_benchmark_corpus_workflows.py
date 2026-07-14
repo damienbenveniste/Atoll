@@ -56,6 +56,8 @@ def test_compatibility_workflow_is_weekly_trusted_and_complete() -> None:
     assert "--tier compatibility --platform ubuntu-24.04" in text
     assert "retention-days: 30" in text
     assert "GITHUB_STEP_SUMMARY" in text
+    assert "--allow-unsandboxed" in text
+    assert "Install Bubblewrap" not in text
     assert "promote" not in text
 
 
@@ -85,6 +87,8 @@ def test_performance_workflow_has_reviewed_manual_inputs_and_both_platforms() ->
     assert "github.sha" in text
     assert "retention-days: 30" in text
     assert "GITHUB_STEP_SUMMARY" in text
+    assert "--allow-unsandboxed" in text
+    assert "Install Bubblewrap" not in text
     assert "promote" not in text
 
 

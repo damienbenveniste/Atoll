@@ -26,6 +26,11 @@ def _missing_executable(_name: str) -> None:
     """Model a platform where no sandbox executable is installed."""
 
 
+def _installed_executable(name: str) -> str:
+    """Model an installed platform sandbox executable."""
+    return f"/usr/bin/{name}"
+
+
 def test_sanitized_environment_strips_credentials_and_forces_offline_flags(
     tmp_path: Path,
 ) -> None:
@@ -84,6 +89,19 @@ def test_detect_sandbox_refuses_unsupported_local_execution(
 
     with pytest.raises(RuntimeError, match="external execution refused"):
         detect_sandbox(allow_unsandboxed=False)
+
+    assert detect_sandbox(allow_unsandboxed=True) == "unsandboxed"
+
+
+def test_explicit_unsandboxed_consent_overrides_installed_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ephemeral runners can bypass a present but host-disabled launcher."""
+    monkeypatch.setattr("scripts.benchmark_corpus.process.platform.system", lambda: "Linux")
+    monkeypatch.setattr(
+        "scripts.benchmark_corpus.process.shutil.which",
+        _installed_executable,
+    )
 
     assert detect_sandbox(allow_unsandboxed=True) == "unsandboxed"
 

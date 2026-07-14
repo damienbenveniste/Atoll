@@ -83,7 +83,8 @@ class LifecycleOptions:
         evidence_root: Persistent case-specific evidence directory.
         tier: Manifest tier being executed.
         platform: Workflow runner label.
-        allow_unsandboxed: Explicit local opt-in when no sandbox is available.
+        allow_unsandboxed: Explicit opt-in to use the disposable host itself as
+            the isolation boundary instead of a platform sandbox launcher.
         keep_workspace: Debug-only retention of the disposable workspace.
         repository_mirror: Test-only local Git remote replacing the manifest URL.
         adapter_root: Test-only reviewed adapter directory override.

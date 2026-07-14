@@ -88,6 +88,9 @@ Ubuntu cases with at most four VMs in parallel. The manual
 one platform, and an experiment label. Both workflows run only from the trusted
 default branch, retain evidence for 30 days, and write aggregates to the GitHub
 workflow summary. Neither runs on pull requests or commits history.
+Each scheduled case explicitly uses its ephemeral VM as the external-code
+boundary. Local runs remain sandboxed by default and require an explicit
+`--allow-unsandboxed` acknowledgement to use the same mode.
 
 ## Reviewed History
 

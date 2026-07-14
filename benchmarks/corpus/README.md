@@ -40,8 +40,11 @@ uv run python -m scripts.benchmark_corpus run CASE_ID \
 ```
 
 Local execution requires `sandbox-exec` on macOS or Bubblewrap on Linux. The
-explicit `--allow-unsandboxed` escape hatch is intended only for a disposable
-machine whose external code risk is understood.
+explicit `--allow-unsandboxed` escape hatch selects the host itself as the
+isolation boundary and is intended only for a disposable machine whose external
+code risk is understood. The trusted-branch GitHub workflows set this flag
+because each corpus case owns an ephemeral VM; local commands omit it by
+default.
 
 Repository cases are added only after their dependency lock and canonical oracle
 are present. External code is executed by the isolated lifecycle runner, never by

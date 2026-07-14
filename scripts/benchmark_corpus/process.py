@@ -164,13 +164,17 @@ def sanitized_environment(
 def detect_sandbox(allow_unsandboxed: bool) -> Sandbox:
     """Select a supported boundary for running untrusted external code.
 
-    macOS uses ``sandbox-exec`` and Linux uses Bubblewrap, including on CI.
+    By default, macOS uses ``sandbox-exec`` and Linux uses Bubblewrap.
     Environment markers are not trusted as isolation evidence. A machine
     without the platform tool is refused unless the caller explicitly opts
-    into unsandboxed execution.
+    into unsandboxed execution. Explicit consent selects unsandboxed execution
+    even when an installed sandbox launcher is unusable in the current host,
+    as happens on some ephemeral CI runners.
 
     Args:
-        allow_unsandboxed: Permit local execution without an isolation tool.
+        allow_unsandboxed: Explicitly select execution without an isolation
+            tool. Callers should use this only when the host itself is the
+            disposable isolation boundary.
 
     Returns:
         Sandbox: Execution mode to pass to :func:`run_process`.
@@ -179,13 +183,13 @@ def detect_sandbox(allow_unsandboxed: bool) -> Sandbox:
         RuntimeError: If no supported boundary exists and unsandboxed execution
             was not explicitly allowed.
     """
+    if allow_unsandboxed:
+        return "unsandboxed"
     system = platform.system()
     if system == "Darwin" and shutil.which("sandbox-exec") is not None:
         return "sandbox-exec"
     if system == "Linux" and shutil.which("bwrap") is not None:
         return "bwrap"
-    if allow_unsandboxed:
-        return "unsandboxed"
     raise RuntimeError(
         "external execution refused: no supported sandbox is available; "
         "use an ephemeral GitHub Actions runner, install sandbox-exec/bwrap, "
