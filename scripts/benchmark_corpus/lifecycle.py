@@ -798,10 +798,28 @@ def classify_compile_process(
     )
 
 
-def _agreed_compile_status(cold: CaseStatus, warm: CaseStatus) -> CaseStatus:
-    """Require deterministic compile shape while tolerating timing variance."""
+def agree_compile_status(cold: CaseStatus, warm: CaseStatus) -> CaseStatus:
+    """Combine cold and warm outcomes without turning timing noise into a compiler error.
+
+    A clean no-op and a measured not-profitable result both leave no Atoll wheel.
+    Their difference means a marginal candidate crossed the short search gate in
+    only one run before failing the full promotion gate; the corpus retains that
+    as not-profitable evidence instead of misclassifying it as a compile failure.
+
+    Args:
+        cold: Classification from the empty-cache compile.
+        warm: Classification from the identical cache-reuse compile.
+
+    Returns:
+        CaseStatus: Agreed outcome or an unstable measured result.
+
+    Raises:
+        LifecycleError: The two compiles disagree about a non-timing outcome.
+    """
     if cold == warm:
         return warm
+    if {cold, warm} == {"supported-no-op", "not-profitable"}:
+        return "not-profitable"
     measured = {"accelerated", "not-profitable", "unstable"}
     if cold in measured and warm in measured:
         return "unstable"
@@ -904,10 +922,11 @@ def _compile_cold_and_warm(
     _validate_warm_report(warm_report)
     state.source_after = _current_source_manifest(paths, state)
     _write_source_manifest(state.source_after, paths.evidence / "source-manifest-after.json")
-    status = _agreed_compile_status(cold_status, warm_status)
-    if status == "unstable" and cold_status != warm_status:
+    status = agree_compile_status(cold_status, warm_status)
+    if cold_status != warm_status:
         state.diagnostics.append(
-            f"cold and warm performance outcomes differed: {cold_status} versus {warm_status}"
+            f"cold and warm performance outcomes differed: {cold_status} versus {warm_status}; "
+            f"classified as {status}"
         )
     wheel = _compiled_wheel_for_status(paths, baseline_wheel, status)
     if wheel is not None:

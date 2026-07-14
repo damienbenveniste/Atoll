@@ -170,9 +170,12 @@ build state.
 Benchmark-guided builds continue to collect a fresh profile on every invocation. The 2 ms sampler
 measures process-CPU leaf frames, may combine up to three short sampling passes to reach the minimum
 evidence floor, and retains nested scheduler attribution as orchestration evidence rather than
-native-candidate work. A supported benchmark that still has insufficient evidence follows the
-measured no-op path instead of starting an exhaustive native build. The first strict native
-candidate plan is stored under `.atoll/cache/profile-plans/`, preventing statistical sample jitter,
+native-candidate work. The unmeasured monitoring pass feeds mapped project starts into a
+fixed-budget heavy-hitter summary while limiting lifecycle and argument-type capture to selected
+targets, so very frequent thin work can be trialed without unbounded observation. A supported
+benchmark that still has insufficient evidence follows the measured no-op path instead of starting
+an exhaustive native build. The first strict native candidate plan is stored under
+`.atoll/cache/profile-plans/`, preventing statistical sample jitter,
 including a later empty selection, from creating a cold artifact variant on an unchanged warm
 build. Replay never skips the configured semantic, marginal-profitability, or final benchmark
 gates. After a source candidate passes every final 3x gate, Atoll stores only its strict identity
@@ -199,9 +202,11 @@ successful compilation is not a speedup claim.
 With both `test_command` and `benchmark_command`, `atoll compile` evaluates source rewrites for hot
 async fan-out and fan-in pipelines. Trial eligibility requires 10,000 observed work items, no
 observed suspension for the fused callable shape, and at least 70% mapped hot-path coverage. Atoll
-ranks at most two plans and tests no more than eight ordered compositions with beam width two and
-depth four. An unsafe residual remains report evidence and does not block a later independently
-proven transformation.
+uses the sampled coverage's 95% Wilson upper bound for this pre-trial decision, preventing noisy
+point estimates near 70% from changing unchanged cold and warm eligibility. Fresh semantic and
+profitability gates remain mandatory. Atoll ranks at most two plans and tests no more than eight
+ordered compositions with beam width two and depth four. An unsafe residual remains report
+evidence and does not block a later independently proven transformation.
 
 LibCST applies each candidate only in a temporary project copy. The guarded path can drain a private
 transport in batches, execute proven quiescent coroutine work in one copied `Context` per logical
@@ -276,13 +281,17 @@ commands, it builds and tests the baseline wheel before region selection, then r
 profiling. A 2 ms statistical sampler combines project leaf frames with nested scheduler or library
 frames attributed to the active project caller. A bounded Python 3.12 monitoring pass records
 lifecycle counts and canonical `module.qualname` argument type identities for the hottest combined
-activity without retaining values or representations. Reports keep at most eight signatures per
-member and distinguish polymorphism from a reached observation budget. Recognized task-spawn
-callees are also targeted directly; reports retain their completion count, maximum overlap, and
-pre-completion suspension count. Atoll requires 100 total samples, considers candidates with at
-least 20 attributed samples and 2% of workload samples, and selects at most four in descending order
-until they cover 80% of mapped project activity. Unsupported launchers or insufficient samples fall
-back to static selection while retaining the final performance gate.
+activity without retaining values or representations. It also maintains a bounded heavy-hitter
+summary across mapped project callables, processing at most 1,000,000 mapped starts and retaining at
+most 128 callable identities without collecting unbounded type evidence. Reports keep at most eight
+signatures per targeted member and distinguish polymorphism from a reached observation budget.
+Recognized task-spawn callees are also targeted directly; reports retain their completion count,
+maximum overlap, and pre-completion suspension count. Atoll requires 100 total samples, considers
+candidates with at least 20 leaf samples and 2% of workload samples, and separately considers mapped
+callables observed with a conservative lower bound of at least 10,000 calls and 2% of bounded
+invocation activity. It selects at most four; leaf-sample selection stops at 80% mapped coverage,
+while invocation-hot decisions remain explicit. Unsupported launchers or insufficient evidence
+fall back to static selection while retaining the final performance gate.
 
 For a supported profile, Atoll compiles the candidate superset once and tests candidates in hotness
 order through an internal region allowlist. Each candidate combination runs the semantic command

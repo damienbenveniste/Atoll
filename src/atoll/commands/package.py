@@ -1430,13 +1430,7 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
             project.config.compile.backends,
             support=profile_support,
         )
-        _progress(
-            options.progress,
-            (
-                f"profile selected {len(profile.selected_symbols)} hot member(s) covering "
-                f"{profile.selected_hot_coverage:.1%} of mapped project samples"
-            ),
-        )
+        _profile_selection_progress(options.progress, profile)
     execution_plans = build_execution_plans(scans, profile)
     selected_execution_plans = tuple(
         plan for plan in execution_plans if isinstance(plan, ExecutionPlan)
@@ -1750,6 +1744,7 @@ def _profile_source_candidate(
         support=support,
     )
     _profile_progress(options.progress, selected)
+    _profile_selection_progress(options.progress, selected)
     return selected
 
 
@@ -5322,6 +5317,50 @@ def _profile_progress(progress: PackageProgress | None, profile: ProfileResult) 
     )
 
 
+def _profile_selection_progress(
+    progress: PackageProgress | None,
+    profile: ProfileResult,
+) -> None:
+    """Explain sample-hot and invocation-hot compile selection separately.
+
+    Args:
+        progress: Optional CLI progress callback.
+        profile: Profile after backend-supported candidate mapping.
+    """
+    leaf_hot = sum(
+        candidate.selected and candidate.selection_basis == "leaf-samples"
+        for candidate in profile.candidates
+    )
+    invocation_hot = sum(
+        candidate.selected and candidate.selection_basis == "invocation-count"
+        for candidate in profile.candidates
+    )
+    cache_replayed = sum(
+        candidate.selected and candidate.selection_basis == "cache-replay"
+        for candidate in profile.candidates
+    )
+    other = max(
+        0,
+        len(profile.selected_symbols) - leaf_hot - invocation_hot - cache_replayed,
+    )
+    broad = profile.broad_invocations
+    invocation_evidence = (
+        f"; invocation evidence {broad.observed_events}/{broad.event_limit} mapped starts, "
+        f"{len(broad.members)}/{broad.member_limit} heavy hitters retained"
+        if broad is not None
+        else ""
+    )
+    _progress(
+        progress,
+        (
+            f"profile selected {len(profile.selected_symbols)} compile candidate(s): "
+            f"{leaf_hot} leaf-hot, {invocation_hot} invocation-hot, "
+            f"{cache_replayed} cache-replayed, {other} promoted by call-chain evidence; "
+            f"leaf coverage {profile.selected_hot_coverage:.1%}{invocation_evidence}"
+        ),
+    )
+
+
 def _region_selection_error(
     *,
     profile: ProfileResult | None,
@@ -8841,9 +8880,23 @@ def _profile_with_replayed_compile_selection(
     for candidate in profile.candidates:
         if candidate.symbol in selected:
             seen.add(candidate.symbol)
-            candidates.append(replace(candidate, selected=True, reason="cache-replayed"))
+            candidates.append(
+                replace(
+                    candidate,
+                    selected=True,
+                    reason="cache-replayed",
+                    selection_basis="cache-replay",
+                )
+            )
         elif candidate.selected:
-            candidates.append(replace(candidate, selected=False, reason="cache-replay-excluded"))
+            candidates.append(
+                replace(
+                    candidate,
+                    selected=False,
+                    reason="cache-replay-excluded",
+                    selection_basis="none",
+                )
+            )
         else:
             candidates.append(candidate)
     for symbol in decision.selection:
@@ -8868,6 +8921,17 @@ def _profile_with_replayed_compile_selection(
                 ),
                 selected=True,
                 reason="cache-replayed",
+                invocation_lower_bound=(member.invocation_lower_bound if member is not None else 0),
+                invocation_upper_bound=(member.invocation_upper_bound if member is not None else 0),
+                invocation_coverage=_sample_coverage(
+                    member.invocation_lower_bound if member is not None else 0,
+                    (
+                        profile.broad_invocations.observed_events
+                        if profile.broad_invocations is not None
+                        else 0
+                    ),
+                ),
+                selection_basis="cache-replay",
             )
         )
     selected_samples = sum(

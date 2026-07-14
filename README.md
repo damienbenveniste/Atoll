@@ -210,16 +210,21 @@ all reusable build state.
 For benchmark-guided builds, Atoll still collects a fresh profile on every invocation. The 2 ms
 sampler measures process-CPU leaf frames, may combine up to three short sampling passes to reach the
 minimum evidence floor, and keeps nested scheduler attribution as orchestration evidence rather
-than native-candidate work. A supported benchmark that still produces insufficient evidence takes
-the measured no-op path instead of triggering an exhaustive native build. Atoll stores the first
-source- and environment-bound native candidate plan under `.atoll/cache/profile-plans/` so sampling
-jitter, including a later empty selection, cannot force new compiler work on an unchanged warm
-build. A replayed plan still runs the configured semantic, marginal-profitability, and final
-benchmark gates. A source candidate that passes every final 3x gate stores only its strict identity
-under `.atoll/cache/accepted-winners/`; a warm run re-evaluates that same candidate with fresh tests,
-profiles, and timings. The identity includes benchmark and test content, project metadata, the
-baseline wheel payload, dependency versions, and build environment. If replay fails semantics, that
-candidate remains rejected for the rest of the invocation while the other candidates are searched.
+than native-candidate work. The unmeasured monitoring pass feeds mapped project starts into a
+fixed-budget heavy-hitter summary, while retaining lifecycle and argument-type observations only
+for bounded targets. This lets frequently called work that is too short to appear as a leaf sample
+enter profitability trials without making invocation or type capture unbounded. A supported
+benchmark that still produces insufficient evidence takes the measured no-op path instead of
+triggering an exhaustive native build. Atoll stores the first source- and environment-bound native
+candidate plan under `.atoll/cache/profile-plans/`, so sampling jitter, including a later empty
+selection, cannot force new compiler work on an unchanged warm build. A replayed plan still runs
+the configured semantic, marginal-profitability, and final benchmark gates. A source candidate
+that passes every final 3x gate stores only its strict identity under
+`.atoll/cache/accepted-winners/`; a warm run re-evaluates
+that same candidate with fresh tests, profiles, and timings. The identity includes benchmark and
+test content, project metadata, the baseline wheel payload, dependency versions, and build
+environment. If replay fails semantics, that candidate remains rejected for the rest of the
+invocation while the other candidates are searched.
 If replay passes, it seeds the fresh bounded search but does not bypass current-environment
 candidate comparisons; another candidate replaces it only after meeting the marginal speedup gate.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
@@ -238,8 +243,11 @@ accepted CPU-bound code; successful compilation is not a speedup claim.
 When both `test_command` and `benchmark_command` are configured, `atoll compile` also evaluates
 source-to-source optimization for hot async fan-out and fan-in pipelines. It requires at least
 10,000 observed work items, zero observed suspension for the fused callable shape, and 70% mapped
-hot-path coverage before a source plan can be trialed. Atoll ranks at most two plans and searches at
-most eight ordered compositions with beam width two and depth four. An unsafe residual step is
+hot-path coverage before a source plan can be trialed. Because that coverage is sampled, Atoll uses
+the 95% Wilson upper bound to avoid alternating cold and warm eligibility at the threshold; only
+clearly sub-threshold plans are rejected before trial. Fresh semantic and performance gates still
+control every promotion. Atoll ranks at most two plans and searches at most eight ordered
+compositions with beam width two and depth four. An unsafe residual step is
 reported and skipped without blocking a later independently proven step.
 
 The source lowerer uses LibCST in a temporary project copy. Its cumulative guarded path can batch
@@ -321,14 +329,17 @@ commands, Atoll first builds and tests the baseline wheel, then runs unmeasured 
 selecting regions. A 2 ms statistical sampler attributes both project leaf frames and nested
 scheduler or library frames to the active project caller. A bounded Python 3.12 monitoring pass
 records lifecycle counts and canonical `module.qualname` argument type identities for the hottest
-combined activity. Reports never persist argument values or representations, retain at most eight
-signatures per member, and mark polymorphic or observation-capped evidence explicitly. Recognized
-task-spawn callees are also observed directly. Their evidence includes completed calls, maximum
-overlapping active calls, and suspensions before completion.
-Atoll requires 100 workload samples, then considers members with at least 20 attributed samples and
-2% of the workload. It selects at most four in descending order until they cover 80% of mapped
-project activity. Unsupported launchers or insufficient samples use static selection, but still run
-the final benchmark gate.
+combined activity. The same unmeasured pass maintains a bounded heavy-hitter summary across mapped
+project callables without collecting values or unbounded signatures. It processes at most 1,000,000
+mapped starts and retains at most 128 callable identities. Reports never persist argument values or
+representations, retain at most eight signatures per targeted member, and mark polymorphic or
+observation-capped evidence explicitly. Recognized task-spawn callees are also observed directly.
+Their evidence includes completed calls, maximum overlapping active calls, and suspensions before
+completion. Atoll requires 100 workload samples, then considers members with at least 20 leaf
+samples and 2% of the workload, plus mapped callables whose conservative lower bound reaches 10,000
+calls and 2% of bounded invocation activity. It selects at most four; leaf-sample selection stops at
+80% mapped coverage, while invocation-hot selection is reported separately. Unsupported launchers
+or insufficient evidence use static selection, but still run the final benchmark gate.
 
 For a supported profile, Atoll compiles the selected candidates once and evaluates them in hotness
 order. Each candidate combination runs the semantic command once, then one warmup and three

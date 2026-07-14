@@ -10,6 +10,7 @@ a plan is credible enough for a later disposable trial.
 from __future__ import annotations
 
 import ast
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -36,6 +37,7 @@ SOURCE_OPTIMIZATION_LOWERING_VERSION = "source-optimization-analysis-v1"
 MINIMUM_SOURCE_OPTIMIZATION_SPEEDUP = HARD_BENCHMARK_MINIMUM_SPEEDUP
 MINIMUM_OBSERVED_WORK_ITEMS = 10_000
 MINIMUM_ATTRIBUTED_HOT_SHARE = 0.70
+_HOT_SHARE_CONFIDENCE_Z = 1.959963984540054
 MAX_SOURCE_OPTIMIZATION_PLANS = 2
 _TRANSPORT_PAIR_SIZE = 2
 
@@ -123,6 +125,7 @@ class _AssessmentEvidence:
     observed_work_items: int
     immediate_result_ratio: float
     attributed_hot_share: float
+    attributable_sample_count: int
     work_evidence: tuple[SourceCallableEvidence, ...]
 
 
@@ -255,6 +258,15 @@ def _assessment(context: _AssessmentContext) -> SourceOptimizationAssessment:
         default=0.0,
     )
     attributed_hot_share = min(1.0, sum(item.hot_share for item in evidence))
+    attributable_sample_count = (
+        profile.mapped_project_samples + profile.scheduler_overhead_samples
+        if profile is not None
+        else 0
+    )
+    hot_share_upper_bound = _hot_share_upper_confidence_bound(
+        attributed_hot_share,
+        attributable_sample_count,
+    )
     scheduler_overhead_samples = sum(item.scheduler_overhead_samples for item in evidence)
     scheduler_overhead_share = (
         scheduler_overhead_samples / profile.total_samples
@@ -269,6 +281,7 @@ def _assessment(context: _AssessmentContext) -> SourceOptimizationAssessment:
             observed_work_items=observed_work_items,
             immediate_result_ratio=immediate_result_ratio,
             attributed_hot_share=attributed_hot_share,
+            attributable_sample_count=attributable_sample_count,
             work_evidence=work_evidence,
         ),
     )
@@ -301,6 +314,11 @@ def _assessment(context: _AssessmentContext) -> SourceOptimizationAssessment:
             (
                 f"{attributed_hot_share:.1%} of attributable project and scheduler samples "
                 "map to the execution-plan boundary"
+            ),
+            (
+                "95% hot-share upper confidence bound is "
+                f"{hot_share_upper_bound:.1%} "
+                f"from {attributable_sample_count} attributable sample(s)"
             ),
         ),
         callable_evidence=evidence,
@@ -350,9 +368,17 @@ def _scale_rejections(
             f"observed {evidence.observed_work_items} work items; "
             f"{MINIMUM_OBSERVED_WORK_ITEMS} required"
         )
-    if evidence.attributed_hot_share < MINIMUM_ATTRIBUTED_HOT_SHARE:
+    hot_share_upper_bound = _hot_share_upper_confidence_bound(
+        evidence.attributed_hot_share,
+        evidence.attributable_sample_count,
+    )
+    if (
+        evidence.attributed_hot_share < MINIMUM_ATTRIBUTED_HOT_SHARE
+        and hot_share_upper_bound < MINIMUM_ATTRIBUTED_HOT_SHARE
+    ):
         rejections.append(
-            f"attributed hot share {evidence.attributed_hot_share:.1%}; "
+            f"attributed hot share {evidence.attributed_hot_share:.1%} "
+            f"(95% upper bound {hot_share_upper_bound:.1%}); "
             f"{MINIMUM_ATTRIBUTED_HOT_SHARE:.0%} required"
         )
     if not guarded_suspension and evidence.immediate_result_ratio < 1.0:
@@ -361,6 +387,33 @@ def _scale_rejections(
             "zero observed suspension required"
         )
     return tuple(rejections)
+
+
+def _hot_share_upper_confidence_bound(share: float, sample_count: int) -> float:
+    """Return the Wilson upper bound for sampled hot-path coverage.
+
+    A hard decision on the point estimate makes identical workloads alternate
+    around the promotion threshold. The upper bound only decides whether a
+    disposable trial is credible; semantic and performance gates still decide
+    whether any output is promoted.
+
+    Args:
+        share: Observed fraction of attributable samples inside the plan boundary.
+        sample_count: Total attributable project and nested-library samples.
+
+    Returns:
+        float: Two-sided 95% Wilson interval upper endpoint, clamped to one.
+    """
+    if sample_count <= 0:
+        return 0.0
+    bounded_share = min(1.0, max(0.0, share))
+    z_squared = _HOT_SHARE_CONFIDENCE_Z * _HOT_SHARE_CONFIDENCE_Z
+    denominator = 1.0 + z_squared / sample_count
+    center = bounded_share + z_squared / (2.0 * sample_count)
+    radius = _HOT_SHARE_CONFIDENCE_Z * math.sqrt(
+        (bounded_share * (1.0 - bounded_share) + z_squared / (4.0 * sample_count)) / sample_count
+    )
+    return min(1.0, (center + radius) / denominator)
 
 
 def _source_safety_rejections(

@@ -4331,6 +4331,10 @@ def test_profile_compile_plan_replays_first_selection_and_invalidates_on_source_
         (score, "cache-replay-excluded"),
         (rank, "cache-replayed"),
     ]
+    assert [candidate.selection_basis for candidate in warm.candidates] == [
+        "none",
+        "cache-replay",
+    ]
     assert any("profile compile plan cache miss" in message for message in progress)
     assert any("profile compile plan cache hit" in message for message in progress)
 
@@ -4429,6 +4433,11 @@ def test_profile_compile_replay_restores_candidates_missing_from_fresh_ranking(
         (score, 80, "cache-replay-excluded"),
         (rank, PROFILE_REPLAY_RANK_SAMPLES, "cache-replayed"),
         (missing, 0, "cache-replayed"),
+    ]
+    assert [item.selection_basis for item in replayed.candidates] == [
+        "none",
+        "cache-replay",
+        "cache-replay",
     ]
 
 

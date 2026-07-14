@@ -8,6 +8,7 @@ stdout, stderr, and exit status flow through the child process unchanged.
 
 from __future__ import annotations
 
+import heapq
 import inspect
 import json
 import os
@@ -32,6 +33,9 @@ type _SignalHandler = signal.Handlers | int | Callable[[int, FrameType | None], 
 _SAMPLE_INTERVAL_SECONDS = 0.002
 _MAX_SIGNATURES_PER_MEMBER = 8
 _MAX_TYPE_OBSERVATIONS_PER_MEMBER = 256
+_MAX_BROAD_INVOCATION_EVENTS = 1_000_000
+_MAX_BROAD_INVOCATION_MEMBERS = 128
+_HEAVY_HITTER_HEAP_REBUILD_FACTOR = 4
 _MONITORING_TOOL_ID = 5
 _MODULE_PATH_PARTS = 2
 _LIFECYCLE_EVENT_NAMES = ("start", "return", "yield", "resume", "unwind", "throw")
@@ -85,6 +89,94 @@ class _CallEdgeTarget:
     col_offset: int
     end_lineno: int | None
     end_col_offset: int | None
+
+
+class _BoundedInvocationTracker:
+    """Retain conservative heavy hitters with bounded events and memory.
+
+    The space-saving summary stores an estimated upper count and replacement
+    error for at most 128 mapped project callables. ``estimate - error`` is a
+    conservative lower bound suitable for candidate selection. No frame,
+    argument, value, or representation survives the callback.
+    """
+
+    def __init__(self) -> None:
+        self._estimates: dict[str, int] = {}
+        self._errors: dict[str, int] = {}
+        self._heap: list[tuple[int, str]] = []
+        self._observed_events = 0
+
+    @property
+    def capped(self) -> bool:
+        """Return whether the event budget has been exhausted.
+
+        Returns:
+            bool: ``True`` after the tracker processes its fixed event budget.
+        """
+        return self._observed_events >= _MAX_BROAD_INVOCATION_EVENTS
+
+    def observe(self, key: str) -> None:
+        """Observe one mapped start without exceeding fixed state limits.
+
+        Args:
+            key: Canonical ``module::qualname`` identity for the started frame.
+        """
+        if self.capped:
+            return
+        self._observed_events += 1
+        estimate = self._estimates.get(key)
+        if estimate is not None:
+            estimate += 1
+            self._estimates[key] = estimate
+            heapq.heappush(self._heap, (estimate, key))
+        elif len(self._estimates) < _MAX_BROAD_INVOCATION_MEMBERS:
+            self._estimates[key] = 1
+            self._errors[key] = 0
+            heapq.heappush(self._heap, (1, key))
+        else:
+            minimum, evicted = self._minimum()
+            del self._estimates[evicted]
+            del self._errors[evicted]
+            estimate = minimum + 1
+            self._estimates[key] = estimate
+            self._errors[key] = minimum
+            heapq.heappush(self._heap, (estimate, key))
+        if len(self._heap) > _MAX_BROAD_INVOCATION_MEMBERS * _HEAVY_HITTER_HEAP_REBUILD_FACTOR:
+            self._heap = [(count, member) for member, count in self._estimates.items()]
+            heapq.heapify(self._heap)
+
+    def payload(self) -> JsonObject:
+        """Return bounded lower and upper invocation-count evidence.
+
+        Returns:
+            JsonObject: Event and member budgets plus retained callable bounds.
+        """
+        members: list[JsonValue] = []
+        for key, upper_bound in sorted(
+            self._estimates.items(),
+            key=lambda item: (-(item[1] - self._errors[item[0]]), item[0]),
+        ):
+            members.append(
+                {
+                    "key": key,
+                    "lower_bound": upper_bound - self._errors[key],
+                    "upper_bound": upper_bound,
+                }
+            )
+        return {
+            "observed_events": self._observed_events,
+            "event_limit": _MAX_BROAD_INVOCATION_EVENTS,
+            "member_limit": _MAX_BROAD_INVOCATION_MEMBERS,
+            "capped": self.capped,
+            "members": members,
+        }
+
+    def _minimum(self) -> tuple[int, str]:
+        while self._heap:
+            estimate, key = heapq.heappop(self._heap)
+            if self._estimates.get(key) == estimate:
+                return estimate, key
+        raise RuntimeError("bounded invocation heap lost retained members")
 
 
 def main(argv: tuple[str, ...] | None = None) -> int:
@@ -170,6 +262,7 @@ class _SamplingProfiler:
             "signatures": {},
             "spawn_sites": [],
             "call_edges": [],
+            "broad_invocations": _BoundedInvocationTracker().payload(),
         }
 
     def _sample(self, _signum: int, frame: FrameType | None) -> None:
@@ -202,6 +295,7 @@ class _SamplingProfiler:
 class _TypeProfiler:
     def __init__(self, config: _Config) -> None:
         self._mapper = _FrameMapper(config)
+        self._broad_invocations = _BoundedInvocationTracker()
         self._targets = config.targets
         self._spawn_targets = config.spawn_targets
         self._spawn_targets_by_owner = _spawn_targets_by_owner(config.spawn_targets)
@@ -229,7 +323,7 @@ class _TypeProfiler:
         self._enabled = False
 
     def start(self) -> None:
-        """Enable complete lifecycle counts and bounded hot-member argument types.
+        """Enable project invocation counts and bounded target lifecycle and types.
 
         Raises:
             RuntimeError: Python's monitoring tool slot cannot be reserved.
@@ -289,7 +383,7 @@ class _TypeProfiler:
         """Return JSON evidence from the type-observation pass.
 
         Returns:
-            JsonObject: Complete invocation/lifecycle and bounded canonical type observations.
+            JsonObject: Project invocation counts plus bounded target lifecycle and type evidence.
         """
         signatures: JsonObject = {}
         for key in sorted(self._signatures):
@@ -373,12 +467,16 @@ class _TypeProfiler:
                 }
                 for target in self._call_edge_targets
             ],
+            "broad_invocations": self._broad_invocations.payload(),
         }
 
     def _on_start(self, code: CodeType, _offset: int) -> object:
         key = self._mapper.code_key(code)
-        if key is None or key not in self._targets:
+        if key is None:
             return sys.monitoring.DISABLE
+        self._broad_invocations.observe(key)
+        if key not in self._targets:
+            return sys.monitoring.DISABLE if self._broad_invocations.capped else None
         self._enable_target_lifecycle(code, key)
         self._count_lifecycle(key, "start")
         self._start_invocation(key)

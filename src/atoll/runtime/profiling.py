@@ -37,11 +37,19 @@ CandidateDecisionReason = Literal[
     "cache-replayed",
     "cache-replay-excluded",
 ]
+CandidateSelectionBasis = Literal[
+    "none",
+    "leaf-samples",
+    "invocation-count",
+    "cache-replay",
+]
 
 _MIN_TOTAL_SAMPLES = 100
 _MAX_SAMPLING_ATTEMPTS = 3
 _MIN_CANDIDATE_SAMPLES = 20
 _MIN_CANDIDATE_SHARE = 0.02
+_MIN_INVOCATION_CANDIDATE_COUNT = 10_000
+_MIN_INVOCATION_CANDIDATE_SHARE = 0.02
 _TARGET_MAPPED_COVERAGE = 0.80
 _MAX_SELECTED_CANDIDATES = 4
 _BOOTSTRAP_PATH = Path(__file__).with_name("_profile_bootstrap.py")
@@ -91,14 +99,6 @@ class _BootstrapRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class _CandidatePolicyContext:
-    total_samples: int
-    mapped_activity_samples: int
-    selected_samples: int
-    selected_count: int
-
-
-@dataclass(frozen=True, slots=True)
 class _ProfileMemberPayloadContext:
     """Merged sampling and lifecycle payloads used to construct one member record.
 
@@ -107,12 +107,14 @@ class _ProfileMemberPayloadContext:
         scheduler_overhead_counts: Nested non-project samples grouped by project caller.
         signature_payload: Bounded canonical type observations grouped by member.
         member_lifecycle_payload: Lifecycle event counts grouped by member.
+        broad_invocation_counts: Conservative project-wide count bounds by member.
     """
 
     total_samples: int
     scheduler_overhead_counts: JsonObject
     signature_payload: JsonObject
     member_lifecycle_payload: JsonObject
+    broad_invocation_counts: dict[str, tuple[int, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +157,51 @@ class LifecycleCounts:
     resume: int
     unwind: int
     throw: int
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedInvocationMember:
+    """Conservative invocation bounds for one retained project callable.
+
+    Attributes:
+        module: Importable module resolved from the mapped source path.
+        qualname: Runtime qualified name from the mapped code object.
+        lower_bound: Guaranteed minimum calls observed before the event cap.
+        upper_bound: Space-saving estimate that is at least the true count.
+    """
+
+    module: str
+    qualname: str
+    lower_bound: int
+    upper_bound: int
+
+    @property
+    def symbol(self) -> SymbolId:
+        """Return the static identity implied by this retained member.
+
+        Returns:
+            SymbolId: Module and qualified-name identity used by static scans.
+        """
+        return SymbolId(self.module, self.qualname)
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedInvocationSummary:
+    """Fixed-budget project-wide invocation evidence.
+
+    Attributes:
+        observed_events: Mapped starts processed before workload completion or the cap.
+        event_limit: Maximum mapped starts processed by this profile pass.
+        member_limit: Maximum callable identities retained by the heavy-hitter summary.
+        capped: Whether the event budget was exhausted.
+        members: Retained callable count bounds in deterministic order.
+    """
+
+    observed_events: int
+    event_limit: int
+    member_limit: int
+    capped: bool
+    members: tuple[BoundedInvocationMember, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +357,8 @@ class ProfiledMember:
         completed_calls: Target invocations observed through a return or unwind event.
         max_active_calls: Maximum simultaneous active invocations observed for this member.
         pre_completion_suspensions: Yield events observed while a target invocation was active.
+        invocation_lower_bound: Conservative count from bounded project-wide observation.
+        invocation_upper_bound: Upper count estimate from bounded project-wide observation.
     """
 
     module: str
@@ -327,6 +376,8 @@ class ProfiledMember:
     completed_calls: int = 0
     max_active_calls: int = 0
     pre_completion_suspensions: int = 0
+    invocation_lower_bound: int = 0
+    invocation_upper_bound: int = 0
 
     @property
     def immediate_result_ratio(self) -> float:
@@ -378,6 +429,10 @@ class MappedCandidateDecision:
         scheduler_overhead_samples: Nested scheduler or library samples owned by the member.
         attributed_samples: Leaf plus nested samples used by the hotness policy.
         attributed_coverage: Fraction of total workload samples used by the hotness policy.
+        invocation_lower_bound: Conservative project-wide call-count bound.
+        invocation_upper_bound: Project-wide call-count upper estimate.
+        invocation_coverage: Lower-bound share of bounded mapped invocation events.
+        selection_basis: Evidence that selected this member, or ``none`` when rejected.
     """
 
     symbol: SymbolId | None
@@ -390,6 +445,10 @@ class MappedCandidateDecision:
     attributed_coverage: float
     selected: bool
     reason: CandidateDecisionReason
+    invocation_lower_bound: int = 0
+    invocation_upper_bound: int = 0
+    invocation_coverage: float = 0.0
+    selection_basis: CandidateSelectionBasis = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,6 +474,7 @@ class ProfileResult:
         selected_symbols: Static symbols accepted by the candidate policy.
         spawn_sites: Exact scheduler call-site invocation evidence.
         call_edges: Exact same-module direct call-edge invocation evidence.
+        broad_invocations: Fixed-budget project-wide invocation heavy hitters.
     """
 
     status: ProfileStatus
@@ -434,6 +494,7 @@ class ProfileResult:
     scheduler_overhead_coverage: float = 0.0
     spawn_sites: tuple[ProfiledSpawnSite, ...] = ()
     call_edges: tuple[ProfiledCallEdge, ...] = ()
+    broad_invocations: BoundedInvocationSummary | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,7 +655,16 @@ def select_profile_candidates(
         ProfileResult: The input profile with candidate decisions and selected symbols attached.
     """
     available = frozenset(symbol.id for symbol in symbols)
-    if profile.total_samples < _MIN_TOTAL_SAMPLES:
+    ordered_members = tuple(sorted(profile.members, key=_candidate_member_order))
+    invocation_hot_members = tuple(
+        member
+        for member in sorted(
+            profile.members,
+            key=lambda item: (-item.invocation_lower_bound, item.module, item.qualname),
+        )
+        if member.symbol in available and _is_invocation_hot(member, profile.broad_invocations)
+    )
+    if profile.total_samples < _MIN_TOTAL_SAMPLES and not invocation_hot_members:
         return replace(
             profile,
             status="static-fallback",
@@ -613,6 +683,12 @@ def select_profile_candidates(
                     coverage=member.coverage,
                     selected=False,
                     reason=("below-threshold" if member.symbol in available else "unmapped"),
+                    invocation_lower_bound=member.invocation_lower_bound,
+                    invocation_upper_bound=member.invocation_upper_bound,
+                    invocation_coverage=_invocation_coverage(
+                        member,
+                        profile.broad_invocations,
+                    ),
                     scheduler_overhead_samples=member.scheduler_overhead_samples,
                     attributed_samples=member.attributed_samples,
                     attributed_coverage=_coverage(
@@ -620,35 +696,54 @@ def select_profile_candidates(
                         profile.total_samples,
                     ),
                 )
-                for member in sorted(
-                    profile.members,
-                    key=lambda item: (-item.attributed_samples, item.module, item.qualname),
-                )
+                for member in ordered_members
             ),
             selected_symbols=(),
         )
-    decisions: list[MappedCandidateDecision] = []
+    leaf_candidates = tuple(
+        member
+        for member in ordered_members
+        if member.symbol in available and _is_leaf_hot(member, profile.total_samples)
+    )
+    invocation_only = tuple(
+        member
+        for member in invocation_hot_members
+        if not _is_leaf_hot(member, profile.total_samples)
+    )
+    selected_bases: dict[SymbolId, CandidateSelectionBasis] = {}
     selected_symbols: list[SymbolId] = []
     selected_samples = 0
-    for member in sorted(
-        profile.members,
-        key=lambda item: (-item.attributed_samples, item.module, item.qualname),
-    ):
+    leaf_limit = _MAX_SELECTED_CANDIDATES - (1 if invocation_only else 0)
+    for member in leaf_candidates:
+        if len(selected_symbols) >= leaf_limit:
+            break
+        if (
+            selected_symbols
+            and selected_samples >= profile.mapped_project_samples * _TARGET_MAPPED_COVERAGE
+        ):
+            break
+        selected_symbols.append(member.symbol)
+        selected_bases[member.symbol] = "leaf-samples"
+        selected_samples += member.samples
+    for member in invocation_only:
+        if len(selected_symbols) >= _MAX_SELECTED_CANDIDATES:
+            break
+        selected_symbols.append(member.symbol)
+        selected_bases[member.symbol] = "invocation-count"
+        selected_samples += member.samples
+
+    decisions: list[MappedCandidateDecision] = []
+    for member in ordered_members:
         symbol = member.symbol if member.symbol in available else None
-        reason = _candidate_reason(
-            member=member,
+        selection_basis = selected_bases.get(member.symbol, "none")
+        selected = selection_basis != "none"
+        reason = _unselected_candidate_reason(
+            member,
             symbol=symbol,
-            context=_CandidatePolicyContext(
-                total_samples=profile.total_samples,
-                mapped_activity_samples=profile.mapped_project_samples,
-                selected_samples=selected_samples,
-                selected_count=len(selected_symbols),
-            ),
+            profile=profile,
+            selected_bases=selected_bases,
+            selected_samples=selected_samples,
         )
-        selected = reason == "selected"
-        if selected:
-            selected_symbols.append(member.symbol)
-            selected_samples += member.samples
         decisions.append(
             MappedCandidateDecision(
                 symbol=symbol,
@@ -658,6 +753,13 @@ def select_profile_candidates(
                 coverage=member.coverage,
                 selected=selected,
                 reason=reason,
+                invocation_lower_bound=member.invocation_lower_bound,
+                invocation_upper_bound=member.invocation_upper_bound,
+                invocation_coverage=_invocation_coverage(
+                    member,
+                    profile.broad_invocations,
+                ),
+                selection_basis=selection_basis,
                 scheduler_overhead_samples=member.scheduler_overhead_samples,
                 attributed_samples=member.attributed_samples,
                 attributed_coverage=_coverage(
@@ -823,6 +925,11 @@ def _profile_from_payload(
     scheduler_overhead_counts = _object_field(payload, "scheduler_overhead_counts")
     signature_payload = _object_field(payload, "signatures")
     member_lifecycle_payload = _object_field(payload, "member_lifecycle")
+    broad_invocations = _bounded_invocation_summary(_object_field(payload, "broad_invocations"))
+    broad_invocation_counts = {
+        f"{member.module}::{member.qualname}": (member.lower_bound, member.upper_bound)
+        for member in broad_invocations.members
+    }
     mapped_project_samples = sum(_int_value(value) for value in sample_counts.values())
     member_keys = frozenset(
         _string_key(key)
@@ -831,6 +938,7 @@ def _profile_from_payload(
             scheduler_overhead_counts,
             signature_payload,
             member_lifecycle_payload,
+            broad_invocation_counts,
         )
         for key in container
     )
@@ -843,6 +951,7 @@ def _profile_from_payload(
                 scheduler_overhead_counts=scheduler_overhead_counts,
                 signature_payload=signature_payload,
                 member_lifecycle_payload=member_lifecycle_payload,
+                broad_invocation_counts=broad_invocation_counts,
             ),
         )
         for key in sorted(
@@ -885,6 +994,7 @@ def _profile_from_payload(
             _profiled_call_edge(_object_value(item))
             for item in _list_value(payload.get("call_edges", []))
         ),
+        broad_invocations=broad_invocations,
     )
 
 
@@ -913,6 +1023,30 @@ def _profiled_member(
         completed_calls=_int_field(member_payload, "completed_calls"),
         max_active_calls=_int_field(member_payload, "max_active_calls"),
         pre_completion_suspensions=_int_field(member_payload, "pre_completion_suspensions"),
+        invocation_lower_bound=context.broad_invocation_counts.get(key, (0, 0))[0],
+        invocation_upper_bound=context.broad_invocation_counts.get(key, (0, 0))[1],
+    )
+
+
+def _bounded_invocation_summary(payload: JsonObject) -> BoundedInvocationSummary:
+    members: list[BoundedInvocationMember] = []
+    for raw_member in _list_value(payload.get("members", [])):
+        member = _object_value(raw_member)
+        module, qualname = _split_member_key(_string_field(member, "key"))
+        members.append(
+            BoundedInvocationMember(
+                module=module,
+                qualname=qualname,
+                lower_bound=_int_field(member, "lower_bound"),
+                upper_bound=_int_field(member, "upper_bound"),
+            )
+        )
+    return BoundedInvocationSummary(
+        observed_events=_int_field(payload, "observed_events"),
+        event_limit=_int_field(payload, "event_limit"),
+        member_limit=_int_field(payload, "member_limit"),
+        capped=_bool_value(payload.get("capped", False)),
+        members=tuple(members),
     )
 
 
@@ -986,28 +1120,116 @@ def _lifecycle_counts(payload: JsonObject) -> LifecycleCounts:
     )
 
 
-def _candidate_reason(
-    *,
+def _is_leaf_hot(member: ProfiledMember, total_samples: int) -> bool:
+    """Return whether exclusive leaf samples independently justify selection.
+
+    Args:
+        member: Profiled callable being assessed.
+        total_samples: Complete workload sample count used as the denominator.
+
+    Returns:
+        bool: Whether the callable passes the leaf count and share thresholds.
+    """
+    return (
+        total_samples >= _MIN_TOTAL_SAMPLES
+        and member.samples >= _MIN_CANDIDATE_SAMPLES
+        and _coverage(member.samples, total_samples) >= _MIN_CANDIDATE_SHARE
+    )
+
+
+def _is_invocation_hot(
     member: ProfiledMember,
+    summary: BoundedInvocationSummary | None,
+) -> bool:
+    """Return whether conservative broad evidence independently justifies a trial.
+
+    Args:
+        member: Profiled callable carrying conservative invocation bounds.
+        summary: Fixed-budget project invocation evidence, when profiling produced it.
+
+    Returns:
+        bool: Whether both the lower count and activity-share thresholds pass.
+    """
+    return (
+        summary is not None
+        and summary.observed_events > 0
+        and member.invocation_lower_bound >= _MIN_INVOCATION_CANDIDATE_COUNT
+        and _invocation_coverage(member, summary) >= _MIN_INVOCATION_CANDIDATE_SHARE
+    )
+
+
+def _invocation_coverage(
+    member: ProfiledMember,
+    summary: BoundedInvocationSummary | None,
+) -> float:
+    """Return the member's conservative share of bounded invocation events.
+
+    Args:
+        member: Profiled callable carrying a conservative invocation lower bound.
+        summary: Fixed-budget project invocation evidence, when available.
+
+    Returns:
+        float: Lower-bound invocation share, or zero without observed events.
+    """
+    return _coverage(
+        member.invocation_lower_bound,
+        summary.observed_events if summary is not None else 0,
+    )
+
+
+def _candidate_member_order(member: ProfiledMember) -> tuple[int, int, str, str]:
+    """Order sampled work first and heavy invocation bounds second.
+
+    Args:
+        member: Profiled callable to rank.
+
+    Returns:
+        tuple[int, int, str, str]: Deterministic descending activity sort key.
+    """
+    return (
+        -member.attributed_samples,
+        -member.invocation_lower_bound,
+        member.module,
+        member.qualname,
+    )
+
+
+def _unselected_candidate_reason(
+    member: ProfiledMember,
+    *,
     symbol: SymbolId | None,
-    context: _CandidatePolicyContext,
+    profile: ProfileResult,
+    selected_bases: dict[SymbolId, CandidateSelectionBasis],
+    selected_samples: int,
 ) -> CandidateDecisionReason:
+    """Explain one decision after the independent selection lanes are resolved.
+
+    Args:
+        member: Profiled callable being explained.
+        symbol: Supported static symbol, or ``None`` when mapping failed.
+        profile: Complete profile used by both hotness policies.
+        selected_bases: Symbols selected by leaf or invocation evidence.
+        selected_samples: Leaf samples covered by the final selected set.
+
+    Returns:
+        CandidateDecisionReason: Stable selected, threshold, coverage, or limit reason.
+    """
     if symbol is None:
         return "unmapped"
-    if (
-        context.total_samples < _MIN_TOTAL_SAMPLES
-        or member.samples < _MIN_CANDIDATE_SAMPLES
-        or _coverage(member.samples, context.total_samples) < _MIN_CANDIDATE_SHARE
-    ):
+    if symbol in selected_bases:
+        return "selected"
+    leaf_hot = _is_leaf_hot(member, profile.total_samples)
+    invocation_hot = _is_invocation_hot(member, profile.broad_invocations)
+    if not leaf_hot and not invocation_hot:
         return "below-threshold"
-    if context.selected_count >= _MAX_SELECTED_CANDIDATES:
+    if len(selected_bases) >= _MAX_SELECTED_CANDIDATES or invocation_hot:
         return "limit"
     if (
-        context.selected_count > 0
-        and context.selected_samples >= context.mapped_activity_samples * _TARGET_MAPPED_COVERAGE
+        selected_bases
+        and selected_samples >= profile.mapped_project_samples * _TARGET_MAPPED_COVERAGE
     ):
         return "coverage-reached"
-    return "selected"
+    return "limit"
 
 
 def _hot_member_keys(payload: JsonObject) -> tuple[tuple[str, int], ...]:
@@ -1037,6 +1259,7 @@ def _merge_payloads(sampling_payload: JsonObject, type_payload: JsonObject) -> J
     merged["member_lifecycle"] = type_payload.get("member_lifecycle", {})
     merged["spawn_sites"] = type_payload.get("spawn_sites", [])
     merged["call_edges"] = type_payload.get("call_edges", [])
+    merged["broad_invocations"] = type_payload.get("broad_invocations", {})
     return merged
 
 
@@ -1079,6 +1302,13 @@ def _empty_payload() -> JsonObject:
         "signatures": {},
         "spawn_sites": [],
         "call_edges": [],
+        "broad_invocations": {
+            "observed_events": 0,
+            "event_limit": 0,
+            "member_limit": 0,
+            "capped": False,
+            "members": [],
+        },
     }
 
 

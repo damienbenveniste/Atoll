@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 from scripts.benchmark_corpus.lifecycle import (
     LifecycleError,
+    agree_compile_status,
     build_performance_compile_policy,
     calibrated_benchmark_repetitions,
     classify_compile_process,
@@ -17,7 +18,7 @@ from scripts.benchmark_corpus.lifecycle import (
     ratio_evidence_from_report,
     validate_performance_assets,
 )
-from scripts.benchmark_corpus.models import CorpusCase, WorkloadProvenance
+from scripts.benchmark_corpus.models import CaseStatus, CorpusCase, WorkloadProvenance
 from scripts.benchmark_corpus.process import ProcessResult
 
 _EXPECTED_SAMPLE_COUNT = 7
@@ -182,6 +183,18 @@ def test_profiled_empty_composition_is_a_supported_noop(tmp_path: Path) -> None:
     )
 
     assert observed == "supported-no-op"
+
+
+@pytest.mark.parametrize(
+    ("cold", "warm"),
+    [("supported-no-op", "not-profitable"), ("not-profitable", "supported-no-op")],
+)
+def test_noop_and_not_profitable_cold_warm_pair_remains_not_profitable(
+    cold: CaseStatus,
+    warm: CaseStatus,
+) -> None:
+    """Marginal timing noise cannot turn two rejected outputs into a compiler error."""
+    assert agree_compile_status(cold, warm) == "not-profitable"
 
 
 def test_unrelated_unbenchmarked_failure_is_not_a_supported_noop(tmp_path: Path) -> None:

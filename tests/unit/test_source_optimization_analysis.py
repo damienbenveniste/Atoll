@@ -8,6 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast
 
+import pytest
+
 from atoll.analysis.ast_scanner import scan_module
 from atoll.execution_plans.models import ExecutionPlan, PlanEdge, PlanNode, PlanRejection
 from atoll.models import CompileConfig, ModuleId, ModuleScan, SymbolId, SymbolRecord
@@ -128,6 +130,39 @@ def test_anyio_source_planner_defers_transport_suspension_to_runtime_guards(
         "incremental-private-completion-accounting",
         "private-result-record-elision",
     ]
+
+
+def test_source_planner_trials_near_threshold_when_sampling_is_inconclusive(
+    tmp_path: Path,
+) -> None:
+    """Sampling jitter near 70% cannot suppress an otherwise safe fresh trial."""
+    scan = _scan(tmp_path, introspection=False, forwarding=False)
+    execution_plan = replace(
+        _execution_plan(scan, observed_work_items=OBSERVED_WORK_ITEMS),
+        dialect="anyio-on-asyncio",
+    )
+
+    result = build_source_optimization_plans(
+        (scan,),
+        (execution_plan,),
+        _planning_options(
+            tmp_path,
+            profile=_profile(
+                immediate=False,
+                attributed_samples=67,
+                background_samples=33,
+            ),
+        ),
+    )
+
+    assessment = result.assessments[0]
+    assert assessment.attributed_hot_share == pytest.approx(0.67)
+    assert assessment.status == "trial-ready"
+    assert not any("attributed hot share" in reason for reason in assessment.rejections)
+    assert any(
+        evidence.startswith("95% hot-share upper confidence bound")
+        for evidence in assessment.scheduler_overhead_evidence
+    )
 
 
 def test_source_planner_rejects_task_introspection(tmp_path: Path) -> None:

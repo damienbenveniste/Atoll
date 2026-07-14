@@ -875,6 +875,8 @@ class CompilationProfileMemberReport(TypedDict):
         scheduler_overhead_samples: Nested scheduler samples attributed to active calls.
         scheduler_overhead_coverage: Fraction of workload samples attributed to scheduler work.
         immediate_result_ratio: Conservative fraction of completed calls without suspension.
+        invocation_lower_bound: Conservative count from bounded project-wide observation.
+        invocation_upper_bound: Upper count estimate from bounded project-wide observation.
     """
 
     module: str
@@ -894,6 +896,8 @@ class CompilationProfileMemberReport(TypedDict):
     scheduler_overhead_samples: int
     scheduler_overhead_coverage: float
     immediate_result_ratio: float
+    invocation_lower_bound: int
+    invocation_upper_bound: int
 
 
 class CompilationProfileCandidateDecisionReport(TypedDict):
@@ -910,6 +914,10 @@ class CompilationProfileCandidateDecisionReport(TypedDict):
         attributed_coverage: Fraction of workload samples used by candidate selection.
         selected: Whether the member passed the candidate policy.
         reason: Deterministic selection or rejection reason.
+        invocation_lower_bound: Conservative project-wide call-count bound.
+        invocation_upper_bound: Project-wide call-count upper estimate.
+        invocation_coverage: Lower-bound share of bounded mapped invocation events.
+        selection_basis: Evidence that selected this member, or ``none`` when rejected.
     """
 
     symbol: str | None
@@ -922,6 +930,26 @@ class CompilationProfileCandidateDecisionReport(TypedDict):
     attributed_coverage: float
     selected: bool
     reason: str
+    invocation_lower_bound: int
+    invocation_upper_bound: int
+    invocation_coverage: float
+    selection_basis: str
+
+
+class CompilationProfileInvocationSummaryReport(TypedDict):
+    """Fixed-budget project-wide invocation summary metadata.
+
+    Attributes:
+        observed_events: Mapped project starts processed by the monitoring pass.
+        event_limit: Maximum starts the pass may process.
+        member_limit: Maximum callable identities retained as heavy hitters.
+        capped: Whether the monitoring pass exhausted its event budget.
+    """
+
+    observed_events: int
+    event_limit: int
+    member_limit: int
+    capped: bool
 
 
 class CompilationProfileCallableIdentityReport(TypedDict):
@@ -963,7 +991,7 @@ class CompilationProfileSpawnSiteReport(TypedDict):
 
 
 class CompilationProfileReport(TypedDict):
-    """Profile-guided selection evidence for compile report schema v4.
+    """Profile-guided selection evidence for compile report schema v6.
 
     Attributes:
         status: Profile status describing dynamic evidence or static fallback.
@@ -981,6 +1009,7 @@ class CompilationProfileReport(TypedDict):
         lifecycle: Aggregate Python lifecycle event counts.
         members: Profiled project members with sample and type evidence.
         spawn_sites: Exact scheduler call-site invocation evidence.
+        broad_invocations: Fixed-budget project-wide invocation summary metadata.
         candidate_mapping_decisions: Static mapping and hotness policy decisions.
         selected_symbols: Static symbols accepted by the profile candidate policy.
     """
@@ -1000,6 +1029,7 @@ class CompilationProfileReport(TypedDict):
     lifecycle: CompilationProfileLifecycleReport
     members: list[CompilationProfileMemberReport]
     spawn_sites: list[CompilationProfileSpawnSiteReport]
+    broad_invocations: CompilationProfileInvocationSummaryReport
     candidate_mapping_decisions: list[CompilationProfileCandidateDecisionReport]
     selected_symbols: list[str]
 
@@ -3170,6 +3200,9 @@ def _append_profile_guided_selection_markdown(
     lines: list[str],
     profile: CompilationProfileReport,
 ) -> None:
+    broad_invocations = profile["broad_invocations"]
+    observed_invocations = broad_invocations["observed_events"]
+    invocation_cap_reached = broad_invocations["capped"]
     lines.extend(
         [
             "## Profile-Guided Selection",
@@ -3182,7 +3215,12 @@ def _append_profile_guided_selection_markdown(
                 f"{profile['mapped_project_samples']} mapped to project code"
             ),
             f"- Mapped coverage: {profile['mapped_coverage']:.1%}",
-            f"- Selected hot coverage: {profile['selected_hot_coverage']:.1%}",
+            f"- Selected leaf-sample coverage: {profile['selected_hot_coverage']:.1%}",
+            (
+                "- Bounded invocation evidence: "
+                f"{observed_invocations} event(s), "
+                f"cap reached: {invocation_cap_reached}"
+            ),
         ]
     )
     if profile["launch_kind"] == "unsupported":
@@ -3204,7 +3242,10 @@ def _append_profile_guided_selection_markdown(
                 f"`{candidate['module']}::{candidate['qualname']}` "
                 f"{candidate['samples']} leaf + "
                 f"{candidate['scheduler_overhead_samples']} nested = "
-                f"{candidate['attributed_samples']}"
+                f"{candidate['attributed_samples']}; "
+                f"{candidate.get('invocation_lower_bound', 0)}.."
+                f"{candidate.get('invocation_upper_bound', 0)} invocation(s); "
+                f"basis {candidate.get('selection_basis', 'legacy')}"
             )
             for candidate in selected_activity
         )
@@ -4905,6 +4946,12 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
             "lifecycle": _empty_profile_lifecycle_report(),
             "members": [],
             "spawn_sites": [],
+            "broad_invocations": {
+                "observed_events": 0,
+                "event_limit": 0,
+                "member_limit": 0,
+                "capped": False,
+            },
             "candidate_mapping_decisions": [],
             "selected_symbols": [],
         }
@@ -4962,6 +5009,8 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
                 "scheduler_overhead_samples": member.scheduler_overhead_samples,
                 "scheduler_overhead_coverage": member.scheduler_overhead_coverage,
                 "immediate_result_ratio": member.immediate_result_ratio,
+                "invocation_lower_bound": member.invocation_lower_bound,
+                "invocation_upper_bound": member.invocation_upper_bound,
             }
             for member in result.members
         ],
@@ -4982,6 +5031,22 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
             }
             for site in result.spawn_sites
         ],
+        "broad_invocations": {
+            "observed_events": (
+                result.broad_invocations.observed_events
+                if result.broad_invocations is not None
+                else 0
+            ),
+            "event_limit": (
+                result.broad_invocations.event_limit if result.broad_invocations is not None else 0
+            ),
+            "member_limit": (
+                result.broad_invocations.member_limit if result.broad_invocations is not None else 0
+            ),
+            "capped": (
+                result.broad_invocations.capped if result.broad_invocations is not None else False
+            ),
+        },
         "candidate_mapping_decisions": [
             {
                 "symbol": candidate.symbol.stable_id if candidate.symbol is not None else None,
@@ -4994,6 +5059,10 @@ def _compilation_profile_report(result: ProfileResult | None) -> CompilationProf
                 "attributed_coverage": candidate.attributed_coverage,
                 "selected": candidate.selected,
                 "reason": candidate.reason,
+                "invocation_lower_bound": candidate.invocation_lower_bound,
+                "invocation_upper_bound": candidate.invocation_upper_bound,
+                "invocation_coverage": candidate.invocation_coverage,
+                "selection_basis": candidate.selection_basis,
             }
             for candidate in result.candidates
         ],

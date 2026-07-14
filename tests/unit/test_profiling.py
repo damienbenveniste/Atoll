@@ -23,6 +23,8 @@ import pytest
 from atoll.models import SymbolId, SymbolRecord
 from atoll.runtime import profiling
 from atoll.runtime.profiling import (
+    BoundedInvocationMember,
+    BoundedInvocationSummary,
     CanonicalTypeObservation,
     LifecycleCounts,
     MappedCandidateDecision,
@@ -41,6 +43,12 @@ MAX_TYPE_OBSERVATIONS_PER_MEMBER = 256
 ASYNC_WORKER_CALLS = 5
 ASYNC_CAPPED_WORKER_CALLS = 300
 FREQUENT_CALLS = 800_000
+THIN_HOT_CALLS = 12_000
+BROAD_INVOCATION_MEMBER_LIMIT = 128
+TRACKER_HOT_CALLS = 20_000
+TRACKER_COLD_IDENTITIES = 256
+PROFILE_CANDIDATE_LIMIT = 4
+RESERVED_LANE_LEAF_CANDIDATES = 3
 SPAWN_SITE_CALLS = 1_200
 DIRECT_CALL_EDGE_CALLS = 1_200
 DIRECT_SPAWN_CALLBACKS = 2
@@ -914,6 +922,182 @@ def test_select_profile_candidates_reports_limit_after_four_selected() -> None:
     assert _candidate(selected, "epsilon").reason == "limit"
 
 
+def test_select_profile_candidates_promotes_frequent_thin_project_member() -> None:
+    """Invocation evidence can nominate work too thin for statistical leaf samples."""
+    profile = _profile_with_members(
+        total_samples=100,
+        members=(("pkg.hot", "thin", 0), ("pkg.hot", "background", 100)),
+    )
+    profile = replace(
+        profile,
+        members=tuple(
+            replace(
+                member,
+                invocation_lower_bound=THIN_HOT_CALLS,
+                invocation_upper_bound=THIN_HOT_CALLS,
+            )
+            if member.qualname == "thin"
+            else member
+            for member in profile.members
+        ),
+        broad_invocations=BoundedInvocationSummary(
+            observed_events=100_000,
+            event_limit=1_000_000,
+            member_limit=128,
+            capped=False,
+            members=(
+                BoundedInvocationMember(
+                    module="pkg.hot",
+                    qualname="thin",
+                    lower_bound=THIN_HOT_CALLS,
+                    upper_bound=THIN_HOT_CALLS,
+                ),
+            ),
+        ),
+    )
+
+    selected = select_profile_candidates(
+        profile,
+        tuple(_symbol(module, qualname) for module, qualname, _samples in _member_specs(profile)),
+    )
+
+    thin = _candidate(selected, "thin")
+    assert thin.selected is True
+    assert thin.selection_basis == "invocation-count"
+    assert thin.invocation_lower_bound == THIN_HOT_CALLS
+    assert thin.invocation_upper_bound == THIN_HOT_CALLS
+    assert thin.invocation_coverage == pytest.approx(0.12)
+    assert SymbolId("pkg.hot", "thin") in selected.selected_symbols
+
+
+def test_select_profile_candidates_reserves_one_lane_for_invocation_hot_work() -> None:
+    """Four leaf candidates cannot crowd out independently hot thin work."""
+    profile = _profile_with_members(
+        total_samples=200,
+        members=(
+            ("pkg.hot", "alpha", 40),
+            ("pkg.hot", "beta", 40),
+            ("pkg.hot", "gamma", 40),
+            ("pkg.hot", "delta", 40),
+            ("pkg.hot", "epsilon", 40),
+            ("pkg.hot", "thin", 0),
+        ),
+    )
+    profile = replace(
+        profile,
+        members=tuple(
+            replace(
+                member,
+                invocation_lower_bound=THIN_HOT_CALLS,
+                invocation_upper_bound=THIN_HOT_CALLS,
+            )
+            if member.qualname == "thin"
+            else member
+            for member in profile.members
+        ),
+        broad_invocations=BoundedInvocationSummary(
+            observed_events=100_000,
+            event_limit=1_000_000,
+            member_limit=BROAD_INVOCATION_MEMBER_LIMIT,
+            capped=False,
+            members=(
+                BoundedInvocationMember(
+                    module="pkg.hot",
+                    qualname="thin",
+                    lower_bound=THIN_HOT_CALLS,
+                    upper_bound=THIN_HOT_CALLS,
+                ),
+            ),
+        ),
+    )
+
+    selected = select_profile_candidates(
+        profile,
+        tuple(_symbol(module, qualname) for module, qualname, _samples in _member_specs(profile)),
+    )
+
+    assert len(selected.selected_symbols) == PROFILE_CANDIDATE_LIMIT
+    assert SymbolId("pkg.hot", "thin") in selected.selected_symbols
+    assert (
+        sum(candidate.selection_basis == "leaf-samples" for candidate in selected.candidates)
+        == RESERVED_LANE_LEAF_CANDIDATES
+    )
+    assert _candidate(selected, "thin").selection_basis == "invocation-count"
+
+
+def test_select_profile_candidates_does_not_use_nested_scheduler_samples_as_invocations() -> None:
+    """A thin wrapper needs call counts; attributed scheduler samples are insufficient."""
+    profile = _profile_with_members(
+        total_samples=100,
+        members=(("pkg.hot", "wrapper", 0), ("pkg.hot", "background", 100)),
+    )
+    profile = replace(
+        profile,
+        scheduler_overhead_samples=100,
+        members=tuple(
+            replace(member, scheduler_overhead_samples=100)
+            if member.qualname == "wrapper"
+            else member
+            for member in profile.members
+        ),
+    )
+
+    selected = select_profile_candidates(
+        profile,
+        tuple(_symbol(module, qualname) for module, qualname, _samples in _member_specs(profile)),
+    )
+
+    wrapper = _candidate(selected, "wrapper")
+    assert wrapper.selected is False
+    assert wrapper.selection_basis == "none"
+    assert wrapper.reason == "below-threshold"
+
+
+def test_select_profile_candidates_requires_invocation_count_and_share() -> None:
+    """An absolute call count cannot nominate negligible project activity."""
+    profile = _profile_with_members(
+        total_samples=100,
+        members=(("pkg.hot", "thin", 0), ("pkg.hot", "background", 100)),
+    )
+    profile = replace(
+        profile,
+        members=tuple(
+            replace(
+                member,
+                invocation_lower_bound=THIN_HOT_CALLS,
+                invocation_upper_bound=THIN_HOT_CALLS,
+            )
+            if member.qualname == "thin"
+            else member
+            for member in profile.members
+        ),
+        broad_invocations=BoundedInvocationSummary(
+            observed_events=1_000_000,
+            event_limit=1_000_000,
+            member_limit=128,
+            capped=True,
+            members=(
+                BoundedInvocationMember(
+                    module="pkg.hot",
+                    qualname="thin",
+                    lower_bound=THIN_HOT_CALLS,
+                    upper_bound=THIN_HOT_CALLS,
+                ),
+            ),
+        ),
+    )
+
+    selected = select_profile_candidates(
+        profile,
+        tuple(_symbol(module, qualname) for module, qualname, _samples in _member_specs(profile)),
+    )
+
+    thin = _candidate(selected, "thin")
+    assert thin.selected is False
+    assert thin.invocation_coverage == pytest.approx(0.012)
+    assert thin.reason == "below-threshold"
+
+
 def test_scratch_files_are_removed_when_bootstrap_subprocess_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1198,6 +1382,8 @@ def test_profile_bootstrap_type_entrypoint_bounds_hot_observation(
 
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     hot = payload["signatures"]["frequent::hot"]
+    broad = payload["broad_invocations"]
+    thin = next(member for member in broad["members"] if member["key"] == "frequent::thin")
     assert exit_code == 0
     assert hot["call_count"] == MAX_TYPE_OBSERVATIONS_PER_MEMBER
     assert hot["invocation_count"] == FREQUENT_CALLS
@@ -1207,6 +1393,33 @@ def test_profile_bootstrap_type_entrypoint_bounds_hot_observation(
     assert hot["observation_capped"] is True
     assert payload["member_lifecycle"]["frequent::hot"]["start"] == FREQUENT_CALLS
     assert payload["member_lifecycle"]["frequent::hot"]["return"] == FREQUENT_CALLS
+    assert "frequent::thin" not in payload["signatures"]
+    assert thin["lower_bound"] > 0
+    assert thin["upper_bound"] >= thin["lower_bound"]
+    assert broad["observed_events"] == broad["event_limit"]
+    assert broad["member_limit"] == BROAD_INVOCATION_MEMBER_LIMIT
+    assert broad["capped"] is True
+    assert "frequent::thin" not in payload["member_lifecycle"]
+
+
+def test_bounded_invocation_tracker_retains_fixed_heavy_hitter_state() -> None:
+    """Broad invocation evidence keeps fixed state and conservative count bounds."""
+    tracker_type = cast(type[object], vars(_profile_bootstrap())["_BoundedInvocationTracker"])
+    tracker = tracker_type()
+    observe = cast(Callable[[object, str], None], vars(tracker_type)["observe"])
+    payload = cast(Callable[[object], dict[str, object]], vars(tracker_type)["payload"])
+    for index in range(TRACKER_COLD_IDENTITIES):
+        observe(tracker, f"pkg::cold_{index}")
+    for _ in range(TRACKER_HOT_CALLS):
+        observe(tracker, "pkg::hot")
+
+    evidence = payload(tracker)
+    members = cast(list[dict[str, object]], evidence["members"])
+    hot = next(member for member in members if member["key"] == "pkg::hot")
+    assert len(members) == evidence["member_limit"] == BROAD_INVOCATION_MEMBER_LIMIT
+    assert cast(int, hot["lower_bound"]) <= TRACKER_HOT_CALLS <= cast(int, hot["upper_bound"])
+    assert evidence["observed_events"] == TRACKER_HOT_CALLS + TRACKER_COLD_IDENTITIES
+    assert evidence["capped"] is False
 
 
 def test_profile_bootstrap_module_entrypoint_returns_system_exit(
@@ -1673,7 +1886,13 @@ def _write_polymorphic_project(root: Path) -> None:
 
 def _write_frequent_call_project(root: Path) -> None:
     (root / "frequent.py").write_text(
-        "def hot(value: int) -> int:\n    return (value * 3) % 11\n",
+        (
+            "def thin(value: int) -> int:\n"
+            "    return (value * 3) % 11\n"
+            "\n"
+            "def hot(value: int) -> int:\n"
+            "    return thin(value)\n"
+        ),
         encoding="utf-8",
     )
     (root / "bench_frequent.py").write_text(

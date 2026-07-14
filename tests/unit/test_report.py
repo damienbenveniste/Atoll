@@ -59,6 +59,8 @@ from atoll.runtime.fusion_performance import FusionTrial
 from atoll.runtime.package_verify import PackageVerificationResult
 from atoll.runtime.performance import BenchmarkGateResult
 from atoll.runtime.profiling import (
+    BoundedInvocationMember,
+    BoundedInvocationSummary,
     CanonicalCallableCount,
     CanonicalTypeObservation,
     LifecycleCounts,
@@ -91,6 +93,9 @@ PROFILE_SAMPLING_INTERVAL_MS = 2
 PROFILE_COMPLETED_CALLS = 11
 PROFILE_MAX_ACTIVE_CALLS = 2
 PROFILE_SPAWN_INVOCATIONS = 1_200
+PROFILE_BROAD_INVOCATIONS = 12_000
+PROFILE_BROAD_INVOCATION_EVENTS = 100_000
+PROFILE_BROAD_INVOCATION_MEMBER_LIMIT = 128
 PROFILE_SCHEDULER_OVERHEAD_SAMPLES = 20
 PROFILE_SCHEDULER_OVERHEAD_COVERAGE = 0.1
 PROFILE_MEMBER_SCHEDULER_OVERHEAD_SAMPLES = 8
@@ -445,6 +450,12 @@ def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path
         "lifecycle": {"start": 0, "return_": 0, "yield_": 0, "resume": 0, "unwind": 0, "throw": 0},
         "members": [],
         "spawn_sites": [],
+        "broad_invocations": {
+            "observed_events": 0,
+            "event_limit": 0,
+            "member_limit": 0,
+            "capped": False,
+        },
         "candidate_mapping_decisions": [],
         "selected_symbols": [],
     }
@@ -548,6 +559,8 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                 completed_calls=PROFILE_COMPLETED_CALLS,
                 max_active_calls=PROFILE_MAX_ACTIVE_CALLS,
                 pre_completion_suspensions=1,
+                invocation_lower_bound=PROFILE_BROAD_INVOCATIONS,
+                invocation_upper_bound=PROFILE_BROAD_INVOCATIONS + 25,
             ),
             ProfiledMember(
                 module="app.ranking",
@@ -580,6 +593,10 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                 attributed_coverage=0.6,
                 selected=True,
                 reason="selected",
+                invocation_lower_bound=PROFILE_BROAD_INVOCATIONS,
+                invocation_upper_bound=PROFILE_BROAD_INVOCATIONS + 25,
+                invocation_coverage=0.12,
+                selection_basis="leaf-samples",
             ),
             MappedCandidateDecision(
                 symbol=None,
@@ -610,6 +627,20 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
                         identity="asyncio.taskgroups.TaskGroup.create_task",
                         count=PROFILE_SPAWN_INVOCATIONS,
                     ),
+                ),
+            ),
+        ),
+        broad_invocations=BoundedInvocationSummary(
+            observed_events=PROFILE_BROAD_INVOCATION_EVENTS,
+            event_limit=1_000_000,
+            member_limit=PROFILE_BROAD_INVOCATION_MEMBER_LIMIT,
+            capped=False,
+            members=(
+                BoundedInvocationMember(
+                    module="app.ranking",
+                    qualname="score_user",
+                    lower_bound=PROFILE_BROAD_INVOCATIONS,
+                    upper_bound=PROFILE_BROAD_INVOCATIONS + 25,
                 ),
             ),
         ),
@@ -772,6 +803,7 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
     assert report["profile"]["members"][0]["max_active_calls"] == PROFILE_MAX_ACTIVE_CALLS
     assert report["profile"]["members"][0]["pre_completion_suspensions"] == 1
     assert report["profile"]["members"][0]["invocation_count"] == PROFILE_SPAWN_INVOCATIONS
+    assert report["profile"]["members"][0]["invocation_lower_bound"] == PROFILE_BROAD_INVOCATIONS
     assert (
         report["profile"]["members"][0]["scheduler_overhead_samples"]
         == PROFILE_MEMBER_SCHEDULER_OVERHEAD_SAMPLES
@@ -799,13 +831,29 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
             ],
         }
     ]
+    assert report["profile"]["broad_invocations"] == {
+        "observed_events": PROFILE_BROAD_INVOCATION_EVENTS,
+        "event_limit": 1_000_000,
+        "member_limit": PROFILE_BROAD_INVOCATION_MEMBER_LIMIT,
+        "capped": False,
+    }
     assert report["profile"]["candidate_mapping_decisions"][1]["reason"] == "unmapped"
     assert (
         report["profile"]["candidate_mapping_decisions"][0]["attributed_samples"]
         == PROFILE_SELECTED_MEMBER_SAMPLES
     )
-    assert report["profile"]["selected_symbols"] == ["app.ranking::score_user"]
+    decision = report["profile"]["candidate_mapping_decisions"][0]
+    assert (
+        decision["invocation_lower_bound"],
+        decision["invocation_upper_bound"],
+        round(decision["invocation_coverage"], 2),
+    ) == (PROFILE_BROAD_INVOCATIONS, PROFILE_BROAD_INVOCATIONS + 25, 0.12)
+    assert (decision["selection_basis"], report["profile"]["selected_symbols"]) == (
+        "leaf-samples",
+        ["app.ranking::score_user"],
+    )
     assert "120 leaf + 0 nested = 120" in markdown
+    assert "12000..12025 invocation(s); basis leaf-samples" in markdown
     assert "## Candidate Profitability" in markdown
     assert "marginal speedup 1.040x" in markdown
     assert "fallback: mypyc rejected unresolved source TypeVars" in markdown
@@ -822,7 +870,7 @@ def test_compilation_report_serializes_profile_guided_selection_without_values(
     assert "repr(payload)" not in serialized
     assert "- Status: profiled" in markdown
     assert "- Mapped coverage: 75.0%" in markdown
-    assert "- Selected hot coverage: 80.0%" in markdown
+    assert "- Selected leaf-sample coverage: 80.0%" in markdown
     assert "- Selected candidates: `app.ranking::score_user`" in markdown
     assert "`app.ranking::cold_path` (unmapped)" in markdown
     assert "- Unmeasured profiling passes: sampling 0.100s" in markdown
