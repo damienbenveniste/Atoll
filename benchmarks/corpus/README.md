@@ -147,7 +147,8 @@ official 1.1 sdist, whose content-addressed lock includes the test data without
 relaxing the Git-source submodule prohibition. Its source-only test dependency
 is hash-pinned with the rest of the lock, downloaded during the one networked
 bootstrap phase, and built from the case-local wheelhouse after offline mode is
-enforced.
+enforced. Archive baseline wheels are built from a disposable copy so backend
+metadata refreshes cannot mutate the authenticated extraction used by Atoll.
 
 Cases whose measured cold compile exceeds the default 45-minute boundary use
 an explicit 90-minute manifest override. The longer allowance does not change

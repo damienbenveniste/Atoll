@@ -1205,9 +1205,28 @@ def _build_baseline_wheel(
     python: Path,
     environment: dict[str, str],
 ) -> Path:
+    """Build the pristine project wheel without mutating authenticated archive source.
+
+    Git checkouts distinguish tracked files from ordinary backend output. Archive
+    cases have no equivalent index, so their baseline build runs from a disposable
+    source copy and leaves the content-addressed extraction available for identity
+    checks, tests, and the later Atoll invocation.
+
+    Args:
+        context: Active case paths, source kind, and process evidence.
+        python: Isolated interpreter containing the project build requirements.
+        environment: Sanitized offline build environment.
+
+    Returns:
+        Path: The sole wheel emitted by the normal PEP 517 build.
+    """
     paths = context.paths
     destination = paths.workspace / "baseline-dist"
     destination.mkdir()
+    build_project = paths.project
+    if context.state.sdist_source:
+        build_project = paths.workspace / "baseline-source"
+        shutil.copytree(paths.project, build_project, symlinks=True)
     command = [str(python), "-m", "build", "--wheel", "--outdir", str(destination)]
     if context.options.environment_mode == "current-test":
         command.append("--no-isolation")
@@ -1216,7 +1235,7 @@ def _build_baseline_wheel(
         _PhaseRequest(
             name="baseline-wheel",
             argv=tuple(command),
-            cwd=paths.project,
+            cwd=build_project,
             environment=environment,
             timeout_seconds=context.case.compile_timeout_seconds or 900,
         ),

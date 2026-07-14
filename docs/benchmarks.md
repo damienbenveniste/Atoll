@@ -64,6 +64,8 @@ project builds, focused tests, oracles, and benchmarks then use the offline
 wheelhouse and a sanitized credential-free environment. Exact lock hashes cover
 both wheels and source-only test tools; any source distribution is downloaded
 during bootstrap and built only after package tooling switches to offline mode.
+Archive baseline wheels use a disposable source copy, preserving the
+content-addressed extraction for identity checks and the later Atoll compile.
 
 Evidence retains bounded logs, source manifests, toolchain and runner identity,
 policy patches, compiler probes, compile reports, canonical oracle digests, and

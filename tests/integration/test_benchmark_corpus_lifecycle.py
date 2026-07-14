@@ -189,8 +189,12 @@ def test_upstream_generated_files_are_removed_before_compile(tmp_path: Path) -> 
 
 
 def test_sdist_lifecycle_restores_by_fresh_verified_extraction(tmp_path: Path) -> None:
-    """Archive cases discard upstream build output without invoking Git cleanup."""
-    remote, revision = _local_remote(tmp_path, generate_untracked=True)
+    """Archive baseline builds cannot mutate the authenticated extraction."""
+    remote, revision = _local_remote(
+        tmp_path,
+        mutate_tracked=True,
+        generate_untracked=True,
+    )
     archive = tmp_path / "simple-project.tar.gz"
     _git(
         remote,
