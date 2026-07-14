@@ -24,6 +24,7 @@ from atoll.runtime.performance import (
     CommandRunEvidence,
     run_performance_command,
 )
+from atoll.wheel_overlay import WheelBuildEvidence, build_baseline_wheel
 
 FIXTURE_ROOT = Path("tests/fixtures/simple_project")
 EXIT_USAGE = 2
@@ -204,11 +205,22 @@ def drop_cache() -> None:
 def test_compile_uses_cache_on_unchanged_second_run(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A repeated source-clean compile restores unchanged artifacts from cache."""
+    """A repeated compile restores target and Atoll artifacts without rebuilding."""
+    monkeypatch.setenv("ATOLL_BASELINE_CACHE_CONTEXT", "package-cache-integration-test")
     project_root = tmp_path / "simple_project"
     output_dir = project_root / ".atoll" / "dist"
     shutil.copytree(FIXTURE_ROOT, project_root)
+    baseline_build = build_baseline_wheel
+    baseline_build_calls = 0
+
+    def tracked_baseline_build(project: Path, output: Path) -> WheelBuildEvidence:
+        nonlocal baseline_build_calls
+        baseline_build_calls += 1
+        return baseline_build(project, output)
+
+    monkeypatch.setattr(package_command, "build_baseline_wheel", tracked_baseline_build)
 
     first_exit = main(["compile", "app.ranking", "--root", str(project_root)])
     first_report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
@@ -222,6 +234,9 @@ def test_compile_uses_cache_on_unchanged_second_run(
     assert second_exit == 0
     assert first_report["build"]["cache_status"] == "miss"
     assert second_report["build"]["cache_status"] == "hit"
+    assert baseline_build_calls == 1
+    assert "PEP 517 baseline wheel cache miss" in first_capture.err
+    assert "PEP 517 baseline wheel cache hit" in second_capture.err
     assert "compile cache miss" in first_capture.err
     assert "compile cache hit" in second_capture.err
     assert [
@@ -232,6 +247,9 @@ def test_compile_uses_cache_on_unchanged_second_run(
         "cache_lookup",
         "cache_restore",
     ]
+    assert "pep517_cache_restore" in {
+        timing["name"] for timing in second_report["build"]["phase_timings"]
+    }
     assert not (output_dir / "build").exists()
     assert not (output_dir / "install").exists()
     with zipfile.ZipFile(wheel_path) as wheel:

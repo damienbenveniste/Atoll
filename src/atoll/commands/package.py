@@ -37,6 +37,7 @@ from atoll.analysis.typed_regions import build_directed_region_slice
 from atoll.backends.base import CompilerBackend
 from atoll.backends.cython import CYTHON_BACKEND
 from atoll.backends.mypyc import MYPYC_BACKEND
+from atoll.baseline_cache import restore_baseline_wheel, store_baseline_wheel
 from atoll.execution_plans.anyio_task_preserving import ANYIO_TASK_PRESERVING_BACKEND
 from atoll.execution_plans.base import ExecutionPlanBackend
 from atoll.execution_plans.cache import (
@@ -754,6 +755,27 @@ class _BaselineWheelPayload:
     baseline_install_root: Path | None = None
     quality_project_root: Path | None = None
     semantic_test_result: CommandRunEvidence | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _BaselineWheelPreparation:
+    """Inputs for producing one reusable interpreted baseline wheel payload.
+
+    Attributes:
+        project: Discovered target project configuration and modules.
+        build_root: Root of the temporary source-clean build tree.
+        install_root: Temporary install payload receiving compiled artifacts.
+        cache_root: Caller-owned cache root for reusable baseline wheel state.
+        progress: Optional progress callback for long-running work.
+        run_quality_gates: Whether verification, tests, and benchmarks should run.
+    """
+
+    project: DiscoveredProject
+    build_root: Path
+    install_root: Path
+    cache_root: Path
+    progress: PackageProgress | None
+    run_quality_gates: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -4673,11 +4695,14 @@ def _prepare_profile_guided_selection(
     _reset_dir(build_root)
     _reset_dir(install_root)
     baseline = _prepare_baseline_wheel_payload(
-        project=project,
-        build_root=build_root,
-        install_root=install_root,
-        progress=options.progress,
-        run_quality_gates=options.run_quality_gates,
+        _BaselineWheelPreparation(
+            project=project,
+            build_root=build_root,
+            install_root=install_root,
+            cache_root=options.cache_dir or project.config.cache_dir,
+            progress=options.progress,
+            run_quality_gates=options.run_quality_gates,
+        )
     )
     preparation = _ProfilePreparation(
         baseline=baseline,
@@ -5030,37 +5055,34 @@ def _package_baseline(
     _reset_dir(build_root)
     _reset_dir(install_root)
     return _prepare_baseline_wheel_payload(
-        project=project,
-        build_root=build_root,
-        install_root=install_root,
-        progress=options.progress,
-        run_quality_gates=options.run_quality_gates,
+        _BaselineWheelPreparation(
+            project=project,
+            build_root=build_root,
+            install_root=install_root,
+            cache_root=options.cache_dir or project.config.cache_dir,
+            progress=options.progress,
+            run_quality_gates=options.run_quality_gates,
+        )
     )
 
 
 def _prepare_baseline_wheel_payload(
-    *,
-    project: DiscoveredProject,
-    build_root: Path,
-    install_root: Path,
-    progress: PackageProgress | None,
-    run_quality_gates: bool,
+    preparation: _BaselineWheelPreparation,
 ) -> _BaselineWheelPayload:
     """Build and unpack the target project's normal wheel from a clean copy.
 
     Args:
-        project: Discovered target project configuration and modules.
-        build_root: Root of the temporary source-clean build tree.
-        install_root: Temporary install payload receiving compiled artifacts.
-        progress: Optional progress callback for long-running work.
-        run_quality_gates: Whether verification, tests, and benchmarks should run.
+        preparation: Project, paths, cache ownership, and quality-gate policy.
 
     Returns:
         _BaselineWheelPayload: Baseline wheel and unpacked payload evidence.
     """
+    project = preparation.project
+    build_root = preparation.build_root
+    install_root = preparation.install_root
     copied_project = build_root / "pep517-project"
     baseline_output = build_root / "pep517-dist"
-    _progress(progress, "building target PEP 517 baseline wheel")
+    _progress(preparation.progress, "building target PEP 517 baseline wheel")
     copy_started = time.perf_counter()
     _copy_pep517_project(
         project.config.root,
@@ -5072,15 +5094,61 @@ def _prepare_baseline_wheel_payload(
         duration_seconds=time.perf_counter() - copy_started,
         detail="source-clean project copy",
     )
-    evidence = build_baseline_wheel(copied_project, baseline_output)
-    build_timing = CompilePhaseTiming(
-        name="pep517_wheel",
-        duration_seconds=evidence.duration_seconds,
-        detail=f"exit {evidence.returncode}",
+    cache_probe = restore_baseline_wheel(
+        project_root=copied_project,
+        cache_root=preparation.cache_root / "baseline-wheel",
+        output_dir=baseline_output,
     )
+    phase_timings = [
+        copy_timing,
+        CompilePhaseTiming(
+            name="pep517_cache_lookup",
+            duration_seconds=cache_probe.lookup_duration_seconds,
+            detail=f"{cache_probe.status}; {cache_probe.reason}",
+        ),
+    ]
+    if cache_probe.wheel_path is not None:
+        cache_key = cast(str, cache_probe.key)
+        phase_timings.append(
+            CompilePhaseTiming(
+                name="pep517_cache_restore",
+                duration_seconds=cache_probe.restore_duration_seconds,
+                detail=cache_probe.wheel_path.name,
+            )
+        )
+        evidence = WheelBuildEvidence(
+            command=("atoll", "cache", "restore", "baseline-wheel", cache_key),
+            project_root=copied_project.resolve(),
+            outdir=baseline_output.resolve(),
+            returncode=0,
+            stdout="restored target PEP 517 baseline wheel from Atoll cache",
+            stderr="",
+            duration_seconds=(
+                cache_probe.lookup_duration_seconds + cache_probe.restore_duration_seconds
+            ),
+            wheel_paths=(cache_probe.wheel_path,),
+        )
+        _progress(preparation.progress, "PEP 517 baseline wheel cache hit")
+    else:
+        cache_action = "miss" if cache_probe.status == "miss" else "bypass"
+        _progress(
+            preparation.progress,
+            f"PEP 517 baseline wheel cache {cache_action}: {cache_probe.reason}",
+        )
+        evidence = build_baseline_wheel(copied_project, baseline_output)
+        phase_timings.append(
+            CompilePhaseTiming(
+                name="pep517_wheel",
+                duration_seconds=evidence.duration_seconds,
+                detail=f"exit {evidence.returncode}",
+            )
+        )
     if not evidence.succeeded or len(evidence.wheel_paths) != 1:
         error = _baseline_build_error(evidence)
-        _progress(progress, f"PEP 517 baseline wheel failed in {evidence.duration_seconds:.2f}s")
+        _progress(
+            preparation.progress,
+            f"PEP 517 baseline wheel failed in {evidence.duration_seconds:.2f}s",
+        )
         return _BaselineWheelPayload(
             wheel_path=None,
             build=CompileAttempt(
@@ -5089,8 +5157,8 @@ def _prepare_baseline_wheel_payload(
                 stdout=evidence.stdout,
                 stderr=error,
                 artifact_paths=(),
-                duration_seconds=copy_timing.duration_seconds + evidence.duration_seconds,
-                phase_timings=(copy_timing, build_timing),
+                duration_seconds=sum(timing.duration_seconds for timing in phase_timings),
+                phase_timings=tuple(phase_timings),
             ),
         )
     wheel_path = evidence.wheel_paths[0]
@@ -5112,11 +5180,10 @@ def _prepare_baseline_wheel_payload(
                 stderr=f"PEP 517 wheel unpack failed: {error}",
                 artifact_paths=(),
                 duration_seconds=(
-                    copy_timing.duration_seconds
-                    + evidence.duration_seconds
+                    sum(timing.duration_seconds for timing in phase_timings)
                     + unpack_timing.duration_seconds
                 ),
-                phase_timings=(copy_timing, build_timing, unpack_timing),
+                phase_timings=(*phase_timings, unpack_timing),
             ),
         )
     unpack_timing = CompilePhaseTiming(
@@ -5124,6 +5191,20 @@ def _prepare_baseline_wheel_payload(
         duration_seconds=time.perf_counter() - unpack_started,
         detail=wheel_path.name,
     )
+    phase_timings.append(unpack_timing)
+    if cache_probe.status == "miss" and cache_probe.key is not None:
+        cache_store = store_baseline_wheel(
+            key=cache_probe.key,
+            wheel_path=wheel_path,
+            cache_root=preparation.cache_root / "baseline-wheel",
+        )
+        phase_timings.append(
+            CompilePhaseTiming(
+                name="pep517_cache_store",
+                duration_seconds=cache_store.duration_seconds,
+                detail="stored" if cache_store.stored else "store skipped",
+            )
+        )
     baseline_started = time.perf_counter()
     baseline_install_root = build_root / "baseline-install"
     shutil.copytree(install_root, baseline_install_root)
@@ -5134,17 +5215,16 @@ def _prepare_baseline_wheel_payload(
             detail="immutable interpreted baseline",
         ),
     )
+    phase_timings.extend(baseline_copy_timing)
     quality_project_root: Path | None = None
-    if run_quality_gates and (
+    if preparation.run_quality_gates and (
         project.config.compile.test_command is not None
         or project.config.compile.benchmark_command is not None
     ):
         _remove_quality_gate_sources(project, copied_project)
         quality_project_root = copied_project
-    _progress(
-        progress,
-        f"built and unpacked PEP 517 baseline wheel in {evidence.duration_seconds:.2f}s",
-    )
+    action = "restored" if cache_probe.status == "hit" else "built"
+    _progress(preparation.progress, f"{action} and unpacked PEP 517 baseline wheel")
     return _BaselineWheelPayload(
         wheel_path=wheel_path,
         build=CompileAttempt(
@@ -5153,13 +5233,8 @@ def _prepare_baseline_wheel_payload(
             stdout=evidence.stdout,
             stderr=evidence.stderr,
             artifact_paths=(),
-            duration_seconds=(
-                copy_timing.duration_seconds
-                + evidence.duration_seconds
-                + unpack_timing.duration_seconds
-                + sum(timing.duration_seconds for timing in baseline_copy_timing)
-            ),
-            phase_timings=(copy_timing, build_timing, unpack_timing, *baseline_copy_timing),
+            duration_seconds=sum(timing.duration_seconds for timing in phase_timings),
+            phase_timings=tuple(phase_timings),
         ),
         baseline_install_root=baseline_install_root,
         quality_project_root=quality_project_root,

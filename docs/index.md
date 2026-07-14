@@ -151,8 +151,11 @@ diagnostics are still captured in Atoll's build diagnostics. Atoll keeps strict 
 and mypy cache state under `.atoll/cache/`. Typed variants are cached independently by backend and
 region under `.atoll/cache/compile/regions/`; deterministic non-transient backend rejections use
 the separate `.atoll/cache/compile/decisions/` namespace. An unchanged variant restores either the
-decision or native files without invoking mypyc or Cython. `atoll clean --cache` removes all
-reusable compiler state.
+decision or native files without invoking mypyc or Cython. With reproducible PEP 517 dependency
+resolution, such as an offline wheelhouse, a digest-verified copy of the target's normal wheel lives
+under `.atoll/cache/baseline-wheel/`; mutable online resolution bypasses reuse. Safe warm builds can
+therefore avoid recompiling target-owned extensions. `atoll clean --cache` removes all reusable
+build state.
 Benchmark-guided builds continue to collect a fresh profile on every invocation. The first strict
 native candidate plan is stored under `.atoll/cache/profile-plans/`, preventing statistical sample
 jitter from creating a cold artifact variant on an unchanged warm build. Replay never skips the
