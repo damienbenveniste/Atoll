@@ -47,10 +47,16 @@ because each corpus case owns an ephemeral VM; local commands omit it by
 default.
 
 Repository cases are added only after their dependency lock and canonical oracle
-are present. External code is executed by the isolated lifecycle runner, never by
-manifest validation, lock inspection, matrix generation, or aggregation. Successful runs
-delete cloned sources and wheels while retaining bounded logs, source manifests,
-policy evidence, toolchain identity, compile reports, and wheel digests.
+are present. Git is the default source provider. A case whose qualifying release
+cannot be represented without a Git submodule may instead lock an HTTPS sdist by
+exact byte count, archive SHA-256, and normalized regular-file tree digest. Archive
+extraction rejects links, special files, traversal, duplicate paths, multiple roots,
+VCS administration paths, and `.gitmodules` before external code executes.
+External code is executed by the isolated lifecycle runner, never by manifest
+validation, lock inspection, matrix generation, or aggregation. Successful runs
+delete materialized sources and wheels while retaining bounded logs, source
+manifests, archive identity when applicable, policy evidence, toolchain identity,
+compile reports, and wheel digests.
 
 Twelve cases also carry the `performance` tier. Each uses one reviewed workload,
 the fixed seed `1729`, one warmup, and seven measured baseline/compiled pairs.
@@ -136,6 +142,6 @@ The version-1 compatibility matrix contains all 25 planned repositories on both
 Ubuntu 24.04 and macOS 14. Pins use the inspected default-branch revision when it
 passes baseline qualification. SQLGlot uses the newest qualifying Python 3.12
 release revision because newer revisions contain a forbidden submodule.
-html5lib remains in the matrix even though its newest Python 3.12 release still
-contains a test-data submodule; its explicit `security-violation` result is part
-of corpus coverage rather than an omitted hard case.
+html5lib retains the full release commit as provenance but materializes the
+official 1.1 sdist, whose content-addressed lock includes the test data without
+relaxing the Git-source submodule prohibition.

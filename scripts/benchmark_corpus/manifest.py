@@ -21,6 +21,7 @@ from scripts.benchmark_corpus.models import (
     CorpusPlatform,
     CorpusTier,
     MatrixEntry,
+    SdistSource,
     WorkloadProvenance,
     WorkloadSource,
 )
@@ -62,8 +63,10 @@ _CASE_FIELDS = frozenset(
         "test_timeout_seconds",
         "compile_timeout_seconds",
         "performance_timeout_seconds",
+        "sdist",
     }
 )
+_SDIST_FIELDS = frozenset({"url", "archive_sha256", "archive_size", "tree_sha256"})
 _WORKLOAD_FIELDS = frozenset({"source", "repository", "revision", "path", "sha256", "notice"})
 _TIERS: tuple[CorpusTier, ...] = (
     "compatibility",
@@ -236,6 +239,12 @@ def _parse_case(index: int, payload: dict[str, object]) -> CorpusCase:
     )
     if "performance" in tiers and workload is None:
         raise ManifestError(f"{label} is a performance case but has no workload provenance")
+    sdist_payload = payload.get("sdist")
+    sdist = (
+        None
+        if sdist_payload is None
+        else _parse_sdist(_mapping(sdist_payload, f"{label}.sdist"), label)
+    )
     return CorpusCase(
         id=case_id,
         name=_required_string(payload, "name", label),
@@ -256,6 +265,23 @@ def _parse_case(index: int, payload: dict[str, object]) -> CorpusCase:
         performance_timeout_seconds=_optional_positive_integer(
             payload, "performance_timeout_seconds", label
         ),
+        sdist=sdist,
+    )
+
+
+def _parse_sdist(payload: dict[str, object], case_label: str) -> SdistSource:
+    """Parse one exact archive and normalized tree identity."""
+    label = f"{case_label}.sdist"
+    _reject_unknown(payload, _SDIST_FIELDS, label)
+    archive_sha256 = _sha256(
+        _required_string(payload, "archive_sha256", label), f"{label}.archive_sha256"
+    )
+    tree_sha256 = _sha256(_required_string(payload, "tree_sha256", label), f"{label}.tree_sha256")
+    return SdistSource(
+        url=_https_archive_url(_required_string(payload, "url", label), label),
+        archive_sha256=archive_sha256,
+        archive_size=_positive_integer(payload.get("archive_size"), f"{label}.archive_size"),
+        tree_sha256=tree_sha256,
     )
 
 
@@ -372,6 +398,12 @@ def _full_sha(value: str, label: str) -> str:
     return value
 
 
+def _sha256(value: str, label: str) -> str:
+    if _SHA256_PATTERN.fullmatch(value) is None:
+        raise ManifestError(f"{label} must be 64 lowercase hexadecimal characters")
+    return value
+
+
 def _repository_url(value: str, label: str) -> str:
     parsed = urlparse(value)
     if (
@@ -383,6 +415,22 @@ def _repository_url(value: str, label: str) -> str:
         or not parsed.path.endswith(".git")
     ):
         raise ManifestError(f"{label}.repository must be a canonical HTTPS .git URL")
+    return value
+
+
+def _https_archive_url(value: str, label: str) -> str:
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.endswith((".tar.gz", ".tgz"))
+    ):
+        raise ManifestError(f"{label}.url must be a canonical HTTPS tar archive URL")
     return value
 
 

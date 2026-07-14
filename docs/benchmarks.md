@@ -12,11 +12,14 @@ not pooled into one headline number.
 
 ## Repository Corpus
 
-The schema-v1 manifest pins 25 repositories at full commit SHAs. Every case
-compiles the complete declared project root with both mypyc and Cython enabled;
-the runner does not choose favorable modules. Twelve cases add reviewed,
-seeded performance workloads covering validation, parsing, rendering, graph
-algorithms, symbolic work, typing, ORM construction, and async fan-out.
+The schema-v1 manifest pins 25 repositories at full commit SHAs. Git is the
+default source provider; an optional content-addressed sdist retains the commit
+as provenance when a qualifying release cannot be represented without a Git
+submodule. Every case compiles the complete declared project root with both
+mypyc and Cython enabled; the runner does not choose favorable modules. Twelve
+cases add reviewed, seeded performance workloads covering validation, parsing,
+rendering, graph algorithms, symbolic work, typing, ORM construction, and async
+fan-out.
 
 A clean no-op is `supported-no-op`: it is compatible but not accelerated.
 Unsupported and unprofitable cases stay in the result set. Setup, timeout,
@@ -50,17 +53,19 @@ as interchangeable speedups.
 
 ## Isolation And Evidence
 
-Each case runs in a fresh detached checkout and isolated environment. The
-runner validates the pinned `HEAD`, rejects submodules, unresolved Git LFS
-pointers, escaping symlinks, and pre-existing Atoll policy, then appends the
-reviewed benchmark policy only to the disposable `pyproject.toml`. Dependency
-bootstrap is network-enabled once; project builds, focused tests, oracles, and
-benchmarks then use the offline wheelhouse and a sanitized credential-free
-environment.
+Each case runs from a fresh immutable source materialization in an isolated
+environment. Git cases validate the pinned detached `HEAD` and reject
+submodules, unresolved Git LFS pointers, escaping symlinks, and pre-existing
+Atoll policy. Archive cases authenticate the byte size and SHA-256 before tar
+parsing, safely extract one regular-file root, and verify its normalized tree
+digest. The runner then appends the reviewed benchmark policy only to the
+disposable `pyproject.toml`. Dependency bootstrap is network-enabled once;
+project builds, focused tests, oracles, and benchmarks then use the offline
+wheelhouse and a sanitized credential-free environment.
 
 Evidence retains bounded logs, source manifests, toolchain and runner identity,
 policy patches, compiler probes, compile reports, canonical oracle digests, and
-wheel digests. Cloned source and wheel payloads are deleted rather than
+wheel digests. Materialized source and wheel payloads are deleted rather than
 uploaded. A warm run uses only the first run's case-local Atoll cache and must
 invoke no native compiler.
 

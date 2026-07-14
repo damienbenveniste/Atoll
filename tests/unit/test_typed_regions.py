@@ -338,6 +338,55 @@ def test_registration_decorator_keeps_original_class_for_method_binding(tmp_path
     )
 
 
+def test_methodless_inherited_class_cannot_capture_foreign_owner_methods(
+    tmp_path: Path,
+) -> None:
+    """An inherited class remains interpreted when another class references it."""
+    scan = _scan_source(
+        tmp_path,
+        "foreign_class_dependency",
+        [
+            "from dataclasses import dataclass",
+            "from enum import IntEnum",
+            "",
+            "class Code(IntEnum):",
+            "    OK = 1",
+            "",
+            "@dataclass",
+            "class Result:",
+            "    code: Code",
+            "",
+            "    @staticmethod",
+            "    def parse(value: int) -> Code:",
+            "        return Code(value)",
+            "",
+            "    def serialize(self) -> int:",
+            "        return int(self.code)",
+            "",
+        ],
+    )
+
+    assert all(
+        member.id.qualname != "Code" for region in scan.typed_regions for member in region.members
+    )
+    method_region = next(
+        region
+        for region in scan.typed_regions
+        if any(member.id.qualname == "Result.parse" for member in region.members)
+    )
+    assert method_region.atomic_class is False
+    assert {member.id.qualname for member in method_region.members} == {
+        "Result.parse",
+        "Result.serialize",
+    }
+    assert any(
+        decision.target == "foreign_class_dependency::Code"
+        and decision.action == "fallback"
+        and "source inheritance" in decision.reason
+        for decision in method_region.decisions
+    )
+
+
 @pytest.mark.parametrize(
     ("name", "owner", "lines", "reason"),
     [

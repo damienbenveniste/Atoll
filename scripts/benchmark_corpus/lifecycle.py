@@ -52,7 +52,11 @@ from scripts.benchmark_corpus.process import (
 from scripts.benchmark_corpus.results import classify_compile_report, write_case_result
 from scripts.benchmark_corpus.security import (
     CheckoutSecurityError,
+    CheckoutValidation,
+    SdistValidation,
     TrackedSourceManifest,
+    extract_sdist_archive,
+    regular_source_manifest,
     tracked_source_manifest,
     validate_checkout,
 )
@@ -154,6 +158,7 @@ class _Paths:
     temporary: Path
     wheelhouse: Path
     tools_environment: Path
+    source_archive: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +187,7 @@ class _State:
     warm_compiler_invocations: int | None = None
     comparison_key: str | None = None
     ratios: RatioEvidence = field(default_factory=RatioEvidence)
+    sdist_source: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,9 +310,7 @@ def _execute_case(context: _RunContext) -> None:
         python_path = os.pathsep.join(current_paths)
         online_environment["PYTHONPATH"] = python_path
         offline_environment["PYTHONPATH"] = python_path
-    repository = str(options.repository_mirror or case.repository)
-    _clone_checkout(context, repository, online_environment)
-    validation = validate_checkout(paths.checkout, case.revision, case.project_subroot)
+    validation = _prepare_source(context, online_environment)
     _write_source_manifest(
         validation.source_manifest,
         paths.evidence / "source-manifest-pristine.json",
@@ -336,8 +340,7 @@ def _execute_case(context: _RunContext) -> None:
     _require_pristine_source(paths, validation.source_manifest, "focused upstream tests")
     state.baseline_oracle_digest = _run_oracle(context, "baseline-oracle", baseline_arm)
     _require_pristine_source(paths, validation.source_manifest, "baseline oracle")
-    _clean_generated_checkout(context, offline_environment)
-    cleaned = validate_checkout(paths.checkout, case.revision, case.project_subroot)
+    cleaned = _restore_pristine_source(context, offline_environment)
     if cleaned.source_manifest != validation.source_manifest:
         raise LifecycleError(
             "upstream-broken",
@@ -351,7 +354,7 @@ def _execute_case(context: _RunContext) -> None:
         paths.checkout,
     )
     state.comparison_key = comparison_key(case, state.environment, state.policy)
-    state.source_before = tracked_source_manifest(paths.checkout)
+    state.source_before = _current_source_manifest(paths, state)
     _write_source_manifest(state.source_before, paths.evidence / "source-manifest-before.json")
     outcome = _compile_cold_and_warm(
         context,
@@ -761,7 +764,7 @@ def _compile_cold_and_warm(
             f"warm compile invoked native compiler {state.warm_compiler_invocations} time(s)",
         )
     _validate_warm_report(warm_report)
-    state.source_after = tracked_source_manifest(paths.checkout)
+    state.source_after = _current_source_manifest(paths, state)
     _write_source_manifest(state.source_after, paths.evidence / "source-manifest-after.json")
     status = _agreed_compile_status(cold_status, warm_status)
     if status == "unstable" and cold_status != warm_status:
@@ -855,6 +858,7 @@ def _prepare_paths(case: CorpusCase, options: LifecycleOptions) -> _Paths:
         temporary=temporary,
         wheelhouse=workspace / "wheelhouse",
         tools_environment=workspace / "envs" / "tools",
+        source_archive=workspace / "source.tar.gz",
     )
 
 
@@ -920,12 +924,124 @@ def _clone_checkout(
     _require_success(checkout, "infrastructure-error", "detached revision checkout")
 
 
+def _prepare_source(
+    context: _RunContext,
+    environment: dict[str, str],
+) -> CheckoutValidation | SdistValidation:
+    """Materialize and validate the selected Git or content-addressed source."""
+    case = context.case
+    if case.sdist is None:
+        repository = str(context.options.repository_mirror or case.repository)
+        _clone_checkout(context, repository, environment)
+        return validate_checkout(context.paths.checkout, case.revision, case.project_subroot)
+    context.state.sdist_source = True
+    _acquire_sdist(context)
+    validation = extract_sdist_archive(
+        context.paths.source_archive,
+        context.paths.checkout,
+        case.sdist,
+        project_subroot=case.project_subroot,
+    )
+    (context.paths.evidence / "source-archive-identity.json").write_text(
+        _render_sdist_identity(context, validation),
+        encoding="utf-8",
+    )
+    return validation
+
+
+def _acquire_sdist(context: _RunContext) -> None:
+    """Download or copy exactly the locked number of archive bytes."""
+    source = context.case.sdist
+    if source is None:
+        raise LifecycleError("infrastructure-error", "sdist source identity is unavailable")
+    mirror = context.options.repository_mirror
+    if mirror is not None:
+        _copy_bounded_archive(Path(mirror), context.paths.source_archive, source.archive_size)
+        return
+    curl = shutil.which("curl")
+    if curl is None:
+        raise LifecycleError("infrastructure-error", "curl executable is unavailable")
+    _required_phase(
+        context,
+        _PhaseRequest(
+            name="download-sdist",
+            argv=(
+                curl,
+                "--fail",
+                "--location",
+                "--silent",
+                "--show-error",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--max-filesize",
+                str(source.archive_size),
+                "--output",
+                str(context.paths.source_archive),
+                source.url,
+            ),
+            cwd=context.paths.workspace,
+            environment=_environment(context.paths, offline=False),
+            timeout_seconds=300,
+            network_allowed=True,
+        ),
+        "sdist archive download",
+    )
+
+
+def _copy_bounded_archive(source: Path, destination: Path, expected_size: int) -> None:
+    """Copy a test mirror without writing beyond its locked size."""
+    copied = 0
+    with source.open("rb") as stream, destination.open("xb") as output:
+        while chunk := stream.read(1024 * 1024):
+            copied += len(chunk)
+            if copied > expected_size:
+                destination.unlink(missing_ok=True)
+                raise LifecycleError(
+                    "security-violation", "sdist mirror exceeds its locked byte size"
+                )
+            output.write(chunk)
+    if copied != expected_size:
+        destination.unlink(missing_ok=True)
+        raise LifecycleError(
+            "security-violation",
+            f"sdist mirror size {copied} does not equal locked size {expected_size}",
+        )
+
+
+def _sdist_identity_payload(
+    context: _RunContext,
+    validation: SdistValidation,
+) -> dict[str, object]:
+    source = context.case.sdist
+    if source is None:
+        raise LifecycleError("infrastructure-error", "sdist source identity is unavailable")
+    return {
+        "archive_sha256": validation.archive_sha256,
+        "archive_size": source.archive_size,
+        "tree_sha256": validation.source_manifest.manifest_digest,
+    }
+
+
+def _render_sdist_identity(context: _RunContext, validation: SdistValidation) -> str:
+    payload = _sdist_identity_payload(context, validation)
+    return f"{json.dumps(payload, sort_keys=True, separators=(',', ':'))}\n"
+
+
 def _require_pristine_source(
     paths: _Paths,
     expected: TrackedSourceManifest,
     phase: str,
 ) -> None:
-    observed = tracked_source_manifest(paths.checkout)
+    observed = (
+        regular_source_manifest(
+            paths.checkout,
+            paths=tuple(record.path for record in expected.files),
+        )
+        if not (paths.checkout / ".git").is_dir()
+        else tracked_source_manifest(paths.checkout)
+    )
     if observed.manifest_digest != expected.manifest_digest:
         raise LifecycleError("upstream-broken", f"{phase} changed tracked project files")
 
@@ -947,6 +1063,24 @@ def _clean_generated_checkout(
             timeout_seconds=300,
         ),
         "disposable checkout cleanup",
+    )
+
+
+def _restore_pristine_source(
+    context: _RunContext,
+    environment: dict[str, str],
+) -> CheckoutValidation | SdistValidation:
+    """Restore source from its immutable origin after upstream qualification."""
+    case = context.case
+    if case.sdist is None:
+        _clean_generated_checkout(context, environment)
+        return validate_checkout(context.paths.checkout, case.revision, case.project_subroot)
+    shutil.rmtree(context.paths.checkout)
+    return extract_sdist_archive(
+        context.paths.source_archive,
+        context.paths.checkout,
+        case.sdist,
+        project_subroot=case.project_subroot,
     )
 
 
@@ -1520,7 +1654,7 @@ def _capture_final_source(paths: _Paths, state: _State) -> None:
     if state.source_before is None or not paths.checkout.exists():
         return
     try:
-        state.source_after = tracked_source_manifest(paths.checkout)
+        state.source_after = _current_source_manifest(paths, state)
         _write_source_manifest(state.source_after, paths.evidence / "source-manifest-after.json")
     except (CheckoutSecurityError, OSError) as error:
         state.diagnostics.append(f"cannot capture final tracked source manifest: {error}")
@@ -1532,6 +1666,18 @@ def _source_changed(state: _State) -> bool:
         and state.source_after is not None
         and state.source_before.manifest_digest != state.source_after.manifest_digest
     )
+
+
+def _current_source_manifest(paths: _Paths, state: _State) -> TrackedSourceManifest:
+    """Capture source identity with the selected source provider's semantics."""
+    if state.sdist_source:
+        locked_paths = (
+            None
+            if state.source_before is None
+            else tuple(record.path for record in state.source_before.files)
+        )
+        return regular_source_manifest(paths.checkout, paths=locked_paths)
+    return tracked_source_manifest(paths.checkout)
 
 
 def _case_result(

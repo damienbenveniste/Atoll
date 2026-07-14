@@ -364,10 +364,8 @@ def _connect_atomic_classes(
     for symbol in symbols:
         if symbol.kind == "method" and symbol.owner_class is not None:
             methods_by_owner[symbol.owner_class].append(symbol)
-    for owner, methods in methods_by_owner.items():
-        class_symbol = classes.get(owner)
-        if class_symbol is None:
-            continue
+    for owner, class_symbol in classes.items():
+        methods = methods_by_owner.get(owner, [])
         unsafe_reason = _atomic_class_unsafe_reason(class_symbol, tree)
         if unsafe_reason is not None:
             eligible.pop(class_symbol.id, None)
@@ -786,11 +784,19 @@ def _typed_region(
     atomic_class = any(symbol.kind == "class" for symbol in symbols)
     bindings = _binding_targets(symbols, atomic_class=atomic_class)
     owner_names = {symbol.owner_class for symbol in symbols if symbol.owner_class is not None}
+    dependency_class_names = {
+        edge.dst.qualname
+        for edge in context.edges
+        if edge.src in component
+        and isinstance(edge.dst, SymbolId)
+        and edge.dst.qualname in context.downgraded_classes
+    }
+    downgraded_names = owner_names | dependency_class_names
     decisions = (
         *(_lowering_decision(symbol, scopes[symbol.id]) for symbol in symbols),
         *(
             context.downgraded_classes[owner]
-            for owner in sorted(owner_names & context.downgraded_classes.keys())
+            for owner in sorted(downgraded_names & context.downgraded_classes.keys())
         ),
     )
     source_hash = _region_hash(

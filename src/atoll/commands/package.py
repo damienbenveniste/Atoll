@@ -6,6 +6,7 @@ import ast
 import hashlib
 import re
 import shutil
+import sys
 import tempfile
 import textwrap
 import time
@@ -139,6 +140,7 @@ from atoll.optimization_policy import (
     DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
     PROFILE_GUIDED_MINIMUM_MARGINAL_SPEEDUP,
 )
+from atoll.profile_plan_cache import ProfilePlanDecision, ProfilePlanIdentity, select_profile_plan
 from atoll.project import DiscoveredProject, discover_project
 from atoll.region_cache import compile_many_with_region_cache, compile_with_region_cache
 from atoll.runtime.execution_plan_performance import (
@@ -170,6 +172,7 @@ from atoll.runtime.performance import (
     run_performance_command,
 )
 from atoll.runtime.profiling import (
+    MappedCandidateDecision,
     ProfileCallEdgeTarget,
     ProfileResult,
     run_baseline_profile,
@@ -225,6 +228,8 @@ _RUN_GUARD_DISPATCH_RANK = 25
 _MAX_PROFILED_CALL_CHAIN_ROOTS = 4
 _MINIMUM_CYTHON_BATCH_SIZE = 2
 _MINIMUM_INTERACTION_VARIANTS = 2
+_PROFILE_PLAN_CACHE_FORMAT_VERSION = "1"
+_PROFILE_PLAN_LOWERING_VERSION = "profile-native-selection-v1"
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -1300,6 +1305,14 @@ def execute_package(options: PackageOptions) -> PackageCommandResult:
     )
     if source_terminal is not None:
         return source_terminal
+    profile = _stabilize_profile_compile_selection(
+        options=options,
+        project=project,
+        scans=scans,
+        profile=profile,
+        scope_identity="baseline",
+    )
+    preparation = replace(preparation, profile=profile)
     source_trials = source_search.trials if source_search is not None else ()
     profile_members = (
         profile.selected_symbols if profile is not None and profile.status == "profiled" else ()
@@ -1649,6 +1662,16 @@ def _execute_composed_source_arm(
     active_execution_plans = build_execution_plans(active_scans, active_profile)
     active_fusion_plans = (
         build_fusion_plans(active_scans, active_profile) if active_profile is not None else ()
+    )
+    active_profile = _stabilize_profile_compile_selection(
+        options=options,
+        project=arm.active_project,
+        scans=active_scans,
+        profile=active_profile,
+        scope_identity=(
+            "accepted-source:"
+            + hashlib.sha256(search.materialization_patch.patch_text.encode("utf-8")).hexdigest()
+        ),
     )
     typed_regions = tuple(region for scan in active_scans for region in scan.typed_regions)
     profile_members = (
@@ -7677,6 +7700,156 @@ def _select_profile_with_call_chains(
     )
 
 
+def _stabilize_profile_compile_selection(
+    *,
+    options: PackageOptions,
+    project: DiscoveredProject,
+    scans: tuple[ModuleScan, ...],
+    profile: ProfileResult | None,
+    scope_identity: str,
+) -> ProfileResult | None:
+    """Replay the first strict native candidate plan for an unchanged scope.
+
+    Profiling and source/execution-plan discovery run before this boundary on
+    every invocation. The cache controls only which native bindings are offered
+    to compilation, preventing statistical sample jitter from creating new
+    cold artifact variants on an otherwise identical warm build. Semantic and
+    profitability gates still evaluate the replayed selection from scratch.
+
+    Args:
+        options: Current package options, including an optional cache override.
+        project: Active original or transformed project configuration.
+        scans: Active source scans whose content and symbols bound replay.
+        profile: Fresh current-invocation profile and candidate selection.
+        scope_identity: Stable baseline or accepted-source arm identity.
+
+    Returns:
+        ProfileResult | None: Fresh profile evidence with a strictly replayed native
+            selection on a cache hit, otherwise the current selection.
+    """
+    benchmark = project.config.compile.benchmark_command
+    if (
+        profile is None
+        or profile.status != "profiled"
+        or not profile.selected_symbols
+        or benchmark is None
+    ):
+        return profile
+    available = frozenset(symbol.id for scan in scans for symbol in scan.symbols)
+    try:
+        identity = ProfilePlanIdentity(
+            scope_identity=scope_identity,
+            candidate_identity=tuple(sorted(symbol.stable_id for symbol in available)),
+            module_source_hashes=tuple(
+                sorted(
+                    (
+                        scan.module.name,
+                        hashlib.sha256(scan.module.path.read_bytes()).hexdigest(),
+                    )
+                    for scan in scans
+                )
+            ),
+            benchmark_argv=benchmark,
+            backend_order=tuple(project.config.compile.backends),
+            module_scope=options.module_name,
+            python_cache_tag=(
+                sys.implementation.cache_tag
+                or f"{sys.implementation.name}-{sys.version_info.major}{sys.version_info.minor}"
+            ),
+            python_platform=next(tags.sys_tags()).platform,
+            cache_format_version=_PROFILE_PLAN_CACHE_FORMAT_VERSION,
+            lowering_version=_PROFILE_PLAN_LOWERING_VERSION,
+        )
+        decision = select_profile_plan(
+            options.cache_dir or project.config.cache_dir,
+            identity,
+            profile.selected_symbols,
+            available,
+        )
+    except (OSError, ValueError) as error:
+        _progress(options.progress, f"profile compile plan cache unavailable: {error}")
+        return profile
+    _progress(
+        options.progress,
+        (
+            f"profile compile plan cache {decision.status}: "
+            f"{len(decision.selection)} member(s); {decision.diagnostic}"
+        ),
+    )
+    if decision.status != "hit":
+        return profile
+    return _profile_with_replayed_compile_selection(profile, decision)
+
+
+def _profile_with_replayed_compile_selection(
+    profile: ProfileResult,
+    decision: ProfilePlanDecision,
+) -> ProfileResult:
+    """Make cached native selection explicit in otherwise fresh profile evidence.
+
+    Args:
+        profile: Current profile whose samples and lifecycle evidence remain authoritative.
+        decision: Strict cache hit containing the first ordered native selection.
+
+    Returns:
+        ProfileResult: Profile with replayed selection, current-run coverage,
+            and candidate reasons that distinguish replay from fresh ranking.
+    """
+    selected = frozenset(decision.selection)
+    members = {member.symbol: member for member in profile.members}
+    seen: set[SymbolId] = set()
+    candidates: list[MappedCandidateDecision] = []
+    for candidate in profile.candidates:
+        if candidate.symbol in selected:
+            seen.add(candidate.symbol)
+            candidates.append(replace(candidate, selected=True, reason="cache-replayed"))
+        elif candidate.selected:
+            candidates.append(replace(candidate, selected=False, reason="cache-replay-excluded"))
+        else:
+            candidates.append(candidate)
+    for symbol in decision.selection:
+        if symbol in seen:
+            continue
+        member = members.get(symbol)
+        samples = member.samples if member is not None else 0
+        scheduler_samples = member.scheduler_overhead_samples if member is not None else 0
+        attributed_samples = samples + scheduler_samples
+        candidates.append(
+            MappedCandidateDecision(
+                symbol=symbol,
+                module=symbol.module,
+                qualname=symbol.qualname,
+                samples=samples,
+                coverage=member.coverage if member is not None else 0.0,
+                scheduler_overhead_samples=scheduler_samples,
+                attributed_samples=attributed_samples,
+                attributed_coverage=_sample_coverage(
+                    attributed_samples,
+                    profile.total_samples,
+                ),
+                selected=True,
+                reason="cache-replayed",
+            )
+        )
+    selected_samples = sum(
+        member.attributed_samples for member in profile.members if member.symbol in selected
+    )
+    return replace(
+        profile,
+        reason=(
+            f"{profile.reason}; native candidate selection replayed from strict cache "
+            f"{decision.identity_digest[:12]}"
+        ),
+        selected_hot_samples=selected_samples,
+        selected_hot_coverage=_sample_coverage(
+            selected_samples,
+            profile.mapped_project_samples + profile.scheduler_overhead_samples,
+        ),
+        candidates=tuple(candidates),
+        selected_symbols=decision.selection,
+    )
+
+
 def _profile_candidate_members(
     scans: tuple[ModuleScan, ...],
     backends: tuple[Backend, ...],
@@ -8030,7 +8203,11 @@ def _eligible_atomic_class(
         return None
     if not method_members:
         return None
-    if any(member.execution_kind != "sync" for member in method_members):
+    owner_class = class_members[0].id.qualname
+    if any(
+        member.owner_class != owner_class or member.execution_kind != "sync"
+        for member in method_members
+    ):
         return None
     supported = set(assessment.supported_members)
     if any(member.id not in supported for member in region.members):

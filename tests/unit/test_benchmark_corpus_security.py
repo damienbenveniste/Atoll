@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import shutil
 import subprocess
+import tarfile
 from pathlib import Path, PurePosixPath
 
 import pytest
+from scripts.benchmark_corpus.models import SdistSource
 from scripts.benchmark_corpus.security import (
     CheckoutSecurityError,
+    extract_sdist_archive,
     tracked_source_manifest,
     validate_checkout,
 )
@@ -64,6 +68,43 @@ def _commit_detached(repository: Path, message: str) -> str:
 def _finding_codes(error: CheckoutSecurityError) -> set[str]:
     """Return stable finding codes from a rejected checkout."""
     return {finding.code for finding in error.findings}
+
+
+def _tar_archive(
+    path: Path,
+    members: tuple[tuple[str, bytes, bytes, str], ...],
+) -> Path:
+    """Write a small tar.gz with exact member types for security tests."""
+    with tarfile.open(path, mode="w:gz") as archive:
+        for name, content, member_type, linkname in members:
+            member = tarfile.TarInfo(name)
+            member.type = member_type
+            member.linkname = linkname
+            member.size = len(content) if member_type == tarfile.REGTYPE else 0
+            archive.addfile(member, io.BytesIO(content) if member.size else None)
+    return path
+
+
+def _tree_digest(files: tuple[tuple[str, bytes], ...]) -> str:
+    """Encode regular files using the corpus tree-manifest contract."""
+    aggregate = hashlib.sha256()
+    for name, content in sorted(files):
+        content_digest = hashlib.sha256(content).hexdigest()
+        for value in (name.encode(), content_digest.encode(), str(len(content)).encode()):
+            aggregate.update(len(value).to_bytes(8, byteorder="big"))
+            aggregate.update(value)
+    return aggregate.hexdigest()
+
+
+def _sdist_source(archive: Path, files: tuple[tuple[str, bytes], ...]) -> SdistSource:
+    """Lock one local test archive and its expected stripped tree."""
+    content = archive.read_bytes()
+    return SdistSource(
+        url="https://example.invalid/source.tar.gz",
+        archive_sha256=hashlib.sha256(content).hexdigest(),
+        archive_size=len(content),
+        tree_sha256=_tree_digest(files),
+    )
 
 
 def test_validate_checkout_rejects_head_that_moved_from_pin(tmp_path: Path) -> None:
@@ -120,6 +161,23 @@ def test_validate_checkout_rejects_symlink_escape(tmp_path: Path) -> None:
         validate_checkout(repository, revision, git_executable=_git_executable())
 
     assert "symlink-escape" in _finding_codes(raised.value)
+
+
+def test_git_source_still_rejects_submodule_metadata_and_gitlinks(tmp_path: Path) -> None:
+    """Adding sdist support does not relax the strict Git source boundary."""
+    repository, revision = _repository(tmp_path)
+    (repository / ".gitmodules").write_text(
+        '[submodule "vendor"]\npath = vendor\nurl = https://example.invalid/vendor.git\n',
+        encoding="utf-8",
+    )
+    _git(repository, "add", ".gitmodules")
+    _git(repository, "update-index", "--add", "--cacheinfo", f"160000,{revision},vendor")
+    pinned_revision = _commit_detached(repository, "add forbidden submodule")
+
+    with pytest.raises(CheckoutSecurityError) as raised:
+        validate_checkout(repository, pinned_revision, git_executable=_git_executable())
+
+    assert {"gitmodules", "submodule"}.issubset(_finding_codes(raised.value))
 
 
 def test_validate_checkout_rejects_existing_compile_policy(tmp_path: Path) -> None:
@@ -192,3 +250,110 @@ def test_tracked_source_manifest_has_stable_sorted_hashes(tmp_path: Path) -> Non
     changed = tracked_source_manifest(repository, git_executable=_git_executable())
     assert changed.manifest_digest != first.manifest_digest
     assert changed.files != first.files
+
+
+def test_sdist_hash_is_rejected_before_malformed_archive_is_parsed(tmp_path: Path) -> None:
+    """Untrusted bytes never reach tar parsing before content authentication."""
+    archive = tmp_path / "source.tar.gz"
+    archive.write_bytes(b"not a tar archive")
+    source = SdistSource(
+        url="https://example.invalid/source.tar.gz",
+        archive_sha256="0" * 64,
+        archive_size=archive.stat().st_size,
+        tree_sha256="0" * 64,
+    )
+
+    with pytest.raises(CheckoutSecurityError) as raised:
+        extract_sdist_archive(archive, tmp_path / "checkout", source)
+
+    assert _finding_codes(raised.value) == {"archive-digest"}
+    assert not (tmp_path / "checkout").exists()
+
+
+def test_sdist_extracts_one_root_and_omits_git_pointer_files(tmp_path: Path) -> None:
+    """Verified regular files are root-stripped while VCS pointers are omitted."""
+    pyproject = b'[project]\nname = "fixture"\nversion = "1.0"\n'
+    source_bytes = b"VALUE = 1\n"
+    files = (("pyproject.toml", pyproject), ("src/source.py", source_bytes))
+    archive = _tar_archive(
+        tmp_path / "source.tar.gz",
+        (
+            ("fixture-1.0/pyproject.toml", pyproject, tarfile.REGTYPE, ""),
+            ("fixture-1.0/src/source.py", source_bytes, tarfile.REGTYPE, ""),
+            ("fixture-1.0/tests/data/.git", b"gitdir: ../admin\n", tarfile.REGTYPE, ""),
+        ),
+    )
+
+    validation = extract_sdist_archive(
+        archive,
+        tmp_path / "checkout",
+        _sdist_source(archive, files),
+    )
+
+    assert validation.source_manifest.manifest_digest == _tree_digest(files)
+    assert (tmp_path / "checkout/src/source.py").read_bytes() == source_bytes
+    assert not (tmp_path / "checkout/tests/data/.git").exists()
+
+
+@pytest.mark.parametrize(
+    ("members", "code"),
+    [
+        ((("root/../escape.py", b"x", tarfile.REGTYPE, ""),), "unsafe-path"),
+        ((("/root/escape.py", b"x", tarfile.REGTYPE, ""),), "unsafe-path"),
+        ((("root\\escape.py", b"x", tarfile.REGTYPE, ""),), "unsafe-path"),
+        (
+            (
+                ("root/source.py", b"x", tarfile.REGTYPE, ""),
+                ("root/source.py", b"y", tarfile.REGTYPE, ""),
+            ),
+            "archive-member",
+        ),
+        (
+            (
+                ("root/source.py", b"x", tarfile.REGTYPE, ""),
+                ("other/source.py", b"y", tarfile.REGTYPE, ""),
+            ),
+            "archive-member",
+        ),
+        ((("root/link", b"", tarfile.SYMTYPE, "outside"),), "archive-member"),
+        ((("root/link", b"", tarfile.LNKTYPE, "root/source.py"),), "archive-member"),
+        ((("root/device", b"", tarfile.CHRTYPE, ""),), "archive-member"),
+        ((("root/.gitmodules", b"[submodule]\n", tarfile.REGTYPE, ""),), "gitmodules"),
+    ],
+)
+def test_sdist_rejects_unsafe_member_graphs(
+    tmp_path: Path,
+    members: tuple[tuple[str, bytes, bytes, str], ...],
+    code: str,
+) -> None:
+    """Tar metadata cannot introduce aliases, external paths, or submodules."""
+    archive = _tar_archive(tmp_path / "source.tar.gz", members)
+    source = _sdist_source(archive, (("placeholder", b"placeholder"),))
+
+    with pytest.raises(CheckoutSecurityError) as raised:
+        extract_sdist_archive(archive, tmp_path / "checkout", source)
+
+    assert code in _finding_codes(raised.value)
+    assert not (tmp_path / "checkout").exists()
+
+
+def test_sdist_rejects_declared_file_over_size_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Declared expansion size is bounded before extraction writes a file."""
+    archive = _tar_archive(
+        tmp_path / "source.tar.gz",
+        (("root/source.py", b"four", tarfile.REGTYPE, ""),),
+    )
+    monkeypatch.setattr("scripts.benchmark_corpus.security.MAX_EXTRACTED_FILE_BYTES", 3)
+
+    with pytest.raises(CheckoutSecurityError) as raised:
+        extract_sdist_archive(
+            archive,
+            tmp_path / "checkout",
+            _sdist_source(archive, (("source.py", b"four"),)),
+        )
+
+    assert _finding_codes(raised.value) == {"archive-size"}
+    assert not (tmp_path / "checkout").exists()

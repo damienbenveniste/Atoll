@@ -186,6 +186,10 @@ region under `.atoll/cache/compile/regions/`; deterministic non-transient backen
 stored separately under `.atoll/cache/compile/decisions/`. An unchanged variant restores the
 rejection decision or native files without invoking mypyc or Cython again. `atoll clean --cache`
 removes all reusable compiler state.
+For benchmark-guided builds, Atoll still collects a fresh profile on every invocation. It stores the
+first source- and environment-bound native candidate plan under `.atoll/cache/profile-plans/` so
+sampling jitter cannot force new compiler work on an unchanged warm build. A replayed plan still
+runs the configured semantic, marginal-profitability, and final benchmark gates.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
 scan and compile reports. A callable from such a module is compiled only when the typed-region
 analysis and backend capability assessment can still preserve its source behavior.

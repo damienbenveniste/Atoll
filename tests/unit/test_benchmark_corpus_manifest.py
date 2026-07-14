@@ -13,6 +13,8 @@ _SHA_A = "a" * 40
 _SHA_B = "b" * 40
 _INVALID_MANIFEST_EXIT_CODE = 2
 _VALID_HASH = "a" * 64
+_TREE_HASH = "b" * 64
+_ARCHIVE_SIZE = 1234
 _EXPECTED_REPOSITORY_CASES = {
     "anyio",
     "attrs",
@@ -124,6 +126,51 @@ def test_load_manifest_accepts_exact_schema_version_one(tmp_path: Path) -> None:
     assert manifest.schema_version == 1
     assert manifest.python_version == "3.12"
     assert manifest.backends == ("mypyc", "cython")
+
+
+def test_schema_one_accepts_optional_content_addressed_sdist(tmp_path: Path) -> None:
+    """Schema one adds archive sources without changing existing Git cases."""
+    sdist = (
+        "[case.sdist]",
+        'url = "https://files.example.invalid/source/alpha-1.0.tar.gz"',
+        f'archive_sha256 = "{_VALID_HASH}"',
+        f"archive_size = {_ARCHIVE_SIZE}",
+        f'tree_sha256 = "{_TREE_HASH}"',
+    )
+    manifest = load_manifest(_write_manifest(tmp_path / "corpus.toml", cases=(_case(extra=sdist),)))
+
+    assert manifest.schema_version == 1
+    assert manifest.cases[0].sdist is not None
+    assert manifest.cases[0].sdist.archive_size == _ARCHIVE_SIZE
+    assert manifest.cases[0].revision == _SHA_A
+
+
+@pytest.mark.parametrize(
+    "sdist_field",
+    [
+        'url = "http://files.example.invalid/alpha.tar.gz"',
+        'archive_sha256 = "short"',
+        "archive_size = 0",
+        'tree_sha256 = "short"',
+    ],
+)
+def test_sdist_identity_rejects_mutable_or_incomplete_locks(
+    tmp_path: Path,
+    sdist_field: str,
+) -> None:
+    """Every archive representation has a canonical URL and complete lock."""
+    fields = {
+        "url": 'url = "https://files.example.invalid/alpha.tar.gz"',
+        "archive_sha256": f'archive_sha256 = "{_VALID_HASH}"',
+        "archive_size": f"archive_size = {_ARCHIVE_SIZE}",
+        "tree_sha256": f'tree_sha256 = "{_TREE_HASH}"',
+    }
+    key = sdist_field.split(" =", maxsplit=1)[0]
+    fields[key] = sdist_field
+    case = _case(extra=("[case.sdist]", *fields.values()))
+
+    with pytest.raises(ValueError, match=key):
+        load_manifest(_write_manifest(tmp_path / "corpus.toml", cases=(case,)))
 
 
 def test_load_manifest_rejects_missing_schema_version(tmp_path: Path) -> None:
@@ -389,6 +436,16 @@ def test_repository_manifest_keeps_httpx_and_dulwich_tests_with_their_projects()
         "tests.test_objects.BlobReadTests.test_create_blob_from_string"
     )
     assert set(commands) == _EXPECTED_REPOSITORY_CASES
+    cases = {case.id: case for case in manifest.cases}
+    html5lib_source = cases["html5lib"].sdist
+    assert html5lib_source is not None
+    assert html5lib_source.archive_sha256 == (
+        "b2e5b40261e20f354d198eae92afc10d750afb487ed5e50f9c4eaf07c184146f"
+    )
+    assert html5lib_source.tree_sha256 == (
+        "ce3f57e64d28229d48b210b348d831126546abe0c8290250f74144e8bffef3f5"
+    )
+    assert all(case.sdist is None for case in manifest.cases if case.id != "html5lib")
 
 
 def test_lock_cli_write_uses_reviewed_input_and_reproducible_uv_policy(

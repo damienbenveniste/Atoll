@@ -92,6 +92,12 @@ oracle_arguments = ["--case", "html5lib"]
 tiers = ["compatibility", "performance"]
 platforms = ["ubuntu-24.04", "macos-14"]
 
+[case.sdist]
+url = "https://files.pythonhosted.org/packages/source/h/html5lib/html5lib-1.1.tar.gz"
+archive_sha256 = "b2e5b40261e20f354d198eae92afc10d750afb487ed5e50f9c4eaf07c184146f"
+archive_size = 272215
+tree_sha256 = "ce3f57e64d28229d48b210b348d831126546abe0c8290250f74144e8bffef3f5"
+
 [case.workload]
 source = "atoll"
 repository = "https://github.com/damienbenveniste/Atoll.git"

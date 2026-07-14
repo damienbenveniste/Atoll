@@ -70,6 +70,7 @@ from atoll.runtime.profiling import (
     ProfiledCallEdge,
     ProfiledMember,
     ProfileResult,
+    select_profile_candidates,
     unconfigured_profile,
 )
 from atoll.source_optimization.analysis import SourceOptimizationPlanningResult
@@ -357,6 +358,10 @@ _selected_typed_regions = cast(
     Callable[..., tuple[_TypedSelection, ...]],
     _package_attr("_selected_typed_regions"),
 )
+_eligible_atomic_class = cast(
+    Callable[[TypedRegion, BackendAssessment], SymbolId | None],
+    _package_attr("_eligible_atomic_class"),
+)
 _prepare_typed_region = cast(
     Callable[..., _PreparedTypedRegion], _package_attr("_prepare_typed_region")
 )
@@ -399,6 +404,10 @@ _staged_typed_selection = cast(
 _profile_candidate_members = cast(
     Callable[[tuple[ModuleScan, ...], tuple[Backend, ...]], tuple[SymbolId, ...]],
     _package_attr("_profile_candidate_members"),
+)
+_stabilize_profile_compile_selection = cast(
+    Callable[..., ProfileResult | None],
+    _package_attr("_stabilize_profile_compile_selection"),
 )
 _call_chain_analyses = cast(
     Callable[
@@ -1198,6 +1207,32 @@ def test_atomic_class_selection_is_exclusive_and_partial_classes_split(
         for selection in worker_selections
         for member in selection.members
     )
+
+
+def test_atomic_class_selection_rejects_methods_from_another_owner(tmp_path: Path) -> None:
+    """A foreign method cannot authorize replacement of an unrelated class."""
+    project_root = tmp_path / "typed_region_project"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    scan = _selected_scans(project, "typed_region_project.worker")[0]
+    region = next(item for item in scan.typed_regions if item.atomic_class)
+    class_member = next(member for member in region.members if member.kind == "class")
+    method_member = next(member for member in region.members if member.kind == "method")
+    malformed = replace(
+        region,
+        members=(class_member, replace(method_member, owner_class="ForeignOwner")),
+    )
+    assessment = BackendAssessment(
+        region_id=malformed.id,
+        backend="cython",
+        status="supported",
+        supported_members=tuple(member.id for member in malformed.members),
+        unsupported_members=(),
+        capabilities=("native_class", "instance_method"),
+        reasons=("test assessment",),
+    )
+
+    assert _eligible_atomic_class(malformed, assessment) is None
 
 
 def test_method_selection_rejects_class_cell_and_private_name_semantics() -> None:
@@ -3319,6 +3354,127 @@ minimum_speedup = 1.10
     ]
     assert "benchmark sample pair 1 baseline completed in 0.12s" in progress_messages
     assert {binding.source.qualname for binding in result.compiled_bindings} == {"rank_candidates"}
+
+
+def test_profile_compile_plan_replays_first_selection_and_invalidates_on_source_change(
+    tmp_path: Path,
+) -> None:
+    """Fresh profile jitter cannot create a new warm native artifact plan."""
+    project = _quality_gate_project(
+        tmp_path,
+        (
+            'test_command = ["python", "-c", "pass"]',
+            'benchmark_command = ["python", "bench.py"]',
+        ),
+    )
+    scans = _selected_scans(project, "app.ranking")
+    rank = SymbolId("app.ranking", "rank_candidates")
+    score = SymbolId("app.ranking", "score_user")
+    profile_symbols = tuple(
+        symbol for scan in scans for symbol in scan.symbols if symbol.id in {rank, score}
+    )
+    warm_rank_samples = 20
+    warm_score_samples = 140
+    expected_cache_misses = 2
+    cache_root = tmp_path / "compile-cache"
+    progress: list[str] = []
+    options = package_command.PackageOptions(
+        root=project.config.root,
+        module_name="app.ranking",
+        cache_dir=cache_root,
+        progress=progress.append,
+    )
+
+    def profile(selected: SymbolId, *, rank_samples: int, score_samples: int) -> ProfileResult:
+        members = tuple(
+            ProfiledMember(
+                module=symbol.module,
+                qualname=symbol.qualname,
+                samples=samples,
+                coverage=samples / 200,
+                call_count=10,
+                lifecycle=LifecycleCounts(
+                    start=10,
+                    return_=10,
+                    yield_=0,
+                    resume=0,
+                    unwind=0,
+                    throw=0,
+                ),
+                signatures=(),
+                polymorphic_overflow=False,
+            )
+            for symbol, samples in ((rank, rank_samples), (score, score_samples))
+        )
+        fresh = replace(
+            unconfigured_profile(),
+            status="profiled",
+            reason="fresh fixture profile",
+            launch_kind="script",
+            total_samples=200,
+            mapped_project_samples=rank_samples + score_samples,
+            mapped_coverage=(rank_samples + score_samples) / 200,
+            members=members,
+        )
+        ranked = select_profile_candidates(fresh, profile_symbols)
+        assert ranked.selected_symbols == (selected,)
+        return ranked
+
+    cold = _stabilize_profile_compile_selection(
+        options=options,
+        project=project,
+        scans=scans,
+        profile=profile(rank, rank_samples=140, score_samples=20),
+        scope_identity="baseline",
+    )
+    warm = _stabilize_profile_compile_selection(
+        options=options,
+        project=project,
+        scans=scans,
+        profile=profile(
+            score,
+            rank_samples=warm_rank_samples,
+            score_samples=warm_score_samples,
+        ),
+        scope_identity="baseline",
+    )
+
+    assert cold is not None
+    assert warm is not None
+    assert cold.selected_symbols == (rank,)
+    assert warm.selected_symbols == (rank,)
+    assert warm.selected_hot_samples == warm_rank_samples
+    assert warm.selected_hot_coverage == pytest.approx(0.125)
+    assert "native candidate selection replayed from strict cache" in warm.reason
+    assert [(candidate.symbol, candidate.reason) for candidate in warm.candidates] == [
+        (score, "cache-replay-excluded"),
+        (rank, "cache-replayed"),
+    ]
+    assert any("profile compile plan cache miss" in message for message in progress)
+    assert any("profile compile plan cache hit" in message for message in progress)
+
+    module_path = next(scan.module.path for scan in scans if scan.module.name == "app.ranking")
+    module_path.write_text(module_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    changed_project = discover_project(project.config.root)
+    changed_scans = _selected_scans(changed_project, "app.ranking")
+    changed = _stabilize_profile_compile_selection(
+        options=options,
+        project=changed_project,
+        scans=changed_scans,
+        profile=profile(
+            score,
+            rank_samples=warm_rank_samples,
+            score_samples=warm_score_samples,
+        ),
+        scope_identity="baseline",
+    )
+
+    assert changed is not None
+    assert changed.selected_symbols == (score,)
+    assert (
+        sum("profile compile plan cache miss" in message for message in progress)
+        == expected_cache_misses
+    )
 
 
 def test_conditional_task_fusion_trials_disposable_payload_after_safe_miss(

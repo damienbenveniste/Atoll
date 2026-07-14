@@ -71,6 +71,23 @@ class WorkloadProvenance:
 
 
 @dataclass(frozen=True, slots=True)
+class SdistSource:
+    """Content-addressed source-distribution identity.
+
+    Attributes:
+        url: Canonical HTTPS URL for the immutable archive bytes.
+        archive_sha256: SHA-256 of the complete archive before parsing.
+        archive_size: Exact expected archive byte count.
+        tree_sha256: Digest of normalized extracted regular-file paths and bytes.
+    """
+
+    url: str
+    archive_sha256: str
+    archive_size: int
+    tree_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class CorpusCase:
     """One immutable external project and its qualification contract.
 
@@ -90,6 +107,7 @@ class CorpusCase:
         test_timeout_seconds: Optional per-case focused-test timeout override.
         compile_timeout_seconds: Optional per-case normal compile timeout override.
         performance_timeout_seconds: Optional performance compile timeout override.
+        sdist: Content-addressed sdist source, or ``None`` for strict Git checkout.
     """
 
     id: str
@@ -107,6 +125,7 @@ class CorpusCase:
     test_timeout_seconds: int | None = None
     compile_timeout_seconds: int | None = None
     performance_timeout_seconds: int | None = None
+    sdist: SdistSource | None = None
 
 
 @dataclass(frozen=True, slots=True)

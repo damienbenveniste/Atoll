@@ -32,6 +32,8 @@ CandidateDecisionReason = Literal[
     "below-threshold",
     "coverage-reached",
     "limit",
+    "cache-replayed",
+    "cache-replay-excluded",
 ]
 
 _MIN_TOTAL_SAMPLES = 100

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from scripts.benchmark_corpus.lifecycle import (
     venv_python,
 )
 from scripts.benchmark_corpus.manifest import load_manifest
+from scripts.benchmark_corpus.models import SdistSource
 from scripts.benchmark_corpus.process import detect_sandbox
 
 ATOLL_ROOT = Path(__file__).resolve().parents[2]
@@ -184,6 +187,47 @@ def test_upstream_generated_files_are_removed_before_compile(tmp_path: Path) -> 
     assert generated.exists() is False
 
 
+def test_sdist_lifecycle_restores_by_fresh_verified_extraction(tmp_path: Path) -> None:
+    """Archive cases discard upstream build output without invoking Git cleanup."""
+    remote, revision = _local_remote(tmp_path, generate_untracked=True)
+    archive = tmp_path / "simple-project.tar.gz"
+    _git(
+        remote,
+        "archive",
+        "--format=tar.gz",
+        "--prefix=simple-project/",
+        f"--output={archive}",
+        revision,
+    )
+    source = SdistSource(
+        url="https://example.invalid/simple-project.tar.gz",
+        archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+        archive_size=archive.stat().st_size,
+        tree_sha256=_archive_tree_digest(archive),
+    )
+    manifest = load_manifest(_write_manifest(tmp_path, revision, sdist=source))
+    options = replace(
+        _options(tmp_path),
+        repository_mirror=archive,
+        keep_workspace=True,
+    )
+
+    summary = run_case(manifest, "simple-project", options)
+
+    workspace = tmp_path / "workspaces" / "simple-project-compatibility-ubuntu-24.04"
+    assert summary.result.status == "compiled-unbenchmarked", summary.result.diagnostics
+    assert summary.result.source_unchanged is True
+    assert not (workspace / "checkout/src/app/generated_by_build.py").exists()
+    identity = json.loads(
+        (tmp_path / "evidence/source-archive-identity.json").read_text(encoding="utf-8")
+    )
+    assert identity == {
+        "archive_sha256": source.archive_sha256,
+        "archive_size": source.archive_size,
+        "tree_sha256": source.tree_sha256,
+    }
+
+
 def test_lifecycle_runs_inside_available_platform_sandbox(tmp_path: Path) -> None:
     """The complete local lifecycle honors the advertised sandbox boundary."""
     try:
@@ -305,37 +349,68 @@ def _write_manifest(
     revision: str,
     *,
     oracle_arguments: tuple[str, ...] = (),
+    sdist: SdistSource | None = None,
 ) -> Path:
     path = tmp_path / "manifest.toml"
-    path.write_text(
-        "\n".join(
+    case_lines = [
+        "schema_version = 1",
+        'python_version = "3.12"',
+        'backends = ["mypyc", "cython"]',
+        "test_timeout_seconds = 300",
+        "compile_timeout_seconds = 900",
+        "performance_timeout_seconds = 900",
+        "max_log_bytes = 10485760",
+        "",
+        "[[case]]",
+        'id = "simple-project"',
+        'name = "Simple Project"',
+        'repository = "https://example.invalid/simple-project.git"',
+        f'revision = "{revision}"',
+        'project_subroot = "."',
+        'dependency_lock = "uv.lock"',
+        'focused_test_command = ["python", "-m", "pytest", "tests/test_ranking.py", "-q"]',
+        'oracle_adapter = "corpus_oracle"',
+        f"oracle_arguments = {json.dumps(oracle_arguments)}",
+        'tiers = ["compatibility"]',
+        'platforms = ["ubuntu-24.04"]',
+    ]
+    if sdist is not None:
+        case_lines.extend(
             (
-                "schema_version = 1",
-                'python_version = "3.12"',
-                'backends = ["mypyc", "cython"]',
-                "test_timeout_seconds = 300",
-                "compile_timeout_seconds = 900",
-                "performance_timeout_seconds = 900",
-                "max_log_bytes = 10485760",
                 "",
-                "[[case]]",
-                'id = "simple-project"',
-                'name = "Simple Project"',
-                'repository = "https://example.invalid/simple-project.git"',
-                f'revision = "{revision}"',
-                'project_subroot = "."',
-                'dependency_lock = "uv.lock"',
-                'focused_test_command = ["python", "-m", "pytest", "tests/test_ranking.py", "-q"]',
-                'oracle_adapter = "corpus_oracle"',
-                f"oracle_arguments = {json.dumps(oracle_arguments)}",
-                'tiers = ["compatibility"]',
-                'platforms = ["ubuntu-24.04"]',
-                "",
+                "[case.sdist]",
+                f'url = "{sdist.url}"',
+                f'archive_sha256 = "{sdist.archive_sha256}"',
+                f"archive_size = {sdist.archive_size}",
+                f'tree_sha256 = "{sdist.tree_sha256}"',
             )
-        ),
+        )
+    path.write_text(
+        "\n".join((*case_lines, "")),
         encoding="utf-8",
     )
     return path
+
+
+def _archive_tree_digest(archive_path: Path) -> str:
+    """Compute the expected stripped regular-file tree for a Git archive fixture."""
+    files: list[tuple[str, bytes]] = []
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        for member in archive:
+            if not member.isreg():
+                continue
+            relative = Path(*Path(member.name).parts[1:]).as_posix()
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise AssertionError(f"cannot read archive fixture member {member.name}")
+            files.append((relative, stream.read()))
+    aggregate = hashlib.sha256()
+    for relative, content in sorted(files):
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        for value in (relative.encode(), content_sha256.encode(), str(len(content)).encode()):
+            aggregate.update(len(value).to_bytes(8, byteorder="big"))
+            aggregate.update(value)
+    return aggregate.hexdigest()
 
 
 def _git(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
