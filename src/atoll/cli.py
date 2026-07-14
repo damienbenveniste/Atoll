@@ -935,6 +935,7 @@ def _write_source_clean_compile_report(
             module_filter=module_name,
             islands=result.islands,
             build=_source_clean_report_build(result),
+            operation_success=result.success,
             wheel_path=result.wheel_path,
             cleanup_removed=result.cleanup_removed,
             cleanup_kept=result.cleanup_kept,

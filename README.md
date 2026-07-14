@@ -384,7 +384,9 @@ from a temporary copy that retains project tests and benchmark files but removes
 modules, so a flat-layout checkout cannot shadow the baseline or compiled payload. On verification
 or gate failure, Atoll removes the disposable build tree, install payload, and rejected wheel. The
 JSON and Markdown reports retain the command, verification, and performance evidence; no candidate
-remains in `.atoll/dist/*.whl`.
+remains in `.atoll/dist/*.whl`. Runtime safety selection can record failed probes for native variants
+that Atoll rejected; those probes remain diagnostic evidence, while the report's overall status reflects
+the final reduced payload and promoted wheel.
 
 Compiled functions and methods retain their source name, qualified name, documentation,
 annotations, signature, and sync, coroutine, generator, or async-generator shape. Async-generator

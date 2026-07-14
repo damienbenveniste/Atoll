@@ -54,6 +54,7 @@ from atoll.report import (
     score_summary,
 )
 from atoll.runtime.fusion_performance import FusionTrial
+from atoll.runtime.package_verify import PackageVerificationResult
 from atoll.runtime.profiling import (
     CanonicalCallableCount,
     CanonicalTypeObservation,
@@ -268,6 +269,61 @@ def test_compilation_report_includes_semantic_test_gate(tmp_path: Path) -> None:
     assert report["summary"]["semantic_test_failures"] == 1
     assert "Semantic tests: failed (`pytest tests`, exit code 1)" in markdown
     assert "- Command: `pytest tests`" in markdown
+
+
+def test_source_clean_report_keeps_rejected_candidate_probes_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """Rejected selection probes do not override a successful final package."""
+    wheel_path = tmp_path / ".atoll" / "dist" / "pkg-0+atoll.whl"
+    failed_probe = PackageVerificationResult(
+        stage="payload",
+        target=tmp_path / ".atoll" / "dist" / "install",
+        command=("python", "verify"),
+        success=False,
+        exit_code=1,
+        stdout="",
+        stderr="optional dependency unavailable",
+        duration_seconds=0.1,
+    )
+    final_verification = PackageVerificationResult(
+        stage="wheel",
+        target=wheel_path,
+        command=("python", "verify"),
+        success=True,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_seconds=0.2,
+    )
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            mode="source-clean",
+            module_filter=None,
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("mypyc",),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.3,
+            ),
+            operation_success=True,
+            wheel_path=wheel_path,
+            verification_steps=(failed_probe, final_verification),
+        )
+    )
+
+    markdown = render_compilation_markdown_report(report)
+
+    assert report["success"] is True
+    assert report["summary"]["subprocess_verification_failures"] == 1
+    assert "- Status: success" in markdown
+    assert "rejected candidate-selection probes" in markdown
+    assert "- payload: failed" in markdown
 
 
 def test_source_clean_compilation_report_explains_wheel_and_skips(tmp_path: Path) -> None:

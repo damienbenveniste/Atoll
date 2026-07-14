@@ -335,7 +335,8 @@ from a temporary project copy that retains tests and benchmark files but removes
 modules, preventing flat-layout source from shadowing either payload. Verification and gate failures
 remove the disposable build tree, install payload, and rejected wheel while retaining command and
 decision evidence in the compile reports; no failed candidate remains in the normal wheel output
-directory.
+directory. Runtime safety selection can retain failed probes for rejected native variants without
+marking a successfully reduced and promoted wheel as failed.
 
 Compiled functions and methods retain their source name, qualified name, documentation, annotations,
 signature, and sync, coroutine, generator, or async-generator shape. Async-generator wrappers

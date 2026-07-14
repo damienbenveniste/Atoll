@@ -8380,7 +8380,10 @@ def _member_requires_source_class(source_text: str) -> bool:
     Returns:
         bool: Whether generated code must retain the source owner class.
     """
-    tree = ast.parse(textwrap.dedent(source_text))
+    try:
+        tree = ast.parse(textwrap.dedent(source_text))
+    except SyntaxError:
+        return True
     return any(
         (isinstance(node, ast.Name) and node.id == "__class__")
         or (

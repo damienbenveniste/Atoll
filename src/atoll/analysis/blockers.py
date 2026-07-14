@@ -52,6 +52,7 @@ _FRAME_ATTRIBUTE_BLOCKERS = frozenset(
 _GETATTR_MIN_ARGS = 2
 _TYPING_MODULES = frozenset({"typing", "typing_extensions"})
 _MYPYC_UNSUPPORTED_TYPEVAR_KEYWORDS = frozenset({"default", "infer_variance"})
+_MODULE_RUNTIME_HOOKS = frozenset({"__dir__", "__getattr__"})
 
 
 def detect_function_blockers(
@@ -77,6 +78,16 @@ def detect_function_blockers(
     blockers = [*visitor.blockers]
     blockers.extend(_annotation_blockers(node, symbol))
     blockers.extend(_decorator_blockers(node.decorator_list, symbol))
+    if "." not in symbol.qualname and node.name in _MODULE_RUNTIME_HOOKS:
+        blockers.append(
+            Blocker(
+                severity="hard",
+                code="DYN_MODULE_HOOK",
+                message=f"module runtime hook {node.name} must remain interpreted",
+                lineno=node.lineno,
+                symbol=symbol,
+            )
+        )
     if isinstance(node, ast.AsyncFunctionDef):
         blockers.append(
             Blocker(

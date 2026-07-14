@@ -16,6 +16,7 @@ from atoll.commands import package as package_command
 from atoll.commands.package import PackageCommandResult, PackageOptions, PackagePreflightFailure
 from atoll.models import Blocker, CompileAttempt, ModuleId, ModuleScan
 from atoll.report import COMPILE_REPORT_SCHEMA_VERSION
+from atoll.runtime.package_verify import PackageVerificationResult
 from atoll.runtime.performance import (
     BenchmarkGateConfig,
     BenchmarkGateResult,
@@ -667,6 +668,65 @@ def test_compile_reports_preflight_skipped_modules(
     assert "- pkg.blocked: line 4: TypeVar keyword(s) default are rejected by mypyc" in captured.out
     assert report["summary"]["preflight_blockers"] == 1
     assert report["preflight_blockers"][0]["module"] == "pkg.blocked"
+
+
+def test_compile_report_uses_successful_final_package_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed safety probes stay diagnostic after final package promotion succeeds."""
+    output_dir = tmp_path / ".atoll" / "dist"
+    wheel_path = output_dir / "pkg-0+atoll.whl"
+    wheel_path.parent.mkdir(parents=True)
+    wheel_path.write_bytes(b"wheel")
+    failed_probe = PackageVerificationResult(
+        stage="payload",
+        target=output_dir / "install",
+        command=("python", "verify"),
+        success=False,
+        exit_code=1,
+        stdout="",
+        stderr="candidate rejected",
+        duration_seconds=0.1,
+    )
+    final_verification = PackageVerificationResult(
+        stage="wheel",
+        target=wheel_path,
+        command=("python", "verify"),
+        success=True,
+        exit_code=0,
+        stdout="",
+        stderr="",
+        duration_seconds=0.1,
+    )
+
+    def fake_execute_package(*_args: object, **_kwargs: object) -> PackageCommandResult:
+        return PackageCommandResult(
+            success=True,
+            project_root=tmp_path,
+            output_dir=output_dir,
+            install_root=output_dir / "install",
+            wheel_path=wheel_path,
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("mypyc",),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.2,
+            ),
+            verification_steps=(failed_probe, final_verification),
+        )
+
+    monkeypatch.setattr("atoll.cli.execute_package", fake_execute_package)
+
+    exit_code = main(["compile", "--root", str(tmp_path)])
+    report = json.loads((tmp_path / ".atoll" / "compile-report.json").read_text())
+
+    assert exit_code == 0
+    assert report["success"] is True
+    assert report["summary"]["subprocess_verification_failures"] == 1
 
 
 def test_compile_keeps_unresolved_generic_functions_interpreted(

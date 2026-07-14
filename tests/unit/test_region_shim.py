@@ -704,7 +704,7 @@ def test_region_shim_renders_atomic_class_identity_checks(tmp_path: Path) -> Non
     assert "def _atoll_prepare_class" in rendered
     assert "compiled class changed source inheritance" in rendered
     assert "compiled class changed its constructor signature" in rendered
-    assert "globals()[_atoll_name] = _atoll_value" in rendered
+    assert "_atoll_builtins.globals()[_atoll_name] = _atoll_value" in rendered
     assert "'kind': 'class'" in rendered
 
 
@@ -1196,7 +1196,9 @@ def test_region_shim_falls_back_without_artifacts(
 ) -> None:
     """Unavailable native artifacts retain source methods and clean helpers."""
     config = _config(tmp_path)
-    source = """class Worker:
+    source = """import types as globals
+
+class Worker:
     def scale(self, value: int) -> int:
         return value + 1
 """
@@ -1220,6 +1222,7 @@ def test_region_shim_falls_back_without_artifacts(
     status = cast(dict[str, object], namespace["__atoll_status__"])
     assert status["compiled"] is False
     assert "ImportError" in str(status["error"])
+    assert namespace["globals"].__name__ == "types"
     assert not any(name.startswith("_atoll_") for name in namespace)
 
 

@@ -69,6 +69,7 @@ def test_isolated_bootstrap_uses_bundled_pip_and_hash_verified_locks(
     assert bootstrap.ensure_pip[-3:] == ("-m", "ensurepip", "--upgrade")
     assert bootstrap.download[:4] == (str(tools_python), "-m", "pip", "download")
     assert "--require-hashes" in bootstrap.download
+    assert "--only-binary=:all:" not in bootstrap.download
     assert bootstrap.download[-1] == str(wheelhouse)
     assert bootstrap.sync[:3] == ("/uv", "pip", "sync")
     assert "--require-hashes" in bootstrap.sync

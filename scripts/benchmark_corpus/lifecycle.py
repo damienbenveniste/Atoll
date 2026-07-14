@@ -2144,7 +2144,10 @@ def dependency_bootstrap_commands(
 
     Returns:
         DependencyBootstrapCommands: Commands with one explicit network download
-        and offline installation from the resulting wheelhouse.
+        and offline installation from the resulting wheelhouse. Hash-pinned source
+        distributions remain eligible because some qualified upstream test tools do
+        not publish wheels; installation still resolves exclusively from the
+        populated offline wheelhouse.
     """
     return DependencyBootstrapCommands(
         ensure_pip=(str(python), "-m", "ensurepip", "--upgrade"),
@@ -2153,7 +2156,6 @@ def dependency_bootstrap_commands(
             "-m",
             "pip",
             "download",
-            "--only-binary=:all:",
             "--require-hashes",
             "--requirement",
             str(lock_path),

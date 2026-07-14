@@ -61,7 +61,9 @@ parsing, safely extract one regular-file root, and verify its normalized tree
 digest. The runner then appends the reviewed benchmark policy only to the
 disposable `pyproject.toml`. Dependency bootstrap is network-enabled once;
 project builds, focused tests, oracles, and benchmarks then use the offline
-wheelhouse and a sanitized credential-free environment.
+wheelhouse and a sanitized credential-free environment. Exact lock hashes cover
+both wheels and source-only test tools; any source distribution is downloaded
+during bootstrap and built only after package tooling switches to offline mode.
 
 Evidence retains bounded logs, source manifests, toolchain and runner identity,
 policy patches, compiler probes, compile reports, canonical oracle digests, and

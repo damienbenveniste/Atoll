@@ -87,6 +87,29 @@ def test_module_level_monkey_patch_is_recorded(tmp_path: Path) -> None:
     assert [blocker.code for blocker in scan.blockers] == ["DYN_MODULE_MONKEYPATCH"]
 
 
+def test_module_runtime_hooks_remain_interpreted(tmp_path: Path) -> None:
+    """PEP 562 hooks retain Python import and attribute lookup semantics."""
+    module_path = tmp_path / "module_hooks.py"
+    module_path.write_text(
+        "def __getattr__(name: str) -> object:\n"
+        "    raise AttributeError(name)\n\n"
+        "def __dir__() -> list[str]:\n"
+        "    return []\n\n"
+        "def regular(value: int) -> int:\n"
+        "    return value + 1\n",
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="module_hooks", path=module_path))
+    blockers_by_symbol = {
+        symbol.id.qualname: {blocker.code for blocker in symbol.blockers} for symbol in scan.symbols
+    }
+
+    assert blockers_by_symbol["__getattr__"] == {"DYN_MODULE_HOOK"}
+    assert blockers_by_symbol["__dir__"] == {"DYN_MODULE_HOOK"}
+    assert blockers_by_symbol["regular"] == set()
+
+
 def test_frame_introspection_gets_hard_blockers(tmp_path: Path) -> None:
     """Frame APIs and frame attributes are unsafe for compiled sidecars."""
     module_path = tmp_path / "frames.py"

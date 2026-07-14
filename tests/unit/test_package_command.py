@@ -1245,6 +1245,20 @@ def test_method_selection_rejects_class_cell_and_private_name_semantics() -> Non
     )
 
 
+def test_method_selection_keeps_unparseable_normalized_source_interpreted() -> None:
+    """Column-zero string contents cannot crash whole-project method selection."""
+    source = (
+        "    @staticmethod\n"
+        "    def render(self) -> str:\n"
+        '        return """first line\n'
+        "column-zero content\n"
+        '        last line"""\n'
+    )
+
+    assert _member_requires_source_class(source)
+    assert _member_requires_source_class("    def malformed(:\n")
+
+
 def test_method_selection_preserves_registered_and_dynamic_owner_classes() -> None:
     """Method mutation is rejected when an owner may be replaced or intercept writes."""
     registered = LoweringDecision(

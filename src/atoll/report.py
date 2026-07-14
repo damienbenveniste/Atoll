@@ -2280,8 +2280,11 @@ class CompilationReportInput:
     """All command evidence needed to render one compilation report.
 
     The renderer derives success from build, verification, and optional semantic
-    test evidence instead of trusting a caller-supplied status. Paths are kept as
-    `Path` objects until rendering so they can be normalized relative to `root`.
+    test evidence by default. Source-clean orchestration may also supply its
+    authoritative operation status because its verification history can include
+    failed candidate-selection probes followed by a successful final package.
+    Paths are kept as `Path` objects until rendering so they can be normalized
+    relative to `root`.
 
     Attributes:
         root: Root directory of the target Python project.
@@ -2289,6 +2292,8 @@ class CompilationReportInput:
         module_filter: Optional module restriction applied to compilation.
         islands: Enabled islands included in the operation or report.
         build: Captured native build evidence.
+        operation_success: Authoritative command outcome when candidate-selection
+            diagnostics must not determine the final package status.
         mode: Compilation or runtime mode represented by this record.
         wheel_path: Source-clean wheel path, when produced.
         verification: Runtime routing result for the island, when run.
@@ -2324,6 +2329,7 @@ class CompilationReportInput:
     module_filter: str | None
     islands: tuple[EnabledIslandConfig, ...]
     build: CompileAttempt
+    operation_success: bool | None = None
     mode: CompilationMode = "in-place"
     wheel_path: Path | None = None
     verification: tuple[VerifyResult, ...] = ()
@@ -2534,14 +2540,19 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     )
     performance_failed = performance["status"] not in {"passed", "unbenchmarked"}
     wheel_missing = report_input.mode == "source-clean" and report_input.wheel_path is None
-    success = (
+    required_evidence_succeeded = (
         report_input.build.success
         and verify_failures == 0
-        and subprocess_verify_failures == 0
         and test_failures == 0
         and not performance_failed
         and not wheel_missing
     )
+    verification_history_succeeded = (
+        subprocess_verify_failures == 0
+        if report_input.operation_success is None
+        else report_input.operation_success
+    )
+    success = required_evidence_succeeded and verification_history_succeeded
     return {
         "version": COMPILE_REPORT_SCHEMA_VERSION,
         "tool": "atoll",
@@ -3083,6 +3094,9 @@ def _append_package_verification_markdown(
     if not results:
         lines.append("- Not run")
         return
+    lines.append(
+        "- Evidence can include rejected candidate-selection probes as well as final validation."
+    )
     lines.extend(
         (
             f"- {result['stage']}: {'passed' if result['success'] else 'failed'} "

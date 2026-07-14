@@ -144,4 +144,7 @@ passes baseline qualification. SQLGlot uses the newest qualifying Python 3.12
 release revision because newer revisions contain a forbidden submodule.
 html5lib retains the full release commit as provenance but materializes the
 official 1.1 sdist, whose content-addressed lock includes the test data without
-relaxing the Git-source submodule prohibition.
+relaxing the Git-source submodule prohibition. Its source-only test dependency
+is hash-pinned with the rest of the lock, downloaded during the one networked
+bootstrap phase, and built from the case-local wheelhouse after offline mode is
+enforced.
