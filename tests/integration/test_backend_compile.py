@@ -12,6 +12,16 @@ from atoll.models import BackendCompileContext, BackendLoweringRequest, ModuleId
 
 def test_mypyc_compiles_native_class_generator_and_coroutine_region(tmp_path: Path) -> None:
     """The adapter produces a real extension for every capability it advertises."""
+    (tmp_path / "pyproject.toml").write_text(
+        """[tool.mypy]
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["unused_optional_dependency.*"]
+ignore_missing_imports = true
+""",
+        encoding="utf-8",
+    )
     source_path = tmp_path / "shapes.py"
     source_path.write_text(
         """from __future__ import annotations

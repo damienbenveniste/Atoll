@@ -93,7 +93,10 @@ def test_build_sidecars_detects_generated_artifact(
     )
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert paths == [
+            "--no-warn-unused-configs",
+            ".atoll/sidecars/_atoll_app_ranking.py",
+        ]
         assert target_dir == ".atoll/build/generated"
         return []
 
@@ -147,7 +150,10 @@ def test_build_sidecars_reports_support_artifacts(
     )
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert paths == [
+            "--no-warn-unused-configs",
+            ".atoll/sidecars/_atoll_app_ranking.py",
+        ]
         assert target_dir == ".atoll/build/generated"
         return []
 
@@ -185,7 +191,10 @@ def test_mypyc_adapter_returns_structured_primary_and_support_artifacts(
     )
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert paths == [
+            "--no-warn-unused-configs",
+            ".atoll/sidecars/_atoll_app_ranking.py",
+        ]
         assert target_dir == ".atoll/build/generated"
         return []
 
@@ -247,7 +256,11 @@ def test_artifact_ownership_uses_logical_module_for_duplicate_stems(
     FakeBuildExtDuplicateStems.artifact_paths = (first_artifact, second_artifact)
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert paths == ["first/shared.py", "second/shared.py"]
+        assert paths == [
+            "--no-warn-unused-configs",
+            "first/shared.py",
+            "second/shared.py",
+        ]
         assert target_dir == ".atoll/build/generated"
         return []
 
@@ -300,7 +313,10 @@ def test_build_sidecars_captures_and_filters_native_stderr(
     )
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert paths == [
+            "--no-warn-unused-configs",
+            ".atoll/sidecars/_atoll_app_ranking.py",
+        ]
         assert target_dir == ".atoll/build/generated"
         return []
 
@@ -340,7 +356,10 @@ def test_build_sidecars_adds_source_roots_to_mypy_path(
     monkeypatch.setenv("MYPY_CACHE_DIR", "existing_cache")
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert paths == [".atoll/sidecars/_atoll_app_ranking.py"]
+        assert paths == [
+            "--no-warn-unused-configs",
+            ".atoll/sidecars/_atoll_app_ranking.py",
+        ]
         assert target_dir == ".atoll/build/generated"
         seen_mypy_path.append(os.environ.get("MYPYPATH"))
         seen_cache_dir.append(os.environ.get("MYPY_CACHE_DIR"))
@@ -461,7 +480,7 @@ def test_build_sidecars_handles_external_source_without_artifact(
     sidecar.write_text("def score_user() -> int:\n    return 1\n", encoding="utf-8")
 
     def fake_mypycify(paths: list[str], *, target_dir: str | None = None) -> list[object]:
-        assert paths == [str(sidecar)]
+        assert paths == ["--no-warn-unused-configs", str(sidecar)]
         assert target_dir == ".atoll/build/generated"
         return []
 

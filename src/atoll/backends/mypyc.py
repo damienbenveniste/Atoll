@@ -50,7 +50,8 @@ from atoll.models import (
 )
 
 _MAX_DIAGNOSTIC_LINES = 20
-_MYPYC_ADAPTER_VERSION = "1"
+_MYPYC_ADAPTER_VERSION = "2"
+_MYPYC_MYPY_OPTIONS = ("--no-warn-unused-configs",)
 _SHARED_REGION_ID = "__shared__"
 
 
@@ -198,6 +199,7 @@ class MypycBackend:
             "adapter_version": _MYPYC_ADAPTER_VERSION,
             "backend": self.name,
             "mypy_version": importlib_metadata.version("mypy"),
+            "mypy_options": _MYPYC_MYPY_OPTIONS,
             "setuptools_version": importlib_metadata.version("setuptools"),
             "python_cache_tag": sys.implementation.cache_tag,
             "platform": sysconfig.get_platform(),
@@ -501,7 +503,12 @@ def _build_paths(
     previous_artifacts = {
         path: path.stat().st_mtime_ns for path in _all_extension_artifacts(artifact_dir)
     }
-    command = ("mypyc", *tuple(str(path) for path in paths), "build_ext")
+    command = (
+        "mypyc",
+        *_MYPYC_MYPY_OPTIONS,
+        *tuple(str(path) for path in paths),
+        "build_ext",
+    )
     stdout = io.StringIO()
     stderr = io.StringIO()
     native_stderr = _NativeStderrCapture()
@@ -518,7 +525,10 @@ def _build_paths(
             active_phase = ("mypycify", time.perf_counter())
             generated_target = _source_arg(build_dir / "generated", project_root)
             ext_modules = mypycify(
-                [_source_arg(path, project_root) for path in paths],
+                [
+                    *_MYPYC_MYPY_OPTIONS,
+                    *(_source_arg(path, project_root) for path in paths),
+                ],
                 target_dir=generated_target,
             )
             phase_timings.append(_phase_timing(active_phase))
