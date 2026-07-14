@@ -6,8 +6,10 @@ from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
+from typing import cast
 
 import pytest
+from Cython.Compiler.Errors import CompileError as CythonCompileError
 
 from atoll.analysis.ast_scanner import scan_module
 from atoll.analysis.clustering import enrich_island_analysis
@@ -24,6 +26,7 @@ from atoll.models import (
     SymbolId,
     TypedRegion,
 )
+from atoll.region_cache import compile_with_region_cache
 
 SHA256_HEX_LENGTH = 64
 
@@ -416,6 +419,61 @@ def test_cython_normalizes_backend_diagnostics(
     assert diagnostic.transient is transient
     if diagnostics:
         assert "Captured 1 Cython error line(s)." in diagnostic.details
+
+
+def test_cython_compile_error_is_cached_despite_compiler_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source CompileError mentioning a compiler remains a deterministic rejection."""
+    source_path = tmp_path / "broken_region.py"
+    source_path.write_text(
+        "def score(value: int) -> int:\n    return value + missing_compiler\n",
+        encoding="utf-8",
+    )
+    unit = CompilationUnit(
+        region_id="broken:cython",
+        backend="cython",
+        logical_module="broken_region",
+        source_paths=(source_path,),
+        source_hash="source-hash",
+        members=(),
+    )
+    compile_count = 0
+
+    def fail_cythonize(
+        units: tuple[CompilationUnit, ...],
+        build_dir: Path,
+        *,
+        project_root: Path,
+        workers: int,
+    ) -> list[object]:
+        nonlocal compile_count
+        _ = (units, build_dir, project_root, workers)
+        compile_count += 1
+        raise cast(type[Exception], CythonCompileError)(
+            None,
+            "generated compiler reference is invalid",
+        )
+
+    monkeypatch.setattr(cython_backend_module, "_cythonize_extensions", fail_cythonize)
+    context = BackendCompileContext(
+        project_root=tmp_path,
+        build_dir=tmp_path / ".atoll" / "build",
+        source_roots=(tmp_path,),
+    )
+    backend = CythonBackend()
+    cache_root = tmp_path / ".atoll" / "cache" / "regions"
+
+    first = compile_with_region_cache(backend, unit, context, cache_root=cache_root)
+    second = compile_with_region_cache(backend, unit, context, cache_root=cache_root)
+
+    assert compile_count == 1
+    assert first.attempt.cache_status == "miss"
+    assert first.attempt.stderr.startswith("CYTHON_COMPILE_ERROR:")
+    assert second.attempt.cache_status == "hit"
+    assert second.attempt.command[:3] == ("atoll", "cache", "reject")
+    assert [timing.name for timing in second.attempt.phase_timings] == ["backend_decision_cache"]
 
 
 def test_cython_rejects_incompatible_sourceless_and_non_python_units(tmp_path: Path) -> None:

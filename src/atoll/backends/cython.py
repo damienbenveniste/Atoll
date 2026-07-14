@@ -317,7 +317,7 @@ class CythonBackend:
         """
         message = repr(error)
         lowered = f"{message}\n{diagnostics}".lower()
-        code = _diagnostic_code(lowered)
+        code = _diagnostic_code(error, lowered)
         detail = _diagnostic_summary(diagnostics, log_path)
         return BackendDiagnostic(
             code=code,
@@ -875,7 +875,10 @@ def _write_build_log(
     return log_path
 
 
-def _diagnostic_code(lowered: str) -> BackendDiagnosticCode:
+def _diagnostic_code(error: BaseException, lowered: str) -> BackendDiagnosticCode:
+    error_type = type(error)
+    if error_type.__module__ == "Cython.Compiler.Errors" and error_type.__name__ == "CompileError":
+        return "CYTHON_COMPILE_ERROR"
     if "no such file" in lowered or "compiler" in lowered or "clang" in lowered or "gcc" in lowered:
         return "NATIVE_BUILD_ENV_ERROR"
     if "cython" in lowered or ": error:" in lowered or "compileerror" in lowered:
