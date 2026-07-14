@@ -363,6 +363,52 @@ def test_scan_treats_exception_targets_as_coroutine_locals(tmp_path: Path) -> No
     assert tracked_task.uses_globals == ("record_failure",)
 
 
+def test_scan_records_global_write_and_indirect_binding_forms(tmp_path: Path) -> None:
+    """Write-only globals and special AST binders remain runtime dependencies."""
+    module_path = tmp_path / "global_bindings.py"
+    module_path.write_text(
+        """state = None
+
+def assign(value: object) -> None:
+    global state
+    state = value
+
+def remove() -> None:
+    global state
+    del state
+
+def import_alias() -> object:
+    global state
+    import json as state
+    return state
+
+def exception_alias() -> object:
+    global state
+    try:
+        raise ValueError('failure')
+    except ValueError as state:
+        return state
+
+def pattern_alias(value: object) -> object:
+    global state
+    match value:
+        case state:
+            return state
+""",
+        encoding="utf-8",
+    )
+
+    scan = scan_module(ModuleId(name="global_bindings", path=module_path))
+
+    assert {symbol.id.qualname: symbol.uses_globals for symbol in scan.symbols} == {
+        "assign": ("state",),
+        "remove": ("state",),
+        "import_alias": ("state",),
+        "exception_alias": ("state",),
+        "pattern_alias": ("state",),
+    }
+
+
 def test_scan_records_ordered_call_sites_suspensions_and_runtime_imports(
     tmp_path: Path,
 ) -> None:

@@ -181,7 +181,9 @@ def _function_record(
     arg_count, annotated_arg_count = _argument_counts(node)
     blockers = detect_function_blockers(node, symbol)
     referenced_names = tuple(sorted(collector.referenced_names))
-    runtime_referenced_names = tuple(sorted(collector.runtime_referenced_names))
+    runtime_referenced_names = tuple(
+        sorted(collector.runtime_referenced_names | collector.runtime_global_bound_names)
+    )
     local_names = tuple(sorted(collector.local_names))
     return SymbolRecord(
         id=symbol,
@@ -809,6 +811,7 @@ class _FunctionNameCollector(ast.NodeVisitor):
         self.local_names: set[str] = set()
         self.referenced_names: set[str] = set()
         self.runtime_referenced_names: set[str] = set()
+        self.runtime_global_bound_names: set[str] = set()
         self._declared_global_names: set[str] = set()
         self._declared_nonlocal_names: set[str] = set()
         self._in_annotation = False
@@ -873,8 +876,8 @@ class _FunctionNameCollector(ast.NodeVisitor):
             self.referenced_names.add(node.id)
             if not self._in_annotation:
                 self.runtime_referenced_names.add(node.id)
-        elif isinstance(node.ctx, ast.Store | ast.Del) and not self._is_external_binding(node.id):
-            self.local_names.add(node.id)
+        elif isinstance(node.ctx, ast.Store | ast.Del):
+            self._record_binding(node.id)
 
     def visit_Call(self, node: ast.Call) -> None:
         """Record directly named calls for conservative same-module edges.
@@ -966,8 +969,7 @@ class _FunctionNameCollector(ast.NodeVisitor):
         """
         for alias in node.names:
             name = alias.asname or alias.name.split(".", maxsplit=1)[0]
-            if not self._is_external_binding(name):
-                self.local_names.add(name)
+            self._record_binding(name)
         self.runtime_imports.append(_import_record(node, self._lines))
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -976,11 +978,8 @@ class _FunctionNameCollector(ast.NodeVisitor):
         Args:
             node: Syntax node being visited without executing target code.
         """
-        self.local_names.update(
-            name
-            for alias in node.names
-            if not self._is_external_binding(name := alias.asname or alias.name)
-        )
+        for alias in node.names:
+            self._record_binding(alias.asname or alias.name)
         self.runtime_imports.append(_import_record(node, self._lines))
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
@@ -991,8 +990,8 @@ class _FunctionNameCollector(ast.NodeVisitor):
         """
         if node.type is not None:
             self.visit(node.type)
-        if node.name is not None and not self._is_external_binding(node.name):
-            self.local_names.add(node.name)
+        if node.name is not None:
+            self._record_binding(node.name)
         for child in node.body:
             self.visit(child)
 
@@ -1005,11 +1004,8 @@ class _FunctionNameCollector(ast.NodeVisitor):
         self.visit(node.subject)
         for case in node.cases:
             self.visit(case.pattern)
-            self.local_names.update(
-                name
-                for name in _pattern_bound_names(case.pattern)
-                if not self._is_external_binding(name)
-            )
+            for name in _pattern_bound_names(case.pattern):
+                self._record_binding(name)
             if case.guard is not None:
                 self.visit(case.guard)
             for child in case.body:
@@ -1063,7 +1059,7 @@ class _FunctionNameCollector(ast.NodeVisitor):
         Args:
             node: Syntax node being visited without executing target code.
         """
-        self.local_names.add(node.name)
+        self._record_binding(node.name)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Treat nested async functions as local bindings and do not traverse them.
@@ -1071,7 +1067,7 @@ class _FunctionNameCollector(ast.NodeVisitor):
         Args:
             node: Syntax node being visited without executing target code.
         """
-        self.local_names.add(node.name)
+        self._record_binding(node.name)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Treat nested classes as local bindings and do not traverse them.
@@ -1079,7 +1075,7 @@ class _FunctionNameCollector(ast.NodeVisitor):
         Args:
             node: Syntax node being visited without executing target code.
         """
-        self.local_names.add(node.name)
+        self._record_binding(node.name)
 
     def _visit_annotation(self, node: ast.expr) -> None:
         was_in_annotation = self._in_annotation
@@ -1141,8 +1137,16 @@ class _FunctionNameCollector(ast.NodeVisitor):
     def _is_suppressed_load(self, name: str) -> bool:
         return any(name in scope_names for scope_names in self._suppressed_load_names)
 
-    def _is_external_binding(self, name: str) -> bool:
-        return name in self._declared_global_names or name in self._declared_nonlocal_names
+    def _record_binding(self, name: str) -> None:
+        """Classify one runtime binding according to its lexical declaration.
+
+        Args:
+            name: Identifier receiving a value or being deleted.
+        """
+        if name in self._declared_global_names:
+            self.runtime_global_bound_names.add(name)
+        elif name not in self._declared_nonlocal_names:
+            self.local_names.add(name)
 
 
 @dataclass(slots=True)

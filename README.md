@@ -60,7 +60,9 @@ configured backends to assess each region automatically, compiles and caches sup
 overlays staged routing code and region-owned native artifacts onto the project's normal PEP 517
 wheel, verifies the result, and removes temporary artifacts by default. The hidden `package`
 command uses the same source-clean typed-region pipeline. Neither command rewrites the original
-source files.
+source files. Project discovery prefers the conventional `src/` import root, then honors explicit
+Setuptools, Hatch, Poetry, PDM, or Maturin source-root metadata for layouts such as
+`lib/package_name`; undeclared layouts fall back to the project root.
 
 ```bash
 uv run atoll compile app.ranking
@@ -127,7 +129,9 @@ Cython also handles member execution shapes mypyc rejects and deterministic mypy
 Cython annotation typing and C-type inference are disabled so Python integer and container
 semantics are not silently narrowed. Relative imports inside copied callables remain in their
 original execution scope and resolve against the source package rather than the private extension
-module. When profiling identifies a hot callable, Cython may compile
+module. Reads, writes, and deletions of omitted same-module state route through the original source
+module so native bindings and Python fallbacks share one cache or registry. When profiling
+identifies a hot callable, Cython may compile
 explicit `Any`, incomplete annotations, or unresolved TypeVars with boxed Python semantics. PEP
 695 function type-parameter syntax is removed only from the private generated Cython input; the
 public wrapper retains the source function's annotations and type-parameter metadata. Without a

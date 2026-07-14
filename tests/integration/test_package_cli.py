@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import shutil
 import sys
@@ -32,6 +33,7 @@ PROFILE_BENCHMARK_ITERATIONS = 100_000
 PROFILE_REPORT_SCHEMA_VERSION = COMPILE_REPORT_SCHEMA_VERSION
 MINIMUM_PROFILE_SAMPLES = 100
 CLASS_DEPENDENCY_COMPILED_SYMBOLS = 2
+STATEFUL_SECOND_VALUE = 2
 
 
 def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
@@ -106,6 +108,97 @@ def test_compile_builds_wheel_without_source_edits_or_kept_install_tree(
     )
     assert report["summary"]["artifacts"] == len(artifact_names)
     assert sorted(report["build"]["artifacts"]) == artifact_names
+
+
+def test_compile_maps_nonstandard_packaging_root_to_wheel_modules(tmp_path: Path) -> None:
+    """A declared ``lib`` import root compiles the wheel's logical package names."""
+    project_root = tmp_path / "lib_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    shutil.move(project_root / "src", project_root / "lib")
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'where = ["src"]',
+            'where = ["lib"]',
+        ),
+        encoding="utf-8",
+    )
+    source_path = project_root / "lib" / "app" / "ranking.py"
+    original_source = source_path.read_text(encoding="utf-8")
+
+    exit_code = main(["compile", "app.ranking", "--root", str(project_root)])
+
+    report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    wheel_path = next((project_root / ".atoll" / "dist").glob("*.whl"))
+    with zipfile.ZipFile(wheel_path) as wheel:
+        names = set(wheel.namelist())
+    assert exit_code == 0
+    assert report["success"] is True
+    assert source_path.read_text(encoding="utf-8") == original_source
+    assert {
+        binding["source"] for region in report["compiled_regions"] for binding in region["bindings"]
+    } >= {"app.ranking::rank_candidates"}
+    assert "app/ranking.py" in names
+    assert "lib/app/ranking.py" not in names
+
+
+def test_compile_routes_stateful_globals_to_the_source_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native binding shares global cache reads and writes with Python fallback."""
+    project_root = tmp_path / "stateful_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    stateful_path = project_root / "src" / "app" / "stateful.py"
+    stateful_path.write_text(
+        """_cache: dict[str, int] | None = None
+
+def next_value() -> int:
+    global _cache
+    if _cache is None:
+        _cache = {}
+    _cache["value"] = _cache.get("value", 0) + 1
+    return _cache["value"]
+
+def reset_cache() -> None:
+    global _cache
+    _cache = None
+
+def drop_cache() -> None:
+    global _cache
+    del _cache
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "compile",
+            "app.stateful",
+            "--root",
+            str(project_root),
+            "--keep-install-tree",
+        ]
+    )
+
+    install_root = project_root / ".atoll" / "dist" / "install"
+    monkeypatch.setattr(sys, "path", [str(install_root), *sys.path])
+    monkeypatch.setenv("ATOLL_REQUIRE_COMPILED", "1")
+    sys.modules.pop("app.stateful", None)
+    sys.modules.pop("app", None)
+    stateful = importlib.import_module("app.stateful")
+    assert exit_code == 0
+    assert stateful.next_value() == 1
+    assert stateful.next_value() == STATEFUL_SECOND_VALUE
+    assert stateful._cache == {"value": STATEFUL_SECOND_VALUE}
+    stateful.reset_cache()
+    assert stateful._cache is None
+    assert stateful.next_value() == 1
+    stateful.drop_cache()
+    assert not hasattr(stateful, "_cache")
+    assert hasattr(stateful.next_value, "__atoll_compiled_target__")
+    assert hasattr(stateful.reset_cache, "__atoll_compiled_target__")
+    assert hasattr(stateful.drop_cache, "__atoll_compiled_target__")
 
 
 def test_compile_uses_cache_on_unchanged_second_run(

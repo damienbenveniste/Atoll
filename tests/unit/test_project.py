@@ -1,6 +1,9 @@
 """Tests for Atoll project discovery."""
 
+import tomllib
 from pathlib import Path
+
+import pytest
 
 from atoll.models import CompileConfig
 from atoll.project import discover_project, module_name_for_path
@@ -54,6 +57,102 @@ def test_discover_project_accepts_absolute_source_root(tmp_path: Path) -> None:
     discovered = discover_project(tmp_path, source_roots=(source_root,))
 
     assert [module.name for module in discovered.modules] == ["pkg.module"]
+
+
+def test_discover_project_honors_nonstandard_setuptools_source_root(tmp_path: Path) -> None:
+    """Setuptools ``where`` metadata maps a nonstandard layout to import names."""
+    package_dir = tmp_path / "lib" / "pkg"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    (examples / "decoy.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.setuptools.packages.find]\nwhere = ["lib"]\n',
+        encoding="utf-8",
+    )
+
+    discovered = discover_project(tmp_path)
+
+    assert discovered.config.source_roots == ((tmp_path / "lib").resolve(),)
+    assert [module.name for module in discovered.modules] == ["pkg", "pkg.module"]
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    [
+        '[tool.setuptools.package-dir]\n"" = "python"\n',
+        '[tool.setuptools]\npackage_dir = {"" = "python"}\n',
+        '[tool.hatch.build]\nsources = ["python"]\n',
+        '[tool.hatch.build.targets.wheel]\nsources = ["python"]\n',
+        '[tool.hatch.build.targets.wheel]\npackages = ["python/pkg"]\n',
+        '[tool.hatch.build.sources]\n"python/pkg" = "pkg"\n',
+        '[tool.hatch.build.targets.wheel.sources]\n"python/pkg" = "pkg"\n',
+        '[[tool.poetry.packages]]\ninclude = "pkg"\nfrom = "python"\n',
+        '[tool.pdm.build]\npackage-dir = "python"\n',
+        '[tool.maturin]\npython-source = "python"\n',
+    ],
+)
+def test_discover_project_honors_supported_backend_source_roots(
+    tmp_path: Path,
+    configuration: str,
+) -> None:
+    """Common backend metadata identifies its declared import root.
+
+    Args:
+        tmp_path: Isolated project root supplied by pytest.
+        configuration: Backend-specific TOML source-root declaration.
+    """
+    package_dir = tmp_path / "python" / "pkg"
+    package_dir.mkdir(parents=True)
+    (package_dir / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(configuration, encoding="utf-8")
+
+    discovered = discover_project(tmp_path)
+
+    assert discovered.config.source_roots == ((tmp_path / "python").resolve(),)
+    assert [module.name for module in discovered.modules] == ["pkg.module"]
+
+
+def test_discover_project_keeps_src_precedence_over_backend_metadata(tmp_path: Path) -> None:
+    """The established ``src`` convention remains authoritative when present."""
+    package_dir = tmp_path / "src" / "pkg"
+    package_dir.mkdir(parents=True)
+    (package_dir / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.setuptools.packages.find]\nwhere = ["lib"]\n',
+        encoding="utf-8",
+    )
+
+    discovered = discover_project(tmp_path)
+
+    assert discovered.config.source_roots == ((tmp_path / "src").resolve(),)
+    assert [module.name for module in discovered.modules] == ["pkg.module"]
+
+
+def test_discover_project_ignores_packaging_source_root_escape(tmp_path: Path) -> None:
+    """Build metadata cannot make automatic discovery scan outside the project."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.setuptools.packages.find]\nwhere = [".."]\n',
+        encoding="utf-8",
+    )
+
+    discovered = discover_project(tmp_path)
+
+    assert discovered.config.source_roots == (tmp_path.resolve(),)
+    assert [module.name for module in discovered.modules] == ["pkg.module"]
+
+
+def test_discover_project_surfaces_malformed_packaging_metadata(tmp_path: Path) -> None:
+    """Source-root probing does not hide the compile config loader's TOML error."""
+    (tmp_path / "pyproject.toml").write_text("[tool.setuptools\n", encoding="utf-8")
+
+    with pytest.raises(tomllib.TOMLDecodeError):
+        discover_project(tmp_path)
 
 
 def test_discover_project_ignores_tests_and_cache_dirs(tmp_path: Path) -> None:

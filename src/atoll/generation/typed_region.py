@@ -26,7 +26,7 @@ from atoll.models import (
     TypedRegion,
 )
 
-TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-region-v6"
+TYPED_METHOD_GENERATOR_VERSION = "atoll-typed-region-v7"
 _SUPPORTED_BINDINGS = frozenset({"instance_method", "staticmethod", "classmethod"})
 _SUPPORTED_EXECUTION_KINDS = frozenset({"sync", "generator", "coroutine"})
 
@@ -768,13 +768,13 @@ def _rewrite_optional_runtime_expression(
 
 
 class _RuntimeBoundaryRewriter(ast.NodeTransformer):
-    """Route omitted same-module globals through the live source module."""
+    """Route omitted same-module state through the live source module."""
 
     def __init__(self, roots: frozenset[str]) -> None:
         self.roots = roots
 
     def visit_Name(self, node: ast.Name) -> ast.expr:
-        """Rewrite one loaded boundary root without touching stores.
+        """Rewrite one boundary root while retaining its expression context.
 
         Args:
             node: Syntax node being visited without executing target code.
@@ -782,7 +782,7 @@ class _RuntimeBoundaryRewriter(ast.NodeTransformer):
         Returns:
             ast.expr: Live source-module lookup or the unchanged name.
         """
-        if isinstance(node.ctx, ast.Load) and node.id in self.roots:
+        if node.id in self.roots:
             return ast.copy_location(
                 ast.Attribute(
                     value=ast.Name(id="_atoll_source", ctx=ast.Load()),
@@ -792,6 +792,144 @@ class _RuntimeBoundaryRewriter(ast.NodeTransformer):
                 node,
             )
         return node
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> ast.NamedExpr:
+        """Reject global walrus targets that Python forbids as attributes.
+
+        Args:
+            node: Assignment expression whose target must remain a plain name.
+
+        Returns:
+            ast.NamedExpr: Rewritten assignment expression when its target is safe.
+
+        Raises:
+            ValueError: The assignment targets source-module state that cannot
+                be represented without changing expression semantics.
+            TypeError: Recursive rewriting changes the expression node type.
+        """
+        if node.target.id in self.roots:
+            raise ValueError(
+                f"unsupported runtime-boundary assignment expression: {node.target.id}"
+            )
+        rewritten = self.generic_visit(node)
+        if not isinstance(rewritten, ast.NamedExpr):
+            raise TypeError("runtime-boundary rewrite produced a non-assignment expression")
+        return rewritten
+
+    def visit_Import(self, node: ast.Import) -> ast.Import:
+        """Reject import aliases that bind source-module state indirectly.
+
+        Args:
+            node: Function-local import declaration being preserved.
+
+        Returns:
+            ast.Import: Original import when none of its aliases target shared state.
+        """
+        names = {alias.asname or alias.name.split(".", maxsplit=1)[0] for alias in node.names}
+        self._reject_indirect_binders(names, "import")
+        return node
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+        """Reject imported names that bind source-module state indirectly.
+
+        Args:
+            node: Function-local from-import declaration being preserved.
+
+        Returns:
+            ast.ImportFrom: Original import when no imported name targets shared state.
+        """
+        self._reject_indirect_binders(
+            {alias.asname or alias.name for alias in node.names},
+            "from-import",
+        )
+        return node
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> ast.ExceptHandler:
+        """Reject exception aliases whose assignment is encoded as a string.
+
+        Args:
+            node: Exception handler containing an optional alias.
+
+        Returns:
+            ast.ExceptHandler: Recursively rewritten handler without shared-state aliases.
+
+        Raises:
+            TypeError: Recursive rewriting changes the handler node type.
+        """
+        self._reject_indirect_binders(
+            {node.name} if node.name is not None else set(),
+            "exception target",
+        )
+        rewritten = self.generic_visit(node)
+        if not isinstance(rewritten, ast.ExceptHandler):
+            raise TypeError("runtime-boundary rewrite produced a non-exception handler")
+        return rewritten
+
+    def visit_Match(self, node: ast.Match) -> ast.Match:
+        """Reject pattern captures that cannot be redirected to an attribute.
+
+        Args:
+            node: Structural match statement containing zero or more captures.
+
+        Returns:
+            ast.Match: Recursively rewritten match without shared-state captures.
+
+        Raises:
+            TypeError: Recursive rewriting changes the match node type.
+        """
+        names: set[str] = set()
+        for case in node.cases:
+            for child in ast.walk(case.pattern):
+                if isinstance(child, ast.MatchAs | ast.MatchStar) and child.name is not None:
+                    names.add(child.name)
+                elif isinstance(child, ast.MatchMapping) and child.rest is not None:
+                    names.add(child.rest)
+        self._reject_indirect_binders(names, "pattern capture")
+        rewritten = self.generic_visit(node)
+        if not isinstance(rewritten, ast.Match):
+            raise TypeError("runtime-boundary rewrite produced a non-match statement")
+        return rewritten
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        """Reject nested function names that bind source-module state.
+
+        Args:
+            node: Nested synchronous function declaration.
+
+        Returns:
+            ast.FunctionDef: Original declaration when its name is a local binding.
+        """
+        self._reject_indirect_binders({node.name}, "nested function")
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+        """Reject nested async-function names that bind source-module state.
+
+        Args:
+            node: Nested asynchronous function declaration.
+
+        Returns:
+            ast.AsyncFunctionDef: Original declaration when its name is a local binding.
+        """
+        self._reject_indirect_binders({node.name}, "nested async function")
+        return node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+        """Reject nested class names that bind source-module state.
+
+        Args:
+            node: Nested class declaration.
+
+        Returns:
+            ast.ClassDef: Original declaration when its name is a local binding.
+        """
+        self._reject_indirect_binders({node.name}, "nested class")
+        return node
+
+    def _reject_indirect_binders(self, names: set[str], kind: str) -> None:
+        blocked = sorted(names & self.roots)
+        if blocked:
+            raise ValueError(f"unsupported runtime-boundary {kind}: {', '.join(blocked)}")
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
         """Rewrite runtime parts of an annotated assignment, not its annotation.

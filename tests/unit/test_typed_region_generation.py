@@ -264,6 +264,110 @@ def hot(
     assert "result: int = _atoll_source.helper(value)" in generation.source_text
 
 
+def test_directed_generation_routes_stateful_globals_through_source_module(
+    tmp_path: Path,
+) -> None:
+    """Global reads, stores, and mutations share the source module namespace."""
+    source_path = tmp_path / "stateful_boundary.py"
+    source_path.write_text(
+        """_cache: dict[str, int] | None = None
+
+def next_value() -> int:
+    global _cache
+    if _cache is None:
+        _cache = {}
+    _cache["value"] = _cache.get("value", 0) + 1
+    return _cache["value"]
+
+def reset_cache() -> None:
+    global _cache
+    _cache = None
+
+def drop_cache() -> None:
+    global _cache
+    del _cache
+""",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="stateful_boundary", path=source_path)))
+    generated: dict[str, str] = {}
+    for qualname in ("next_value", "reset_cache", "drop_cache"):
+        region = next(
+            region
+            for region in scan.typed_regions
+            if any(member.id.qualname == qualname for member in region.members)
+        )
+        member = next(member.id for member in region.members if member.id.qualname == qualname)
+        generated[qualname] = generate_typed_method_region(
+            scan,
+            region,
+            (member,),
+            output_path=tmp_path / f"generated_{qualname}.py",
+            options=TypedRegionGenerationOptions(backend="cython"),
+        ).source_text
+
+    assert "import stateful_boundary as _atoll_source" in generated["next_value"]
+    assert "_atoll_source._cache = {}" in generated["next_value"]
+    assert "_atoll_source._cache['value'] = _atoll_source._cache.get" in generated["next_value"]
+    assert "return _atoll_source._cache['value']" in generated["next_value"]
+    assert "_atoll_source._cache = None" in generated["reset_cache"]
+    assert "del _atoll_source._cache" in generated["drop_cache"]
+
+
+@pytest.mark.parametrize(
+    ("statement", "message"),
+    [
+        ("return (state := value)", "assignment expression"),
+        ("import json as state\n    return state", "import"),
+        (
+            "try:\n        raise ValueError('failure')\n"
+            "    except ValueError as state:\n        return state",
+            "exception target",
+        ),
+        (
+            "match value:\n        case state:\n            return state",
+            "pattern capture",
+        ),
+    ],
+)
+def test_directed_generation_rejects_indirect_global_binders(
+    tmp_path: Path,
+    statement: str,
+    message: str,
+) -> None:
+    """Boundary stores that cannot become attributes remain interpreted.
+
+    Args:
+        tmp_path: Isolated source and generated-code directory.
+        statement: Function body containing one unsupported binding form.
+        message: Diagnostic fragment identifying the rejected form.
+    """
+    source_path = tmp_path / "indirect_boundary.py"
+    source_path.write_text(
+        "state: object = None\n\n"
+        "def update(value: object) -> object:\n"
+        "    global state\n"
+        f"    {statement}\n",
+        encoding="utf-8",
+    )
+    scan = enrich_island_analysis(scan_module(ModuleId(name="indirect_boundary", path=source_path)))
+    region = next(
+        region
+        for region in scan.typed_regions
+        if any(member.id.qualname == "update" for member in region.members)
+    )
+    update = next(member.id for member in region.members if member.id.qualname == "update")
+
+    with pytest.raises(ValueError, match=message):
+        generate_typed_method_region(
+            scan,
+            region,
+            (update,),
+            output_path=tmp_path / "generated_indirect.py",
+            options=TypedRegionGenerationOptions(backend="cython"),
+        )
+
+
 def test_cython_private_type_parameter_analysis_handles_nested_declarations(
     tmp_path: Path,
 ) -> None:

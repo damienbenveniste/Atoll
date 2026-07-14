@@ -38,7 +38,9 @@ region-owned native artifacts onto the project's normal PEP 517 wheel, verifies 
 removes temporary artifacts by default. Pass a module name to limit the operation to one source
 module. `--root ROOT` selects the target checkout without changing the compile contract. The hidden
 `package` command uses the same source-clean typed-region pipeline. The original source files are
-left untouched.
+left untouched. Discovery prefers the conventional `src/` import root, then resolves explicit
+Setuptools, Hatch, Poetry, PDM, or Maturin source-root metadata for nonstandard layouts such as
+`lib/package_name`; undeclared layouts fall back to the project root.
 
 The default persistent outputs are the wheel in `.atoll/dist/*.whl` plus
 `.atoll/compile-report.json` and `.atoll/compile-report.md`. Use `--output` to place generated
@@ -95,8 +97,10 @@ atomic classes so their method reflection remains Python-compatible. Mypyc remai
 callable members, while Cython also handles unsupported member execution shapes or deterministic
 mypyc type failures. Cython annotation typing and C-type inference are disabled to preserve Python
 integer and container semantics. Relative imports inside copied callables keep their original
-execution scope and resolve against the source package rather than the private extension module. A
-profile-hot callable with explicit `Any`, incomplete
+execution scope and resolve against the source package rather than the private extension module.
+Reads, writes, and deletions of omitted same-module state route through the original source module
+so native bindings and Python fallbacks share one cache or registry. A profile-hot callable with
+explicit `Any`, incomplete
 annotations, or unresolved TypeVars may use boxed Cython semantics; without a configured benchmark
 those boxed candidates remain interpreted. PEP 695 function type-parameter syntax is removed only
 from private generated Cython input, while the public wrapper retains source annotations and type
