@@ -95,8 +95,14 @@ registry use, source-defined base, asynchronous method, or class-body side effec
 fails, Atoll preserves the source class and routes eligible methods independently. Cython owns
 atomic classes so their method reflection remains Python-compatible. Mypyc remains preferred for
 callable members, while Cython also handles unsupported member execution shapes or deterministic
-mypyc type failures. Cython annotation typing and C-type inference are disabled to preserve Python
-integer and container semantics. Relative imports inside copied callables keep their original
+mypyc type failures. During automatic whole-project selection, a mypyc error originating in
+imported target-project source opens a cached project-scoped circuit for that import package: later
+eligible variants use batched Cython fallbacks instead of repeating the same type-graph failure,
+and an unchanged warm compile restores the decision and artifacts without compiler processes.
+Cached mypyc successes keep priority, any target-source change invalidates the project decision,
+and explicit module or member selections continue trying their requested backend. Cython annotation
+typing and C-type inference are disabled to preserve Python integer and container semantics.
+Relative imports inside copied callables keep their original
 execution scope and resolve against the source package rather than the private extension module.
 Reads, writes, and deletions of omitted same-module state route through the original source module
 so native bindings and Python fallbacks share one cache or registry. A profile-hot callable with

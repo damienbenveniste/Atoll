@@ -126,6 +126,12 @@ asynchronous method, or class-body side effect. Otherwise Atoll preserves the so
 compiles eligible methods independently. Cython owns atomic classes because its Python-compatible
 class objects can preserve method reflection; mypyc remains preferred for callable members, while
 Cython also handles member execution shapes mypyc rejects and deterministic mypyc type failures.
+During automatic whole-project selection, when mypyc reports errors in imported target-project
+source instead of the generated unit, Atoll records that project-scoped decision, stops repeating
+the same mypyc check for that import package, and batches eligible Cython fallbacks. The next
+unchanged compile restores both the decision and native artifacts without invoking either compiler.
+Existing cached mypyc successes still take priority, any target-source change invalidates the
+project decision, and explicit module or member selections continue trying their requested backend.
 Cython annotation typing and C-type inference are disabled so Python integer and container
 semantics are not silently narrowed. Relative imports inside copied callables remain in their
 original execution scope and resolve against the source package rather than the private extension

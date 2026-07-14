@@ -36,6 +36,7 @@ BackendDiagnosticCode = Literal[
     "IMPORT_PATH_ERROR",
     "UNKNOWN_BUILD_ERROR",
 ]
+BackendDiagnosticScope = Literal["unit", "project"]
 BindingKind = Literal["module", "class", "instance_method", "staticmethod", "classmethod"]
 BlockerSeverity = Literal["hard", "soft", "info"]
 CompileCacheStatus = Literal["disabled", "hit", "miss", "partial"]
@@ -903,6 +904,8 @@ class BackendCompileContext:
         cache_dir: Directory containing reusable Atoll cache entries.
         record_artifacts: Whether compilation must emit and validate artifact records.
         backend_options: Normalized backend options included in cache fingerprints.
+        project_source_digest: Exact staged-source identity used only to validate
+            project-scoped deterministic rejection decisions.
     """
 
     project_root: Path
@@ -911,6 +914,7 @@ class BackendCompileContext:
     cache_dir: Path | None = None
     record_artifacts: bool = True
     backend_options: tuple[tuple[str, str], ...] = ()
+    project_source_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1272,10 +1276,14 @@ class BackendCompileResult:
     Attributes:
         attempt: Compatibility build evidence for the backend invocation.
         artifacts: Validated install-facing records for produced native files.
+        diagnostic_scope: Scope of a deterministic rejection. ``project`` means
+            the backend rejected imported target-project source independently of
+            the generated unit; successful and transient results leave this unset.
     """
 
     attempt: CompileAttempt
     artifacts: tuple[ArtifactRecord, ...]
+    diagnostic_scope: BackendDiagnosticScope | None = None
 
 
 @dataclass(frozen=True, slots=True)

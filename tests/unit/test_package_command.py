@@ -308,6 +308,65 @@ class _SequencedCompileBackend:
         return self.results[index]
 
 
+class _ArtifactBatchCompileBackend:
+    """Native test double that emits one cacheable artifact per submitted unit."""
+
+    def __init__(self, name: Backend = "cython") -> None:
+        self.name: Backend = name
+        self.calls: list[tuple[CompilationUnit, ...]] = []
+
+    def fingerprint(
+        self,
+        unit: CompilationUnit,
+        context: BackendCompileContext,
+    ) -> str:
+        """Return a deterministic per-unit key independent of batch membership."""
+        _ = context
+        return hashlib.sha256(
+            f"{self.name}:{unit.region_id}:{unit.source_hash}".encode()
+        ).hexdigest()
+
+    def compile(
+        self,
+        units: tuple[CompilationUnit, ...],
+        context: BackendCompileContext,
+    ) -> BackendCompileResult:
+        """Record one physical invocation and produce partitionable artifacts."""
+        self.calls.append(units)
+        artifact_root = context.build_dir.parent / "artifacts"
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        paths: list[Path] = []
+        records: list[ArtifactRecord] = []
+        for unit in units:
+            artifact = artifact_root / f"{unit.logical_module}.so"
+            artifact.write_bytes(unit.region_id.encode())
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            paths.append(artifact)
+            records.append(
+                ArtifactRecord(
+                    region_id=unit.region_id,
+                    backend=self.name,
+                    logical_module=unit.logical_module,
+                    role="primary",
+                    install_relative_path=f"{unit.install_relative_dir}/{artifact.name}",
+                    digest=digest,
+                    abi="cp312",
+                    platform_tag="test-platform",
+                )
+            )
+        return BackendCompileResult(
+            attempt=CompileAttempt(
+                success=True,
+                command=(self.name, *(unit.region_id for unit in units)),
+                stdout="",
+                stderr="",
+                artifact_paths=tuple(paths),
+                duration_seconds=0.2,
+            ),
+            artifacts=tuple(records),
+        )
+
+
 def _package_attr(name: str) -> object:
     return vars(package_command)[name]
 
@@ -323,6 +382,17 @@ _copy_if_different = cast(
 _copy_source_roots = cast(
     Callable[[DiscoveredProject, Path], tuple[Path, ...]],
     _package_attr("_copy_source_roots"),
+)
+_source_roots_digest = cast(
+    Callable[[tuple[Path, ...]], str],
+    _package_attr("_source_roots_digest"),
+)
+_stage_target_sources = cast(
+    Callable[
+        [DiscoveredProject, Path, Callable[[str], None] | None],
+        tuple[tuple[Path, ...], str],
+    ],
+    _package_attr("_stage_target_sources"),
 )
 _find_module = cast(
     Callable[[tuple[ModuleId, ...], str], ModuleId],
@@ -2172,6 +2242,185 @@ def test_typed_region_build_restores_rejection_and_cython_artifact_on_second_run
     assert second.build.artifact_paths[0].read_bytes() == b"native-cython-artifact"
     assert "backend_decision_cache" in {timing.name for timing in second.build.phase_timings}
     assert "cache_restore" in {timing.name for timing in second.build.phase_timings}
+
+
+def test_typed_region_build_circuits_project_mypyc_failure_and_batches_fallbacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One imported-source rejection routes package peers through cached Cython."""
+    project_root = tmp_path / "typed_region_project"
+    build_root = tmp_path / "build"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    selections = tuple(
+        selection
+        for selection in _selected_typed_regions(_selected_scans(project, None))
+        if selection.backend == "mypyc" and selection.conditional_on_failure_of is None
+    )[:3]
+    staged_source_roots = _copy_source_roots(project, build_root)
+    prepared = tuple(
+        _prepare_typed_region(
+            project=project,
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            selection=selection,
+        )
+        for selection in selections
+    )
+    assert all(item.fallback is not None for item in prepared)
+    mypyc = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=False,
+                command=("mypyc",),
+                stdout="",
+                stderr=(
+                    "MYPYC_TYPE_ERROR: SystemExit(1)\n"
+                    "typed_region_project/async_runner.py:1: error: "
+                    "project graph rejection  [misc]"
+                ),
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    cython = _ArtifactBatchCompileBackend()
+    monkeypatch.setitem(_compiler_backends, "mypyc", mypyc)
+    monkeypatch.setitem(_compiler_backends, "cython", cython)
+    progress: list[str] = []
+    context = _TypedRegionBuildContext(
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        mypy_cache_dir=tmp_path / "mypy-cache",
+        compile_cache_dir=tmp_path / "compile-cache",
+        progress=progress.append,
+        source_tree_digest="fixture-tree",
+        enable_project_circuit=True,
+    )
+
+    cold = _build_typed_regions(
+        prepared=prepared,
+        context=context,
+        initial_failures=(),
+    )
+    cold_call_counts = (len(mypyc.calls), len(cython.calls))
+
+    def forbidden_compile(
+        units: tuple[CompilationUnit, ...],
+        backend_context: BackendCompileContext,
+    ) -> BackendCompileResult:
+        _ = (units, backend_context)
+        raise AssertionError("warm project circuit reached a native compiler")
+
+    monkeypatch.setattr(mypyc, "compile", forbidden_compile)
+    monkeypatch.setattr(cython, "compile", forbidden_compile)
+    warm = _build_typed_regions(
+        prepared=prepared,
+        context=context,
+        initial_failures=(),
+    )
+
+    assert cold.build.success is True
+    assert warm.build.success is True
+    assert cold_call_counts == (1, 1)
+    assert (len(mypyc.calls), len(cython.calls)) == cold_call_counts
+    assert len(cython.calls[0]) == len(prepared)
+    assert all(item.generation.backend == "cython" for item in cold.successful)
+    assert all(item.generation.backend == "cython" for item in warm.successful)
+    assert "BACKEND_POLICY_BYPASS:" in cold.build.stdout
+    assert (
+        sum(timing.name == "backend_project_circuit" for timing in cold.build.phase_timings)
+        == len(prepared) - 1
+    )
+    assert any("project circuit opened" in message for message in progress)
+    assert any("restored all project-circuit" in message for message in progress)
+
+
+def test_project_backend_circuit_honors_cached_mypyc_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prior verified preferred artifact wins over a later package circuit."""
+    project_root = tmp_path / "typed_region_project"
+    build_root = tmp_path / "build"
+    shutil.copytree(TYPED_FIXTURE_ROOT, project_root)
+    project = discover_project(project_root)
+    selections = tuple(
+        selection
+        for selection in _selected_typed_regions(_selected_scans(project, None))
+        if selection.backend == "mypyc" and selection.conditional_on_failure_of is None
+    )[:2]
+    staged_source_roots = _copy_source_roots(project, build_root)
+    prepared = tuple(
+        _prepare_typed_region(
+            project=project,
+            build_root=build_root,
+            staged_source_roots=staged_source_roots,
+            selection=selection,
+        )
+        for selection in selections
+    )
+    assert all(item.fallback is not None for item in prepared)
+    first_fallback = prepared[0].fallback
+    assert first_fallback is not None
+    context = _TypedRegionBuildContext(
+        build_root=build_root,
+        staged_source_roots=staged_source_roots,
+        mypy_cache_dir=tmp_path / "mypy-cache",
+        compile_cache_dir=tmp_path / "compile-cache",
+        progress=None,
+        source_tree_digest="fixture-tree",
+        enable_project_circuit=True,
+    )
+    seed_mypyc = _ArtifactBatchCompileBackend("mypyc")
+    dormant_cython = _ArtifactBatchCompileBackend()
+    monkeypatch.setitem(_compiler_backends, "mypyc", seed_mypyc)
+    monkeypatch.setitem(_compiler_backends, "cython", dormant_cython)
+    seeded = _build_typed_regions(
+        prepared=(prepared[1],),
+        context=context,
+        initial_failures=(),
+    )
+    assert seeded.build.success is True
+    assert dormant_cython.calls == []
+
+    rejecting_mypyc = _FakeCompileBackend(
+        BackendCompileResult(
+            attempt=CompileAttempt(
+                success=False,
+                command=("mypyc",),
+                stdout="",
+                stderr=(
+                    "MYPYC_TYPE_ERROR: SystemExit(1)\n"
+                    "typed_region_project/async_runner.py:1: error: "
+                    "project graph rejection  [misc]"
+                ),
+                artifact_paths=(),
+                duration_seconds=0.1,
+            ),
+            artifacts=(),
+        )
+    )
+    cython = _ArtifactBatchCompileBackend()
+    monkeypatch.setitem(_compiler_backends, "mypyc", rejecting_mypyc)
+    monkeypatch.setitem(_compiler_backends, "cython", cython)
+
+    outcome = _build_typed_regions(
+        prepared=prepared,
+        context=context,
+        initial_failures=(),
+    )
+
+    assert outcome.build.success is True
+    assert len(rejecting_mypyc.calls) == 1
+    assert len(cython.calls) == 1
+    assert len(cython.calls[0]) == 1
+    assert cython.calls[0][0].region_id == first_fallback.unit.region_id
+    assert [item.generation.backend for item in outcome.successful] == ["cython", "mypyc"]
+    assert outcome.successful[1].unit.region_id == prepared[1].unit.region_id
+    assert outcome.successful[1].fallback_reason is None
 
 
 def test_typed_region_build_does_not_compile_speculative_cython_after_mypyc_success(
@@ -5167,6 +5416,47 @@ def test_package_helpers_handle_flat_source_roots(tmp_path: Path) -> None:
 
     assert staged_roots == (build_root,)
     assert (build_root / "pkg" / "mod.py").exists()
+
+
+def test_source_roots_digest_invalidates_on_imported_source_change(tmp_path: Path) -> None:
+    """The backend cache identity covers files outside a generated native unit."""
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    source = first_root / "pkg" / "dependency.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    (second_root / "config.ini").write_text("strict = true\n", encoding="utf-8")
+
+    original = _source_roots_digest((first_root, second_root))
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    changed_source = _source_roots_digest((first_root, second_root))
+    reversed_roots = _source_roots_digest((second_root, first_root))
+
+    assert original != changed_source
+    assert changed_source != reversed_roots
+    assert changed_source == _source_roots_digest((first_root, second_root))
+
+
+def test_staged_source_digest_identifies_the_copied_snapshot(tmp_path: Path) -> None:
+    """A post-copy checkout edit cannot relabel staged bytes in the backend cache."""
+    project_root = tmp_path / "project"
+    source = project_root / "pkg" / "dependency.py"
+    source.parent.mkdir(parents=True)
+    (project_root / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    project = discover_project(project_root)
+
+    staged_roots, staged_digest = _stage_target_sources(
+        project,
+        tmp_path / "build",
+        None,
+    )
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+
+    assert staged_digest == _source_roots_digest(staged_roots)
+    assert staged_digest != _source_roots_digest(project.config.source_roots)
 
 
 def test_atoll_artifact_helpers_copy_artifacts_and_skip_same_file(tmp_path: Path) -> None:

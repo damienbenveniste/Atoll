@@ -19,7 +19,11 @@ from atoll.models import (
     CompileAttempt,
     SymbolId,
 )
-from atoll.region_cache import compile_many_with_region_cache, compile_with_region_cache
+from atoll.region_cache import (
+    compile_many_with_region_cache,
+    compile_with_region_cache,
+    probe_region_cache,
+)
 
 EXPECTED_DOUBLE_COMPILE_COUNT = 2
 EXPECTED_BATCH_ARTIFACT_COUNT = 2
@@ -218,6 +222,42 @@ def test_region_cache_restores_successful_artifact_and_record(tmp_path: Path) ->
     ]
 
 
+def test_region_cache_probe_restores_success_without_compiling(tmp_path: Path) -> None:
+    """A cache-only probe honors an existing success and leaves misses untouched."""
+    backend = _FakeBackend()
+    context = _context(tmp_path)
+    unit = _unit(tmp_path)
+
+    assert (
+        probe_region_cache(
+            cast(CompilerBackend, backend),
+            unit,
+            context,
+            cache_root=tmp_path / "cache",
+        )
+        is None
+    )
+    first = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    first.attempt.artifact_paths[0].unlink()
+    restored = probe_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert backend.compile_count == 1
+    assert restored is not None
+    assert restored.attempt.success is True
+    assert restored.attempt.cache_status == "hit"
+    assert restored.attempt.artifact_paths[0].read_bytes() == b"build-1"
+
+
 def test_region_cache_treats_corruption_as_miss(tmp_path: Path) -> None:
     """Digest mismatch triggers a fresh build and atomically replaces the entry."""
     backend = _FakeBackend()
@@ -365,6 +405,11 @@ def test_region_cache_bisects_deterministic_cython_failure(tmp_path: Path) -> No
         (units[1].region_id,),
         (units[2].region_id, units[3].region_id),
     ]
+    assert sum(
+        timing.name in {"cython_batch", "cython_batch_retry"}
+        for result in results
+        for timing in result.attempt.phase_timings
+    ) == len(backend.compile_calls)
     assert [result.attempt.success for result in results] == [True, False, True, True]
     assert results[1].attempt.phase_timings[-1].name == "backend_decision_store"
     backend.compile_calls.clear()
@@ -466,8 +511,143 @@ def test_region_cache_restores_deterministic_backend_rejection(tmp_path: Path) -
     assert second.attempt.cache_status == "hit"
     assert second.attempt.command[:3] == ("atoll", "cache", "reject")
     assert second.attempt.stderr.startswith("MYPYC_TYPE_ERROR:")
+    assert first.diagnostic_scope == "unit"
+    assert second.diagnostic_scope == "unit"
     assert second.attempt.phase_timings[0].name == "backend_decision_cache"
     assert decision.is_file()
+
+
+def test_region_cache_restores_project_scoped_mypyc_rejection(tmp_path: Path) -> None:
+    """Imported project diagnostics retain scope across the decision cache."""
+    backend = _FakeBackend()
+    backend.fail = True
+    dependency = tmp_path / "src" / "pkg" / "dependency.py"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("value: int = 'invalid'\n", encoding="utf-8")
+    backend.failure_stderr = (
+        "MYPYC_TYPE_ERROR: SystemExit(1)\n"
+        "src/pkg/dependency.py:1: error: Incompatible types in assignment  [assignment]"
+    )
+    context = _context(tmp_path, project_source_digest="tree-a")
+    unit = _unit(tmp_path)
+
+    first = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+    second = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    manifest = json.loads(
+        (tmp_path / "cache" / "decisions" / "mypyc" / f"{backend.key}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert backend.compile_count == 1
+    assert first.diagnostic_scope == "project"
+    assert second.diagnostic_scope == "project"
+    assert manifest["diagnostic_scope"] == "project"
+    assert manifest["project_source_digest"] == "tree-a"
+
+
+def test_region_cache_invalidates_project_rejection_when_source_digest_changes(
+    tmp_path: Path,
+) -> None:
+    """A source snapshot change retries a formerly project-blocked backend."""
+    backend = _FakeBackend()
+    backend.fail = True
+    dependency = tmp_path / "src" / "pkg" / "dependency.py"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("value: int = 'invalid'\n", encoding="utf-8")
+    backend.failure_stderr = (
+        "MYPYC_TYPE_ERROR: SystemExit(1)\n"
+        "src/pkg/dependency.py:1: error: Incompatible types in assignment  [assignment]"
+    )
+    unit = _unit(tmp_path)
+
+    first = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        _context(tmp_path, project_source_digest="tree-a"),
+        cache_root=tmp_path / "cache",
+    )
+    second = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        _context(tmp_path, project_source_digest="tree-b"),
+        cache_root=tmp_path / "cache",
+    )
+
+    assert backend.compile_count == EXPECTED_DOUBLE_COMPILE_COUNT
+    assert first.diagnostic_scope == "project"
+    assert second.diagnostic_scope == "project"
+    assert second.attempt.cache_status == "miss"
+
+
+def test_region_cache_keeps_generated_mypyc_diagnostic_unit_scoped(tmp_path: Path) -> None:
+    """An error in the submitted generated source cannot open a project circuit."""
+    backend = _FakeBackend()
+    backend.fail = True
+    backend.failure_stderr = (
+        "MYPYC_TYPE_ERROR: SystemExit(1)\n"
+        f"{(tmp_path / 'generated.py').as_posix()}:1: error: Invalid generated code  [misc]"
+    )
+    unit = _unit(tmp_path)
+    context = BackendCompileContext(
+        project_root=tmp_path,
+        build_dir=tmp_path / "native" / "build",
+        source_roots=(tmp_path,),
+    )
+
+    result = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert result.diagnostic_scope == "unit"
+
+
+@pytest.mark.parametrize("generated_first", [True, False])
+def test_region_cache_keeps_mixed_mypyc_diagnostics_unit_scoped(
+    tmp_path: Path,
+    *,
+    generated_first: bool,
+) -> None:
+    """Any generated-unit error prevents propagation to the project circuit."""
+    backend = _FakeBackend()
+    backend.fail = True
+    unit = _unit(tmp_path)
+    dependency = tmp_path / "pkg" / "dependency.py"
+    dependency.parent.mkdir()
+    dependency.write_text("value: int = 'invalid'\n", encoding="utf-8")
+    generated_error = f"{unit.source_paths[0]}:1: error: Invalid generated code  [misc]"
+    project_error = f"{dependency}:1: error: Invalid imported code  [misc]"
+    errors = (
+        (generated_error, project_error) if generated_first else (project_error, generated_error)
+    )
+    backend.failure_stderr = "MYPYC_TYPE_ERROR: SystemExit(1)\n" + "\n".join(errors)
+    context = BackendCompileContext(
+        project_root=tmp_path,
+        build_dir=tmp_path / "native" / "build",
+        source_roots=(tmp_path,),
+    )
+
+    result = compile_with_region_cache(
+        cast(CompilerBackend, backend),
+        unit,
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert result.diagnostic_scope == "unit"
 
 
 def test_region_cache_invalidates_rejection_when_backend_fingerprint_changes(
@@ -772,11 +952,16 @@ def _malformed_manifest(manifest: dict[str, object], variant: str) -> object:
     return manifest
 
 
-def _context(root: Path) -> BackendCompileContext:
+def _context(
+    root: Path,
+    *,
+    project_source_digest: str | None = None,
+) -> BackendCompileContext:
     return BackendCompileContext(
         project_root=root,
         build_dir=root / "native" / "build",
         source_roots=(root / "src",),
+        project_source_digest=project_source_digest,
     )
 
 

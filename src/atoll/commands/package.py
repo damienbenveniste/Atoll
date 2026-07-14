@@ -143,7 +143,11 @@ from atoll.optimization_policy import (
 )
 from atoll.profile_plan_cache import ProfilePlanDecision, ProfilePlanIdentity, select_profile_plan
 from atoll.project import DiscoveredProject, discover_project
-from atoll.region_cache import compile_many_with_region_cache, compile_with_region_cache
+from atoll.region_cache import (
+    compile_many_with_region_cache,
+    compile_with_region_cache,
+    probe_region_cache,
+)
 from atoll.runtime.execution_plan_performance import (
     ExecutionPlanBenchmarkConfig,
     ExecutionPlanBenchmarkProgress,
@@ -231,6 +235,7 @@ _MINIMUM_CYTHON_BATCH_SIZE = 2
 _MINIMUM_INTERACTION_VARIANTS = 2
 _PROFILE_PLAN_CACHE_FORMAT_VERSION = "1"
 _PROFILE_PLAN_LOWERING_VERSION = "profile-native-selection-v1"
+_BACKEND_POLICY_BYPASS_PREFIX = "BACKEND_POLICY_BYPASS:"
 
 _GENERATED_DIR_NAMES = frozenset(
     {
@@ -257,6 +262,20 @@ _PEP517_IGNORED_NAMES = frozenset(
         ".venv",
         "__pycache__",
         "venv",
+    }
+)
+_STAGED_SOURCE_DIGEST_IGNORED_TOP_LEVEL = frozenset(
+    {
+        ".atoll",
+        "accepted-source-baseline",
+        "accepted-source-project",
+        "baseline-install",
+        "candidate-dist",
+        "execution-plan-trials",
+        "fusion-research",
+        "pep517-dist",
+        "pep517-project",
+        "profile",
     }
 )
 
@@ -501,7 +520,7 @@ class _PreparedTypedRegion:
         lowering_mode: Whether the target owns a callable, outlined blocks, or
             one helper introduced by an accepted source transform.
         native_helpers: Private helper names used by outlined or source-fused lowering.
-        fallback_reason: Ordered deterministic backend failures preceding this successful variant.
+        fallback_reason: Ordered backend rejection or policy-bypass evidence preceding success.
         minimum_marginal_speedup: Candidate-specific profitability floor, or
             ``None`` for the generic compiler policy.
         profitability_symbols: Public hot bindings whose workload is represented
@@ -565,6 +584,8 @@ class _TypedRegionBuildContext:
         mypy_cache_dir: Mypy cache directory used by the native build.
         compile_cache_dir: Cache directory used for native region compilation.
         progress: Optional progress callback.
+        source_tree_digest: Exact copied-source identity for project-scoped decisions.
+        enable_project_circuit: Whether automatic whole-project selection may bypass retries.
     """
 
     build_root: Path
@@ -572,6 +593,37 @@ class _TypedRegionBuildContext:
     mypy_cache_dir: Path
     compile_cache_dir: Path
     progress: PackageProgress | None
+    source_tree_digest: str = ""
+    enable_project_circuit: bool = False
+
+
+@dataclass(slots=True)
+class _BackendCircuitBuildState:
+    """Coordinate project-scoped backend rejections during one native build.
+
+    Persistent decisions and artifacts remain owned by the region cache. This
+    mutable state only routes later variants around a rejection that was already
+    proven for their imported source package in the current invocation.
+
+    Attributes:
+        context: Backend filesystem and toolchain context.
+        cache_root: Persistent region cache namespace.
+        progress: Optional user-facing progress callback.
+        batched_cython: Independently selected top-level Cython results by index.
+        triggers: First project rejection by backend and top-level import package.
+        primaries: Preferred backend cache results discovered before fallback batching.
+        fallbacks: Precompiled Cython fallback results by variant ID.
+        enabled: Whether this automatic whole-project build permits circuit bypasses.
+    """
+
+    context: BackendCompileContext
+    cache_root: Path
+    progress: PackageProgress | None
+    batched_cython: dict[int, BackendCompileResult]
+    triggers: dict[tuple[Backend, str], str]
+    primaries: dict[str, BackendCompileResult]
+    fallbacks: dict[str, BackendCompileResult]
+    enabled: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -2273,11 +2325,11 @@ def _execute_typed_region_package(
             fusion_plans=context.fusion_plans,
         )
 
-    copy_started = time.perf_counter()
-    _progress(options.progress, "copying source roots into temporary build tree")
-    staged_source_roots = _copy_source_roots(project, build_root)
-    _progress(options.progress, f"copied source roots in {_duration(copy_started)}")
-
+    staged_source_roots, source_tree_digest = _stage_target_sources(
+        project,
+        build_root,
+        options.progress,
+    )
     generation_started = time.perf_counter()
     prepared, preparation_failures = _prepare_selected_variants(
         project=project,
@@ -2379,6 +2431,8 @@ def _execute_typed_region_package(
             / "compile"
             / "regions",
             progress=options.progress,
+            source_tree_digest=source_tree_digest,
+            enable_project_circuit=(options.module_name is None and not options.selected_members),
         ),
         initial_failures=tuple(preparation_failures),
     )
@@ -4030,12 +4084,23 @@ def _build_typed_regions(
             ("buffer_kernel_generator", BUFFER_KERNEL_GENERATOR_VERSION),
             ("run_guard_generator", RUN_GUARD_GENERATOR_VERSION),
         ),
+        project_source_digest=context.source_tree_digest or None,
     )
     batched_cython = _compile_batched_cython_variants(
         prepared,
         backend_context,
         cache_root=context.compile_cache_dir,
         progress=context.progress,
+    )
+    circuit_state = _BackendCircuitBuildState(
+        context=backend_context,
+        cache_root=context.compile_cache_dir,
+        progress=context.progress,
+        batched_cython=batched_cython,
+        triggers={},
+        primaries={},
+        fallbacks={},
+        enabled=context.enable_project_circuit,
     )
     for index, item in enumerate(prepared, start=1):
         if (
@@ -4050,33 +4115,20 @@ def _build_typed_regions(
         candidate = item
         rejected_attempts: list[tuple[_PreparedTypedRegion, CompileAttempt]] = []
         while True:
-            _progress(
-                context.progress,
-                (
-                    f"compiling typed region variant {index}/{len(prepared)} with "
-                    f"{candidate.generation.backend} ({candidate.lowering_mode}): "
-                    f"{candidate.unit.region_id}"
-                ),
+            result = _compile_or_skip_typed_variant(
+                candidate=candidate,
+                preferred=item,
+                index=index - 1,
+                total=len(prepared),
+                state=circuit_state,
             )
-            result = (
-                batched_cython[index - 1]
-                if candidate is item and index - 1 in batched_cython
-                else _compile_typed_variant(
-                    candidate,
-                    backend_context,
-                    cache_root=context.compile_cache_dir,
-                )
+            circuit_routed = _is_backend_circuit_routed(candidate, circuit_state)
+            _progress_typed_variant_cache(
+                result=result,
+                candidate=candidate,
+                circuit_routed=circuit_routed,
+                progress=context.progress,
             )
-            if result.attempt.cache_status == "hit":
-                _progress(
-                    context.progress,
-                    f"compile cache hit for typed region variant {candidate.unit.region_id}",
-                )
-            elif result.attempt.cache_status == "miss":
-                _progress(
-                    context.progress,
-                    f"compile cache miss for typed region variant {candidate.unit.region_id}",
-                )
             tagged_attempt = _tag_region_timings(result.attempt, candidate.unit.region_id)
             if result.attempt.success:
                 attempts.extend(
@@ -4093,25 +4145,33 @@ def _build_typed_regions(
                 artifacts.extend(result.artifacts)
                 cache_statuses.append((candidate.unit.region_id, result.attempt.cache_status))
                 successful_promises.add(item.unit.region_id)
-                _progress(
-                    context.progress,
-                    (
-                        f"compiled typed region variant {candidate.unit.region_id} "
-                        f"as {candidate.lowering_mode}"
-                    ),
-                )
+                if not circuit_routed:
+                    _progress(
+                        context.progress,
+                        (
+                            f"compiled typed region variant {candidate.unit.region_id} "
+                            f"as {candidate.lowering_mode}"
+                        ),
+                    )
                 break
+            _open_project_backend_circuit(
+                result=result,
+                candidate=candidate,
+                remaining=prepared[index - 1 :],
+                state=circuit_state,
+            )
             fallback = candidate.fallback
             if fallback is not None and _should_retry_with_fallback(candidate, result):
                 rejected_attempts.append((candidate, tagged_attempt))
-                _progress(
-                    context.progress,
-                    (
-                        f"retrying deterministic {candidate.generation.backend} failure with "
-                        f"{fallback.generation.backend} {fallback.lowering_mode}: "
-                        f"{fallback.unit.region_id}"
-                    ),
-                )
+                if not circuit_routed:
+                    _progress(
+                        context.progress,
+                        (
+                            f"retrying deterministic {candidate.generation.backend} failure "
+                            f"with {fallback.generation.backend} {fallback.lowering_mode}: "
+                            f"{fallback.unit.region_id}"
+                        ),
+                    )
                 candidate = fallback
                 continue
             attempts.extend(attempt for _rejected, attempt in rejected_attempts)
@@ -4125,10 +4185,11 @@ def _build_typed_regions(
                     build=result.attempt,
                 )
             )
-            _progress(
-                context.progress,
-                f"kept typed region variant {candidate.unit.region_id} as fallback",
-            )
+            if not circuit_routed:
+                _progress(
+                    context.progress,
+                    f"kept typed region variant {candidate.unit.region_id} as fallback",
+                )
             break
     return _TypedRegionBuildOutcome(
         successful=tuple(successful),
@@ -4136,6 +4197,256 @@ def _build_typed_regions(
         artifacts=tuple(artifacts),
         skipped=tuple(skipped),
         cache_statuses=tuple(cache_statuses),
+    )
+
+
+def _backend_circuit_key(item: _PreparedTypedRegion) -> tuple[Backend, str]:
+    """Return the backend and import-package scope for repeated rejection control.
+
+    Args:
+        item: Prepared variant whose source binding defines the import package.
+
+    Returns:
+        tuple[Backend, str]: Backend and top-level import package identity.
+    """
+    source_package = item.shim.source_module.partition(".")[0]
+    return item.generation.backend, source_package
+
+
+def _compile_or_skip_typed_variant(
+    *,
+    candidate: _PreparedTypedRegion,
+    preferred: _PreparedTypedRegion,
+    index: int,
+    total: int,
+    state: _BackendCircuitBuildState,
+) -> BackendCompileResult:
+    """Resolve one variant from a circuit, batch, cache, or compiler backend.
+
+    Args:
+        candidate: Current member of a preferred/fallback chain.
+        preferred: Top-level prepared variant owning the ordered build slot.
+        index: Zero-based position of the preferred variant.
+        total: Total number of preferred variants in this build.
+        state: Per-build circuit and precompiled-result state.
+
+    Returns:
+        BackendCompileResult: Explicit skip, restored entry, or compiler result.
+    """
+    primary_result = state.primaries.get(candidate.unit.region_id)
+    if primary_result is not None:
+        return primary_result
+    trigger = state.triggers.get(_backend_circuit_key(candidate))
+    if trigger is not None:
+        cached = probe_region_cache(
+            _compiler_backend(candidate.generation.backend),
+            candidate.unit,
+            state.context,
+            cache_root=state.cache_root,
+        )
+        if cached is not None:
+            return cached
+        return _project_circuit_bypass(candidate, trigger=trigger)
+    fallback_result = state.fallbacks.get(candidate.unit.region_id)
+    if fallback_result is not None:
+        return fallback_result
+    _progress(
+        state.progress,
+        (
+            f"compiling typed region variant {index + 1}/{total} with "
+            f"{candidate.generation.backend} ({candidate.lowering_mode}): "
+            f"{candidate.unit.region_id}"
+        ),
+    )
+    if candidate is preferred and index in state.batched_cython:
+        return state.batched_cython[index]
+    return _compile_typed_variant(
+        candidate,
+        state.context,
+        cache_root=state.cache_root,
+    )
+
+
+def _is_backend_circuit_routed(
+    item: _PreparedTypedRegion,
+    state: _BackendCircuitBuildState,
+) -> bool:
+    """Return whether package-level circuit evidence already resolves a variant.
+
+    Args:
+        item: Current preferred or fallback variant.
+        state: Per-build project-circuit and batched-result state.
+
+    Returns:
+        bool: Whether per-variant progress would duplicate a package-level summary.
+    """
+    return _backend_circuit_key(item) in state.triggers or item.unit.region_id in state.fallbacks
+
+
+def _progress_typed_variant_cache(
+    *,
+    result: BackendCompileResult,
+    candidate: _PreparedTypedRegion,
+    circuit_routed: bool,
+    progress: PackageProgress | None,
+) -> None:
+    """Report a direct cache result without repeating circuit batch details.
+
+    Args:
+        result: Backend result whose cache status may be user-visible.
+        candidate: Variant owning the cache result.
+        circuit_routed: Whether package-level progress already covered the result.
+        progress: Optional user-facing compile progress callback.
+    """
+    if circuit_routed or result.attempt.cache_status not in {"hit", "miss"}:
+        return
+    _progress(
+        progress,
+        (
+            f"compile cache {result.attempt.cache_status} for typed region variant "
+            f"{candidate.unit.region_id}"
+        ),
+    )
+
+
+def _project_circuit_bypass(
+    item: _PreparedTypedRegion,
+    *,
+    trigger: str,
+) -> BackendCompileResult:
+    """Represent a policy skip after a project-scoped deterministic failure.
+
+    Args:
+        item: Preferred backend variant skipped before native execution.
+        trigger: Earlier variant whose diagnostic opened the project circuit.
+
+    Returns:
+        BackendCompileResult: Honest bypass evidence with no compiler process.
+    """
+    backend = item.generation.backend
+    return BackendCompileResult(
+        attempt=CompileAttempt(
+            success=False,
+            command=("atoll", "backend-circuit", backend, item.unit.region_id),
+            stdout="",
+            stderr=(
+                f"{_BACKEND_POLICY_BYPASS_PREFIX} skipped {backend} for "
+                f"{item.unit.region_id}; imported project source was already rejected by "
+                f"{trigger}"
+            ),
+            artifact_paths=(),
+            duration_seconds=0.0,
+            phase_timings=(
+                CompilePhaseTiming(
+                    name="backend_project_circuit",
+                    duration_seconds=0.0,
+                    detail=f"{backend}; trigger={trigger}; skipped={item.unit.region_id}",
+                ),
+            ),
+        ),
+        artifacts=(),
+    )
+
+
+def _open_project_backend_circuit(
+    *,
+    result: BackendCompileResult,
+    candidate: _PreparedTypedRegion,
+    remaining: tuple[_PreparedTypedRegion, ...],
+    state: _BackendCircuitBuildState,
+) -> None:
+    """Open one project circuit and precompile independent Cython fallbacks.
+
+    Conditional variants remain dormant until their preferred class variant
+    fails. A deterministic failure inside the Cython batch is still isolated by
+    the region cache's recursive bisection, so one fallback cannot discard peers.
+
+    Args:
+        result: Current backend result carrying structured diagnostic scope.
+        candidate: Variant whose backend produced the result.
+        remaining: Current and later preferred variants in build order.
+        state: Per-build circuit and precompiled-result state to update.
+    """
+    if not state.enabled or result.diagnostic_scope != "project":
+        return
+    circuit_key = _backend_circuit_key(candidate)
+    if circuit_key in state.triggers:
+        return
+    trigger = candidate.unit.region_id
+    state.triggers[circuit_key] = trigger
+    blocked_backend, source_package = circuit_key
+    eligible: dict[str, _PreparedTypedRegion] = {}
+    for item in remaining:
+        if (
+            item.generation.backend != blocked_backend
+            or item.shim.source_module.partition(".")[0] != source_package
+            or item.conditional_on_failure_of is not None
+        ):
+            continue
+        cached_primary = probe_region_cache(
+            _compiler_backend(blocked_backend),
+            item.unit,
+            state.context,
+            cache_root=state.cache_root,
+        )
+        if cached_primary is not None:
+            state.primaries[item.unit.region_id] = cached_primary
+            if cached_primary.attempt.success:
+                continue
+        fallback = item.fallback
+        if fallback is None or fallback.generation.backend != "cython":
+            continue
+        eligible.setdefault(fallback.unit.region_id, fallback)
+    if len(eligible) < _MINIMUM_CYTHON_BATCH_SIZE:
+        return
+    fallbacks = tuple(eligible.values())
+    _progress(
+        state.progress,
+        (
+            f"{blocked_backend} project circuit opened for {source_package} after {trigger}; "
+            f"probing {len(fallbacks)} Cython fallback(s) as one batch frontier"
+        ),
+    )
+    results = compile_many_with_region_cache(
+        _compiler_backend("cython"),
+        tuple(item.unit for item in fallbacks),
+        state.context,
+        cache_root=state.cache_root,
+    )
+    batch_invocations = _cython_batch_invocation_count(results)
+    if batch_invocations:
+        _progress(
+            state.progress,
+            f"compiled project-circuit fallbacks in {batch_invocations} Cython batch(es)",
+        )
+    else:
+        _progress(
+            state.progress,
+            "restored all project-circuit Cython fallbacks from cache",
+        )
+    state.fallbacks.update(
+        {
+            fallback.unit.region_id: fallback_result
+            for fallback, fallback_result in zip(fallbacks, results, strict=True)
+        }
+    )
+
+
+def _cython_batch_invocation_count(
+    results: tuple[BackendCompileResult, ...],
+) -> int:
+    """Count successful, terminal-failure, and bisected Cython processes.
+
+    Args:
+        results: Per-unit cache results carrying cold physical-build timings.
+
+    Returns:
+        int: Exact number of native compiler invocations represented by results.
+    """
+    return sum(
+        timing.name in {"cython_batch", "cython_batch_retry"}
+        for result in results
+        for timing in result.attempt.phase_timings
     )
 
 
@@ -4178,11 +4489,7 @@ def _compile_batched_cython_variants(
         context,
         cache_root=cache_root,
     )
-    batch_invocations = sum(
-        timing.name == "cython_batch"
-        for result in results
-        for timing in result.attempt.phase_timings
-    )
+    batch_invocations = _cython_batch_invocation_count(results)
     if batch_invocations:
         _progress(
             progress,
@@ -4222,7 +4529,7 @@ def _should_retry_with_fallback(
     item: _PreparedTypedRegion,
     result: BackendCompileResult,
 ) -> bool:
-    """Return whether deterministic diagnostics permit the prepared fallback.
+    """Return whether rejection or circuit policy permits the prepared fallback.
 
     Args:
         item: Object being formatted for deterministic diagnostics.
@@ -4236,30 +4543,33 @@ def _should_retry_with_fallback(
     diagnostic_prefix = (
         "MYPYC_TYPE_ERROR:" if item.generation.backend == "mypyc" else "CYTHON_COMPILE_ERROR:"
     )
-    return result.attempt.stderr.startswith(diagnostic_prefix)
+    return result.attempt.stderr.startswith((diagnostic_prefix, _BACKEND_POLICY_BYPASS_PREFIX))
 
 
 def _recovered_backend_attempt(
     attempt: CompileAttempt,
     fallback_variant_id: str,
 ) -> CompileAttempt:
-    """Retain deterministic rejection evidence without failing the aggregate build.
+    """Retain rejected or bypassed backend evidence after fallback succeeds.
 
     Args:
-        attempt: Native compilation attempt being recovered or reported.
+        attempt: Native rejection or orchestration bypass being recovered.
         fallback_variant_id: Variant ID used when no preferred backend succeeds.
 
     Returns:
         CompileAttempt: Rejection augmented with successful fallback evidence.
     """
-    recovery = (
-        f"mypyc rejected this variant; compiled {fallback_variant_id} with Cython"
-        if attempt.stderr.startswith("MYPYC_TYPE_ERROR:")
-        else (
+    if attempt.stderr.startswith(_BACKEND_POLICY_BYPASS_PREFIX):
+        recovery = (
+            f"project-scoped backend circuit bypassed this variant; selected {fallback_variant_id}"
+        )
+    elif attempt.stderr.startswith("MYPYC_TYPE_ERROR:"):
+        recovery = f"mypyc rejected this variant; compiled {fallback_variant_id} with Cython"
+    else:
+        recovery = (
             "whole-callable Cython rejected this variant; compiled "
             f"{fallback_variant_id} with outlined Cython"
         )
-    )
     return replace(
         attempt,
         success=True,
@@ -7202,10 +7512,10 @@ def _candidate_fallback_reason(
 def _fallback_attempt_reason(
     rejected: tuple[tuple[_PreparedTypedRegion, CompileAttempt], ...],
 ) -> str | None:
-    """Describe the ordered backend chain preceding a successful fallback.
+    """Describe the ordered rejection or bypass chain preceding a fallback.
 
     Args:
-        rejected: Prepared variants and deterministic failed attempts in retry order.
+        rejected: Prepared variants and failed or bypassed attempts in retry order.
 
     Returns:
         str | None: Concise ordered fallback provenance, when retries occurred.
@@ -8475,6 +8785,80 @@ def _member_requires_source_class(source_text: str) -> bool:
         )
         for node in ast.walk(tree)
     )
+
+
+def _stage_target_sources(
+    project: DiscoveredProject,
+    build_root: Path,
+    progress: PackageProgress | None,
+) -> tuple[tuple[Path, ...], str]:
+    """Copy target source roots and fingerprint their source-clean originals.
+
+    Args:
+        project: Discovered target whose original source roots remain source-clean.
+        build_root: Disposable destination for native generation and staged shims.
+        progress: Optional user-facing compile progress callback.
+
+    Returns:
+        tuple[tuple[Path, ...], str]: Copied roots and strict backend cache digest.
+    """
+    copy_started = time.perf_counter()
+    _progress(progress, "copying source roots into temporary build tree")
+    staged = _copy_source_roots(project, build_root)
+    _progress(progress, f"copied source roots in {_duration(copy_started)}")
+    fingerprint_started = time.perf_counter()
+    digest = _source_roots_digest(
+        staged,
+        ignored_top_level=_STAGED_SOURCE_DIGEST_IGNORED_TOP_LEVEL,
+    )
+    _progress(
+        progress,
+        f"fingerprinted target sources in {_duration(fingerprint_started)}",
+    )
+    return staged, digest
+
+
+def _source_roots_digest(
+    source_roots: tuple[Path, ...],
+    *,
+    ignored_top_level: frozenset[str] = frozenset(),
+) -> str:
+    """Hash source-clean target inputs before Atoll generates private source.
+
+    The digest covers every regular file path and byte sequence under each
+    ordered source root. It is included in backend cache keys so a deterministic
+    rejection caused by imported project source cannot survive a source edit.
+
+    Args:
+        source_roots: Ordered copied import roots before native generation.
+        ignored_top_level: Disposable sibling names present only in a flat build root.
+
+    Returns:
+        str: Lowercase SHA-256 digest of copied target inputs.
+    """
+    digest = hashlib.sha256()
+    for index, source_root in enumerate(source_roots):
+        digest.update(f"root:{index}".encode("ascii"))
+        digest.update(b"\0")
+        for path in sorted(source_root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(source_root).as_posix()
+            relative_parts = PurePosixPath(relative).parts
+            if (
+                (relative_parts and relative_parts[0] in ignored_top_level)
+                or any(part in _GENERATED_DIR_NAMES for part in relative_parts)
+                or path.suffix
+                in {
+                    ".pyd",
+                    ".so",
+                }
+            ):
+                continue
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def _copy_source_roots(

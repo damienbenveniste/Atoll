@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import time
 from collections.abc import Iterator
@@ -26,13 +27,14 @@ from atoll.models import (
     Backend,
     BackendCompileContext,
     BackendCompileResult,
+    BackendDiagnosticScope,
     CompilationUnit,
     CompileAttempt,
     CompilePhaseTiming,
 )
 
 REGION_CACHE_VERSION = 1
-BACKEND_DECISION_CACHE_VERSION = 1
+BACKEND_DECISION_CACHE_VERSION = 2
 _DETERMINISTIC_DIAGNOSTIC_CODES = (
     "MYPYC_TYPE_ERROR",
     "CYTHON_COMPILE_ERROR",
@@ -119,9 +121,35 @@ def compile_with_region_cache(
     return _finalize_miss(
         probe,
         result,
+        unit=unit,
         context=context,
         cache_root=cache_root,
     )
+
+
+def probe_region_cache(
+    backend: CompilerBackend,
+    unit: CompilationUnit,
+    context: BackendCompileContext,
+    *,
+    cache_root: Path,
+) -> BackendCompileResult | None:
+    """Restore one cached result without invoking the compiler on a miss.
+
+    Successful probes restore validated artifact bytes into the active backend
+    output root. Deterministic rejection probes restore their structured scope.
+    A miss returns ``None`` and leaves backend execution to the caller.
+
+    Args:
+        backend: Compiler backend that owns the fingerprint and cache namespace.
+        unit: Content-addressable backend compilation unit.
+        context: Filesystem, cache, and artifact restoration boundaries.
+        cache_root: Root directory for typed-region artifacts and decisions.
+
+    Returns:
+        BackendCompileResult | None: Restored success or rejection, otherwise ``None``.
+    """
+    return _probe_cache(backend, unit, context, cache_root=cache_root).cached_result
 
 
 def compile_many_with_region_cache(
@@ -237,6 +265,7 @@ def _probe_cache(
     cached_rejection = _restore_rejection(
         path=_decision_path(cache_root, identity),
         identity=identity,
+        context=context,
         duration_seconds=lookup_duration,
     )
     return _CacheProbe(
@@ -250,6 +279,7 @@ def _finalize_miss(
     probe: _CacheProbe,
     result: BackendCompileResult,
     *,
+    unit: CompilationUnit,
     context: BackendCompileContext,
     cache_root: Path,
 ) -> BackendCompileResult:
@@ -270,11 +300,19 @@ def _finalize_miss(
         code = _deterministic_diagnostic_code(result.attempt.stderr)
         if code is None:
             return replace(result, attempt=attempt)
+        diagnostic_scope = _diagnostic_scope(
+            code=code,
+            stderr=result.attempt.stderr,
+            unit=unit,
+            context=context,
+        )
         store_started = time.perf_counter()
         store_detail = _store_rejection(
             path=decision_path,
             identity=identity,
             diagnostic_code=code,
+            diagnostic_scope=diagnostic_scope,
+            project_source_digest=context.project_source_digest,
         )
         store_timing = CompilePhaseTiming(
             name="backend_decision_store",
@@ -288,6 +326,7 @@ def _finalize_miss(
                 duration_seconds=attempt.duration_seconds + store_timing.duration_seconds,
                 phase_timings=(*attempt.phase_timings, store_timing),
             ),
+            diagnostic_scope=diagnostic_scope,
         )
     if not result.attempt.artifact_paths:
         return replace(result, attempt=attempt)
@@ -360,6 +399,7 @@ def _compile_cython_misses(
                     _finalize_miss(
                         miss.probe,
                         result,
+                        unit=miss.unit,
                         context=batch_context,
                         cache_root=cache_root,
                     ),
@@ -369,7 +409,7 @@ def _compile_cython_misses(
     deterministic = _deterministic_diagnostic_code(physical.attempt.stderr) is not None
     if deterministic and len(misses) > 1:
         midpoint = len(misses) // 2
-        return (
+        isolated = (
             *_compile_cython_misses(
                 backend,
                 misses[:midpoint],
@@ -385,6 +425,12 @@ def _compile_cython_misses(
                 sequence=sequence,
             ),
         )
+        return _retain_failed_batch_invocation(
+            isolated,
+            physical=physical,
+            invocation=invocation,
+            unit_count=len(misses),
+        )
     failures = _split_failed_batch(misses, physical, invocation=invocation)
     return tuple(
         (
@@ -392,11 +438,61 @@ def _compile_cython_misses(
             _finalize_miss(
                 miss.probe,
                 result,
+                unit=miss.unit,
                 context=batch_context,
                 cache_root=cache_root,
             ),
         )
         for miss, result in zip(misses, failures, strict=True)
+    )
+
+
+def _retain_failed_batch_invocation(
+    results: tuple[tuple[_BatchMiss, BackendCompileResult], ...],
+    *,
+    physical: BackendCompileResult,
+    invocation: int,
+    unit_count: int,
+) -> tuple[tuple[_BatchMiss, BackendCompileResult], ...]:
+    """Attach one failed parent process to the first isolated child result.
+
+    Recursive bisection replaces a failed aggregate result with independently
+    cacheable child results. This helper preserves the parent's duration and one
+    explicit timing marker without persisting that transient aggregate evidence
+    into any per-unit cache entry.
+
+    Args:
+        results: Ordered isolated child results from both recursive halves.
+        physical: Failed aggregate Cython invocation being represented.
+        invocation: Monotonic physical process identifier.
+        unit_count: Number of units submitted to the failed process.
+
+    Returns:
+        tuple[tuple[_BatchMiss, BackendCompileResult], ...]: Results with exact
+        cold-process timing retained once.
+    """
+    if not results:
+        return results
+    first_miss, first_result = results[0]
+    retry_timing = CompilePhaseTiming(
+        name="cython_batch_retry",
+        duration_seconds=0.0,
+        detail=f"failed invocation {invocation}; {unit_count} unit(s); recursively isolated",
+    )
+    first_attempt = replace(
+        first_result.attempt,
+        duration_seconds=(
+            first_result.attempt.duration_seconds + physical.attempt.duration_seconds
+        ),
+        phase_timings=(
+            *physical.attempt.phase_timings,
+            retry_timing,
+            *first_result.attempt.phase_timings,
+        ),
+    )
+    return (
+        (first_miss, replace(first_result, attempt=first_attempt)),
+        *results[1:],
     )
 
 
@@ -531,6 +627,7 @@ def _restore_rejection(
     *,
     path: Path,
     identity: _CacheIdentity,
+    context: BackendCompileContext,
     duration_seconds: float,
 ) -> BackendCompileResult | None:
     manifest = _read_manifest(path)
@@ -544,6 +641,19 @@ def _restore_rejection(
         return None
     code = manifest.get("diagnostic_code")
     if not isinstance(code, str) or code not in _DETERMINISTIC_DIAGNOSTIC_CODES:
+        return None
+    diagnostic_scope = manifest.get("diagnostic_scope")
+    if diagnostic_scope not in {"unit", "project"}:
+        return None
+    restored_scope: BackendDiagnosticScope = "project" if diagnostic_scope == "project" else "unit"
+    project_source_digest = manifest.get("project_source_digest")
+    if restored_scope == "project":
+        if (
+            not isinstance(project_source_digest, str)
+            or project_source_digest != context.project_source_digest
+        ):
+            return None
+    elif project_source_digest is not None:
         return None
     return BackendCompileResult(
         attempt=CompileAttempt(
@@ -563,6 +673,7 @@ def _restore_rejection(
             cache_status="hit",
         ),
         artifacts=(),
+        diagnostic_scope=restored_scope,
     )
 
 
@@ -571,7 +682,11 @@ def _store_rejection(
     path: Path,
     identity: _CacheIdentity,
     diagnostic_code: str,
+    diagnostic_scope: BackendDiagnosticScope,
+    project_source_digest: str | None,
 ) -> str:
+    if diagnostic_scope == "project" and not project_source_digest:
+        return "project-scoped rejection not stored because source digest is unavailable"
     temp_path = path.with_suffix(".tmp")
     manifest = {
         "version": BACKEND_DECISION_CACHE_VERSION,
@@ -579,6 +694,8 @@ def _store_rejection(
         "backend": identity.backend,
         "region_id": identity.region_id,
         "diagnostic_code": diagnostic_code,
+        "diagnostic_scope": diagnostic_scope,
+        "project_source_digest": (project_source_digest if diagnostic_scope == "project" else None),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -590,7 +707,59 @@ def _store_rejection(
     except OSError as error:
         temp_path.unlink(missing_ok=True)
         return f"decision store failed: {error}"
-    return f"stored deterministic {diagnostic_code} rejection"
+    return f"stored deterministic {diagnostic_code} {diagnostic_scope}-scoped rejection"
+
+
+def _diagnostic_scope(
+    *,
+    code: str,
+    stderr: str,
+    unit: CompilationUnit,
+    context: BackendCompileContext,
+) -> BackendDiagnosticScope:
+    """Classify mypyc diagnostics that originate in imported project source.
+
+    Mypyc type-checks the import graph around each generated unit. When its
+    normalized diagnostics point at copied target-project files but not at the
+    generated unit itself, retrying another unit from the same package repeats
+    the same deterministic project rejection. Other backends and ambiguous
+    paths remain unit-scoped.
+
+    Args:
+        code: Normalized deterministic backend diagnostic code.
+        stderr: Backend diagnostic summary retained by the compile attempt.
+        unit: Generated compilation unit submitted to the backend.
+        context: Copied project and source-root boundaries used by the backend.
+
+    Returns:
+        BackendDiagnosticScope: ``project`` only for verified copied-source errors.
+    """
+    if unit.backend != "mypyc" or code != "MYPYC_TYPE_ERROR":
+        return "unit"
+    generated_paths = frozenset(path.resolve() for path in unit.source_paths)
+    source_roots = tuple(path.resolve() for path in context.source_roots)
+    generated_error = False
+    project_error = False
+    for match in re.finditer(r"(?m)^(.+?\.py):\d+(?::\d+)?: error:", stderr):
+        raw_path = Path(match.group(1))
+        candidates = (
+            (raw_path.resolve(),)
+            if raw_path.is_absolute()
+            else (
+                (context.project_root / raw_path).resolve(),
+                *((root / raw_path).resolve() for root in source_roots),
+            )
+        )
+        for candidate in candidates:
+            if candidate in generated_paths:
+                generated_error = True
+                break
+            if not candidate.is_file():
+                continue
+            if any(candidate.is_relative_to(root) for root in source_roots):
+                project_error = True
+                break
+    return "project" if project_error and not generated_error else "unit"
 
 
 def _deterministic_diagnostic_code(stderr: str) -> str | None:
