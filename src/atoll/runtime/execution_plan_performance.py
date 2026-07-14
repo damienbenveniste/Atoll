@@ -188,6 +188,9 @@ class _ExecutionPlanBenchmarkOptions(TypedDict, total=False):
     baseline_variant_allowlist: frozenset[str] | None
     unplanned_variant_allowlist: frozenset[str] | None
     planned_variant_allowlist: frozenset[str] | None
+    baseline_require_optimized: bool
+    unplanned_require_optimized: bool
+    planned_require_optimized: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +207,9 @@ class _ExecutionPlanBenchmarkContext:
     baseline_variant_allowlist: frozenset[str] | None
     unplanned_variant_allowlist: frozenset[str] | None
     planned_variant_allowlist: frozenset[str] | None
+    baseline_require_optimized: bool
+    unplanned_require_optimized: bool
+    planned_require_optimized: bool
 
 
 def run_execution_plan_benchmark(
@@ -229,7 +235,8 @@ def run_execution_plan_benchmark(
         baseline_payload_root: Payload root for interpreted baseline measurements.
         unplanned_payload_root: Payload root for compiled measurements without the plan.
         planned_payload_root: Payload root for compiled measurements with the plan staged.
-        **options: Optional progress callback and per-arm region allowlists.
+        **options: Optional progress callback, per-arm allowlists, and strict
+            source-optimization routing requirements.
 
     Returns:
         ExecutionPlanBenchmarkResult: Three-arm run evidence, medians, speedups, and decision.
@@ -254,6 +261,9 @@ def run_execution_plan_benchmark(
         baseline_variant_allowlist=options.get("baseline_variant_allowlist"),
         unplanned_variant_allowlist=options.get("unplanned_variant_allowlist"),
         planned_variant_allowlist=options.get("planned_variant_allowlist"),
+        baseline_require_optimized=options.get("baseline_require_optimized", False),
+        unplanned_require_optimized=options.get("unplanned_require_optimized", False),
+        planned_require_optimized=options.get("planned_require_optimized", False),
     )
 
     warmups, failure = _run_trios(context, phase="warmup", count=1)
@@ -405,6 +415,9 @@ def _reject_unexpected_options(options: _ExecutionPlanBenchmarkOptions) -> None:
         "baseline_variant_allowlist",
         "unplanned_variant_allowlist",
         "planned_variant_allowlist",
+        "baseline_require_optimized",
+        "unplanned_require_optimized",
+        "planned_require_optimized",
     }
     unexpected_options = set(options) - allowed_options
     if unexpected_options:
@@ -453,6 +466,7 @@ def _run_arm_sequence(
                 mode="baseline" if arm == "baseline" else "compiled",
                 region_allowlist=_region_allowlist(context, arm),
                 variant_allowlist=_variant_allowlist(context, arm),
+                require_optimized=_require_optimized(context, arm),
             ),
         )
         runs.append(wrapped)
@@ -520,6 +534,26 @@ def _variant_allowlist(
     if arm == "unplanned":
         return context.unplanned_variant_allowlist
     return context.planned_variant_allowlist
+
+
+def _require_optimized(
+    context: _ExecutionPlanBenchmarkContext,
+    arm: ExecutionPlanBenchmarkArm,
+) -> bool:
+    """Return whether one benchmark arm must exercise source optimization.
+
+    Args:
+        context: Per-arm execution-plan benchmark controls.
+        arm: Baseline, unplanned, or planned payload arm.
+
+    Returns:
+        bool: Whether fallback from generated source optimization is forbidden.
+    """
+    if arm == "baseline":
+        return context.baseline_require_optimized
+    if arm == "unplanned":
+        return context.unplanned_require_optimized
+    return context.planned_require_optimized
 
 
 def _arm_median(

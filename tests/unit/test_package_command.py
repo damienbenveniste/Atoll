@@ -104,6 +104,7 @@ EXPECTED_SAFETY_VERIFICATION_STEPS = 2
 OWNER_PROFILE_SAMPLES = 40
 SECOND_CANDIDATE_REGION_COUNT = 2
 PROFILE_REPLAY_RANK_SAMPLES = 120
+FULL_BENCHMARK_SAMPLES = 7
 
 
 def _assert_candidate_baseline_allowlist(options: dict[str, object], accepted_count: int) -> None:
@@ -141,15 +142,7 @@ class _Metadata(Protocol):
 
 
 class _BaselinePayloadFactory(Protocol):
-    def __call__(
-        self,
-        *,
-        wheel_path: Path | None,
-        build: CompileAttempt,
-        baseline_install_root: Path | None = None,
-        quality_project_root: Path | None = None,
-        semantic_test_result: CommandRunEvidence | None = None,
-    ) -> object: ...
+    def __call__(self, **kwargs: object) -> object: ...
 
 
 class _Pep517ProjectCopy(Protocol):
@@ -165,6 +158,8 @@ class _Pep517ProjectCopy(Protocol):
 
 class _BaselinePayloadView(Protocol):
     baseline_install_root: Path | None
+    original_install_root: Path | None
+    source_optimized: bool
 
 
 class _OptimizationArmView(Protocol):
@@ -177,6 +172,7 @@ class _QualityGateOutcomeView(Protocol):
     success: bool
     tests: tuple[CommandRunEvidence, ...]
     performance: BenchmarkGateResult
+    composition_performance: BenchmarkGateResult | None
     error: str | None
 
 
@@ -3332,6 +3328,191 @@ def test_quality_gate_reuses_early_baseline_semantic_test(
     assert executed_modes == ["compiled"]
 
 
+def test_quality_gate_requires_composed_payload_to_improve_accepted_source_arm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later native layer cannot displace a faster accepted source-only wheel."""
+    project = _quality_gate_project(
+        tmp_path,
+        (
+            'test_command = ["python", "-c", "pass"]',
+            'benchmark_command = ["python", "bench.py"]',
+            "benchmark_warmups = 1",
+            "benchmark_samples = 7",
+            "minimum_speedup = 1.10",
+        ),
+    )
+    quality_root = tmp_path / "quality-project"
+    baseline_root = tmp_path / "source-only"
+    compiled_root = tmp_path / "composed"
+    quality_root.mkdir()
+    baseline_root.mkdir()
+    compiled_root.mkdir()
+    baseline_result = CommandRunEvidence(
+        command=("python", "-c", "pass"),
+        project_root=quality_root,
+        payload_root=baseline_root,
+        mode="baseline",
+        returncode=0,
+        stdout="",
+        stderr="",
+        duration_seconds=0.2,
+    )
+    baseline = _BaselineWheelPayload(
+        wheel_path=tmp_path / "source-only.whl",
+        build=_successful_attempt(),
+        baseline_install_root=baseline_root,
+        quality_project_root=quality_root,
+        semantic_test_result=baseline_result,
+        source_optimized=True,
+    )
+    semantic_options: list[dict[str, object]] = []
+
+    def run_test(
+        command: tuple[str, ...],
+        *,
+        project_root: Path,
+        payload_root: Path,
+        mode: RuntimeMode,
+        **options: object,
+    ) -> CommandRunEvidence:
+        semantic_options.append(options)
+        return CommandRunEvidence(
+            command=command,
+            project_root=project_root,
+            payload_root=payload_root,
+            mode=mode,
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration_seconds=0.2,
+        )
+
+    benchmark_options: list[dict[str, object]] = []
+    rejected = BenchmarkGateResult(
+        status="not-profitable",
+        reason="compiled median speedup 0.900 is below threshold 1.050",
+        minimum_speedup=1.05,
+        baseline_median_seconds=0.9,
+        compiled_median_seconds=1.0,
+        speedup=0.9,
+        warmups=(),
+        samples=(),
+    )
+
+    def reject_composition(
+        config: BenchmarkGateConfig,
+        **options: object,
+    ) -> BenchmarkGateResult:
+        assert config.warmups == 1
+        assert config.samples == FULL_BENCHMARK_SAMPLES
+        assert config.minimum_speedup == pytest.approx(1.05)
+        benchmark_options.append(options)
+        return rejected
+
+    monkeypatch.setattr(package_command, "run_performance_command", run_test)
+    monkeypatch.setattr(package_command, "run_benchmark_gate", reject_composition)
+
+    outcome = _run_configured_quality_gate(
+        project=project,
+        baseline=baseline,
+        compiled_payload_root=compiled_root,
+        progress=None,
+    )
+
+    assert outcome.success is False
+    assert outcome.performance is rejected
+    assert outcome.composition_performance is rejected
+    assert outcome.error is not None
+    assert outcome.error.startswith("composed payload did not improve")
+    assert semantic_options == [{"require_optimized": True}]
+    assert len(benchmark_options) == 1
+    assert benchmark_options[0]["baseline_require_optimized"] is True
+    assert benchmark_options[0]["compiled_require_optimized"] is True
+
+
+def test_quality_gate_retains_direct_composition_and_final_payload_measurements(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reports keep paired marginal evidence separate from the overall final gate."""
+    project = _quality_gate_project(
+        tmp_path,
+        (
+            'test_command = ["python", "-c", "pass"]',
+            'benchmark_command = ["python", "bench.py"]',
+            "benchmark_warmups = 1",
+            "benchmark_samples = 7",
+            "minimum_speedup = 1.10",
+        ),
+    )
+    quality_root = tmp_path / "quality-project"
+    original_root = tmp_path / "original"
+    baseline_root = tmp_path / "source-only"
+    compiled_root = tmp_path / "composed"
+    quality_root.mkdir()
+    original_root.mkdir()
+    baseline_root.mkdir()
+    compiled_root.mkdir()
+    baseline = _BaselineWheelPayload(
+        wheel_path=tmp_path / "source-only.whl",
+        build=_successful_attempt(),
+        baseline_install_root=baseline_root,
+        original_install_root=original_root,
+        quality_project_root=quality_root,
+        source_optimized=True,
+    )
+    composition = BenchmarkGateResult(
+        status="passed",
+        reason="composition passed",
+        minimum_speedup=1.05,
+        baseline_median_seconds=0.5,
+        compiled_median_seconds=0.4,
+        speedup=1.25,
+        warmups=(),
+        samples=(),
+    )
+    final = BenchmarkGateResult(
+        status="passed",
+        reason="final passed",
+        minimum_speedup=1.1,
+        baseline_median_seconds=2.0,
+        compiled_median_seconds=0.4,
+        speedup=5.0,
+        warmups=(),
+        samples=(),
+    )
+    calls: list[tuple[float, dict[str, object]]] = []
+
+    def benchmark(
+        config: BenchmarkGateConfig,
+        **options: object,
+    ) -> BenchmarkGateResult:
+        calls.append((config.minimum_speedup, options))
+        return composition if len(calls) == 1 else final
+
+    monkeypatch.setattr(package_command, "run_benchmark_gate", benchmark)
+
+    outcome = _run_configured_quality_gate(
+        project=project,
+        baseline=baseline,
+        compiled_payload_root=compiled_root,
+        progress=None,
+    )
+
+    assert outcome.success is True
+    assert outcome.composition_performance is composition
+    assert outcome.performance is final
+    assert [minimum for minimum, _options in calls] == [1.05, 1.1]
+    assert calls[0][1]["baseline_require_optimized"] is True
+    assert calls[0][1]["compiled_require_optimized"] is True
+    assert calls[0][1]["baseline_payload_root"] == baseline_root
+    assert calls[1][1]["compiled_require_optimized"] is True
+    assert "baseline_require_optimized" not in calls[1][1]
+    assert calls[1][1]["baseline_payload_root"] == original_root
+
+
 def test_quality_gate_reports_semantic_test_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5252,6 +5433,7 @@ def test_composition_fallback_preserves_source_success_and_rejection_evidence(
         compiled_variants=(variant,),
         artifact_records=(artifact,),
         applied_execution_plans=("rejected-plan",),
+        composition_performance=_benchmark_result("not-profitable"),
     )
 
     recovered = _source_result_with_composition_fallback(
@@ -5263,6 +5445,7 @@ def test_composition_fallback_preserves_source_success_and_rejection_evidence(
     assert recovered.success is True
     assert recovered.wheel_path == source_result.wheel_path
     assert recovered.performance == source_result.performance
+    assert recovered.composition_performance == rejected.composition_performance
     assert recovered.compiled_regions == ()
     assert recovered.compiled_bindings == ()
     assert recovered.compiled_variants == ()
@@ -5352,6 +5535,8 @@ def test_materialize_source_optimization_arm_recreates_disposable_project(
     ) == "WHEEL_VALUE = 1\n"
     assert baseline.baseline_install_root is not None
     assert (baseline.baseline_install_root / "app" / "ranking.py").exists()
+    assert baseline.original_install_root == baseline_payload
+    assert baseline.source_optimized is True
     assert arm.source_search is search
 
 

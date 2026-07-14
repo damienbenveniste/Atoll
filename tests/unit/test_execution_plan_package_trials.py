@@ -165,7 +165,7 @@ def test_passing_execution_plan_replaces_payload_after_disposable_trial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A semantic and marginal-performance pass promotes only the staged copy."""
-    context, source_path, install_path = _trial_context(tmp_path)
+    context, source_path, install_path = _trial_context(tmp_path, source_optimized=True)
     original_source = source_path.read_text(encoding="utf-8")
     original_payload = install_path.read_text(encoding="utf-8")
     events: list[str] = []
@@ -176,15 +176,16 @@ def test_passing_execution_plan_replaces_payload_after_disposable_trial(
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        variant_allowlist: frozenset[str] | None = None,
+        **options: object,
     ) -> CommandRunEvidence:
+        assert options["require_optimized"] is True
         events.append("semantic")
         return _passing_semantics(
             command,
             project_root=project_root,
             payload_root=payload_root,
             mode=mode,
-            variant_allowlist=variant_allowlist,
+            variant_allowlist=options.get("variant_allowlist"),
         )
 
     def benchmark(
@@ -195,6 +196,9 @@ def test_passing_execution_plan_replaces_payload_after_disposable_trial(
         assert config.samples == _PLAN_BENCHMARK_SAMPLES
         assert config.minimum_marginal_speedup == pytest.approx(1.05)
         assert config.minimum_overall_speedup == pytest.approx(1.10)
+        assert kwargs["baseline_require_optimized"] is True
+        assert kwargs["unplanned_require_optimized"] is True
+        assert kwargs["planned_require_optimized"] is True
         progress = cast(
             Callable[[ExecutionPlanBenchmarkProgress], None],
             kwargs["progress"],
@@ -471,9 +475,10 @@ def test_task_preserving_backend_follows_a_callback_semantic_failure(
         project_root: Path,
         payload_root: Path,
         mode: RuntimeMode,
-        variant_allowlist: frozenset[str] | None = None,
+        **options: object,
     ) -> CommandRunEvidence:
         nonlocal semantic_calls
+        assert options["require_optimized"] is False
         semantic_calls += 1
         runner = _failing_semantics if semantic_calls == 1 else _passing_semantics
         return runner(
@@ -481,7 +486,7 @@ def test_task_preserving_backend_follows_a_callback_semantic_failure(
             project_root=project_root,
             payload_root=payload_root,
             mode=mode,
-            variant_allowlist=variant_allowlist,
+            variant_allowlist=options.get("variant_allowlist"),
         )
 
     monkeypatch.setattr(
@@ -578,6 +583,8 @@ def test_post_swap_backup_cleanup_cannot_invalidate_an_applied_plan(
 
 def _trial_context(
     tmp_path: Path,
+    *,
+    source_optimized: bool = False,
 ) -> tuple[object, Path, Path]:
     project_root = tmp_path / "project"
     source_path = project_root / "src" / "app" / "scheduler.py"
@@ -627,6 +634,7 @@ benchmark_command = ["python", "bench.py"]
         ),
         baseline_install_root=tmp_path / "baseline-install",
         quality_project_root=quality_root,
+        source_optimized=source_optimized,
     )
     context = _ExecutionPlanApplicationContext(
         options=package_command.PackageOptions(root=project_root),
@@ -696,8 +704,12 @@ def _passing_semantics(
     project_root: Path,
     payload_root: Path,
     mode: RuntimeMode,
-    variant_allowlist: frozenset[str] | None = None,
+    **options: object,
 ) -> CommandRunEvidence:
+    variant_allowlist = cast(
+        frozenset[str] | None,
+        options.get("variant_allowlist"),
+    )
     assert mode == "compiled"
     assert variant_allowlist == frozenset({"native-region"})
     return CommandRunEvidence(
@@ -718,9 +730,9 @@ def _failing_semantics(
     project_root: Path,
     payload_root: Path,
     mode: RuntimeMode,
-    variant_allowlist: frozenset[str] | None = None,
+    **options: object,
 ) -> CommandRunEvidence:
-    del variant_allowlist
+    del options
     return CommandRunEvidence(
         command=command,
         project_root=project_root,

@@ -179,7 +179,8 @@ gates. After a source candidate passes every final 3x gate, Atoll stores only it
 under `.atoll/cache/accepted-winners/`; warm replay reruns tests, profiles, timings, and both final
 gates. The identity covers benchmark and test content, project metadata, the baseline wheel payload,
 dependency versions, and the build environment. A candidate that fails replay semantics is not
-retried during that invocation; the full search continues with the remaining candidates.
+retried during that invocation; the full search continues with the remaining candidates. A passing
+replay seeds, but never replaces, fresh bounded candidate comparison under the current environment.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
 scan and compile reports. A callable from such a module is compiled only when the typed-region
 analysis and backend capability assessment can still preserve its source behavior. Boxed executable
@@ -239,7 +240,8 @@ Accepted source optimization remains available as the fallback baseline for late
 recreates the patch under disposable build storage, rescans it, and can layer profitable native
 regions or execution plans onto the transformed wheel. If a later stage fails semantics or its
 performance gate, the accepted source-only wheel survives; the transformed project copy is always
-removed with build scratch.
+removed with build scratch. The complete composition must improve the accepted source-only arm by
+at least `1.05x` in a direct paired benchmark before the final overall gate can promote it.
 
 ```bash
 uv run atoll compile --root . --apply-source

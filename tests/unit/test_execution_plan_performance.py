@@ -201,12 +201,20 @@ def test_execution_plan_benchmark_forwards_variant_allowlists(
         baseline_variant_allowlist=frozenset(("base",)),
         unplanned_variant_allowlist=frozenset(("native",)),
         planned_variant_allowlist=frozenset(("native", "planned")),
+        baseline_require_optimized=True,
+        unplanned_require_optimized=False,
+        planned_require_optimized=True,
     )
 
     assert [(call.arm, call.allowlist) for call in calls[:3]] == [
         ("baseline", frozenset(("base",))),
         ("unplanned", frozenset(("native",))),
         ("planned", frozenset(("native", "planned"))),
+    ]
+    assert [(call.arm, call.require_optimized) for call in calls[:3]] == [
+        ("baseline", True),
+        ("unplanned", False),
+        ("planned", True),
     ]
 
 
@@ -457,6 +465,7 @@ class CallRecord:
     mode: RuntimeMode
     payload_name: str
     allowlist: frozenset[str] | None
+    require_optimized: bool
 
 
 def _fake_runner(
@@ -485,6 +494,7 @@ def _fake_runner(
                 mode=mode,
                 payload_name=payload_root.name,
                 allowlist=variant_allowlist or region_allowlist,
+                require_optimized=cast(bool, options.get("require_optimized", False)),
             )
         )
         return CommandRunEvidence(

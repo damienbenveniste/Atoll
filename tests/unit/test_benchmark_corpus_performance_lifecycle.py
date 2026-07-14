@@ -305,6 +305,14 @@ def test_ratio_evidence_labels_composed_source_and_native_layers() -> None:
                 {"mode": "baseline", "success": False, "duration_seconds": 99.0},
             ],
         },
+        "composition_performance": {
+            "status": "passed",
+            "speedup": 1.25,
+            "samples": [
+                {"mode": "baseline", "success": True, "duration_seconds": 0.5},
+                {"mode": "compiled", "success": True, "duration_seconds": 0.4},
+            ],
+        },
         "final_composition": {
             "source_plan_ids": ["source-plan"],
             "native_variant_ids": ["native-variant"],
@@ -314,7 +322,7 @@ def test_ratio_evidence_labels_composed_source_and_native_layers() -> None:
                 {
                     "plan_id": "source-plan",
                     "status": "accepted",
-                    "source_speedup": 2.0,
+                    "source_speedup": 4.0,
                 }
             ]
         },
@@ -322,12 +330,38 @@ def test_ratio_evidence_labels_composed_source_and_native_layers() -> None:
 
     evidence = ratio_evidence_from_report(report)
 
-    assert evidence.python_rewrite_vs_original == pytest.approx(2.0)
+    assert evidence.python_rewrite_vs_original == pytest.approx(4.0)
     assert evidence.final_wheel_vs_original == pytest.approx(3.0)
-    assert evidence.native_vs_source_only == pytest.approx(1.5)
+    assert evidence.native_vs_source_only == pytest.approx(1.25)
     assert evidence.baseline_samples_seconds == (0.9,)
-    assert evidence.source_only_samples_seconds == ()
+    assert evidence.source_only_samples_seconds == (0.5,)
     assert evidence.final_wheel_samples_seconds == (0.3,)
+
+
+def test_ratio_evidence_does_not_divide_independent_benchmark_rounds() -> None:
+    """Older reports without a direct composition gate omit the native ratio."""
+    report: dict[str, object] = {
+        "performance": {"speedup": 3.0, "samples": []},
+        "final_composition": {
+            "source_plan_ids": ["source-plan"],
+            "native_variant_ids": ["native-variant"],
+        },
+        "source_optimization": {
+            "trials": [
+                {
+                    "plan_id": "source-plan",
+                    "status": "accepted",
+                    "source_speedup": 4.0,
+                }
+            ]
+        },
+    }
+
+    evidence = ratio_evidence_from_report(report)
+
+    assert evidence.python_rewrite_vs_original == pytest.approx(4.0)
+    assert evidence.final_wheel_vs_original == pytest.approx(3.0)
+    assert evidence.native_vs_source_only is None
 
 
 def _process(exit_code: int) -> ProcessResult:

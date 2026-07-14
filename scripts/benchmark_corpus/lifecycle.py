@@ -2066,10 +2066,11 @@ def _performance_sample_payload(value: object, index: int) -> dict[str, object]:
 def ratio_evidence_from_report(report: dict[str, object]) -> RatioEvidence:
     """Extract labeled performance ratios and successful raw samples.
 
-    Schema v6 does not expose raw source-only search samples, so that tuple
-    remains empty rather than fabricating observations from a median. Source
-    and native-layer ratios are retained only when the final composition proves
-    the corresponding layers were accepted.
+    Source and native-layer ratios are retained only when the final composition
+    proves the corresponding layers were accepted. Native improvement comes
+    from Atoll's direct source-only-versus-composed gate; ratios from independent
+    final and source-search rounds are never divided because their baseline
+    medians are not paired observations.
 
     Args:
         report: Valid schema-v6 compile report.
@@ -2093,19 +2094,60 @@ def ratio_evidence_from_report(report: dict[str, object]) -> RatioEvidence:
     source_ids = _string_list(composition.get("source_plan_ids"))
     native_ids = _string_list(composition.get("native_variant_ids"))
     source_speedup = _accepted_source_speedup(report, source_ids)
-    native_speedup = (
-        final_speedup / source_speedup
-        if final_speedup is not None and source_speedup is not None and native_ids
-        else None
-    )
+    composition_performance = report.get("composition_performance")
+    native_speedup = _native_composition_speedup(report, native_ids)
     return RatioEvidence(
         python_rewrite_vs_original=source_speedup,
         final_wheel_vs_original=final_speedup,
         native_vs_source_only=native_speedup,
         baseline_samples_seconds=baseline_samples,
-        source_only_samples_seconds=(),
+        source_only_samples_seconds=(
+            _successful_sample_durations(
+                cast(dict[str, object], composition_performance).get("samples"),
+                "baseline",
+            )
+            if isinstance(composition_performance, dict) and native_ids
+            else ()
+        ),
         final_wheel_samples_seconds=final_samples,
     )
+
+
+def _native_composition_speedup(
+    report: dict[str, object],
+    accepted_variant_ids: tuple[str, ...],
+) -> float | None:
+    """Return a directly measured source-only versus native composition ratio.
+
+    New reports expose the full-sample composition gate explicitly. The stage
+    median lookup retains compatibility with additive schema-v6 reports that
+    serialized the same evidence only in their normalized progression.
+
+    Args:
+        report: Valid schema-v6 compile report.
+        accepted_variant_ids: Native variants present in the final wheel.
+
+    Returns:
+        float | None: Direct composition speedup, when accepted and measured.
+    """
+    if not accepted_variant_ids:
+        return None
+    performance_value = report.get("composition_performance")
+    if isinstance(performance_value, dict):
+        performance = cast(dict[str, object], performance_value)
+        if performance.get("status") == "passed":
+            return _positive_finite_float(performance.get("speedup"))
+    stages = report.get("stage_medians")
+    if not isinstance(stages, list):
+        return None
+    for value in reversed(cast(list[object], stages)):
+        if not isinstance(value, dict):
+            continue
+        stage = cast(dict[str, object], value)
+        if stage.get("stage") != "native-composition" or stage.get("status") != "passed":
+            continue
+        return _positive_finite_float(stage.get("speedup"))
+    return None
 
 
 def _accepted_source_speedup(

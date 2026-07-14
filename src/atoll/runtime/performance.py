@@ -190,6 +190,8 @@ class _BenchmarkGateOptions(TypedDict, total=False):
     compiled_region_allowlist: frozenset[str] | None
     baseline_variant_allowlist: frozenset[str] | None
     compiled_variant_allowlist: frozenset[str] | None
+    baseline_require_optimized: bool
+    compiled_require_optimized: bool
 
 
 class _PerformanceCommandOptions(TypedDict, total=False):
@@ -273,6 +275,8 @@ class _BenchmarkExecutionContext:
     compiled_region_allowlist: frozenset[str] | None
     baseline_variant_allowlist: frozenset[str] | None
     compiled_variant_allowlist: frozenset[str] | None
+    baseline_require_optimized: bool
+    compiled_require_optimized: bool
     progress: ProgressCallback | None
 
 
@@ -369,8 +373,9 @@ def run_benchmark_gate(
         baseline_payload_root: Unpacked baseline wheel payload used for interpreted measurements.
         compiled_payload_root: Unpacked compiled wheel payload used for native measurements.
         **options: Optional benchmark controls. `progress` receives phase notifications,
-            `baseline_region_allowlist` exposes region IDs to baseline-side child runs,
-            and `compiled_region_allowlist` exposes region IDs to compiled-side child runs.
+            region and variant allowlists independently select each child arm, and the
+            `*_require_optimized` flags require generated source optimization without
+            implicitly enabling native variants.
 
     Returns:
         BenchmarkGateResult: Paired baseline and compiled samples plus the derived speedup decision.
@@ -384,6 +389,8 @@ def run_benchmark_gate(
     compiled_region_allowlist = options.get("compiled_region_allowlist")
     baseline_variant_allowlist = options.get("baseline_variant_allowlist")
     compiled_variant_allowlist = options.get("compiled_variant_allowlist")
+    baseline_require_optimized = options.get("baseline_require_optimized", False)
+    compiled_require_optimized = options.get("compiled_require_optimized", False)
     if config.command is None:
         return BenchmarkGateResult(
             status="unbenchmarked",
@@ -404,6 +411,8 @@ def run_benchmark_gate(
         compiled_region_allowlist=compiled_region_allowlist,
         baseline_variant_allowlist=baseline_variant_allowlist,
         compiled_variant_allowlist=compiled_variant_allowlist,
+        baseline_require_optimized=baseline_require_optimized,
+        compiled_require_optimized=compiled_require_optimized,
         progress=progress,
     )
 
@@ -492,6 +501,8 @@ def _reject_unexpected_benchmark_options(options: _BenchmarkGateOptions) -> None
         "compiled_region_allowlist",
         "baseline_variant_allowlist",
         "compiled_variant_allowlist",
+        "baseline_require_optimized",
+        "compiled_require_optimized",
         "progress",
     }
     unexpected_options = set(options) - allowed_options
@@ -577,6 +588,11 @@ def _run_phase(
                     context.baseline_variant_allowlist
                     if mode == "baseline"
                     else context.compiled_variant_allowlist
+                ),
+                require_optimized=(
+                    context.baseline_require_optimized
+                    if mode == "baseline"
+                    else context.compiled_require_optimized
                 ),
             )
             runs.append(run)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from typing import cast
 
 import pytest
 
@@ -44,6 +45,7 @@ from atoll.models import (
 from atoll.report import (
     COMPILE_REPORT_SCHEMA_VERSION,
     CompilationPreflightBlockerInput,
+    CompilationReport,
     CompilationReportInput,
     CompilationSkippedModuleInput,
     SourceOptimizationReportStatus,
@@ -55,6 +57,7 @@ from atoll.report import (
 )
 from atoll.runtime.fusion_performance import FusionTrial
 from atoll.runtime.package_verify import PackageVerificationResult
+from atoll.runtime.performance import BenchmarkGateResult
 from atoll.runtime.profiling import (
     CanonicalCallableCount,
     CanonicalTypeObservation,
@@ -1735,6 +1738,65 @@ def test_suspension_report_applies_member_rejections_to_block_eligibility(
     assert {rejection["code"] for rejection in plan["rejections"]} == {"nested_scope"}
     assert plan["blocks"][0]["eligible"] is False
     assert "0/1 synchronous blocks eligible" in render_compilation_markdown_report(report)
+
+
+def test_report_separates_composition_gain_from_final_payload_speedup(tmp_path: Path) -> None:
+    """Independent final baselines cannot be reused as native marginal evidence."""
+    composition = BenchmarkGateResult(
+        status="passed",
+        reason="composition passed",
+        minimum_speedup=1.05,
+        baseline_median_seconds=0.5,
+        compiled_median_seconds=0.4,
+        speedup=1.25,
+        warmups=(),
+        samples=(),
+    )
+    final = BenchmarkGateResult(
+        status="passed",
+        reason="final passed",
+        minimum_speedup=1.1,
+        baseline_median_seconds=1.3,
+        compiled_median_seconds=0.4,
+        speedup=3.25,
+        warmups=(),
+        samples=(),
+    )
+    report = build_compilation_report(
+        CompilationReportInput(
+            root=tmp_path,
+            operation="compile",
+            module_filter=None,
+            islands=(),
+            build=CompileAttempt(
+                success=True,
+                command=("atoll", "source-clean-build"),
+                stdout="",
+                stderr="",
+                artifact_paths=(),
+                duration_seconds=0.0,
+            ),
+            performance=final,
+            composition_performance=composition,
+        )
+    )
+    markdown = render_compilation_markdown_report(report)
+
+    composition_report = report["composition_performance"]
+    assert composition_report is not None
+    assert composition_report["speedup"] == pytest.approx(1.25)
+    assert report["performance"]["speedup"] == pytest.approx(3.25)
+    composition_stage = next(
+        stage for stage in report["stage_medians"] if stage["stage"] == "native-composition"
+    )
+    assert composition_stage["speedup"] == pytest.approx(1.25)
+    assert "## Composition Performance" in markdown
+
+    legacy_payload = dict(report)
+    legacy_payload.pop("composition_performance")
+    legacy_markdown = render_compilation_markdown_report(cast(CompilationReport, legacy_payload))
+    assert "## Composition Performance" not in legacy_markdown
+    assert "## Performance" in legacy_markdown
 
 
 @pytest.mark.parametrize(

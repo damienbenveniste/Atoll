@@ -220,6 +220,8 @@ under `.atoll/cache/accepted-winners/`; a warm run re-evaluates that same candid
 profiles, and timings. The identity includes benchmark and test content, project metadata, the
 baseline wheel payload, dependency versions, and build environment. If replay fails semantics, that
 candidate remains rejected for the rest of the invocation while the other candidates are searched.
+If replay passes, it seeds the fresh bounded search but does not bypass current-environment
+candidate comparisons; another candidate replaces it only after meeting the marginal speedup gate.
 Module-level typing diagnostics, such as unsupported `TypeVar` keyword arguments, remain visible in
 scan and compile reports. A callable from such a module is compiled only when the typed-region
 analysis and backend capability assessment can still preserve its source behavior.
@@ -279,7 +281,9 @@ An accepted source candidate is also an optimization baseline, not a terminal br
 recreates that patch in disposable build storage, rescans the transformed project, and may overlay
 profitable native regions or execution plans onto its wheel. A later semantic or performance
 rejection retains the already accepted source-only wheel. The temporary transformed project is
-removed with normal build scratch and never changes the checkout.
+removed with normal build scratch and never changes the checkout. Before promotion, the complete
+composition must beat that accepted source-only wheel by at least `1.05x` in a direct paired gate;
+Atoll does not allow a slower later layer to consume speedup earned by the source rewrite.
 
 Use `--apply-source` only after reviewing the accepted report and patch:
 

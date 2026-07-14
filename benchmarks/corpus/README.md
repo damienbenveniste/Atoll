@@ -92,7 +92,9 @@ speedup where supported no-ops, unsupported cases, and unprofitable candidates
 contribute `1.0x`. Infrastructure and semantic failures remain separate and make
 the aggregate command exit nonzero. Case reports label ratios as "Python rewrite
 versus original," "final wheel versus original," and "native layer versus
-source-only wheel."
+source-only wheel." The native-layer ratio comes from a direct paired
+source-only-versus-composed gate. The runner never derives it by dividing ratios
+from independent benchmark rounds.
 
 After reviewing the complete raw evidence, retain a compact immutable snapshot
 and refresh only the generated history block in the benchmark documentation:

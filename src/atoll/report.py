@@ -2135,6 +2135,16 @@ class _StageMedianInput:
 
 
 @dataclass(frozen=True, slots=True)
+class _StageMedianEvidence:
+    candidate_trials: list[CompilationCandidateTrialReport]
+    execution_plan_trials: list[CompilationExecutionPlanTrialReport]
+    fusion_trials: list[CompilationFusionTrialReport]
+    source_optimization: CompilationSourceOptimizationReport
+    composition_performance: CompilationPerformanceReport | None
+    performance: CompilationPerformanceReport
+
+
+@dataclass(frozen=True, slots=True)
 class _FinalCompositionInput:
     root: Path
     wheel_path: Path | None
@@ -2163,6 +2173,7 @@ class CompilationReport(TypedDict):
         test_results: Target-project command evidence used by quality gates.
         verification_steps: Isolated wheel and payload verification evidence.
         performance: Paired performance-gate evidence.
+        composition_performance: Direct accepted-arm versus composed-payload evidence.
         optimization_policy: Numerical policy applied by every profitability gate.
         stage_medians: Normalized ordered comparisons across optimization stages.
         cache_decisions: Per-native-variant cache and batching outcomes.
@@ -2202,6 +2213,7 @@ class CompilationReport(TypedDict):
     test_results: list[CompilationCommandRunReport]
     verification_steps: list[CompilationVerificationStepReport]
     performance: CompilationPerformanceReport
+    composition_performance: CompilationPerformanceReport | None
     optimization_policy: CompilationOptimizationPolicyReport
     stage_medians: list[CompilationStageMedianReport]
     cache_decisions: list[CompilationCacheDecisionReport]
@@ -2312,6 +2324,7 @@ class CompilationReportInput:
         verification_steps: Isolated wheel and payload verification evidence.
         test_results: Target-project command evidence used by quality gates.
         performance: Paired performance-gate evidence.
+        composition_performance: Direct accepted-arm versus composed-payload evidence.
         profile: Profile-guided candidate evidence, or `None` for explicit static fallback.
         candidate_trials: Greedy marginal-profitability decisions in profile order.
         execution_plans: Selected and rejected scheduler execution-plan candidates.
@@ -2348,6 +2361,7 @@ class CompilationReportInput:
     verification_steps: tuple[PackageVerificationResult, ...] = ()
     test_results: tuple[CommandRunEvidence, ...] = ()
     performance: BenchmarkGateResult | None = None
+    composition_performance: BenchmarkGateResult | None = None
     profile: ProfileResult | None = None
     candidate_trials: tuple[CandidateTrial, ...] = ()
     execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = ()
@@ -2494,6 +2508,14 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
         not result.succeeded for result in report_input.test_results
     )
     performance = _compilation_performance_report(report_input.root, report_input.performance)
+    composition_performance = (
+        _compilation_performance_report(
+            report_input.root,
+            report_input.composition_performance,
+        )
+        if report_input.composition_performance is not None
+        else None
+    )
     profile = _compilation_profile_report(report_input.profile)
     candidate_trials = _candidate_trial_reports(report_input.candidate_trials)
     execution_plans = _execution_plan_reports(report_input.execution_plans)
@@ -2520,11 +2542,14 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
     rejected_variants = _rejected_variant_reports(report_input.skipped_modules)
     optimization_policy = _optimization_policy_report(performance)
     stage_medians = _stage_median_reports(
-        candidate_trials=candidate_trials,
-        execution_plan_trials=execution_plan_trials,
-        fusion_trials=fusion_trials,
-        source_optimization=source_optimization,
-        performance=performance,
+        _StageMedianEvidence(
+            candidate_trials=candidate_trials,
+            execution_plan_trials=execution_plan_trials,
+            fusion_trials=fusion_trials,
+            source_optimization=source_optimization,
+            composition_performance=composition_performance,
+            performance=performance,
+        )
     )
     cache_decisions = _cache_decision_reports(compiled_regions, report_input.build)
     final_composition = _final_composition_report(
@@ -2641,6 +2666,7 @@ def build_compilation_report(report_input: CompilationReportInput) -> Compilatio
             for result in report_input.verification_steps
         ],
         "performance": performance,
+        "composition_performance": composition_performance,
         "optimization_policy": optimization_policy,
         "stage_medians": stage_medians,
         "cache_decisions": cache_decisions,
@@ -2949,6 +2975,13 @@ def render_compilation_markdown_report(report: CompilationReport) -> str:
         lines.extend(f"- `{artifact}`" for artifact in report["build"]["support_artifacts"])
     _append_test_gate_markdown(lines, report)
     _append_package_verification_markdown(lines, report["verification_steps"])
+    composition_performance = report.get("composition_performance")
+    if composition_performance is not None:
+        _append_performance_markdown(
+            lines,
+            composition_performance,
+            heading="Composition Performance",
+        )
     _append_performance_markdown(lines, report["performance"])
     _append_cleanup_markdown(lines, report["cleanup"])
     _append_source_clean_skip_markdown(lines, report)
@@ -3109,11 +3142,13 @@ def _append_package_verification_markdown(
 def _append_performance_markdown(
     lines: list[str],
     performance: CompilationPerformanceReport,
+    *,
+    heading: str = "Performance",
 ) -> None:
     lines.extend(
         [
             "",
-            "## Performance",
+            f"## {heading}",
             "",
             f"- Status: {performance['status']}",
             f"- Reason: {performance['reason']}",
@@ -4039,28 +4074,17 @@ def _optimization_policy_report(
     }
 
 
-def _stage_median_reports(
-    *,
-    candidate_trials: list[CompilationCandidateTrialReport],
-    execution_plan_trials: list[CompilationExecutionPlanTrialReport],
-    fusion_trials: list[CompilationFusionTrialReport],
-    source_optimization: CompilationSourceOptimizationReport,
-    performance: CompilationPerformanceReport,
-) -> list[CompilationStageMedianReport]:
+def _stage_median_reports(evidence: _StageMedianEvidence) -> list[CompilationStageMedianReport]:
     """Normalize family-specific timing evidence into one ordered progression.
 
     Args:
-        candidate_trials: Native variant benchmark evidence.
-        execution_plan_trials: Async execution-plan benchmark evidence.
-        fusion_trials: Experimental fusion benchmark evidence.
-        source_optimization: Source transformation search and final-gate evidence.
-        performance: Final promoted-payload benchmark evidence.
+        evidence: Native, execution-plan, source, composition, and final timing evidence.
 
     Returns:
         Credible timing comparisons in optimizer application order.
     """
     reports: list[CompilationStageMedianReport] = []
-    for candidate_trial in candidate_trials:
+    for candidate_trial in evidence.candidate_trials:
         _append_stage_median(
             reports,
             _StageMedianInput(
@@ -4072,7 +4096,7 @@ def _stage_median_reports(
                 minimum=candidate_trial["minimum_speedup"],
             ),
         )
-    for execution_plan_trial in execution_plan_trials:
+    for execution_plan_trial in evidence.execution_plan_trials:
         _append_stage_median(
             reports,
             _StageMedianInput(
@@ -4084,7 +4108,7 @@ def _stage_median_reports(
                 minimum=execution_plan_trial["minimum_speedup"],
             ),
         )
-    for source_trial in source_optimization["trials"]:
+    for source_trial in evidence.source_optimization["trials"]:
         current_median = source_trial["current_median_seconds"]
         source_median = source_trial["source_median_seconds"]
         _append_stage_median(
@@ -4106,10 +4130,10 @@ def _stage_median_reports(
                 baseline=source_trial["baseline_median_seconds"],
                 candidate=source_trial["wheel_median_seconds"],
                 speedup=source_trial["wheel_speedup"],
-                minimum=source_optimization["minimum_speedup"],
+                minimum=evidence.source_optimization["minimum_speedup"],
             ),
         )
-    for fusion_trial in fusion_trials:
+    for fusion_trial in evidence.fusion_trials:
         _append_stage_median(
             reports,
             _StageMedianInput(
@@ -4121,15 +4145,27 @@ def _stage_median_reports(
                 minimum=DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
             ),
         )
+    if evidence.composition_performance is not None:
+        _append_stage_median(
+            reports,
+            _StageMedianInput(
+                stage="native-composition",
+                status=evidence.composition_performance["status"],
+                baseline=evidence.composition_performance["baseline_median_seconds"],
+                candidate=evidence.composition_performance["compiled_median_seconds"],
+                speedup=evidence.composition_performance["speedup"],
+                minimum=evidence.composition_performance["minimum_speedup"],
+            ),
+        )
     _append_stage_median(
         reports,
         _StageMedianInput(
             stage="final-payload",
-            status=performance["status"],
-            baseline=performance["baseline_median_seconds"],
-            candidate=performance["compiled_median_seconds"],
-            speedup=performance["speedup"],
-            minimum=performance["minimum_speedup"],
+            status=evidence.performance["status"],
+            baseline=evidence.performance["baseline_median_seconds"],
+            candidate=evidence.performance["compiled_median_seconds"],
+            speedup=evidence.performance["speedup"],
+            minimum=evidence.performance["minimum_speedup"],
         ),
     )
     return reports

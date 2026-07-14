@@ -247,6 +247,25 @@ class _CandidateFormation:
 
 
 @dataclass(frozen=True, slots=True)
+class _SearchSeed:
+    """Fresh current-invocation evidence used to seed bounded search.
+
+    Attributes:
+        excluded_candidate_ids: Candidates already rejected during replay.
+        trials: Formation and replay trial evidence already collected.
+        timings: Replay phase timings already collected.
+        evaluations: Revalidated candidates that begin in the beam.
+        evaluated_count: Candidate budget consumed before ordinary traversal.
+    """
+
+    excluded_candidate_ids: frozenset[str] = frozenset()
+    trials: tuple[SourceOptimizationTrial, ...] | None = None
+    timings: tuple[CompilePhaseTiming, ...] = ()
+    evaluations: tuple[_CandidateEvaluation, ...] = ()
+    evaluated_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class _SearchBenchmarkContext:
     command: tuple[str, ...]
     project_root: Path
@@ -355,26 +374,44 @@ def _run_formed_search(
             None,
         )
         if replay is not None:
-            replay_result, replay_timings = _replay_cached_winner(
+            replay_evaluation, replay_trial, replay_timings = _evaluate_candidate(
                 replay,
-                formation=formation,
                 options=options,
+                current=None,
             )
-            if replay_result.accepted:
-                _store_accepted_winner(replay_result, options, winner_identity)
-                return replay_result
-            _progress(
-                options.progress,
-                f"accepted winner replay failed for {replay.id}; restarting full source search",
-            )
-            _reset_dir(options.scratch_root)
-            result = _run_full_search(
-                formation,
-                options,
-                excluded_candidate_ids=frozenset((replay.id,)),
-                initial_trials=replay_result.trials,
-                initial_timings=replay_timings,
-            )
+            replay_trials = (*formation.trials, replay_trial)
+            if replay_evaluation is None or replay_trial.status != "not-run":
+                _progress(
+                    options.progress,
+                    f"accepted winner replay failed for {replay.id}; restarting full source search",
+                )
+                _reset_dir(options.scratch_root)
+                result = _run_full_search(
+                    formation,
+                    options,
+                    seed=_SearchSeed(
+                        excluded_candidate_ids=frozenset((replay.id,)),
+                        trials=replay_trials,
+                        timings=replay_timings,
+                        evaluated_count=1,
+                    ),
+                )
+            else:
+                _progress(
+                    options.progress,
+                    f"accepted winner replay seeded fresh source search: {replay.id}",
+                )
+                result = _run_full_search(
+                    formation,
+                    options,
+                    seed=_SearchSeed(
+                        excluded_candidate_ids=frozenset((replay.id,)),
+                        trials=replay_trials,
+                        timings=replay_timings,
+                        evaluations=(replay_evaluation,),
+                        evaluated_count=1,
+                    ),
+                )
         else:
             result = _run_full_search(formation, options)
         if result.accepted:
@@ -385,63 +422,28 @@ def _run_formed_search(
             shutil.rmtree(options.scratch_root)
 
 
-def _replay_cached_winner(
-    candidate: _SourceCandidate,
-    *,
-    formation: _CandidateFormation,
-    options: SourceOptimizationSearchOptions,
-) -> tuple[SourceOptimizationSearchResult, tuple[CompilePhaseTiming, ...]]:
-    """Re-evaluate only a cached candidate and reproduce every acceptance gate.
-
-    Args:
-        candidate: Previously accepted candidate still present in the exact universe.
-        formation: Current deterministic formation and lowering evidence.
-        options: Current invocation paths, commands, profiler, and gate policy.
-
-    Returns:
-        tuple[SourceOptimizationSearchResult, tuple[CompilePhaseTiming, ...]]:
-            Fresh replay result and its current-invocation phase timings.
-    """
-    evaluation, trial, timings = _evaluate_candidate(candidate, options=options, current=None)
-    trials = (*formation.trials, trial)
-    if evaluation is None:
-        return _search_rejected(options, list(trials), list(timings)), timings
-    return (
-        _finalize_candidate(
-            evaluation,
-            options=options,
-            trials=trials,
-            timings=timings,
-        ),
-        timings,
-    )
-
-
 def _run_full_search(
     formation: _CandidateFormation,
     options: SourceOptimizationSearchOptions,
     *,
-    excluded_candidate_ids: frozenset[str] = frozenset(),
-    initial_trials: tuple[SourceOptimizationTrial, ...] | None = None,
-    initial_timings: tuple[CompilePhaseTiming, ...] = (),
+    seed: _SearchSeed | None = None,
 ) -> SourceOptimizationSearchResult:
     """Run the ordinary bounded beam search over the complete formed universe.
 
     Args:
         formation: Complete deterministic candidates and lowering rejections.
         options: Prepared source-search paths and command policy.
-        excluded_candidate_ids: Candidates that failed a semantic gate earlier
-            in this invocation and must not be retried.
-        initial_trials: Earlier current-invocation evidence to retain.
-        initial_timings: Earlier current-invocation phase timings to retain.
+        seed: Revalidated candidates, rejected IDs, trials, timings, and consumed
+            candidate budget from an accepted-winner replay, or `None` for a cold search.
 
     Returns:
         SourceOptimizationSearchResult: Fresh bounded-search and final-gate result.
     """
-    timings = list(initial_timings)
-    evaluations: list[_CandidateEvaluation] = []
-    trials = list(formation.trials if initial_trials is None else initial_trials)
-    evaluated_count = 0
+    active_seed = seed or _SearchSeed()
+    timings = list(active_seed.timings)
+    evaluations = list(active_seed.evaluations)
+    trials = list(formation.trials if active_seed.trials is None else active_seed.trials)
+    evaluated_count = active_seed.evaluated_count
     for depth, candidates in itertools.groupby(
         formation.candidates,
         key=lambda candidate: candidate.depth,
@@ -449,7 +451,7 @@ def _run_full_search(
         current = _fastest_evaluation(evaluations)
         depth_evaluations: list[_CandidateEvaluation] = []
         for candidate in candidates:
-            if candidate.id in excluded_candidate_ids:
+            if candidate.id in active_seed.excluded_candidate_ids:
                 continue
             if evaluated_count >= SOURCE_SEARCH_MAX_TRIALS:
                 break
@@ -461,7 +463,7 @@ def _run_full_search(
             evaluated_count += 1
             timings.extend(candidate_timings)
             trials.append(trial)
-            if evaluation is not None:
+            if evaluation is not None and trial.status == "not-run":
                 depth_evaluations.append(evaluation)
         evaluations = sorted(
             (*evaluations, *depth_evaluations),

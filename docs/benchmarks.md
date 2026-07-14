@@ -46,7 +46,9 @@ Reports and snapshots use three names with distinct denominators:
   final Atoll wheel median. This is the end-to-end product result.
 - **Native layer versus source-only wheel** is the accepted source-only wheel
   median divided by the final composed wheel median. This measures only the
-  native layer added after source optimization.
+  native layer added after source optimization. Atoll measures this in a direct
+  paired gate; it does not divide the other two ratios, whose baseline samples
+  may come from different rounds.
 
 These ratios answer different questions. They must not be added or described
 as interchangeable speedups.

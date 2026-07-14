@@ -1,10 +1,12 @@
 """Persist accepted source-search winner identity without performance evidence.
 
 The cache records only which candidate most recently passed every promotion
-gate for an exact, caller-computed search identity. Benchmark measurements and
-semantic results are deliberately excluded so every invocation must reproduce
-all acceptance evidence. Missing, stale, and corrupt entries are ordinary cache
-misses and never prevent a full source search.
+gate. An exact identity supports diagnostics, while a stable replay identity
+survives rebuilt payload and environment metadata so warm runs can try the same
+candidate first. The candidate only seeds a fresh bounded search; it does not
+terminate candidate comparison. Benchmark measurements and semantic results
+are deliberately excluded, so every invocation reproduces all acceptance
+evidence. Missing, stale, and corrupt entries never prevent a full search.
 """
 
 from __future__ import annotations
@@ -17,8 +19,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast
 
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
 _WINNER_DIRECTORY = "accepted-winners"
+_REPLAY_DIRECTORY = "accepted-winner-replays"
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +77,32 @@ class SourceWinnerIdentity:
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
+    @property
+    def replay_key(self) -> str:
+        """Return the stable identity for choosing a candidate to revalidate.
+
+        Baseline-wheel and environment digests are intentionally absent. They
+        remain part of :attr:`key` for exact diagnostics, while replay only
+        seeds a bounded search that compares candidates using fresh semantic
+        and benchmark evidence under the current payload and environment.
+
+        Returns:
+            str: SHA-256 identity for a deterministic revalidation hint.
+        """
+        payload = {
+            "benchmark_command": self.benchmark_command,
+            "candidate_ids": self.candidate_ids,
+            "configuration": self.configuration,
+            "plan_sources": self.plan_sources,
+            "platform": self.platform,
+            "python_abi": self.python_abi,
+            "quality_project_digest": self.quality_project_digest,
+            "test_command": self.test_command,
+            "versions": self.versions,
+        }
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class SourceWinnerLookup:
@@ -95,35 +124,32 @@ class _WinnerManifest(TypedDict):
 
 
 def load_source_winner(cache_root: Path, identity: SourceWinnerIdentity) -> SourceWinnerLookup:
-    """Load a winner for an exact identity, treating invalid data as a miss.
+    """Load an exact winner or a stable candidate selected for revalidation.
 
     Args:
         cache_root: Caller-owned source-optimization cache directory.
         identity: Complete static replay compatibility identity.
 
     Returns:
-        SourceWinnerLookup: Candidate ID only when the manifest is exact and valid.
+        SourceWinnerLookup: Candidate ID only when an exact or replay manifest is valid.
     """
-    path = _winner_path(cache_root, identity)
-    if path.is_symlink():
-        return SourceWinnerLookup(
-            candidate_id=None,
-            diagnostic="ignored invalid accepted winner cache: manifest is a symlink",
-        )
-    if not path.is_file():
-        return SourceWinnerLookup(candidate_id=None, diagnostic="accepted winner cache miss")
-    try:
-        payload: object = json.loads(path.read_text(encoding="utf-8"))
-        candidate_id = _validated_candidate_id(payload, identity.key)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-        return SourceWinnerLookup(
-            candidate_id=None,
-            diagnostic=f"ignored invalid accepted winner cache: {error}",
-        )
-    return SourceWinnerLookup(
-        candidate_id=candidate_id,
-        diagnostic=f"accepted winner cache hit: {candidate_id}",
+    exact = _load_manifest(
+        _winner_path(cache_root, _WINNER_DIRECTORY, identity.key),
+        identity.key,
+        hit_label="accepted winner cache hit",
     )
+    if exact.candidate_id is not None:
+        return exact
+    replay = _load_manifest(
+        _winner_path(cache_root, _REPLAY_DIRECTORY, identity.replay_key),
+        identity.replay_key,
+        hit_label="accepted winner replay hit",
+    )
+    if replay.candidate_id is not None:
+        return replay
+    if exact.diagnostic != "accepted winner cache miss":
+        return exact
+    return replay
 
 
 def store_source_winner(
@@ -144,13 +170,36 @@ def store_source_winner(
     """
     if candidate_id not in identity.candidate_ids:
         raise ValueError("accepted winner is outside the formed candidate universe")
-    path = _winner_path(cache_root, identity)
+    _store_manifest(
+        _winner_path(cache_root, _WINNER_DIRECTORY, identity.key),
+        identity_key=identity.key,
+        candidate_id=candidate_id,
+    )
+    _store_manifest(
+        _winner_path(cache_root, _REPLAY_DIRECTORY, identity.replay_key),
+        identity_key=identity.replay_key,
+        candidate_id=candidate_id,
+    )
+
+
+def _store_manifest(path: Path, *, identity_key: str, candidate_id: str) -> None:
+    """Atomically persist one exact or stable replay manifest.
+
+    Args:
+        path: Atoll-owned manifest path.
+        identity_key: Exact or replay identity recorded in the manifest.
+        candidate_id: Formed source candidate to revalidate.
+
+    Raises:
+        OSError: If the cache directory or atomic write cannot complete.
+        ValueError: If an existing manifest path is a symlink.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.is_symlink():
         raise ValueError(f"refusing to replace symlink: {path}")
     manifest: _WinnerManifest = {
         "schema_version": _SCHEMA_VERSION,
-        "identity_key": identity.key,
+        "identity_key": identity_key,
         "candidate_id": candidate_id,
     }
     descriptor, temporary_name = tempfile.mkstemp(
@@ -181,11 +230,53 @@ def winner_manifest_path(cache_root: Path, identity: SourceWinnerIdentity) -> Pa
     Returns:
         Path: Content-addressed accepted-winner manifest path.
     """
-    return _winner_path(cache_root, identity)
+    return _winner_path(cache_root, _WINNER_DIRECTORY, identity.key)
 
 
-def _winner_path(cache_root: Path, identity: SourceWinnerIdentity) -> Path:
-    return cache_root / _WINNER_DIRECTORY / f"{identity.key}.json"
+def _winner_path(cache_root: Path, directory: str, identity_key: str) -> Path:
+    """Return one content-addressed winner manifest path.
+
+    Args:
+        cache_root: Source-optimization cache root.
+        directory: Exact or replay manifest namespace.
+        identity_key: Content-derived filename stem.
+
+    Returns:
+        Path: Atoll-owned manifest path.
+    """
+    return cache_root / directory / f"{identity_key}.json"
+
+
+def _load_manifest(path: Path, identity_key: str, *, hit_label: str) -> SourceWinnerLookup:
+    """Load one manifest without treating cache absence as an error.
+
+    Args:
+        path: Exact or replay manifest path.
+        identity_key: Identity the manifest must reproduce exactly.
+        hit_label: Diagnostic prefix distinguishing exact from replay hits.
+
+    Returns:
+        SourceWinnerLookup: Valid candidate or a conservative miss diagnostic.
+    """
+    if path.is_symlink():
+        return SourceWinnerLookup(
+            candidate_id=None,
+            diagnostic="ignored invalid accepted winner cache: manifest is a symlink",
+        )
+    if not path.is_file():
+        return SourceWinnerLookup(candidate_id=None, diagnostic="accepted winner cache miss")
+    try:
+        payload: object = json.loads(path.read_text(encoding="utf-8"))
+        candidate_id = _validated_candidate_id(payload, identity_key)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return SourceWinnerLookup(
+            candidate_id=None,
+            diagnostic=f"ignored invalid accepted winner cache: {error}",
+        )
+    return SourceWinnerLookup(
+        candidate_id=candidate_id,
+        diagnostic=f"{hit_label}: {candidate_id}",
+    )
 
 
 def _validated_candidate_id(payload: object, identity_key: str) -> str:

@@ -425,6 +425,45 @@ def test_benchmark_gate_passes_distinct_variant_allowlists_to_each_side(
     assert captured == ["baseline-a\nbaseline-b", "compiled-a"]
 
 
+def test_benchmark_gate_requires_source_optimization_independently_per_arm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source-only arm stays active without pretending to be native transport."""
+    captured: list[dict[str, str]] = []
+    monkeypatch.setattr(performance, "_perf_counter", _clock([2.0, 1.0]))
+
+    def fake_run(
+        invocation: SubprocessInvocationView,
+    ) -> subprocess.CompletedProcess[str]:
+        captured.append(dict(invocation.env))
+        return subprocess.CompletedProcess(invocation.command, 0, "", "")
+
+    monkeypatch.setattr(performance, "_run_subprocess", fake_run)
+
+    result = run_benchmark_gate(
+        BenchmarkGateConfig(
+            command=("python", "bench.py"),
+            warmups=0,
+            samples=1,
+            minimum_speedup=1.01,
+        ),
+        project_root=tmp_path,
+        baseline_payload_root=tmp_path / "source-only",
+        compiled_payload_root=tmp_path / "composed",
+        baseline_require_optimized=True,
+        compiled_require_optimized=True,
+    )
+
+    assert result.status == "passed"
+    baseline_env, compiled_env = captured
+    assert baseline_env["ATOLL_REQUIRE_OPTIMIZED"] == "1"
+    assert "ATOLL_DISABLE" not in baseline_env
+    assert "ATOLL_REQUIRE_COMPILED" not in baseline_env
+    assert compiled_env["ATOLL_REQUIRE_OPTIMIZED"] == "1"
+    assert compiled_env["ATOLL_REQUIRE_COMPILED"] == "1"
+
+
 def test_benchmark_gate_runs_warmups_then_alternating_sample_pairs_and_medians(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

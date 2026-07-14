@@ -1494,14 +1494,16 @@ def test_accepted_winner_replay_is_stable_despite_opposite_timing_jitter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A warm search revalidates only the accepted cold winner despite jitter."""
+    """Replay seeds fresh search and changes winner only for material improvement."""
     project_root = tmp_path / "project"
     _copy_fixture(project_root)
     plan, assessment = _plan_and_assessment(project_root)
-    options = _search_options(project_root, tmp_path)
+    messages: list[str] = []
+    options = replace(_search_options(project_root, tmp_path), progress=messages.append)
     observed_candidate_ids: list[str] = []
     search_seconds: dict[str, float] = {}
     warm = False
+    environment_changed = False
     wheel_builds = 0
 
     def fake_run(
@@ -1522,7 +1524,10 @@ def test_accepted_winner_replay_is_stable_despite_opposite_timing_jitter(
         elif not candidate_id:
             duration = 1.0
         elif warm:
-            duration = 1.2 if candidate_id == cold_winner else 0.5
+            if environment_changed:
+                duration = 1.2 if candidate_id == cold_winner else 0.5
+            else:
+                duration = 1.2 if candidate_id == cold_winner else 1.16
         else:
             duration = search_seconds.setdefault(
                 candidate_id,
@@ -1559,6 +1564,10 @@ def test_accepted_winner_replay_is_stable_despite_opposite_timing_jitter(
     cold_winner = _accepted_candidate_id(cold)
     assert len(search_seconds) >= LOWERING_VARIANT_COUNT
 
+    (options.baseline_payload_root / "rebuilt-metadata.txt").write_text(
+        "runtime-specific baseline metadata\n",
+        encoding="utf-8",
+    )
     observed_candidate_ids.clear()
     warm = True
     replayed = run_source_optimization_search((plan,), (assessment,), options)
@@ -1566,7 +1575,18 @@ def test_accepted_winner_replay_is_stable_despite_opposite_timing_jitter(
     assert replayed.accepted
     assert _accepted_candidate_id(replayed) == cold_winner
     assert replayed.patch_path == cold.patch_path
-    assert set(observed_candidate_ids) == {cold_winner}
+    assert observed_candidate_ids[0] == cold_winner
+    assert len(set(observed_candidate_ids)) >= LOWERING_VARIANT_COUNT
+    assert any(message.startswith("accepted winner replay hit:") for message in messages)
+
+    observed_candidate_ids.clear()
+    environment_changed = True
+    monkeypatch.setenv("ATOLL_WINNER_TEST_ENVIRONMENT", "changed")
+    changed = run_source_optimization_search((plan,), (assessment,), options)
+
+    assert changed.accepted
+    assert observed_candidate_ids[0] == cold_winner
+    assert _accepted_candidate_id(changed) != cold_winner
 
 
 def test_winner_identity_invalidates_source_config_and_candidate_universe(
@@ -1702,6 +1722,35 @@ def test_winner_identity_invalidates_quality_payload_and_environment_content(
         )
         == WINNER_CONTENT_IDENTITY_VARIANT_COUNT
     )
+
+
+def test_winner_replay_survives_rebuilt_payload_and_environment_identity(
+    tmp_path: Path,
+) -> None:
+    """A validated winner remains the deterministic first trial after runtime churn."""
+    project_root = tmp_path / "project"
+    _copy_fixture(project_root)
+    plan, assessment = _plan_and_assessment(project_root)
+    options = _search_options(project_root, tmp_path)
+    formation = _form_candidates((plan,), (assessment,), project_root)
+    base = _winner_identity((plan,), formation.candidates, options)
+    candidate_id = formation.candidates[0].id
+    store_source_winner(options.cache_root, base, candidate_id)
+    rebuilt = replace(
+        base,
+        baseline_payload_digest="b" * 64,
+        environment_digest="e" * 64,
+    )
+    changed_quality = replace(base, quality_project_digest="q" * 64)
+
+    replay = load_source_winner(options.cache_root, rebuilt)
+
+    assert rebuilt.key != base.key
+    assert rebuilt.replay_key == base.replay_key
+    assert replay.candidate_id == candidate_id
+    assert replay.diagnostic.startswith("accepted winner replay hit:")
+    assert changed_quality.replay_key != base.replay_key
+    assert load_source_winner(options.cache_root, changed_quality).candidate_id is None
 
 
 def test_corrupt_winner_entry_is_safe_cache_data(tmp_path: Path) -> None:

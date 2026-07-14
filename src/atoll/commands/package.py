@@ -353,6 +353,7 @@ class PackageCommandResult:
         verification_steps: Isolated wheel and payload verification evidence.
         test_results: Target-project command evidence used by quality gates.
         performance: Paired performance-gate evidence.
+        composition_performance: Direct accepted-arm versus composed-payload evidence.
         profile: Unmeasured baseline profile and hot-candidate selection evidence.
         candidate_trials: Greedy marginal-profitability decisions in profile order.
         execution_plans: Selected and rejected scheduler execution-plan candidates.
@@ -393,6 +394,7 @@ class PackageCommandResult:
     verification_steps: tuple[PackageVerificationResult, ...] = ()
     test_results: tuple[CommandRunEvidence, ...] = ()
     performance: BenchmarkGateResult | None = None
+    composition_performance: BenchmarkGateResult | None = None
     profile: ProfileResult | None = None
     candidate_trials: tuple[CandidateTrial, ...] = ()
     execution_plans: tuple[ExecutionPlan | PlanRejection, ...] = ()
@@ -886,15 +888,19 @@ class _BaselineWheelPayload:
         wheel_path: Final or intermediate wheel archive path.
         build: Captured native compilation attempt.
         baseline_install_root: Unpacked baseline payload used for interpreted quality gates.
+        original_install_root: Untouched original payload used for literal end-to-end ratios.
         quality_project_root: Project root used by quality-gate subprocesses.
         semantic_test_result: Baseline semantic-test evidence collected before profiling.
+        source_optimized: Whether the baseline payload is an accepted source-fast-path arm.
     """
 
     wheel_path: Path | None
     build: CompileAttempt
     baseline_install_root: Path | None = None
+    original_install_root: Path | None = None
     quality_project_root: Path | None = None
     semantic_test_result: CommandRunEvidence | None = None
+    source_optimized: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -950,13 +956,28 @@ class _QualityGateOutcome:
         success: Whether this operation completed successfully.
         tests: Optional semantic test result.
         performance: Paired performance-gate result.
+        composition_performance: Direct accepted source arm versus composed payload result.
         error: User-facing failure text, or `None` on success.
     """
 
     success: bool
     tests: tuple[CommandRunEvidence, ...]
     performance: BenchmarkGateResult
+    composition_performance: BenchmarkGateResult | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticQualityGateOutcome:
+    """Semantic command evidence collected before performance measurements.
+
+    Attributes:
+        tests: Baseline and compiled semantic command evidence.
+        failure: Normalized terminal quality-gate result when a command failed.
+    """
+
+    tests: tuple[CommandRunEvidence, ...]
+    failure: _QualityGateOutcome | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -999,6 +1020,7 @@ class _SourceCleanPromotionResult:
         verification_steps: Isolated payload and wheel verification evidence.
         test_results: Target-project command evidence.
         performance: Paired performance-gate result.
+        composition_performance: Direct accepted-arm versus composed-payload evidence.
         cleanup_removed: Generated paths removed after completion.
         cleanup_kept: Generated paths retained for diagnostics.
         error: User-facing failure text, or `None` on success.
@@ -1010,6 +1032,7 @@ class _SourceCleanPromotionResult:
     verification_steps: tuple[PackageVerificationResult, ...]
     test_results: tuple[CommandRunEvidence, ...] = ()
     performance: BenchmarkGateResult | None = None
+    composition_performance: BenchmarkGateResult | None = None
     cleanup_removed: tuple[Path, ...] = ()
     cleanup_kept: tuple[Path, ...] = ()
     error: str | None = None
@@ -2096,8 +2119,12 @@ def _materialize_source_optimization_arm(
         wheel_path=search.wheel_path,
         build=search.build,
         baseline_install_root=baseline_install_root,
+        original_install_root=(
+            original_baseline.original_install_root or original_baseline.baseline_install_root
+        ),
         quality_project_root=original_baseline.quality_project_root,
         semantic_test_result=original_baseline.semantic_test_result,
+        source_optimized=True,
     )
     return OptimizationArm(
         report_project=project,
@@ -2204,6 +2231,7 @@ def _source_result_with_composition_fallback(
         fusion_plans=rebased.fusion_plans,
         fusion_trials=rebased.fusion_trials,
         test_results=(*source_result.test_results, *rebased.test_results),
+        composition_performance=rebased.composition_performance,
     )
 
 
@@ -2430,6 +2458,7 @@ def _execute_execution_plan_only_package(
         verification_steps=promotion.verification_steps,
         test_results=promotion.test_results,
         performance=promotion.performance,
+        composition_performance=promotion.composition_performance,
         profile=context.profile,
         execution_plans=context.execution_plans,
         applied_execution_plans=plan_application.applied_plan_ids,
@@ -2848,6 +2877,7 @@ def _execute_typed_region_package(
         verification_steps=promotion.verification_steps,
         test_results=promotion.test_results,
         performance=promotion.performance,
+        composition_performance=promotion.composition_performance,
         profile=profile,
         candidate_trials=finalized.trials,
         execution_plans=context.execution_plans,
@@ -5745,6 +5775,7 @@ def _prepare_baseline_wheel_payload(
             phase_timings=tuple(phase_timings),
         ),
         baseline_install_root=baseline_install_root,
+        original_install_root=baseline_install_root,
         quality_project_root=quality_project_root,
     )
 
@@ -6102,6 +6133,7 @@ def _promote_source_clean_payload(
         verification_steps=verification_steps,
         test_results=quality_gate.tests,
         performance=quality_gate.performance,
+        composition_performance=quality_gate.composition_performance,
         cleanup_removed=tuple(cleanup_removed),
         cleanup_kept=cleanup_kept,
     )
@@ -6155,6 +6187,11 @@ def _failed_promotion(
         test_results=failure.quality_gate.tests if failure.quality_gate is not None else (),
         performance=(
             failure.quality_gate.performance if failure.quality_gate is not None else None
+        ),
+        composition_performance=(
+            failure.quality_gate.composition_performance
+            if failure.quality_gate is not None
+            else None
         ),
         cleanup_removed=cleanup_removed,
         cleanup_kept=(),
@@ -6781,6 +6818,7 @@ def _apply_execution_plan_trials_once(
             payload_root=trial_root,
             mode="compiled",
             variant_allowlist=context.accepted_region_ids,
+            require_optimized=context.baseline.source_optimized,
         )
         timings.append(
             CompilePhaseTiming(
@@ -6836,6 +6874,9 @@ def _apply_execution_plan_trials_once(
             baseline_variant_allowlist=context.accepted_region_ids,
             unplanned_variant_allowlist=context.accepted_region_ids,
             planned_variant_allowlist=context.accepted_region_ids,
+            baseline_require_optimized=context.baseline.source_optimized,
+            unplanned_require_optimized=context.baseline.source_optimized,
+            planned_require_optimized=context.baseline.source_optimized,
             progress=partial(_execution_plan_benchmark_progress, context.options.progress, plan.id),
         )
         timings.extend(_execution_plan_benchmark_timings(plan.id, benchmark))
@@ -7620,11 +7661,11 @@ def _run_exact_candidate_trial(
         candidate_payload = workspace / "candidate"
         _materialize_candidate_payload(context, accepted, accepted_payload)
         _materialize_candidate_payload(context, selected, candidate_payload)
-        semantic = run_performance_command(
+        semantic = _run_compiled_semantic_test(
             test_command,
-            project_root=quality_root,
-            payload_root=candidate_payload,
-            mode="compiled",
+            command_root=quality_root,
+            compiled_payload_root=candidate_payload,
+            require_optimized=context.baseline.source_optimized,
         )
         if not semantic.succeeded:
             return semantic, None
@@ -7642,11 +7683,11 @@ def _run_exact_candidate_trial(
             project_root=quality_root,
             baseline_payload_root=accepted_payload,
             compiled_payload_root=candidate_payload,
-            # An explicit empty allowlist keeps an accepted source optimization
-            # active while proving that the first native variant adds value.
-            # ``None`` would set ATOLL_DISABLE=1 and compare the candidate with
-            # the original Python fallback instead of the current source arm.
-            baseline_variant_allowlist=accepted_ids,
+            baseline_variant_allowlist=(
+                accepted_ids if accepted or not context.baseline.source_optimized else None
+            ),
+            baseline_require_optimized=context.baseline.source_optimized,
+            compiled_require_optimized=context.baseline.source_optimized,
             progress=partial(_candidate_benchmark_progress, context.progress, variant_id),
         )
         return semantic, benchmark
@@ -8019,6 +8060,173 @@ def _sample_coverage(samples: int, total_samples: int) -> float:
     return min(samples / total_samples, 1.0)
 
 
+def _run_configured_semantic_tests(
+    *,
+    project: DiscoveredProject,
+    baseline: _BaselineWheelPayload,
+    compiled_payload_root: Path,
+    command_root: Path,
+    progress: PackageProgress | None,
+) -> _SemanticQualityGateOutcome:
+    """Run baseline and compiled semantic commands before any timing gate.
+
+    The baseline command targets the untouched original payload when available.
+    A composed payload must prove that its source fast path is active instead of
+    silently exercising the preserved fallback implementation.
+
+    Args:
+        project: Active project and configured semantic command.
+        baseline: Original and optional accepted-source payload roots.
+        compiled_payload_root: Exact staged payload proposed for promotion.
+        command_root: Source-stripped project root used as subprocess cwd.
+        progress: Optional package progress callback.
+
+    Returns:
+        _SemanticQualityGateOutcome: Collected evidence and an optional terminal failure.
+    """
+    config = project.config.compile
+    tests = (baseline.semantic_test_result,) if baseline.semantic_test_result is not None else ()
+    if config.test_command is None:
+        return _SemanticQualityGateOutcome(tests=tests)
+    pending: list[CommandRunEvidence] = []
+    if config.benchmark_command is not None and baseline.semantic_test_result is None:
+        baseline_root = baseline.original_install_root or baseline.baseline_install_root
+        if baseline_root is None:
+            return _SemanticQualityGateOutcome(
+                tests=tests,
+                failure=_invalid_quality_gate(
+                    config.minimum_speedup,
+                    "baseline payload is missing",
+                ),
+            )
+        pending.append(
+            run_performance_command(
+                config.test_command,
+                project_root=command_root,
+                payload_root=baseline_root,
+                mode="baseline",
+            )
+        )
+    pending.append(
+        _run_compiled_semantic_test(
+            config.test_command,
+            command_root=command_root,
+            compiled_payload_root=compiled_payload_root,
+            require_optimized=baseline.source_optimized,
+        )
+    )
+    all_tests = (*tests, *pending)
+    for result in pending:
+        status = "passed" if result.succeeded else f"failed with exit {result.returncode}"
+        _progress(
+            progress,
+            f"{result.mode} semantic tests {status} in {result.duration_seconds:.2f}s",
+        )
+    failure = next((result for result in all_tests if not result.succeeded), None)
+    if failure is None:
+        return _SemanticQualityGateOutcome(tests=all_tests)
+    return _SemanticQualityGateOutcome(
+        tests=all_tests,
+        failure=_QualityGateOutcome(
+            success=False,
+            tests=all_tests,
+            performance=BenchmarkGateResult(
+                status="invalid",
+                reason=f"{failure.mode} semantic test command failed",
+                minimum_speedup=config.minimum_speedup,
+                baseline_median_seconds=None,
+                compiled_median_seconds=None,
+                speedup=None,
+                warmups=(),
+                samples=(),
+            ),
+            error=(
+                failure.stderr
+                or f"{failure.mode} semantic test command exited {failure.returncode}"
+            ),
+        ),
+    )
+
+
+def _run_compiled_semantic_test(
+    command: tuple[str, ...],
+    *,
+    command_root: Path,
+    compiled_payload_root: Path,
+    require_optimized: bool,
+) -> CommandRunEvidence:
+    """Run one compiled semantic command with optional strict source routing.
+
+    Args:
+        command: Configured semantic-test argv.
+        command_root: Source-stripped project root used as subprocess cwd.
+        compiled_payload_root: Exact staged payload proposed for promotion.
+        require_optimized: Whether fallback from generated source optimization is forbidden.
+
+    Returns:
+        CommandRunEvidence: Captured semantic subprocess evidence.
+    """
+    if require_optimized:
+        return run_performance_command(
+            command,
+            project_root=command_root,
+            payload_root=compiled_payload_root,
+            mode="compiled",
+            require_optimized=True,
+        )
+    return run_performance_command(
+        command,
+        project_root=command_root,
+        payload_root=compiled_payload_root,
+        mode="compiled",
+    )
+
+
+def _run_composition_performance_gate(
+    *,
+    project: DiscoveredProject,
+    baseline: _BaselineWheelPayload,
+    compiled_payload_root: Path,
+    command_root: Path,
+    progress: PackageProgress | None,
+) -> BenchmarkGateResult | None:
+    """Measure a composed payload directly against its accepted source-only arm.
+
+    Args:
+        project: Active project and configured benchmark policy.
+        baseline: Accepted source-only payload and routing identity.
+        compiled_payload_root: Exact staged composition proposed for promotion.
+        command_root: Source-stripped project root used as subprocess cwd.
+        progress: Optional package progress callback.
+
+    Returns:
+        BenchmarkGateResult | None: Full paired marginal gate, or `None` when no
+        accepted source optimization participates in the composition.
+    """
+    config = project.config.compile
+    if not baseline.source_optimized or config.benchmark_command is None:
+        return None
+    result = run_benchmark_gate(
+        BenchmarkGateConfig(
+            command=config.benchmark_command,
+            warmups=config.benchmark_warmups,
+            samples=config.benchmark_samples,
+            minimum_speedup=DEFAULT_MINIMUM_MARGINAL_SPEEDUP,
+        ),
+        project_root=command_root,
+        baseline_payload_root=baseline.baseline_install_root or compiled_payload_root,
+        compiled_payload_root=compiled_payload_root,
+        baseline_require_optimized=True,
+        compiled_require_optimized=True,
+        progress=lambda event: _composition_benchmark_progress(progress, event),
+    )
+    _progress(
+        progress,
+        f"composition performance status {result.status}: {result.reason}",
+    )
+    return result
+
+
 def _run_configured_quality_gate(
     *,
     project: DiscoveredProject,
@@ -8030,64 +8238,46 @@ def _run_configured_quality_gate(
     payload_roots: tuple[Path, ...] = (compiled_payload_root,)
     if baseline.baseline_install_root is not None:
         payload_roots = (baseline.baseline_install_root, *payload_roots)
+    if (
+        baseline.original_install_root is not None
+        and baseline.original_install_root not in payload_roots
+    ):
+        payload_roots = (baseline.original_install_root, *payload_roots)
     _clear_payload_bytecode_with_progress(payload_roots, progress)
     commands_configured = config.test_command is not None or config.benchmark_command is not None
     if commands_configured and baseline.quality_project_root is None:
         return _invalid_quality_gate(config.minimum_speedup, "quality-gate project is missing")
     command_root = baseline.quality_project_root or project.config.root
-    tests: list[CommandRunEvidence] = []
-    if baseline.semantic_test_result is not None:
-        tests.append(baseline.semantic_test_result)
-    if config.test_command is not None:
-        pending_tests: list[CommandRunEvidence] = []
-        if config.benchmark_command is not None and baseline.semantic_test_result is None:
-            if baseline.baseline_install_root is None:
-                return _invalid_quality_gate(config.minimum_speedup, "baseline payload is missing")
-            pending_tests.append(
-                run_performance_command(
-                    config.test_command,
-                    project_root=command_root,
-                    payload_root=baseline.baseline_install_root,
-                    mode="baseline",
-                )
-            )
-        pending_tests.append(
-            run_performance_command(
-                config.test_command,
-                project_root=command_root,
-                payload_root=compiled_payload_root,
-                mode="compiled",
-            )
-        )
-        tests.extend(pending_tests)
-        for result in pending_tests:
-            status = "passed" if result.succeeded else f"failed with exit {result.returncode}"
-            _progress(
-                progress,
-                f"{result.mode} semantic tests {status} in {result.duration_seconds:.2f}s",
-            )
-        failure = next((result for result in tests if not result.succeeded), None)
-        if failure is not None:
-            return _QualityGateOutcome(
-                success=False,
-                tests=tuple(tests),
-                performance=BenchmarkGateResult(
-                    status="invalid",
-                    reason=f"{failure.mode} semantic test command failed",
-                    minimum_speedup=config.minimum_speedup,
-                    baseline_median_seconds=None,
-                    compiled_median_seconds=None,
-                    speedup=None,
-                    warmups=(),
-                    samples=(),
-                ),
-                error=(
-                    failure.stderr
-                    or f"{failure.mode} semantic test command exited {failure.returncode}"
-                ),
-            )
+    semantic = _run_configured_semantic_tests(
+        project=project,
+        baseline=baseline,
+        compiled_payload_root=compiled_payload_root,
+        command_root=command_root,
+        progress=progress,
+    )
+    if semantic.failure is not None:
+        return semantic.failure
+    tests = semantic.tests
     if config.benchmark_command is not None and baseline.baseline_install_root is None:
         return _invalid_quality_gate(config.minimum_speedup, "baseline payload is missing")
+    composition_benchmark = _run_composition_performance_gate(
+        project=project,
+        baseline=baseline,
+        compiled_payload_root=compiled_payload_root,
+        command_root=command_root,
+        progress=progress,
+    )
+    if composition_benchmark is not None and composition_benchmark.status != "passed":
+        return _QualityGateOutcome(
+            success=False,
+            tests=tests,
+            performance=composition_benchmark,
+            composition_performance=composition_benchmark,
+            error=(
+                "composed payload did not improve the accepted source-only arm: "
+                f"{composition_benchmark.reason}"
+            ),
+        )
     benchmark = run_benchmark_gate(
         BenchmarkGateConfig(
             command=config.benchmark_command,
@@ -8096,16 +8286,22 @@ def _run_configured_quality_gate(
             minimum_speedup=config.minimum_speedup,
         ),
         project_root=command_root,
-        baseline_payload_root=baseline.baseline_install_root or compiled_payload_root,
+        baseline_payload_root=(
+            baseline.original_install_root
+            or baseline.baseline_install_root
+            or compiled_payload_root
+        ),
         compiled_payload_root=compiled_payload_root,
+        compiled_require_optimized=baseline.source_optimized,
         progress=lambda event: _benchmark_progress(progress, event),
     )
     accepted = benchmark.status in {"passed", "unbenchmarked"}
     _progress(progress, f"performance status {benchmark.status}: {benchmark.reason}")
     return _QualityGateOutcome(
         success=accepted,
-        tests=tuple(tests),
+        tests=tests,
         performance=benchmark,
+        composition_performance=composition_benchmark,
         error=None if accepted else benchmark.reason,
     )
 
@@ -8200,6 +8396,25 @@ def _benchmark_progress(progress: PackageProgress | None, event: BenchmarkProgre
     )
 
 
+def _composition_benchmark_progress(
+    progress: PackageProgress | None,
+    event: BenchmarkProgress,
+) -> None:
+    """Report direct source-only versus composed-payload benchmark progress.
+
+    Args:
+        progress: Optional package progress callback.
+        event: One paired warmup or measured composition benchmark event.
+    """
+    _progress(
+        progress,
+        (
+            f"composition benchmark {event.phase} pair {event.pair_index} {event.mode} "
+            f"completed in {event.duration_seconds:.2f}s"
+        ),
+    )
+
+
 def _append_quality_gate_timings(
     attempt: CompileAttempt,
     outcome: _QualityGateOutcome,
@@ -8212,7 +8427,22 @@ def _append_quality_gate_timings(
         )
         for result in outcome.tests
     )
+    if outcome.composition_performance is not None:
+        composition_runs = (
+            *outcome.composition_performance.warmups,
+            *outcome.composition_performance.samples,
+        )
+        timings += tuple(
+            CompilePhaseTiming(
+                name="composition_benchmark",
+                duration_seconds=result.duration_seconds,
+                detail=f"{result.mode}; {outcome.composition_performance.status}",
+            )
+            for result in composition_runs
+        )
     benchmark_runs = (*outcome.performance.warmups, *outcome.performance.samples)
+    if outcome.performance is outcome.composition_performance:
+        benchmark_runs = ()
     timings += tuple(
         CompilePhaseTiming(
             name="benchmark",
