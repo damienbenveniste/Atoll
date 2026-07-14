@@ -892,6 +892,37 @@ def test_profile_bootstrap_sampling_entrypoint_runs_in_process(
     assert payload["sample_counts"]["workload::hot"] > 0
 
 
+def test_profile_bootstrap_script_can_import_sibling_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profiled scripts receive the same import root as direct Python launch."""
+    script_root = tmp_path / "benchmark"
+    script_root.mkdir()
+    (script_root / "sibling.py").write_text("VALUE = 3\n", encoding="utf-8")
+    (script_root / "runner.py").write_text(
+        "from sibling import VALUE\n"
+        "if VALUE != 3:\n"
+        "    raise RuntimeError('wrong sibling module')\n",
+        encoding="utf-8",
+    )
+    config_path, result_path = _write_bootstrap_config(
+        tmp_path,
+        _BootstrapConfigInput(
+            profile_stage="sampling",
+            launch_kind="script",
+            target="benchmark/runner.py",
+        ),
+    )
+    _prepare_in_process_bootstrap(monkeypatch, tmp_path, "sibling")
+
+    exit_code = _profile_bootstrap().main((str(config_path),))
+
+    assert exit_code == 0
+    assert result_path.is_file()
+    assert str(script_root.resolve()) not in sys.path
+
+
 def test_profile_bootstrap_enables_optimized_payload_in_child_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

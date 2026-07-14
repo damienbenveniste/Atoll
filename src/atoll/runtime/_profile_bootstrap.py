@@ -531,7 +531,17 @@ class _FrameMapper:
 
 
 def _run_target(config: _Config) -> None:
+    """Execute the configured Python target with normal launcher path semantics.
+
+    Script execution temporarily exposes the script's parent as ``sys.path[0]``
+    so sibling imports behave exactly as they do under ``python script.py``.
+    Both process-global lists are restored even when the target raises.
+
+    Args:
+        config: Validated launch target and argv for one profiling pass.
+    """
     original_argv = sys.argv[:]
+    original_path = sys.path[:]
     try:
         if config.launch_kind == "module":
             sys.argv = [config.target, *config.args]
@@ -541,9 +551,11 @@ def _run_target(config: _Config) -> None:
             if not script_path.is_absolute():
                 script_path = config.project_root / script_path
             sys.argv = [str(script_path), *config.args]
+            sys.path.insert(0, str(script_path.resolve().parent))
             runpy.run_path(str(script_path), run_name="__main__")
     finally:
         sys.argv = original_argv
+        sys.path[:] = original_path
 
 
 def _frame_signature(frame: FrameType) -> tuple[tuple[str, str], ...]:
