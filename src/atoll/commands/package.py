@@ -9094,6 +9094,11 @@ def _copy_pep517_project(
 ) -> None:
     """Copy complete build inputs while excluding Atoll state and native residue.
 
+    The generated ``.git`` pointer is excluded from the baseline-wheel tree
+    digest. Writing it still changes the destination root directory metadata,
+    so the source root metadata is restored afterward to keep repeated copies
+    content-addressable.
+
     Args:
         source: Source expression, declaration, or filesystem path being processed.
         destination: Filesystem destination receiving copied or overlaid content.
@@ -9118,6 +9123,7 @@ def _copy_pep517_project(
 
     shutil.copytree(source_root, destination, ignore=ignore)
     _write_gitdir_pointer(source_root, destination)
+    shutil.copystat(source_root, destination)
 
 
 def _remove_quality_gate_sources(project: DiscoveredProject, copied_project: Path) -> None:

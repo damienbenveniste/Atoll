@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.machinery
+import os
 import shutil
 import zipfile
 from collections.abc import Callable
@@ -16,6 +17,7 @@ import pytest
 
 from atoll import cli as cli_module
 from atoll.analysis.task_fusion import FusionPlan
+from atoll.baseline_cache import BASELINE_WHEEL_CACHE_CONTEXT_ENV, baseline_wheel_cache_key
 from atoll.commands import package as package_command
 from atoll.execution_plans.models import ExecutionPlanTrial
 from atoll.generation.region_shim import RegionShimConfig
@@ -137,6 +139,17 @@ class _BaselinePayloadFactory(Protocol):
         quality_project_root: Path | None = None,
         semantic_test_result: CommandRunEvidence | None = None,
     ) -> object: ...
+
+
+class _Pep517ProjectCopy(Protocol):
+    def __call__(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        excluded_output: Path,
+    ) -> None:
+        """Copy one stable PEP 517 build-input tree."""
 
 
 class _BaselinePayloadView(Protocol):
@@ -382,6 +395,10 @@ _copy_if_different = cast(
 _copy_source_roots = cast(
     Callable[[DiscoveredProject, Path], tuple[Path, ...]],
     _package_attr("_copy_source_roots"),
+)
+_copy_pep517_project = cast(
+    _Pep517ProjectCopy,
+    _package_attr("_copy_pep517_project"),
 )
 _source_roots_digest = cast(
     Callable[[tuple[Path, ...]], str],
@@ -5457,6 +5474,40 @@ def test_staged_source_digest_identifies_the_copied_snapshot(tmp_path: Path) -> 
 
     assert staged_digest == _source_roots_digest(staged_roots)
     assert staged_digest != _source_roots_digest(project.config.source_roots)
+
+
+def test_pep517_project_copy_preserves_reproducible_root_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generated Git pointer cannot give identical copies different keys."""
+    source = tmp_path / "project"
+    package = source / "src" / "demo"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    git_dir = source / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    fixed_timestamp = 1_700_000_000_000_000_000
+    os.utime(source, ns=(fixed_timestamp, fixed_timestamp))
+    monkeypatch.setenv(BASELINE_WHEEL_CACHE_CONTEXT_ENV, "pep517-copy-test")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+
+    _copy_pep517_project(
+        source,
+        first,
+        excluded_output=source / ".atoll" / "dist",
+    )
+    _copy_pep517_project(
+        source,
+        second,
+        excluded_output=source / ".atoll" / "dist",
+    )
+
+    assert first.stat().st_mtime_ns == fixed_timestamp
+    assert second.stat().st_mtime_ns == fixed_timestamp
+    assert baseline_wheel_cache_key(first) == baseline_wheel_cache_key(second)
 
 
 def test_atoll_artifact_helpers_copy_artifacts_and_skip_same_file(tmp_path: Path) -> None:
