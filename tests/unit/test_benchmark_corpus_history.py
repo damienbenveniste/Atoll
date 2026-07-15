@@ -87,6 +87,7 @@ def test_promotion_retains_compact_reviewed_evidence_and_updates_only_marker(
     assert "Python rewrite versus original" in rendered
     assert "Final wheel versus original" in rendered
     assert "Native layer versus source-only wheel" in rendered
+    assert "### `2026-07-13-initial`: performance on ubuntu-24.04" in rendered
     assert "| `alpha` | `accelerated` | 2.000x | 2.500x | 1.250x |" in rendered
     assert "| `beta` | `supported-no-op` | not measured | not measured | not measured |" in rendered
     assert load_snapshot(snapshot_path).label == "2026-07-13-initial"

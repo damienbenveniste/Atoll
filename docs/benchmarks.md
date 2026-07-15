@@ -135,11 +135,42 @@ key.
 <!-- corpus-history:start -->
 | Label | Group | Platform | Cases | Accelerated | Accepted only | Effective corpus |
 | --- | --- | --- | ---: | ---: | ---: | ---: |
+| `corpus-report-v3` | `compatibility` | `ubuntu-24.04` | 25 | 0.0% | not measured | 1.000x |
 | `corpus-report-v3` | `performance` | `ubuntu-24.04` | 12 | 16.7% | 2.109x | 1.132x |
 
 Snapshots are grouped by tier and platform; their ratios are never pooled.
 
-### `corpus-report-v3` cases
+### `corpus-report-v3`: compatibility on ubuntu-24.04
+
+| Case | Status | Python rewrite versus original | Final wheel versus original | Native layer versus source-only wheel |
+| --- | --- | ---: | ---: | ---: |
+| `anyio` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `attrs` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `cattrs` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `click` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `dulwich` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `html5lib` | `supported-no-op` | not measured | not measured | not measured |
+| `httpx` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `jsonschema` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `mako` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `markdown` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `marshmallow` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `mypy` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `networkx` | `supported-no-op` | not measured | not measured | not measured |
+| `pluggy` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `pydantic` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `pydantic-graph` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `rich` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `sortedcontainers` | `supported-no-op` | not measured | not measured | not measured |
+| `sqlalchemy` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `sqlglot` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `sympy` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `tomli` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `tornado` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `trio` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+| `websockets` | `compiled-unbenchmarked` | not measured | not measured | not measured |
+
+### `corpus-report-v3`: performance on ubuntu-24.04
 
 | Case | Status | Python rewrite versus original | Final wheel versus original | Native layer versus source-only wheel |
 | --- | --- | ---: | ---: | ---: |

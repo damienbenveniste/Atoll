@@ -424,7 +424,7 @@ def render_history_markdown(snapshots: tuple[CorpusSnapshot, ...]) -> str:
         lines.extend(
             (
                 "",
-                f"### `{snapshot.label}` cases",
+                f"### `{snapshot.label}`: {snapshot.tier} on {snapshot.platform}",
                 "",
                 "| Case | Status | Python rewrite versus original | "
                 "Final wheel versus original | Native layer versus source-only wheel |",

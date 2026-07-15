@@ -1,0 +1,291 @@
+{
+  "accelerated_coverage": 0.0,
+  "accepted_geometric_mean": null,
+  "atoll_revision": "137f73f02ac954db658e9d18e293cfde16fc182b",
+  "cases": [
+    {
+      "case_digest": "b46353a11faf4b4c17decdc94122d3466d90b1d7e696ffd540e1230bb1ea57e7",
+      "case_id": "anyio",
+      "comparison_key": "b30977c384489e1bdfccbd8d02830a3b9334353d03866247ce0ab4d31bc5590c",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "c384f99687c64c59ed8a11c3a0f11a2d57daff71"
+    },
+    {
+      "case_digest": "be424ba336e59747e40df180b66358f4f84589ebb430ad9f243c786124780e7c",
+      "case_id": "attrs",
+      "comparison_key": "d114780a6e011b33f6a927f9376add68b56df1a30f062152a397b90946bf736a",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "d544dd2dacb4cbd660891e323ad92751ba65b4e0"
+    },
+    {
+      "case_digest": "69b86bec06208a8f8cd47fbb02d157c57ae4afb32648cb68dad08c49d6f3db65",
+      "case_id": "cattrs",
+      "comparison_key": "e3fb9084b50634f6d66e5587701b7965ef1b37e6a71c6d0d615b01c2ed6421c2",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "a6c0900533af780155510343c1472a46fcb984f5"
+    },
+    {
+      "case_digest": "8770640cfdf6c32133c0bf599d1bc0fc3dccea909b8f282c27046c364679782f",
+      "case_id": "click",
+      "comparison_key": "1150ba7c243c2f99f8b149d1f32f318ca065278ffa92e83f1802087046e347df",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "b67832c2167e5b0ff6764a8c04a0a9087e697b5a"
+    },
+    {
+      "case_digest": "00fa53da2830eea116d91443b7459f7675ecd5fd6c7cb11cde158f70b64dba70",
+      "case_id": "dulwich",
+      "comparison_key": "6c77f06b58ad837f67e62a8bc27fca7a1e8078092da2e7e8ce60798895d7a059",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "fdfd2607e41ad1ca63dd1c4c8a36b5032a2f6562"
+    },
+    {
+      "case_digest": "de6a74c562e7e3d4dfd847f5b39081d9264c539213f2ad91948528c349ed4b50",
+      "case_id": "html5lib",
+      "comparison_key": "71f7b14adde1124004b9ac362d8fd71e7a9c7ad0ddb59a3966eb6ce69d2dfec8",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "f87487a4ada2d6cf223bdd182774a01ba3c84618"
+    },
+    {
+      "case_digest": "76751c2c0ec12980f194b7dec4c04c2bc7da5de4a846b57983d0d47be3fdb48d",
+      "case_id": "httpx",
+      "comparison_key": "6337f512c69f7e1d3698b951d517553abcec7282a66a65f139c94e08eb03c0bc",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254"
+    },
+    {
+      "case_digest": "e7704eaca66cf49eb964f82514c376d1cd063ad645d4e9ac9b134e0239a97b1c",
+      "case_id": "jsonschema",
+      "comparison_key": "f0ccf1a9e08d8385ad86cea4b8bbf5f8ec1e3c531e7d7120471a27c2f5ccfc63",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "597e53f974260aba010716f7c9250f01a193969a"
+    },
+    {
+      "case_digest": "9752dffc82499a8c51378f0421cdc6d1897d3c9a38c518833c583c3a8fed39d4",
+      "case_id": "mako",
+      "comparison_key": "5ec784a969060599add4b16cfba1f5af66e768e77b36e2eb52b7e0d2db30fc78",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "d58a9208fd62a816e9609a35be55aa6d3c5b14e7"
+    },
+    {
+      "case_digest": "d3534b11ac90ceaa05fbba11b7ecf13a67fe8be9b6b6d91ce4227af15f95f3ad",
+      "case_id": "markdown",
+      "comparison_key": "eeb7d564a52a6c925826e1e2a632036be78724978279078f1befaf297744f5c4",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "8453df010daf9547efcc20a05bb12c0e2fd2016a"
+    },
+    {
+      "case_digest": "362c8f276c93f841bd4c7268072dee15591a553cc0883f736760666e8084560c",
+      "case_id": "marshmallow",
+      "comparison_key": "65447c40771becb50ac989f35da8941d89c3ef5bda118041ce18802a60cf6b81",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "3265c13945a9533f9a3ade8d47eb9b32412c4c27"
+    },
+    {
+      "case_digest": "1bb4d92f91b110ba703b36612aec534735840c2a5a3dafb5a28fc80fabce517e",
+      "case_id": "mypy",
+      "comparison_key": "5183d5457b31e0ed5d002894702079ac72848950c587aab37dcf34fea93b3b5e",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "40b75e09260905b3ade37e5bf36d795b733605d4"
+    },
+    {
+      "case_digest": "868499254a5dfd6331f9fab17021ce4463539d60bd31fbe699faec18e5395688",
+      "case_id": "networkx",
+      "comparison_key": "3463c54c04ec5498a0247b07b28320cc7b2572422aeaceb0756eb8c80ae33004",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "b1f956344071ba1adfad17d56d62a7a78dfd37e6"
+    },
+    {
+      "case_digest": "ff69fec51849aec2d0b08b35b4ab21566c7de74b5124039dde36fcc4acdca7ac",
+      "case_id": "pluggy",
+      "comparison_key": "268fde21becc278dbbeb63142508a0b297bb86ab707857e4bf84a95204c97fc0",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "71137409e4b1d48ceaea83d32e30b65f4d712b34"
+    },
+    {
+      "case_digest": "67a13b376aabf126bbe25ae70eb21b78014615ff4e02207545745863e77bba94",
+      "case_id": "pydantic",
+      "comparison_key": "2b28f63522c2bbddc60da54cf92df479975d00a3a726ef17bda3d823bd2ce3ec",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "f59e929c999e8b2efc7b12fd0bc1685c1a186be3"
+    },
+    {
+      "case_digest": "a773acc0f58980173e2970e9b3a896d387e59710b8647a5e97c92ce9e0cae78e",
+      "case_id": "pydantic-graph",
+      "comparison_key": "ee0cea4c5a6dafea728b89e6e01a3d2c5bc69d9bb2cf386d0691603eb01ffd47",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "e6ff64409f74124de581068be644a3dbf8999e7d"
+    },
+    {
+      "case_digest": "98a77c131e7a5d7048177be3e075409a4aef31c2a30bec68332c2233f9984f4b",
+      "case_id": "rich",
+      "comparison_key": "b36e07ed684cb40e74336953d658e0673fa401b5cf481bb9af96555b0e47fc82",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "9d8f9a372cc5916fd4781fec207ced7ddac2f08f"
+    },
+    {
+      "case_digest": "b91a1bbf3b994b08e1588c638043666b3375e8ac84e602ccf0450937f7d64a7f",
+      "case_id": "sortedcontainers",
+      "comparison_key": "9ec6b07700e9f21976b2cd7338aea3254f67e7e0b849a0d401858e0d57b6bfe2",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "3ac358631f58c1347f1d6d2d92784117db0f38ed"
+    },
+    {
+      "case_digest": "9b56cac41b3ed850ca1c67c211818f675d8a34bfe631a0abfb371a8c6b98cbff",
+      "case_id": "sqlalchemy",
+      "comparison_key": "b1ff5df58fda3946a43bde9b4e97dbf00a51f0cfe9dbfdd67450afacf748f154",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "149572707d5332df77838e9014616dedb0f416e5"
+    },
+    {
+      "case_digest": "b5e85d727dc87ef9bf11590ab58d42956631599d15f3e5b3b03f6793e1116033",
+      "case_id": "sqlglot",
+      "comparison_key": "0c66219c1dac58cb4b61efc8e8091cf9c333b36eecec12c17139b6b66b365166",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "21a2a5773717f675963dddbdba3df9343da60abe"
+    },
+    {
+      "case_digest": "7d293172a99ef61070ca992c4a0ee871fedfee6202b2566532ca337554e8b677",
+      "case_id": "sympy",
+      "comparison_key": "e363e8a6ddfb3e8839b540926ee0c8c28a521f1b8bbbfd148b8340f2bdf17bb2",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "15e21aca70f79e9b45e05ac1b474aafd05c919a6"
+    },
+    {
+      "case_digest": "02a653e29ad8a9d46ac0fa006bb47ad2e360c485ace5cc99a8a410376727e93d",
+      "case_id": "tomli",
+      "comparison_key": "3e43ca395642b5848064a3e50fd4c2f315b27ce9b77abaa00fb4b3a036483a4c",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "5a77b12a7a9f052ce5a20c335d2825658f6aea52"
+    },
+    {
+      "case_digest": "9814c368d67e41736c8dbeb829ae59cebbb8a027038a79d809246796ea7bf457",
+      "case_id": "tornado",
+      "comparison_key": "f0afdfd8b9c6056ec478b871a5e62ebe5946caff491d2716d8f57d4b1b1a4eea",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "e530031405e2154654dedc4c84d5656b557ea310"
+    },
+    {
+      "case_digest": "532e98a0c782c7d23cfb8849a029be7a621e32b7f3e2e4a5d7c7cb04c287d38d",
+      "case_id": "trio",
+      "comparison_key": "47477b2a86bf50f38362a47b950e1810838b28a68c5cf7801cb9532ac691b2c1",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "5a5111bba2b26da5668c27ee1824e890f5753c3d"
+    },
+    {
+      "case_digest": "d28bb48fdfcbbbbe606b0258789872b817f9c7349955c9433a9f0e21ebe0b46f",
+      "case_id": "websockets",
+      "comparison_key": "6aeaaccfca07de57f3e04e59cee6cfabc96354fff258cefe779ba6491cb68d73",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "compiled-unbenchmarked",
+      "upstream_revision": "bd85dcecce68d6b2bd5985daeefe4938ad87fa1d"
+    }
+  ],
+  "effective_corpus_speedup": 1.0,
+  "experiment": null,
+  "infrastructure_invalid_case_ids": [],
+  "label": "corpus-report-v3",
+  "manifest_digest": "fabb01c9a6b8cc3ccd47b31b7bb538424a2d430b9a4e4362ed3bb4a97a8a89bf",
+  "platform": "ubuntu-24.04",
+  "reviewed_by": "Codex benchmark review",
+  "schema_version": 1,
+  "semantic_invalid_case_ids": [],
+  "tier": "compatibility",
+  "unmeasured_valid_case_ids": [
+    "anyio",
+    "attrs",
+    "cattrs",
+    "click",
+    "dulwich",
+    "httpx",
+    "jsonschema",
+    "mako",
+    "markdown",
+    "marshmallow",
+    "mypy",
+    "pluggy",
+    "pydantic",
+    "pydantic-graph",
+    "rich",
+    "sqlalchemy",
+    "sqlglot",
+    "sympy",
+    "tomli",
+    "tornado",
+    "trio",
+    "websockets"
+  ]
+}
