@@ -613,6 +613,38 @@ def test_compile_skips_automatic_modules_omitted_by_backend_wheel(tmp_path: Path
     assert "tools/helper.py" not in names
 
 
+def test_compile_treats_only_automatic_wheel_omissions_as_noop(
+    tmp_path: Path,
+) -> None:
+    """Unshipped automatic candidates cannot turn a compatible project into failure."""
+    project_root = tmp_path / "omitted_automatic_project"
+    shutil.copytree(FIXTURE_ROOT, project_root)
+    package = project_root / "empty_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    pyproject = project_root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'where = ["src"]',
+            'where = ["."]\ninclude = ["empty_pkg*"]',
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["compile", "--root", str(project_root)])
+
+    report = json.loads((project_root / ".atoll" / "compile-report.json").read_text())
+    assert exit_code == 1
+    assert report["success"] is False
+    assert report["build"]["stderr"] == "scan found no backend-supported typed regions"
+    assert report["rejected_variants"]
+    assert all(
+        "target PEP 517 wheel omitted" in rejected["reason"]
+        for rejected in report["rejected_variants"]
+    )
+    assert not tuple((project_root / ".atoll" / "dist").glob("*.whl"))
+
+
 def test_compile_rejects_invalid_compile_config_without_traceback(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

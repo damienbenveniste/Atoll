@@ -60,6 +60,8 @@ compile reports, and wheel digests.
 
 Twelve cases also carry the `performance` tier. Each uses one reviewed workload,
 the fixed seed `1729`, one warmup, and seven measured baseline/compiled pairs.
+Before timing, the runner allows four bounded scaling attempts to bring the
+installed baseline workload above the half-second stability floor.
 Manifest validation and the lifecycle verify a bundle digest covering the
 workload, case adapter, shared runner, golden output, and notice before use. The
 adapter rejects any default result that differs from `workloads/golden.json`, and

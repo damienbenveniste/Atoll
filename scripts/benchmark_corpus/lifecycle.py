@@ -21,7 +21,7 @@ import sysconfig
 import zipfile
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Literal, cast
+from typing import Final, Literal, cast
 
 from scripts.benchmark_corpus.identity import case_digest, comparison_key
 from scripts.benchmark_corpus.manifest import ManifestError
@@ -71,7 +71,7 @@ _BOOTSTRAP_ATTEMPTS = 2
 _BENCHMARK_WARMUPS = 1
 _BENCHMARK_SAMPLES = 7
 _BENCHMARK_CALIBRATION_TARGET_SECONDS = 0.50
-_BENCHMARK_CALIBRATION_ATTEMPTS = 3
+BENCHMARK_CALIBRATION_ATTEMPTS: Final[int] = 4
 _BENCHMARK_MAX_REPETITIONS = 128
 _PROFILED_NOOP_REASON = "no profile-guided optimization candidate was retained"
 
@@ -465,7 +465,7 @@ def _calibrate_benchmark_repetitions(
     repetitions = 1
     last_repetitions = repetitions
     last_duration = 0.0
-    for attempt in range(1, _BENCHMARK_CALIBRATION_ATTEMPTS + 1):
+    for attempt in range(1, BENCHMARK_CALIBRATION_ATTEMPTS + 1):
         last_repetitions = repetitions
         result = _phase(
             context,
@@ -509,7 +509,7 @@ def _calibrate_benchmark_repetitions(
         "unstable",
         (
             "performance workload remained below the 0.50s calibration target "
-            f"after {_BENCHMARK_CALIBRATION_ATTEMPTS} attempt(s); "
+            f"after {BENCHMARK_CALIBRATION_ATTEMPTS} attempt(s); "
             f"last duration {last_duration:.3f}s at {last_repetitions} repetition(s)"
         ),
     )

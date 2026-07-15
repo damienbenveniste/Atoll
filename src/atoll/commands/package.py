@@ -238,6 +238,7 @@ _RUN_GUARD_DISPATCH_RANK = 25
 _MAX_PROFILED_CALL_CHAIN_ROOTS = 4
 _MINIMUM_CYTHON_BATCH_SIZE = 2
 _MINIMUM_INTERACTION_VARIANTS = 2
+_NO_SUPPORTED_TYPED_REGIONS_REASON = "scan found no backend-supported typed regions"
 _NO_PROFILE_OPTIMIZATION_REASON = "no profile-guided optimization candidate was retained"
 _PROFILE_PLAN_CACHE_FORMAT_VERSION = "1"
 _PROFILE_PLAN_LOWERING_VERSION = "profile-native-selection-v3"
@@ -2893,16 +2894,28 @@ def _failed_preparation_result(
 
     Returns:
         PackageCommandResult: Failed result with scratch output removed and
-        every rejected variant retained as report evidence.
+        every rejected variant retained as report evidence. Automatic
+        whole-project selections whose candidates are all outside the wheel use
+        the structured no-supported-regions marker consumed as a clean no-op.
     """
     output_dir, build_root, install_root = _source_clean_output_paths(
         context.project.config.root,
         context.options.output_dir,
     )
+    automatic_wheel_noop = (
+        context.options.module_name is None
+        and not context.options.selected_members
+        and bool(context.wheel_omissions)
+        and len(context.failures) == len(context.wheel_omissions)
+    )
     error = (
-        context.wheel_omissions[0].build.stderr
-        if context.wheel_omissions
-        else "No selected typed regions could be lowered for a compiler backend."
+        _NO_SUPPORTED_TYPED_REGIONS_REASON
+        if automatic_wheel_noop
+        else (
+            context.wheel_omissions[0].build.stderr
+            if context.wheel_omissions
+            else "No selected typed regions could be lowered for a compiler backend."
+        )
     )
     _remove_failed_wheels(context.project, output_dir)
     cleanup_removed = _remove_source_clean_scratch(build_root, install_root)
@@ -5378,7 +5391,7 @@ def _region_selection_error(
         return None
     if profile_members:
         return "profile-selected hot members are not supported by the configured compiler backends"
-    return "scan found no backend-supported typed regions"
+    return _NO_SUPPORTED_TYPED_REGIONS_REASON
 
 
 def _failed_region_selection(

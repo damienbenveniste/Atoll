@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 from scripts.benchmark_corpus.lifecycle import (
+    BENCHMARK_CALIBRATION_ATTEMPTS,
     LifecycleError,
     agree_compile_status,
     build_performance_compile_policy,
@@ -22,6 +23,10 @@ from scripts.benchmark_corpus.models import CaseStatus, CorpusCase, WorkloadProv
 from scripts.benchmark_corpus.process import ProcessResult
 
 _EXPECTED_SAMPLE_COUNT = 7
+_EXPECTED_CALIBRATION_ATTEMPTS = 4
+_NEAR_THRESHOLD_REPETITIONS = 6
+_NEAR_THRESHOLD_SECONDS = 0.448
+_EXPECTED_SCALED_REPETITIONS = 12
 
 
 def test_performance_policy_uses_reviewed_adapters_and_isolated_python(tmp_path: Path) -> None:
@@ -75,6 +80,18 @@ def test_benchmark_calibration_scales_above_the_noise_floor(
     expected: int,
 ) -> None:
     assert calibrated_benchmark_repetitions(current, duration_seconds) == expected
+
+
+def test_benchmark_calibration_retries_the_scaled_near_threshold_sample() -> None:
+    """A third near-threshold sample leaves one attempt for its computed scale."""
+    assert BENCHMARK_CALIBRATION_ATTEMPTS == _EXPECTED_CALIBRATION_ATTEMPTS
+    assert (
+        calibrated_benchmark_repetitions(
+            _NEAR_THRESHOLD_REPETITIONS,
+            _NEAR_THRESHOLD_SECONDS,
+        )
+        == _EXPECTED_SCALED_REPETITIONS
+    )
 
 
 @pytest.mark.parametrize(("current", "duration_seconds"), [(0, 0.5), (1, 0.0), (1, float("inf"))])
