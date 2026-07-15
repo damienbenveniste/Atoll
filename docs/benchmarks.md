@@ -133,7 +133,28 @@ the Atoll revision is recorded but intentionally excluded from that comparison
 key.
 
 <!-- corpus-history:start -->
-No reviewed corpus snapshots have been promoted.
+| Label | Group | Platform | Cases | Accelerated | Accepted only | Effective corpus |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| `corpus-report-v3` | `performance` | `ubuntu-24.04` | 12 | 16.7% | 2.109x | 1.132x |
+
+Snapshots are grouped by tier and platform; their ratios are never pooled.
+
+### `corpus-report-v3` cases
+
+| Case | Status | Python rewrite versus original | Final wheel versus original | Native layer versus source-only wheel |
+| --- | --- | ---: | ---: | ---: |
+| `anyio` | `supported-no-op` | not measured | not measured | not measured |
+| `html5lib` | `supported-no-op` | not measured | not measured | not measured |
+| `mako` | `supported-no-op` | not measured | not measured | not measured |
+| `mypy` | `supported-no-op` | not measured | not measured | not measured |
+| `networkx` | `accelerated` | not measured | 1.121x | not measured |
+| `pydantic` | `supported-no-op` | not measured | not measured | not measured |
+| `pydantic-graph` | `accelerated` | 3.349x | 3.967x | 1.202x |
+| `rich` | `supported-no-op` | not measured | not measured | not measured |
+| `sqlalchemy` | `supported-no-op` | not measured | not measured | not measured |
+| `sqlglot` | `supported-no-op` | not measured | not measured | not measured |
+| `sympy` | `supported-no-op` | not measured | not measured | not measured |
+| `tomli` | `supported-no-op` | not measured | not measured | not measured |
 <!-- corpus-history:end -->
 
 ## Existing Experiment Evidence

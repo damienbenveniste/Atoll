@@ -1,0 +1,146 @@
+{
+  "accelerated_coverage": 0.16666666666666666,
+  "accepted_geometric_mean": 2.10898350626647,
+  "atoll_revision": "137f73f02ac954db658e9d18e293cfde16fc182b",
+  "cases": [
+    {
+      "case_digest": "b46353a11faf4b4c17decdc94122d3466d90b1d7e696ffd540e1230bb1ea57e7",
+      "case_id": "anyio",
+      "comparison_key": "7ff5568a0d13c9b174ce4d2e26c7397180fa670c34d51e249510160cb3df55aa",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "c384f99687c64c59ed8a11c3a0f11a2d57daff71"
+    },
+    {
+      "case_digest": "de6a74c562e7e3d4dfd847f5b39081d9264c539213f2ad91948528c349ed4b50",
+      "case_id": "html5lib",
+      "comparison_key": "3aaa16b2fb867d89c0a8f6856c31330f3d1b0c75ae50859d143124e47ed0e712",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "f87487a4ada2d6cf223bdd182774a01ba3c84618"
+    },
+    {
+      "case_digest": "9752dffc82499a8c51378f0421cdc6d1897d3c9a38c518833c583c3a8fed39d4",
+      "case_id": "mako",
+      "comparison_key": "68c052e61b22de89752592784910891ecdec47129f279d5f31c1be4ccb1beaa4",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "d58a9208fd62a816e9609a35be55aa6d3c5b14e7"
+    },
+    {
+      "case_digest": "1bb4d92f91b110ba703b36612aec534735840c2a5a3dafb5a28fc80fabce517e",
+      "case_id": "mypy",
+      "comparison_key": "427545a2e6aaf90b5cf42a072ad521aaaf6e8299088342f5a6c606668aaba8e3",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "40b75e09260905b3ade37e5bf36d795b733605d4"
+    },
+    {
+      "case_digest": "868499254a5dfd6331f9fab17021ce4463539d60bd31fbe699faec18e5395688",
+      "case_id": "networkx",
+      "comparison_key": "f12c88e8c1fbc152ec4d206ca243cd1e12ce86e089d99991e4d916080edd58d5",
+      "final_wheel_vs_original": 1.1211484680567954,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "accelerated",
+      "upstream_revision": "b1f956344071ba1adfad17d56d62a7a78dfd37e6"
+    },
+    {
+      "case_digest": "67a13b376aabf126bbe25ae70eb21b78014615ff4e02207545745863e77bba94",
+      "case_id": "pydantic",
+      "comparison_key": "42149c7f3d1ea919dd5cb8ad41e09a971c47ef2e91464ea5680d56d0b68cf61f",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "f59e929c999e8b2efc7b12fd0bc1685c1a186be3"
+    },
+    {
+      "case_digest": "a773acc0f58980173e2970e9b3a896d387e59710b8647a5e97c92ce9e0cae78e",
+      "case_id": "pydantic-graph",
+      "comparison_key": "b73aa07d3208b1566280e197dfbf09eaded4998d16c8f6c670763f402a7fd51a",
+      "final_wheel_vs_original": 3.9671921751925323,
+      "native_layer_vs_source_only_wheel": 1.2023078492259283,
+      "python_rewrite_vs_original": 3.349310334157149,
+      "status": "accelerated",
+      "upstream_revision": "e6ff64409f74124de581068be644a3dbf8999e7d"
+    },
+    {
+      "case_digest": "98a77c131e7a5d7048177be3e075409a4aef31c2a30bec68332c2233f9984f4b",
+      "case_id": "rich",
+      "comparison_key": "f3107489dbe62a189a6c997da6714baadfb38cb3b52a7b6d564e1635137eb918",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "9d8f9a372cc5916fd4781fec207ced7ddac2f08f"
+    },
+    {
+      "case_digest": "9b56cac41b3ed850ca1c67c211818f675d8a34bfe631a0abfb371a8c6b98cbff",
+      "case_id": "sqlalchemy",
+      "comparison_key": "9524c750df453cbd95845d5942b67933a22365547754107d0253cf196ec5ea08",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "149572707d5332df77838e9014616dedb0f416e5"
+    },
+    {
+      "case_digest": "b5e85d727dc87ef9bf11590ab58d42956631599d15f3e5b3b03f6793e1116033",
+      "case_id": "sqlglot",
+      "comparison_key": "1a3c3684db9da6c5e9dd1e3da7350dc39e5267d418a3afbbd8064c467261aa24",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "21a2a5773717f675963dddbdba3df9343da60abe"
+    },
+    {
+      "case_digest": "7d293172a99ef61070ca992c4a0ee871fedfee6202b2566532ca337554e8b677",
+      "case_id": "sympy",
+      "comparison_key": "296bac3d96294035126289611680f9efe19022c40581c2c7b675bfb436d83711",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "15e21aca70f79e9b45e05ac1b474aafd05c919a6"
+    },
+    {
+      "case_digest": "02a653e29ad8a9d46ac0fa006bb47ad2e360c485ace5cc99a8a410376727e93d",
+      "case_id": "tomli",
+      "comparison_key": "cfa0428f8dc7d89a520f78d949c58673af49cc83aacd77aba9cc834bc83895e9",
+      "final_wheel_vs_original": null,
+      "native_layer_vs_source_only_wheel": null,
+      "python_rewrite_vs_original": null,
+      "status": "supported-no-op",
+      "upstream_revision": "5a77b12a7a9f052ce5a20c335d2825658f6aea52"
+    }
+  ],
+  "effective_corpus_speedup": 1.1324321672773847,
+  "experiment": {
+    "head_sha": "137f73f02ac954db658e9d18e293cfde16fc182b",
+    "label": "corpus-report-v3",
+    "repository": "damienbenveniste/Atoll",
+    "run_attempt": 1,
+    "run_id": 29383728252,
+    "schema_version": 1,
+    "workflow_ref": "damienbenveniste/Atoll/.github/workflows/corpus-performance.yml@refs/heads/main"
+  },
+  "infrastructure_invalid_case_ids": [],
+  "label": "corpus-report-v3",
+  "manifest_digest": "fabb01c9a6b8cc3ccd47b31b7bb538424a2d430b9a4e4362ed3bb4a97a8a89bf",
+  "platform": "ubuntu-24.04",
+  "reviewed_by": "Codex benchmark review",
+  "schema_version": 1,
+  "semantic_invalid_case_ids": [],
+  "tier": "performance",
+  "unmeasured_valid_case_ids": []
+}

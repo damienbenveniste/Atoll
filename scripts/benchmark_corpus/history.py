@@ -389,7 +389,19 @@ def load_snapshot(path: Path) -> CorpusSnapshot:
 
 
 def render_history_markdown(snapshots: tuple[CorpusSnapshot, ...]) -> str:
-    """Render deterministic reviewed history without combining corpus groups."""
+    """Render aggregate and per-case history without combining corpus groups.
+
+    Every promoted case remains visible in the generated documentation.  The
+    summary table supports cross-snapshot comparison, while the detail tables
+    prevent a single accelerated case from obscuring no-op, rejected, or
+    unmeasured members of the same corpus run.
+
+    Args:
+        snapshots: Reviewed snapshots to render.
+
+    Returns:
+        Deterministic Markdown containing snapshot summaries and every case.
+    """
     ordered = tuple(sorted(snapshots, key=lambda item: (item.platform, item.tier, item.label)))
     if not ordered:
         return "No reviewed corpus snapshots have been promoted."
@@ -408,6 +420,25 @@ def render_history_markdown(snapshots: tuple[CorpusSnapshot, ...]) -> str:
         for snapshot in ordered
     )
     lines.extend(("", "Snapshots are grouped by tier and platform; their ratios are never pooled."))
+    for snapshot in ordered:
+        lines.extend(
+            (
+                "",
+                f"### `{snapshot.label}` cases",
+                "",
+                "| Case | Status | Python rewrite versus original | "
+                "Final wheel versus original | Native layer versus source-only wheel |",
+                "| --- | --- | ---: | ---: | ---: |",
+            )
+        )
+        lines.extend(
+            "| "
+            f"`{case.case_id}` | `{case.status}` | "
+            f"{_ratio(case.python_rewrite_vs_original)} | "
+            f"{_ratio(case.final_wheel_vs_original)} | "
+            f"{_ratio(case.native_layer_vs_source_only_wheel)} |"
+            for case in snapshot.cases
+        )
     return "\n".join(lines)
 
 
